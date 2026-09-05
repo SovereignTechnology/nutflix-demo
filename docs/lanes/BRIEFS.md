@@ -1,4 +1,4 @@
-# Stage 1 lane briefs (CONTRACTS_VERSION = 2)
+# Stage 1 lane briefs (CONTRACTS_VERSION = 3 — Wave 1 was issued at v2; ADR 0004)
 
 Fill the lane prompt (`docs/prompts/lane.md`) from this table. Every lane gets, in addition
 to what is listed: `packages/core/src/contracts/`, `SECURITY.md`, `docs/decisions/0003-*.md`
