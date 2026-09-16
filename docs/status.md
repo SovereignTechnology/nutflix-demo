@@ -23,14 +23,30 @@ first.** It is the resume point — what is done, what is in flight, and the exa
 
 ## Stage 1 — parallel lanes
 
-`main` is green: **61 test files, 647 passed / 31 skipped** (`npm run ci`, 2026-09-05).
+`main` is green: **61 test files, 651 passed / 27 skipped** (`npm run ci`, 2026-09-05, with
+the dev `ffmpeg` present). Without ffmpeg the same tree reports **647 passed / 31 skipped** —
+also green, not a regression.
 
-> **Skip count note.** 27 of the 31 are Stage-2-gated by design (13 BlossomAuth, 10 pay/1
-> codec, 4 `it.skipIf(usingMock())` payment tests). The other **4 are L8's real-ffmpeg suite**,
-> which `skipIf`s when no binary is found: the dev copy lives at `/tmp/opencode/ffmpeg/` and
-> **`/tmp` gets cleaned**, so a fresh session usually starts at 31 skipped. Restore it with the
-> recipe in `packages/core/src/media/FFMPEG-PIN.md` ("Install for tests") and the count returns
-> to 647+4 passed / 27 skipped. Neither number is a regression.
+> **Skip count.** The 27 are Stage-2-gated by design: 13 BlossomAuth, 10 pay/1 codec, 4
+> `it.skipIf(usingMock())` payment tests. The extra 4 skips in an ffmpeg-less environment are
+> L8's real-ffmpeg suite (`describe.skipIf`), whose dev binary lives in `/tmp/opencode/ffmpeg/`
+> — **`/tmp` gets cleaned, so a fresh session normally starts there.** Restore it with
+> `packages/core/src/media/FFMPEG-PIN.md`.
+>
+> **ffmpeg pin was re-pinned 2026-09-05.** L8's original URL (`autobuild-2026-09-04-14-01`)
+> was **404 within a day**: BtbN keeps only ~12 daily autobuild releases plus one month-end
+> snapshot per month. The pin is now the month-end `autobuild-2026-08-31-13-27` (same FFmpeg
+> revision `n8.1.2-50-g1a748fe2cd`, different build bytes), verified against the release's own
+> `checksums.sha256`, the GitHub API asset `digest`, and a passing run of the suite.
+>
+> **Known flake (intermittent, not a regression):** `packages/gateway` →
+> `ws-bridge.integration.test.ts` → "a non-paying WS client is cut by the seeder window" times
+> out at 20 s under full-suite CPU load — it waits on Hypercore's `REQUEST_TIMEOUT` after a cut
+> (L2 documented the same sensitivity). Seen twice, both times with the CPU-heavy real-ffmpeg
+> transcodes running concurrently; passes in isolation every time (`npx vitest run --project
+> gateway`, ~8 s) and passed on the immediately following full run. **If you hit it, re-run
+> before believing it.** A durable fix belongs in that test (raise its timeout or serialise the
+> two suites) and is L3's directory, not the orchestrator's.
 
 ### Lane table
 
