@@ -1,0 +1,352 @@
+/**
+ * Studio (upload progress mapping, the worker's `studio.publish` request → a signed NIP-71
+ * event), the seeder over the worker, settings side effects, and the `--dev-fixtures`
+ * catalogue (design §5a).
+ */
+import { mkdir, writeFile } from 'node:fs/promises';
+import { join } from 'node:path';
+
+import { afterEach, describe, expect, it } from 'vitest';
+
+import type { UploadProgress, VideoManifest } from '@sovit/core';
+import { mocks } from '@sovit/core';
+
+import type { IpcError } from '../../ipc/errors.js';
+import type { PublishDraft, StudioUploadArgs } from '../../ipc/worker-protocol.js';
+import { SignerIdentity } from '../identity.js';
+import { coreTestKit } from './support/core-helpers.js';
+import type { FakeWorker } from './support/fake-worker.js';
+import type { Rig } from './support/rig.js';
+import { eventually, rig } from './support/rig.js';
+
+const kit = await coreTestKit();
+
+let r: Rig | undefined;
+afterEach(async () => {
+  await r?.close();
+  r = undefined;
+});
+
+const codeOf = async (p: Promise<unknown>): Promise<string> => {
+  try {
+    await p;
+    return 'resolved';
+  } catch (e) {
+    return (e as IpcError).code;
+  }
+};
+
+const JPEG = Uint8Array.from([0xff, 0xd8, 0xff, 0xe0, 1, 2, 3]);
+
+function draftFor(a: StudioUploadArgs): PublishDraft {
+  return {
+    uploadId: a.uploadId,
+    meta: a.meta,
+    durationSec: 6,
+    blockSize: 65536,
+    renditions: [
+      {
+        label: '360p',
+        mime: 'video/mp4',
+        sha256: 'd'.repeat(64) as never,
+        size: 100_000,
+        width: 640,
+        height: 360,
+        hyper: {
+          core: 'b'.repeat(64) as never,
+          blob: { byteOffset: 0, blockOffset: 0, blockLength: 2, byteLength: 100_000 },
+        },
+        hyperUrl: `hyper://${'b'.repeat(64)}/0-2`,
+        fallbacks: [],
+      },
+    ],
+    thumbnail: { kind: 'custom', sha256: 'e'.repeat(64) as never, type: 'image/jpeg' },
+    codec: 'h264',
+  };
+}
+
+describe('studio.upload', () => {
+  it('maps thumbnail paths to nf-media ids, scrubs error text, and publishes via the signer', async () => {
+    const viewer = new kit.TestSigner();
+    let storage = '';
+    r = await rig({
+      flags: { devMocks: true },
+      identity: new SignerIdentity(viewer),
+      worker: {
+        handlers: {
+          init: (a) => {
+            storage = a.storage;
+            return undefined;
+          },
+          'studio.upload': async (a: StudioUploadArgs, w: FakeWorker) => {
+            await mkdir(join(storage, 'tmp'), { recursive: true });
+            await writeFile(join(storage, 'tmp', 'thumb-0.jpg'), JPEG);
+            w.progress(a.uploadId, { stage: 'probing' });
+            w.progress(a.uploadId, {
+              stage: 'thumbnails',
+              candidates: [join(storage, 'tmp', 'thumb-0.jpg'), '/etc/passwd'],
+            });
+            w.progress(a.uploadId, {
+              stage: 'error',
+              message: `ffmpeg failed on /home/alice/Videos/in.mp4 (${'a'.repeat(64)})`,
+            });
+            return (await w.request('studio.publish', draftFor(a))) as VideoManifest;
+          },
+        },
+      },
+    });
+    await r.ready();
+    const seen: UploadProgress[] = [];
+    const video = await r.host.adapter.studio.upload(
+      {
+        file: '/home/alice/Videos/in.mp4',
+        title: 'My upload',
+        description: 'desc',
+        tags: ['diy'],
+        kind: 21,
+        mints: [mocks.MINTS.a],
+        satsPerBlock: 2 as never,
+        split: { seeder: 40, creator: 60 },
+        thumbnailChoice: {
+          size: JPEG.byteLength,
+          type: 'image/jpeg',
+          arrayBuffer: () => Promise.resolve(JPEG.slice().buffer),
+        },
+      },
+      (p) => seen.push(p),
+    );
+    // What the worker was asked: the path + display name + meta + hex thumbnail.
+    const asked = r.worker().calls('studio.upload')[0] as StudioUploadArgs;
+    expect(asked).toMatchObject({
+      path: '/home/alice/Videos/in.mp4',
+      name: 'in.mp4',
+      thumbnailChoice: { hex: 'ffd8ffe0010203', type: 'image/jpeg' },
+      meta: { title: 'My upload', satsPerBlock: 2, split: { seeder: 40, creator: 60 } },
+    });
+    // Progress: the out-of-storage candidate is dropped; the other became an nf-media id.
+    await eventually(() => seen.length === 3, 'progress events');
+    expect(seen[0]).toEqual({ stage: 'probing' });
+    const thumbs = seen[1] as { stage: 'thumbnails'; candidates: string[] };
+    expect(thumbs.candidates).toHaveLength(1);
+    expect(thumbs.candidates[0]).toMatch(/^nf-media:\/\/img\/[0-9a-f]{32}$/);
+    expect(JSON.stringify(seen)).not.toContain('/home/alice');
+    expect(seen[2]).toEqual({ stage: 'error', message: 'ffmpeg failed on <path> (<hex>)' });
+    const img = await r.host.adapter.image(thumbs.candidates[0]!);
+    expect(img).toBe(thumbs.candidates[0]);
+    // The published event is real: signed by the viewer, verifiable, parsed back.
+    expect(video).toMatchObject({
+      author: viewer.pubkey,
+      title: 'My upload',
+      kind: 21,
+      tags: ['diy'],
+      price: {
+        satsPerBlock: 2,
+        mints: [mocks.MINTS.a],
+        split: { seeder: 40, creator: 60 },
+        creatorP2pk: await r.host.adapter.wallet.p2pkPubkey(),
+      },
+    });
+    expect(r.pool.published.map((p) => p.event.kind)).toContain(21);
+    expect(await r.host.adapter.video(video.id)).toEqual(video);
+  });
+
+  it('studio.publish for an upload the host did not start is refused (not-found)', async () => {
+    r = await rig({ identity: new SignerIdentity(new kit.TestSigner()) });
+    await r.ready();
+    const fake = draftFor({
+      uploadId: 'a'.repeat(32) as never,
+      path: '/x',
+      name: 'x',
+      meta: {
+        title: 't',
+        description: '',
+        tags: [],
+        kind: 21,
+        mints: [mocks.MINTS.a],
+        satsPerBlock: 1 as never,
+        split: { seeder: 50, creator: 50 },
+      },
+    });
+    await expect(r.worker().request('studio.publish', fake)).rejects.toMatchObject({
+      code: 'not-found',
+    });
+    expect(r.pool.published).toEqual([]);
+  });
+
+  it('a reused uploadId is refused while the first upload runs', async () => {
+    let release: () => void = () => undefined;
+    r = await rig({
+      identity: new SignerIdentity(new kit.TestSigner()),
+      worker: {
+        handlers: {
+          'studio.upload': () =>
+            new Promise((_res, rej) => {
+              release = () => {
+                rej(new Error('aborted: cancelled'));
+              };
+            }),
+        },
+      },
+    });
+    await r.ready();
+    const args = {
+      uploadId: 'c'.repeat(32) as never,
+      path: '/tmp/a.mp4',
+      name: 'a.mp4',
+      meta: {
+        title: 't',
+        description: '',
+        tags: [],
+        kind: 21 as const,
+        mints: [mocks.MINTS.a],
+        satsPerBlock: 1 as never,
+        split: { seeder: 50, creator: 50 },
+      },
+    };
+    const first = r.host.adapter.upload(1, args);
+    expect(await codeOf(r.host.adapter.upload(2, args))).toBe('invalid-argument');
+    await eventually(() => r!.worker().calls('studio.upload').length === 1, 'upload started');
+    release();
+    expect(await codeOf(first)).toBe('aborted');
+  });
+});
+
+describe('seeder over the worker; settings side effects', () => {
+  it('status rehydrates the WireMap; setEnabled persists and pushes seeder.configure', async () => {
+    r = await rig();
+    await r.ready();
+    const a = r.host.adapter;
+    const st = await a.seeder.status();
+    expect(st.earned.byMint).toBeInstanceOf(Map);
+    expect([...st.earned.byMint.keys()]).toEqual(['https://mint.fixture-a.example']);
+    await a.seeder.setEnabled(true);
+    expect((await a.settings()).seeding.enabled).toBe(true);
+    expect(r.worker().calls('seeder.configure')).toEqual([
+      { enabled: true, diskCapBytes: 10 * 1024 ** 3 },
+    ]);
+    // Unchanged seeding → no push.
+    await a.updateSettings({ theme: 'dark' });
+    expect(r.worker().calls('seeder.configure')).toHaveLength(1);
+    expect(await a.seeder.melt(mocks.MINTS.a, 'lnbc10n1x')).toEqual({ paid: true });
+    await a.seeder.unban('d'.repeat(64) as never);
+    expect(r.worker().calls('seeder.unban')).toEqual([{ pubkey: 'd'.repeat(64) }]);
+  });
+
+  it('seeder.status events reach onStatus as SeederStatus (Map)', async () => {
+    r = await rig();
+    await r.ready();
+    const got: unknown[] = [];
+    r.host.adapter.seeder.onStatus((s) => got.push(s));
+    r.worker().event({
+      e: 'seeder.status',
+      status: {
+        enabled: true,
+        pubkey: 'a'.repeat(64),
+        videos: 1,
+        bytesStored: 5,
+        diskCapBytes: 9,
+        peers: [],
+        earned: { total: 3, unswapped: 1, byMint: { $map: [[mocks.MINTS.a, 3]] } },
+        banned: [],
+      },
+    });
+    await eventually(() => got.length === 1, 'status');
+    expect(
+      (got[0] as { earned: { byMint: Map<string, number> } }).earned.byMint.get(mocks.MINTS.a),
+    ).toBe(3);
+  });
+
+  it('a seeding change while the worker is down is saved, and reaches the next init', async () => {
+    r = await rig();
+    await r.ready();
+    r.worker().crash(1);
+    await eventually(() => r!.host.worker.state === 'down', 'down');
+    const next = await r.host.adapter.updateSettings({
+      seeding: { enabled: true, diskCapBytes: 5 * 1024 ** 3 },
+    });
+    expect(next.seeding).toEqual({ enabled: true, diskCapBytes: 5 * 1024 ** 3 });
+    expect(r.log.lines.some((l) => l.msg.startsWith('seeding change not pushed'))).toBe(true);
+    // The restart (250 ms default back-off) re-inits with the saved values.
+    await eventually(
+      () => r!.spawned.length === 2 && r!.host.worker.state === 'ready',
+      'restart',
+      5000,
+    );
+    expect(r.spawned[1]!.calls('init')[0]).toMatchObject({
+      seeding: { enabled: true, diskCapBytes: 5 * 1024 ** 3 },
+    });
+  });
+
+  it('desktop.ffmpeg asks the worker with the configured path', async () => {
+    r = await rig();
+    await r.ready();
+    expect(await r.host.adapter.ffmpeg(true)).toEqual({
+      found: true,
+      path: '/usr/bin/ffmpeg',
+      version: '7.1',
+      os: 'linux',
+    });
+    expect(r.worker().calls('studio.ffmpeg')).toEqual([{ recheck: true }]);
+  });
+
+  it('analytics is stats plus an honest empty satsByRendition (Stage 2 has receipts)', async () => {
+    r = await rig();
+    const an = await r.host.adapter.studio.analytics('a'.repeat(64) as never);
+    expect(an.satsByRendition).toEqual(new Map());
+    expect(an).toMatchObject({ likes: 0, dislikes: 0, comments: 0 });
+  });
+});
+
+describe('--dev-fixtures (design §5a)', () => {
+  it('serves mock fixtures + the worker’s live manifests, offline, with a dev identity', async () => {
+    r = await rig({ flags: { devMocks: true, devFixtures: true } });
+    await r.ready();
+    const a = r.host.adapter;
+    expect(r.log.lines.some((l) => l.level === 'warn' && l.msg.startsWith('DEV FIXTURES ON'))).toBe(
+      true,
+    );
+    expect(await a.me()).toBe(mocks.ME);
+    expect(await a.signer()).toMatchObject({ pubkey: mocks.ME, locked: true });
+    // Writes still need a real signer.
+    expect(await codeOf(a.react(mocks.VIDEOS[0]!.id, '+'))).toBe('no-signer');
+
+    const trending = await a.feed({ source: 'trending' });
+    expect(trending.items.length).toBeGreaterThan(0);
+    const newMint = 'https://mint.dev-fixture.example' as never;
+    const live: VideoManifest = {
+      ...mocks.VIDEOS[0]!,
+      id: 'f'.repeat(64) as never,
+      title: 'Live fixture',
+      price: { ...mocks.VIDEOS[0]!.price, mints: [newMint] },
+    };
+    let credited = false;
+    a.wallet.onChange((e) => {
+      if (e.type === 'balance' && e.mint === newMint && e.balance > 0) credited = true;
+    });
+    r.worker().fixtures([live]);
+    await eventually(
+      () => r!.log.lines.find((l) => l.msg.startsWith('dev fixtures: live')),
+      'live',
+    );
+    expect((await a.feed({ source: 'trending' })).items[0]?.id).toBe(live.id);
+    expect((await a.stats(live.id)).seedersOnline).toBe(1);
+    expect((await a.stats(mocks.VIDEOS[1]!.id)).seedersOnline).toBe(0);
+    // The dev wallet is credited at the live fixture's mint, so it is playable.
+    await eventually(() => credited, 'fake sats at the live fixture mint');
+    const s = await a.openSession(1, live.id);
+    expect(s.videoId).toBe(live.id);
+    expect(await a.profile(mocks.ME)).toEqual(mocks.MY_PROFILE);
+    // Offline: the fake pool (the rig's) was never asked for catalogue data.
+    expect(r.pool.queries.filter((q) => q.filter.kinds?.includes(21))).toEqual([]);
+  });
+
+  it('without --dev-fixtures a dev.fixtures event is ignored', async () => {
+    r = await rig({ flags: { devMocks: true } });
+    await r.ready();
+    r.worker().fixtures([mocks.VIDEOS[0]!]);
+    await eventually(
+      () => r!.log.lines.find((l) => l.msg.startsWith('dev.fixtures from the worker ignored')),
+      'ignored',
+    );
+  });
+});
