@@ -1,0 +1,344 @@
+import * as fc from 'fast-check';
+import { describe, expect, it } from 'vitest';
+
+import { mocks } from '@sovit/core';
+
+import {
+  METHODS,
+  isCallMsg,
+  isFileToken,
+  isGrantFileMsg,
+  isHostIn,
+  isHostOut,
+  isMintUrl,
+  isRelayUrl,
+  isReplyMsg,
+  isSessionId,
+  isSubMsg,
+  isTopic,
+  isVideoManifest,
+  isSeederStatusWire,
+  validateArgs,
+} from '../guards.js';
+import type { Guard } from '../guards.js';
+import { EXCLUDED_METHODS, IPC_V, LIMITS, TOPIC_METHODS } from '../protocol.js';
+import type { Method } from '../protocol.js';
+import { dehydrate } from '../wiremap.js';
+import { INVALID, SID, TOKEN, UPLOAD_ID, VALID } from './samples.js';
+
+const methods = Object.keys(VALID) as Method[];
+
+/** Adds an unknown key to the first plain-object argument, if any. */
+function withExtraKey(args: readonly unknown[]): unknown[] | undefined {
+  const i = args.findIndex((a) => typeof a === 'object' && a !== null && !Array.isArray(a));
+  if (i < 0) return undefined;
+  const out = [...args];
+  out[i] = { ...(args[i] as object), __junk: 1 };
+  return out;
+}
+
+/** Values that attack the guards themselves rather than their rules. */
+function hostile(): unknown[] {
+  const getterBomb = Object.defineProperty({}, 'source', {
+    enumerable: true,
+    get() {
+      throw new Error('boom');
+    },
+  });
+  const proxy = new Proxy(
+    {},
+    {
+      ownKeys() {
+        throw new Error('boom');
+      },
+      getPrototypeOf() {
+        throw new Error('boom');
+      },
+    },
+  );
+  const arrayProxy = new Proxy([1], {
+    get() {
+      throw new Error('boom');
+    },
+  });
+  const sparse: unknown[] = [];
+  sparse.length = 3;
+  const nullProto = Object.create(null) as object;
+  return [getterBomb, proxy, arrayProxy, sparse, nullProto, [getterBomb], [proxy], [arrayProxy]];
+}
+
+describe('validateArgs — coverage', () => {
+  it('has a guard for every method, and every guard has valid samples', () => {
+    expect(new Set(METHODS)).toEqual(new Set(methods));
+    expect(METHODS.length).toBe(49);
+  });
+
+  it('D3: wallet.send / wallet.receive (and the engine-internal wallet calls) are not methods', () => {
+    for (const m of Object.keys(EXCLUDED_METHODS)) expect(METHODS).not.toContain(m);
+    for (const m of Object.keys(TOPIC_METHODS)) expect(METHODS).not.toContain(m);
+    expect(Object.keys(EXCLUDED_METHODS)).toEqual(
+      expect.arrayContaining(['wallet.send', 'wallet.receive']),
+    );
+  });
+});
+
+describe.each(methods)('validateArgs[%s]', (m) => {
+  const g = validateArgs[m] as Guard<unknown>;
+
+  it('accepts every valid sample, also after a structured clone', () => {
+    for (const args of VALID[m] as readonly unknown[][]) {
+      expect(g(args), JSON.stringify(args)).toBe(true);
+      expect(g(structuredClone(args))).toBe(true);
+    }
+  });
+
+  it('rejects the hand-picked invalid samples', () => {
+    for (const args of INVALID[m] ?? []) expect(g(args), JSON.stringify(args)).toBe(false);
+  });
+
+  it('rejects an extra argument, an unknown key, and non-array args', () => {
+    for (const args of VALID[m] as readonly unknown[][]) {
+      expect(g([...args, 'extra', 'extra', 'extra'])).toBe(false);
+      const extra = withExtraKey(args);
+      if (extra) expect(g(extra)).toBe(false);
+      expect(g(Object.fromEntries(args.map((a, i) => [String(i), a])))).toBe(false);
+    }
+    for (const x of [undefined, null, 0, '', 'x', {}, true]) expect(g(x)).toBe(false);
+  });
+
+  it('never throws, and rejects hostile values', () => {
+    for (const h of hostile()) {
+      expect(() => g(h)).not.toThrow();
+      expect(g(h)).toBe(false);
+    }
+  });
+
+  it('fuzz: never throws on arbitrary input; non-arrays and oversize arrays are rejected', () => {
+    fc.assert(
+      fc.property(fc.anything({ withNullPrototype: true, withTypedArray: true }), (x) => {
+        const r = g(x);
+        expect(typeof r).toBe('boolean');
+        if (!Array.isArray(x)) expect(r).toBe(false);
+      }),
+      { numRuns: 300 },
+    );
+    fc.assert(
+      fc.property(fc.array(fc.anything(), { minLength: 5, maxLength: 20 }), (x) => {
+        // No method takes more than 4 arguments.
+        expect(g(x)).toBe(false);
+      }),
+      { numRuns: 50 },
+    );
+  });
+
+  it('fuzz: replacing one argument with junk of another type is rejected', () => {
+    const samples = (VALID[m] as readonly unknown[][]).filter((a) => a.length > 0);
+    if (samples.length === 0) return;
+    fc.assert(
+      fc.property(
+        fc.constantFrom(...samples),
+        fc.nat(),
+        fc.oneof(
+          fc.constant(null),
+          fc.constant(Symbol('s')),
+          fc.bigInt(),
+          fc.string({ minLength: LIMITS.maxBody + 1, maxLength: LIMITS.maxBody + 2 }),
+          fc.array(fc.integer(), {
+            minLength: LIMITS.maxPlaylistItems + 1,
+            maxLength: LIMITS.maxPlaylistItems + 1,
+          }),
+          fc.func(fc.boolean()),
+        ),
+        (args, i, junk) => {
+          const out = [...args];
+          out[i % args.length] = junk;
+          expect(g(out)).toBe(false);
+        },
+      ),
+      { numRuns: 60 },
+    );
+  });
+});
+
+describe('message envelopes', () => {
+  const call = { v: IPC_V, id: 1, method: 'feed', args: [{ source: 'trending' }] };
+
+  it('CallMsg: valid envelope + known method + valid args', () => {
+    expect(isCallMsg(call)).toBe(true);
+    expect(isCallMsg({ ...call, v: 2 })).toBe(false);
+    expect(isCallMsg({ ...call, id: -1 })).toBe(false);
+    expect(isCallMsg({ ...call, id: 1.5 })).toBe(false);
+    expect(isCallMsg({ ...call, method: 'wallet.send' })).toBe(false);
+    expect(isCallMsg({ ...call, method: 'constructor' })).toBe(false);
+    expect(isCallMsg({ ...call, method: '__proto__' })).toBe(false);
+    expect(isCallMsg({ ...call, method: 'toString' })).toBe(false);
+    expect(isCallMsg({ ...call, args: [{ source: 'nope' }] })).toBe(false);
+    expect(isCallMsg({ ...call, extra: true })).toBe(false);
+    for (const m of methods)
+      for (const args of VALID[m] as readonly unknown[][])
+        expect(isCallMsg({ v: IPC_V, id: 7, method: m, args })).toBe(true);
+  });
+
+  it('Topic / SubMsg', () => {
+    for (const t of [
+      { t: 'seeder.status' },
+      { t: 'notifications' },
+      { t: 'wallet.change' },
+      { t: 'session.peers', sid: SID },
+      { t: 'session.spend', sid: SID },
+      { t: 'upload.progress', uploadId: UPLOAD_ID },
+    ]) {
+      expect(isTopic(t)).toBe(true);
+      expect(isSubMsg({ v: IPC_V, op: 'sub', subId: 3, topic: t })).toBe(true);
+    }
+    expect(isTopic({ t: 'session.peers' })).toBe(false);
+    expect(isTopic({ t: 'seeder.status', sid: SID })).toBe(false);
+    expect(isTopic({ t: 'wallet.send' })).toBe(false);
+    expect(isSubMsg({ v: IPC_V, op: 'unsub', subId: 3 })).toBe(true);
+    expect(isSubMsg({ v: IPC_V, op: 'unsub', subId: 3, topic: { t: 'notifications' } })).toBe(
+      false,
+    );
+    expect(isSubMsg({ v: IPC_V, op: 'sub', subId: 3 })).toBe(false);
+  });
+
+  it('ReplyMsg: an error must carry a known code and the "<code>: " prefix', () => {
+    expect(isReplyMsg({ v: IPC_V, id: 1, ok: true, result: { a: 1 } })).toBe(true);
+    expect(isReplyMsg({ v: IPC_V, id: 1, ok: true })).toBe(false);
+    const error = { code: 'no-seeders', message: 'no-seeders: nobody' };
+    expect(isReplyMsg({ v: IPC_V, id: 1, ok: false, error })).toBe(true);
+    expect(isReplyMsg({ v: IPC_V, id: 1, ok: false, error: { ...error, message: 'nobody' } })).toBe(
+      false,
+    );
+    expect(
+      isReplyMsg({ v: IPC_V, id: 1, ok: false, error: { code: 'teapot', message: 'teapot: x' } }),
+    ).toBe(false);
+  });
+
+  it('FileToken / SessionId / grant-file (SE-1)', () => {
+    expect(isFileToken(TOKEN)).toBe(true);
+    for (const bad of [
+      '/home/u/.ssh/id_ed25519',
+      'nf-file:',
+      'nf-file:00112233445566778899AABBCCDDEEFF',
+      `${TOKEN}0`,
+      'nf-file:../../../../etc/passwd',
+      42,
+    ])
+      expect(isFileToken(bad)).toBe(false);
+    expect(isSessionId(SID)).toBe(true);
+    expect(isSessionId(SID.toUpperCase())).toBe(false);
+    expect(isGrantFileMsg({ v: IPC_V, path: '/home/u/Videos/a.mp4' })).toBe(true);
+    expect(isGrantFileMsg({ v: IPC_V, path: 'C:\\Users\\u\\a.mp4' })).toBe(true);
+    expect(isGrantFileMsg({ v: IPC_V, path: 'relative/a.mp4' })).toBe(false);
+    expect(isGrantFileMsg({ v: IPC_V, path: '/a\u0000b' })).toBe(false);
+    expect(isGrantFileMsg({ v: IPC_V, path: '/' + 'a'.repeat(LIMITS.maxPath) })).toBe(false);
+  });
+
+  it('HostIn / HostOut', () => {
+    const msg = { v: IPC_V, id: 1, method: 'studio.upload', args: VALID['studio.upload'][0] };
+    const file = { path: '/home/u/Videos/a.mp4', name: 'a.mp4', size: 10 };
+    expect(isHostIn({ kind: 'call', wc: 3, msg, file })).toBe(true);
+    expect(isHostIn({ kind: 'call', wc: 3, msg: call })).toBe(true);
+    expect(isHostIn({ kind: 'call', wc: 0, msg: call })).toBe(false);
+    expect(isHostIn({ kind: 'call', wc: 3, msg: { ...call, method: 'wallet.receive' } })).toBe(
+      false,
+    );
+    expect(isHostIn({ kind: 'wc-gone', wc: 3 })).toBe(true);
+    expect(isHostIn({ kind: 'image', req: 1, id: 'abc' })).toBe(true);
+    expect(isHostIn({ kind: 'image', req: 1, id: '../x' })).toBe(false);
+    expect(
+      isHostOut({ kind: 'media-link', token: 'a'.repeat(43), url: 'http://127.0.0.1:4000/x' }),
+    ).toBe(true);
+    expect(isHostOut({ kind: 'media-link', token: 'a'.repeat(43), url: null })).toBe(true);
+    expect(
+      isHostOut({ kind: 'media-link', token: 'a'.repeat(43), url: 'http://evil.example/x' }),
+    ).toBe(false);
+    expect(isHostOut({ kind: 'image', req: 1, bytes: new Uint8Array(3), type: 'image/png' })).toBe(
+      true,
+    );
+    expect(isHostOut({ kind: 'image', req: 1, bytes: null, type: null })).toBe(true);
+    expect(isHostOut({ kind: 'image', req: 1, bytes: [1], type: 'image/png' })).toBe(false);
+  });
+});
+
+describe('URL rules (consistent with @sovit/ui Settings/Studio validators)', () => {
+  it('relays: wss only, no credentials/fragment, ≤ 512', () => {
+    for (const ok of [
+      'wss://relay.example',
+      'wss://relay.example:444/path?x=1',
+      'wss://[::1]:7000',
+      'wss://127.0.0.1',
+    ])
+      expect(isRelayUrl(ok), ok).toBe(true);
+    for (const bad of [
+      'ws://relay.example',
+      'https://relay.example',
+      'wss://u:p@relay.example',
+      'wss://relay.example#x',
+      'wss://relay.example/',
+      'wss://',
+      'wss://relay example',
+      'wss://relay.example/\u0000',
+      'wss://' + 'a'.repeat(510),
+    ])
+      expect(isRelayUrl(bad), bad).toBe(false);
+  });
+
+  it('mints: https only, no credentials/query/fragment/trailing slash', () => {
+    for (const ok of [
+      'https://mint.example',
+      'https://mint.example:3338/api/v1',
+      'https://127.0.0.1:3338',
+    ])
+      expect(isMintUrl(ok), ok).toBe(true);
+    for (const bad of [
+      'http://mint.example',
+      'https://mint.example/',
+      'https://mint.example?x',
+      'https://a@mint.example',
+    ])
+      expect(isMintUrl(bad), bad).toBe(false);
+  });
+
+  it('every URL the real Settings validators accept is accepted here', async () => {
+    const ui = (await import(
+      /* @vite-ignore */ new URL('../../../../ui/src/screens/Settings/model.ts', import.meta.url)
+        .href
+    )) as {
+      validateRelayUrl(s: string): { ok: boolean; value?: string };
+      validateMintUrl(s: string): { ok: boolean; value?: string };
+    };
+    const host = fc.stringMatching(/^[a-z0-9]{1,12}(\.[a-z0-9]{1,8}){0,3}$/);
+    const path = fc.stringMatching(/^(\/[A-Za-z0-9._~-]{1,8}){0,3}\/?$/);
+    const port = fc.option(fc.integer({ min: 1, max: 65535 }), { nil: undefined });
+    fc.assert(
+      fc.property(
+        fc.constantFrom('wss', 'WSS', 'https', 'ws', 'http'),
+        host,
+        port,
+        path,
+        (s, h, p, pa) => {
+          const raw = `${s}://${h}${p === undefined ? '' : `:${p}`}${pa}`;
+          const r = ui.validateRelayUrl(raw);
+          if (r.ok) expect(isRelayUrl(r.value), `${raw} → ${String(r.value)}`).toBe(true);
+          const mt = ui.validateMintUrl(raw);
+          if (mt.ok) expect(isMintUrl(mt.value), `${raw} → ${String(mt.value)}`).toBe(true);
+        },
+      ),
+      { numRuns: 400 },
+    );
+  });
+});
+
+describe('data-shape guards against the core fixtures', () => {
+  it('every fixture VideoManifest passes isVideoManifest', () => {
+    for (const v of mocks.VIDEOS) expect(isVideoManifest(v), v.title).toBe(true);
+    expect(isVideoManifest({ ...mocks.VIDEOS[0], renditions: [] })).toBe(false);
+  });
+
+  it("the mock seeder's status, dehydrated, passes isSeederStatusWire", async () => {
+    const status = await new mocks.MockNetworkAdapter().seeder.status();
+    expect(isSeederStatusWire(dehydrate(status))).toBe(true);
+    expect(isSeederStatusWire(status)).toBe(false); // a raw Map never passes
+  });
+});

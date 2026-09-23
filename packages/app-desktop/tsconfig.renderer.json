@@ -1,0 +1,17 @@
+{
+  // Renderer (lane L6-A): @sovit/ui screens, router, playback coordinator, rehydrate. Sandboxed,
+  // no network, no Node — "types": [] keeps process/require/Buffer out of renderer code.
+  // scripts/bundle.ts bundles it to dist/renderer/app.js; tsc output is for type-checking and
+  // tests only.
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "outDir": "dist",
+    "lib": ["ES2023", "DOM", "DOM.Iterable"],
+    "jsx": "react-jsx",
+    "types": []
+  },
+  "include": ["src/renderer/**/*"],
+  "exclude": ["src/**/*.stories.tsx"],
+  "references": [{ "path": "./tsconfig.worker.json" }, { "path": "../core" }, { "path": "../ui" }]
+}

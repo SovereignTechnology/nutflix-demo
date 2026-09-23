@@ -1,0 +1,27 @@
+{
+  // Bare worker (lane L6-C) AND the runtime-neutral shared code: src/ipc/** (every process
+  // imports it) and src/index.ts (the package entry: dist/index.js). The shared code lives in
+  // this project because it is the strictest environment — no DOM lib — and because the other
+  // parts must reference one project for it (a sixth config was outside the lane allowlist).
+  // Every other part references this project for ../ipc/*.
+  //
+  // Node types stay on: they cover setTimeout/console/Buffer/URL, which Bare 1.31 also has.
+  // They also declare TextEncoder/TextDecoder/crypto/AbortController/process, which Bare does
+  // NOT have — src/ipc/__tests__/boundaries.test.ts enforces that for src/ipc, and
+  // src/ipc/__tests__/bare-smoke.test.ts runs the compiled ipc modules under the real bare.
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "outDir": "dist",
+    "lib": ["ES2023"]
+  },
+  "include": [
+    "src/index.ts",
+    "src/ipc/**/*",
+    "src/worker/**/*",
+    "src/types/bare.d.ts",
+    "src/types/__tests__/fixtures/**/*"
+  ],
+  "exclude": ["src/**/*.stories.tsx"],
+  "references": [{ "path": "../core" }, { "path": "../seeder" }, { "path": "../gateway" }]
+}

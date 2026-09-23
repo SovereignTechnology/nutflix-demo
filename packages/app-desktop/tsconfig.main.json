@@ -1,0 +1,13 @@
+{
+  // Electron main (lane L6-A): window, security handlers, app:/nf-media: protocols, IPC gate,
+  // file-token registry, host supervision. Emits dist/main/main.js (the e2e entry). Node, no DOM.
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "outDir": "dist",
+    "lib": ["ES2023"]
+  },
+  "include": ["src/main/**/*"],
+  "exclude": ["src/**/*.stories.tsx"],
+  "references": [{ "path": "./tsconfig.worker.json" }]
+}
