@@ -1,0 +1,25 @@
+/**
+ * What the runtime-neutral `WorkerHost` needs from its runtime (design §6 L6-C: "runtime-
+ * neutral, adapters injected — runs under Node in tests and Bare in production"). Bare's
+ * implementation is `adapters/bare.ts` (bare-fs, bare-os, bare-subprocess); tests build a
+ * Node one from `@sovit/seeder`'s and `@sovit/core/media/node`'s adapters. Hashing and
+ * randomness are NOT here: `./crypto.ts` (libsodium) loads under both runtimes.
+ */
+import type { FsAdapter, ProcessRunner } from '@sovit/core';
+import type { SeederFs } from '@sovit/seeder';
+
+import type { OsName } from './ffmpeg.js';
+
+export interface WorkerRuntime {
+  /** `@sovit/seeder`'s filesystem (Corestore dir, CAS index, ban list, fixture dirs). */
+  readonly seederFs: SeederFs;
+  /** `@sovit/core/media`'s filesystem; `mkdtemp(prefix)` creates under `tmpDir`. */
+  mediaFs(tmpDir: string): FsAdapter;
+  /** ffmpeg / ffprobe (argv only, never a shell). */
+  readonly runner: ProcessRunner;
+  /** An environment variable (only `PATH` is read). */
+  env(name: string): string | undefined;
+  /** Exists, is a regular file, and is executable by us. */
+  isExecutable(path: string): Promise<boolean>;
+  readonly os: OsName;
+}
