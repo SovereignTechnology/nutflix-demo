@@ -2,7 +2,8 @@
 
 Kept current by the orchestrator after every merge (execution plan §5.1).
 
-**If you are an agent picking this up cold:** Stage 1 is complete in code (2026-09-23): all L5
+**If you are an agent picking this up cold: read an internal session handoff (not published)
+first** — it is the resume point. Stage 1 is complete in code (2026-09-23): all L5
 screens, contracts v4, and the L6 desktop app (L6-0 IPC, L6-A shell, L6-B host, L6-C worker)
 are merged; `npm run ci` 123 files, 2070 passed / 27 skipped. **The one open Stage 1 exit item
 is the Electron e2e** (`npm run -w packages/app-desktop test:e2e`), which cannot run on
