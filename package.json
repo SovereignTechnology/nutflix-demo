@@ -12,7 +12,7 @@
     "packages/*"
   ],
   "scripts": {
-    "build": "tsc -b && npm run -w packages/ui build:css",
+    "build": "tsc -b && npm run -w packages/ui build:css && npm run -w packages/app-desktop bundle",
     "typecheck": "tsc -b",
     "test": "vitest run",
     "test:watch": "vitest",

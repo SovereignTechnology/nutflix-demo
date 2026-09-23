@@ -81,7 +81,8 @@ present and 647 / 31 without one — that suite `skipIf`s when no binary is foun
 | **L3-flake** | `lane/L3-flake` | **merged 2026-09-23** — real bug, not a flake: late WS frames paused a closing socket (30 s stall); cut sockets left `maxConnections` accounting (F1) and a cut mid-stalled-write never started the close (F2). Fixed + 8 deterministic tests; A/B under load 4/10 → 0/10 failures | see git log |
 | **L6-0 IPC foundation** | `lane/L6-0` | **merged 2026-09-23** (app-desktop 13 → 422 tests; 49-method table exact against v4) | see git log |
 | **L6-B host** | `lane/L6-B` | **merged 2026-09-23** (app-desktop 422 → 674 tests; real `DesktopNetworkAdapter`, SE-4/SE-5, T16 image fetch with DNS-answer checks, 48+12-path conformance vs the mock) | see git log |
-| L6 desktop-shell | `lane/L6-{A,C}` | **in progress** — design `docs/plan/L6-design.md`. No worktree on the dev laptop and no cached Electron binary here (`node node_modules/electron/install.js`) | — |
+| **L6-A shell** | `lane/L6-A` | **merged 2026-09-23** (app-desktop 674 → 687+ tests; Electron main/preload/renderer, IPC gate, SE-1 tokens, playback coordinator; **Electron e2e + fidelity spike written, never run — pending D4**) | see git log |
+| L6 desktop-shell | `lane/L6-C` | **in progress** (Bare worker + two-seeder Stage 1 test) — design `docs/plan/L6-design.md`. No worktree on the dev laptop and no cached Electron binary here (`node node_modules/electron/install.js`) | — |
 | L7 web-shell | `lane/L7` | **NOT STARTED** — out of scope if ADR 0006 (unmerged, "Pear-runtime-only v0") is adopted | — |
 
 Lane reports: `docs/lanes/L1.md`, `L2.md` (incl. v3 section), `L3.md` (incl. markup section),
@@ -259,7 +260,13 @@ v4 (2026-09-23) was a small additive bump: reactions (`likes`/`dislikes`/`myReac
 8. **DONE 2026-09-23 (lane L3-flake): a real bug, not a flaky test** — `ws-duplex.ts` paused an already-closing socket on late frames (30 s stall); cut sockets are now tracked until their own close and terminated after `WS_CLOSE_GRACE_MS` = 5 s. Still load-sensitive: the seeder's "cut inside `upload` leaves EXACTLY windowBlocks" test (hit once at load ~20, green in isolation). Original note: **The gateway `ws-bridge` "non-paying WS client is cut" flake is now frequent** (≥ 5 hits
    this session at load 6–8; always green on re-run). Needs the durable fix in that test
    (L3's directory): raise its timeout or serialise it against the ffmpeg/Storybook load.
-9. Worktrees of merged lanes (`L5-*`) are archaeology — remove when convenient (branches stay);
+9. **From L6-A:** Library and Studio should take `onToast` so the shell owns one toast stack;
+   Shorts should listen for its `<video>` element's `pause` (as Watch does) so a PiP/media-key
+   pause stops paying; residual SE-1 risk — a compromised renderer *process* can still request a
+   token for any regular file it can name → Stage 2: pick upload files via a main-process
+   `dialog`. The §5b fixture seam is assumed to be `NUTFLIX_DEV_FIXTURES_JSON` — reconcile with
+   L6-C at merge.
+10. Worktrees of merged lanes (`L5-*`) are archaeology — remove when convenient (branches stay);
    the PNGs live only in them (gitignored).
 
 ### Findings to act on (non-contract, orchestrator-owned)
