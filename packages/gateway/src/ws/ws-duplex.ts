@@ -10,7 +10,12 @@
  *     socket (`send(data, cb)`), so a slow browser stalls Hypercore instead of buffering
  *     unboundedly in the gateway.
  *   - Read backpressure is real: when `push()` reports a full buffer the socket is
- *     `pause()`d and `resume()`d from `_read`.
+ *     `pause()`d and `resume()`d from `_read` — but never once the duplex is destroying.
+ *     A destroyed duplex has no reader, so frames that arrive after a destroy (after a
+ *     seeder-side cut the viewer keeps sending until it reads our close frame) are DROPPED.
+ *     Pausing for them would stop the socket from reading the viewer's close reply, and the
+ *     closing handshake would then wait out `ws`'s `closeTimeout` (30 s) — the L3-flake bug,
+ *     see docs/lanes/L3-flake.md.
  *   - Destroy is GRACEFUL where possible: a seeder-side cut (spike S-A) destroys the Noise
  *     stream, which destroys this duplex; we `close()` (not `terminate()`) so the frames
  *     already handed to the socket still reach the viewer — that is what makes "the viewer
@@ -50,6 +55,9 @@ export class WsDuplex extends Duplex {
     ws.binaryType = 'nodebuffer';
 
     ws.on('message', (data, isBinary) => {
+      // streamx's destroy() sets the readable highWaterMark to 0, so push() would return
+      // false for every late frame and the socket would be paused for good (see above).
+      if (this.destroying) return;
       if (!isBinary) {
         this.destroy(new Error('ws-duplex: text frame on a binary-only socket'));
         return;

@@ -111,6 +111,126 @@ async function countBlocks(v: Viewer, coreKeyHex: string): Promise<number> {
   return have;
 }
 
+type CutEvent = Extract<SeederEvent, { type: 'session-cut' }>;
+
+/**
+ * Bounds for the cut tests' waits. Every wait there is on an EVENT, bounded well inside the
+ * 20 s test timeout so that a stall fails with a message naming it. Under load the events
+ * simply arrive later; nothing races a timer. (docs/lanes/L3-flake.md)
+ */
+const CUT_WITHIN_MS = 8_000;
+/** Far below `ws`'s 30 s closeTimeout, so a stalled closing handshake is reported as one. */
+const CLOSE_WITHIN_MS = 5_000;
+const CLOSE_STALL =
+  'the WebSocket did not close after the cut — closing handshake stalled (ws closeTimeout is ' +
+  '30 s; a late viewer frame must never pause the gateway socket, see ws/ws-duplex.ts)';
+
+/** `p`, or a failure naming what stalled once `ms` have passed. */
+async function within<T>(p: Promise<T>, ms: number, what: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const expired = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      reject(new Error(`${what} (waited ${ms} ms)`));
+    }, ms);
+  });
+  try {
+    return await Promise.race([p, expired]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** The gateway seeder's next `session-cut`. Subscribe BEFORE the viewer connects. */
+function nextCut(r: Rig): Promise<CutEvent> {
+  return new Promise((resolve) => {
+    const off = r.gateway.seeder.on((e) => {
+      if (e.type === 'session-cut') {
+        off();
+        resolve(e);
+      }
+    });
+  });
+}
+
+const onceClosed = (s: {
+  readonly destroyed: boolean;
+  once: (e: 'close', cb: () => void) => unknown;
+}): Promise<void> =>
+  new Promise((resolve) => {
+    if (s.destroyed) resolve();
+    else s.once('close', resolve);
+  });
+
+interface BackgroundFetch {
+  /** `'complete'`, the error it ended with, or `null` while it is still outstanding. */
+  readonly outcome: () => 'complete' | Error | null;
+  /** Cancel it (destroy the read stream) and wait for how it ended. */
+  readonly cancel: () => Promise<'complete' | Error>;
+}
+
+/**
+ * Fetch a blob in the background with NO request timeout. The cut tests used to wait for the
+ * viewer's `get` to fail with `REQUEST_TIMEOUT`, but Hypercore arms that timer when the
+ * request is created, before the WebSocket is even open: under load a short timeout could
+ * expire before the gateway had uploaded `window + 1` blocks, leaving nothing to cut. Here the
+ * requests stay outstanding until the test has seen the cut, and the test cancels them.
+ */
+function fetchInBackground(
+  stream: AsyncIterable<Uint8Array> & { destroy: (err?: Error) => void },
+): BackgroundFetch {
+  let outcome: 'complete' | Error | null = null;
+  const done = (async (): Promise<'complete' | Error> => {
+    try {
+      // Drain it: what matters is whether the fetch completes, not the bytes.
+      const it = stream[Symbol.asyncIterator]();
+      while (!(await it.next()).done);
+      return (outcome = 'complete');
+    } catch (err) {
+      return (outcome = err instanceof Error ? err : new Error(String(err)));
+    }
+  })();
+  return {
+    outcome: () => outcome,
+    cancel: () => {
+      stream.destroy();
+      return done;
+    },
+  };
+}
+
+/**
+ * The viewer's block count once it has stopped changing: non-zero and unchanged for `quietMs`.
+ * Call it after the viewer's replication stream has closed, so no new data can arrive; this
+ * only lets blocks already received finish verifying and landing in storage. The old test got
+ * that quiet period from its 2.5 s `REQUEST_TIMEOUT` wait.
+ */
+async function settledBlockCount(
+  v: Viewer,
+  coreKeyHex: string,
+  quietMs = 500,
+  withinMs = 4_000,
+): Promise<number> {
+  const t0 = Date.now();
+  let last = await countBlocks(v, coreKeyHex);
+  let since = Date.now();
+  for (;;) {
+    await settle(50);
+    const now = await countBlocks(v, coreKeyHex);
+    if (now !== last) {
+      last = now;
+      since = Date.now();
+    } else if (now > 0 && Date.now() - since >= quietMs) {
+      return now;
+    }
+    if (Date.now() - t0 > withinMs)
+      throw new Error(
+        last === 0
+          ? `the viewer stored no block at all (waited ${withinMs} ms)`
+          : `the viewer's block count kept changing (last ${last}, waited ${withinMs} ms)`,
+      );
+  }
+}
+
 async function putFixture(r: Rig, blocks: number) {
   const data = fixtureBytes(blocks);
   const res = await r.gateway.seeder.putBytes(data, { mime: 'video/mp4' });
@@ -165,15 +285,19 @@ describe('WS bridge: one WebSocket = one replication stream + pay/1', () => {
     const uploadEvents: number[] = [];
     r.gateway.seeder.blobs.coreByKey(entry.coreKey)!.core.on('upload', (i) => uploadEvents.push(i));
 
+    const cut = nextCut(r);
     const { raw, closed } = connectViewer(v, r);
-    const res = await vcore.blobs
-      .get(entry.blob, { wait: true, timeout: 2500 })
-      .catch((e: unknown) => e);
-    expect(res).toBeInstanceOf(Error); // REQUEST_TIMEOUT: the stream was cut mid-fetch
-    await closed; // the gateway closed the WebSocket
-    await settle(150);
+    const fetch = fetchInBackground(vcore.blobs.createReadStream(entry.blob, { wait: true }));
+    const e = await within(cut, CUT_WITHIN_MS, 'the gateway never cut the non-paying viewer');
+    await within(closed, CLOSE_WITHIN_MS, CLOSE_STALL); // the gateway closed the WebSocket
+    await within(onceClosed(raw), 2_000, "the viewer's replication stream outlived its socket");
 
     const viewerNoise = toHex(raw.noiseStream.publicKey!);
+    // The cut was this viewer's session, for the window …
+    expect(e.session.noiseKeyHex).toBe(viewerNoise);
+    expect(e.reason).toBe('window-exceeded');
+    // … and it never obtained the blob: its fetch is still waiting for blocks that will not come.
+    expect(fetch.outcome()).toBeNull();
     // Hypercore fired `upload` at least window+1 times (the crossing block was counted, S-A
     // finding + L2's wire-rig note that one more queued request can pop after destroy) …
     expect(uploadEvents.length).toBeGreaterThanOrEqual(WINDOW + 1);
@@ -187,18 +311,20 @@ describe('WS bridge: one WebSocket = one replication stream + pay/1', () => {
     });
     // … the session was cut for that reason and left the registry …
     expect(r.gateway.seeder.session(viewerNoise)).toBeUndefined();
-    const cut = r.log.records.find((rec) => rec.msg === 'session cut');
-    expect(cut?.fields['reason']).toBe('window-exceeded');
+    const logged = r.log.records.find((rec) => rec.msg === 'session cut');
+    expect(logged?.fields['reason']).toBe('window-exceeded');
     // … the Noise key is on the persisted ban list …
     expect(
       r.gateway.seeder
         .bans()
         .some((b) => b.noiseKey === viewerNoise && b.reason === 'window-exceeded'),
     ).toBe(true);
-    // … and the viewer holds at most `window` blocks (never the crossing one).
-    const have = await countBlocks(v, entry.coreKey);
+    // … and the viewer holds at most `window` blocks (never the crossing one), counted once
+    // everything it received has landed.
+    const have = await settledBlockCount(v, entry.coreKey);
     expect(have).toBeGreaterThan(0);
     expect(have).toBeLessThanOrEqual(WINDOW);
+    expect(await fetch.cancel()).toBeInstanceOf(Error);
     await until(() => r.gateway.stats().wsConnections === 0, 3000);
   });
 
@@ -302,9 +428,14 @@ describe('WS bridge: one WebSocket = one replication stream + pay/1', () => {
     const { entry } = await putFixture(r, 10);
     const v = await viewer();
     const vcore = await v.seeder.blobs.openCoreByKey(Buffer.from(entry.coreKey, 'hex'));
+    const cut = nextCut(r);
     const { closed } = connectViewer(v, r);
-    await vcore.blobs.get(entry.blob, { wait: true, timeout: 1500 }).catch(() => null);
-    await closed;
+    const fetch = fetchInBackground(vcore.blobs.createReadStream(entry.blob, { wait: true }));
+    const e = await within(cut, CUT_WITHIN_MS, 'the gateway never cut the viewer');
+    expect(e.reason).toBe('window-exceeded');
+    await within(closed, CLOSE_WITHIN_MS, CLOSE_STALL);
+    expect(fetch.outcome()).toBeNull();
+    await fetch.cancel();
     expect(r.log.records.some((rec) => rec.msg.includes('session without pay/1'))).toBe(true);
     expect(
       r.log.records.some(

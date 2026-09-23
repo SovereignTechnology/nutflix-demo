@@ -11,6 +11,8 @@ import { WsDuplex } from '../ws/ws-duplex.js';
 
 interface Pair {
   readonly server: WsDuplex;
+  /** The server-side `ws` socket the duplex wraps. */
+  readonly serverWs: WebSocket;
   readonly client: WebSocket;
   readonly close: () => Promise<void>;
 }
@@ -25,17 +27,20 @@ async function pair(opts?: { highWaterMark?: number }): Promise<Pair> {
   const wss = new WebSocketServer({ server: http });
   await new Promise<void>((r) => http.listen(0, '127.0.0.1', r));
   const port = (http.address() as AddressInfo).port;
-  const serverSide = new Promise<WsDuplex>((resolve) => {
+  const serverSide = new Promise<{ server: WsDuplex; serverWs: WebSocket }>((resolve) => {
     wss.once('connection', (ws) => {
-      resolve(new WsDuplex(ws, opts));
+      resolve({ server: new WsDuplex(ws, opts), serverWs: ws });
     });
   });
   const client = new WebSocket(`ws://127.0.0.1:${port}/`);
   await new Promise<void>((r) => client.once('open', r));
-  const server = await serverSide;
+  const { server, serverWs } = await serverSide;
   const close = async (): Promise<void> => {
     client.terminate();
     if (!server.destroyed) server.destroy();
+    // A server socket stuck mid-close would otherwise hold `http.close()` for ws's 30 s
+    // closeTimeout.
+    serverWs.terminate();
     wss.close();
     await new Promise<void>((r) =>
       http.close(() => {
@@ -44,7 +49,7 @@ async function pair(opts?: { highWaterMark?: number }): Promise<Pair> {
     );
   };
   cleanups.push(close);
-  return { server, client, close };
+  return { server, serverWs, client, close };
 }
 
 const onceClose = (s: {
@@ -132,6 +137,40 @@ describe('WsDuplex', () => {
     server.destroy();
     await clientClosed;
     expect(received.length).toBe(5);
+  });
+
+  it('a frame that crosses our close frame is dropped and does not stall the closing handshake', async () => {
+    // Spike S-A cut over a real socket: the seeder destroys the duplex while the viewer still
+    // has requests in flight, so frames keep arriving until the viewer reads our close frame.
+    // They must not pause the socket — a paused socket never reads the viewer's close reply,
+    // and the handshake then waits out ws's closeTimeout (30 s). docs/lanes/L3-flake.md.
+    const { server, serverWs, client } = await pair();
+    const clientClosed = new Promise<number>((r) =>
+      client.once('close', (code) => {
+        r(code);
+      }),
+    );
+    const lateFrameSeen = new Promise<void>((r) =>
+      serverWs.once('message', () => {
+        r();
+      }),
+    );
+    // Order the race with events, not timing: the client has not read the close frame yet …
+    client.pause();
+    server.destroy(); // … when the cut closes the socket …
+    client.send(Buffer.from([1, 2, 3])); // … so its next request crosses the close frame …
+    await lateFrameSeen; // … and the server handles it on its own, not coalesced with the reply.
+    expect(serverWs.isPaused).toBe(false);
+    client.resume(); // The client now reads the close frame and replies.
+    const outcome = await Promise.race([
+      clientClosed,
+      new Promise<'stalled'>((r) => {
+        setTimeout(() => {
+          r('stalled');
+        }, 5000); // ≪ ws's 30 s closeTimeout
+      }),
+    ]);
+    expect(outcome).toBe(1000);
   });
 
   it('write backpressure: `write()` returns false once the socket buffer is full and drains later', async () => {
