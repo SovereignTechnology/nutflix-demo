@@ -2,11 +2,13 @@
 
 Kept current by the orchestrator after every merge (execution plan §5.1).
 
-**If you are an agent picking this up cold:** all nine L5 screens are merged and contracts
-are v4 (2026-09-23, section "Orchestrator actions — 2026-09-23" below). **Next: L4-fixes and
-L5-fixes (ADR 0007), then L6** (desktop shell), then the Stage 1 exit. Cameron's 2026-09-23
-answers: ADR 0007 and "Inputs from Cameron — ANSWERED 2026-09-23" below. Background and hard
-rules: an internal session handoff (not published) §1–§3, §4.2, §5 (its §4.1 is done).
+**If you are an agent picking this up cold:** Stage 1 is complete in code (2026-09-23): all L5
+screens, contracts v4, and the L6 desktop app (L6-0 IPC, L6-A shell, L6-B host, L6-C worker)
+are merged; `npm run ci` 123 files, 2070 passed / 27 skipped. **The one open Stage 1 exit item
+is the Electron e2e** (`npm run -w packages/app-desktop test:e2e`), which cannot run on
+the dev laptop until Cameron applies the D4 sandbox fix (`docs/plan/L6-design.md` D4). After
+that: Stage 2 (`docs/prompts/stage-2-security.md`, contracts v5 — see the v5 list below). Design:
+`docs/plan/L6-design.md`; lane reports `docs/lanes/L6-*.md`.
 
 ## Stage 0 — scaffold, contracts, spikes: **DONE 2026-09-04**
 
@@ -82,7 +84,7 @@ present and 647 / 31 without one — that suite `skipIf`s when no binary is foun
 | **L6-0 IPC foundation** | `lane/L6-0` | **merged 2026-09-23** (app-desktop 13 → 422 tests; 49-method table exact against v4) | see git log |
 | **L6-B host** | `lane/L6-B` | **merged 2026-09-23** (app-desktop 422 → 674 tests; real `DesktopNetworkAdapter`, SE-4/SE-5, T16 image fetch with DNS-answer checks, 48+12-path conformance vs the mock) | see git log |
 | **L6-A shell** | `lane/L6-A` | **merged 2026-09-23** (app-desktop 674 → 687+ tests; Electron main/preload/renderer, IPC gate, SE-1 tokens, playback coordinator; **Electron e2e + fidelity spike written, never run — pending D4**) | see git log |
-| L6 desktop-shell | `lane/L6-C` | **in progress** (Bare worker + two-seeder Stage 1 test) — design `docs/plan/L6-design.md`. No worktree on the dev laptop and no cached Electron binary here (`node node_modules/electron/install.js`) | — |
+| **L6-C worker** | `lane/L6-C` | **merged 2026-09-23** (Bare data plane; day-1 probe 20/20 under real `bare`; gated playback server; credit-paced payer; **§5(a) two-seeder Stage 1 test green, ~2.2 s, 5/5 + under load**) | see git log | No worktree on the dev laptop and no cached Electron binary here (`node node_modules/electron/install.js`) | — |
 | L7 web-shell | `lane/L7` | **NOT STARTED** — out of scope if ADR 0006 (unmerged, "Pear-runtime-only v0") is adopted | — |
 
 Lane reports: `docs/lanes/L1.md`, `L2.md` (incl. v3 section), `L3.md` (incl. markup section),
@@ -223,9 +225,20 @@ v4 (2026-09-23) was a small additive bump: reactions (`likes`/`dislikes`/`myReac
    seeders); `SignerStatus` "none"; which balance `autoTopUp` compares; `satsByRendition` source;
    upload abort (`studio.cancel`). L1: reaction/comment-like counts ignore NIP-09 deletions (the
    host filters them); `trendingFeed` has no kinds filter; NIP-05 fetch policy.
-7. **`UploadInput.file` doc** says "Desktop: absolute path", but under SE-1 the desktop shell
+7. **From L6-C (`docs/contract-requests/L6-C.md`) — money-path bugs in the MOCK, worked around
+   by a dev-only `DevEngine`:** `MockPaymentEngine` treats a block index as a count (a seeder
+   serving a non-prefix set can never be paid — breaks seeking and multi-seeder), and two mock
+   wallets mint identical secrets (false double-spend ban). v5: `recordUpload` carries the block
+   index (or the count rule is written down) and the mock is fixed; each mock wallet gets its own
+   secret namespace. pay/1: `core` in ACK/PRICE, `windowBlocks` in HELLO (credit window 4 caps a
+   viewer at ~2.6 MB/s over 100 ms RTT). Worker protocol: a `shutdown` request (bare-sidecar
+   `end()` never reaches the child). Seeder: loopback-bindable swarm + per-session hook, runtime
+   disk-cap setter. Packaging: a bundled worker needs an unbundled boot module importing
+   `bare-encoding/global` first (bundlers hoist externals). **L10's adversary suite runs against
+   the mock — re-check its expectations when the mock is fixed.**
+8. **`UploadInput.file` doc** says "Desktop: absolute path", but under SE-1 the desktop shell
    passes a main-minted file token across IPC (L6-0) — fix the contract text at v5.
-8. **`Route` changes (orchestrator-owned `screens/shared/route.ts`, not contracts):** `library`
+9. **`Route` changes (orchestrator-owned `screens/shared/route.ts`, not contracts):** `library`
    gets `playlist?`, `watch` gets a playlist/list param, `search` gets filters, `studio` gets
    `videoId`, `wallet` gets an intent.
 
