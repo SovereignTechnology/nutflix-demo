@@ -13,8 +13,9 @@
  *     host would drop it anyway);
  *   - the `ready` event follows a successful `init` response;
  *   - outgoing events are checked with `validateWorkerEvent` and dropped if invalid;
- *   - worker → host requests (`studio.publish`) are numbered, bounded in time and their
- *     results checked with `validateHostResult[m]`;
+ *   - worker → host requests (`studio.publish`) are checked with `validateHostArgs[m]`
+ *     before they leave, numbered, bounded in time, and their results checked with
+ *     `validateHostResult[m]`;
  *   - a corrupt stream (`FramingError`) is terminal: `onFatal`, no resync (the entry exits 3).
  *
  * `push()` never throws.
@@ -24,6 +25,7 @@ import { fromWireError, toWireError, wireError } from '../ipc/errors.js';
 import { FrameDecoder, FramingError, encodeFrame } from '../ipc/framing.js';
 import {
   isHostToWorker,
+  validateHostArgs,
   validateHostResult,
   validateWorkerEvent,
   validateWorkerResult,
@@ -133,10 +135,14 @@ export class WorkerRpc {
     this.send(ev);
   }
 
-  /** A worker → host request (`studio.publish`). */
+  /** A worker → host request (`studio.publish`); arguments the host would refuse fail here. */
   request<M extends HostMethod>(m: M, a: HostMethodTable[M][0]): Promise<HostMethodTable[M][1]> {
     if (this.dead)
       return Promise.reject(fromWireError(wireError('backend-down', 'host pipe closed')));
+    if (!(validateHostArgs[m] as Guard<unknown>)(a))
+      return Promise.reject(
+        fromWireError(wireError('invalid-argument', `${m} arguments are invalid`)),
+      );
     const id = this.nextId;
     this.nextId = this.nextId >= MAX_MSG_ID ? 1 : this.nextId + 1;
     return new Promise((resolve, reject) => {
