@@ -19,8 +19,13 @@
  *   - Destroy is GRACEFUL where possible: a seeder-side cut (spike S-A) destroys the Noise
  *     stream, which destroys this duplex; we `close()` (not `terminate()`) so the frames
  *     already handed to the socket still reach the viewer — that is what makes "the viewer
- *     holds exactly `window` blocks" hold over a real socket. `ws` itself terminates if the
- *     peer never answers the close handshake (its own `closeTimeout`, 30 s).
+ *     holds exactly `window` blocks" hold over a real socket. The close starts in
+ *     `_predestroy`, i.e. AT the destroy: streamx defers `_destroy` until an in-flight
+ *     `_write` calls back, and ours calls back only once `ws` has flushed the frame — never,
+ *     while the peer does not read (L3-flake F2). The close frame still queues behind every
+ *     frame already handed to `ws.send`. A peer that never completes the handshake is
+ *     terminated by the bridge after `WS_CLOSE_GRACE_MS` (and by `ws`'s own `closeTimeout`,
+ *     30 s, when used without the bridge).
  *   - The remote closing the socket destroys the duplex, which the streamx pipeline
  *     propagates to the Noise stream, which closes the seeder's `PeerSession`.
  *
@@ -102,15 +107,23 @@ export class WsDuplex extends Duplex {
     cb(null);
   }
 
+  override _predestroy(): void {
+    this.closeSocket();
+  }
+
   override _destroy(cb: (err: Error | null) => void): void {
-    // A socket paused for read backpressure never sees the peer's close frame; let it
-    // flow again (pushes into a destroyed stream are dropped) so the handshake completes.
-    if (this.ws.isPaused) this.ws.resume();
-    if (!this.remoteClosed) {
-      const state = this.ws.readyState;
-      if (state === OPEN) this.ws.close(1000);
-      else if (state === CONNECTING) this.ws.terminate();
-    }
+    this.closeSocket(); // idempotent; `_predestroy` has normally done it already
     cb(null);
+  }
+
+  /** Start the closing handshake (see the module comment). Idempotent. */
+  private closeSocket(): void {
+    // A socket paused for read backpressure never sees the peer's close frame; let it
+    // flow again (frames arriving now are dropped, see `message`) so the handshake completes.
+    if (this.ws.isPaused) this.ws.resume();
+    if (this.remoteClosed) return;
+    const state = this.ws.readyState;
+    if (state === OPEN) this.ws.close(1000);
+    else if (state === CONNECTING) this.ws.terminate();
   }
 }

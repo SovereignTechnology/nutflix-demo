@@ -15,7 +15,15 @@
  *   - Noise handshake deadline: a socket that has not completed the handshake in time is
  *     dropped (a pre-handshake socket costs the seeder nothing but a file descriptor);
  *   - ping/pong liveness: a peer that misses a pong is terminated;
- *   - `maxPayload` on frames; `perMessageDeflate` off (CRIME-class + CPU).
+ *   - `maxPayload` on frames; `perMessageDeflate` off (CRIME-class + CPU);
+ *   - after its replication stream ends (a cut, a handshake timeout, a remote Noise close) a
+ *     socket stays TRACKED — counted against `maxConnections`, terminated by `close()` —
+ *     until the WebSocket's own `close`. Destroying the duplex starts the closing handshake
+ *     (`WsDuplex._predestroy`, even mid-write); a peer that has not completed it within
+ *     `WS_CLOSE_GRACE_MS` (it never reads, or never answers the close frame) is terminated.
+ *     Before this (docs/lanes/L3-flake.md F1/F2) the socket left the set at the stream's end,
+ *     uncounted and unpinged, and could stay open for 30 s — or indefinitely, if the peer had
+ *     stopped reading mid-write.
  */
 import type { IncomingMessage } from 'node:http';
 import type { Duplex as NodeDuplex } from 'node:stream';
@@ -27,10 +35,19 @@ import type { WebSocket } from 'ws';
 import type { WsLimits } from '../config.js';
 import { WsDuplex } from './ws-duplex.js';
 
+/**
+ * How long a WebSocket may take to finish its closing handshake once its replication stream has
+ * ended, before it is terminated. Honest peers answer in one round trip; this only bounds a
+ * peer that never reads or never answers.
+ */
+export const WS_CLOSE_GRACE_MS = 5_000;
+
 export interface WsBridgeOptions {
   readonly seeder: Seeder;
   readonly limits: WsLimits;
   readonly logger: Logger;
+  /** Override `WS_CLOSE_GRACE_MS` (tests). */
+  readonly closeGraceMs?: number;
 }
 
 export type UpgradeRefusal = 'wrong-path' | 'connection-cap';
@@ -40,13 +57,22 @@ export class WsBridge {
   private readonly seeder: Seeder;
   private readonly limits: WsLimits;
   private readonly log: Logger;
+  private readonly closeGraceMs: number;
   private readonly sockets = new Set<WebSocket>();
   private closed = false;
-  private readonly counters = { accepted: 0, refused: 0, handshakeTimeouts: 0, pingTimeouts: 0 };
+  private readonly counters = {
+    accepted: 0,
+    refused: 0,
+    handshakeTimeouts: 0,
+    pingTimeouts: 0,
+    /** Sockets terminated because they had not closed `closeGraceMs` after their stream ended. */
+    graceTerminations: 0,
+  };
 
   constructor(o: WsBridgeOptions) {
     this.seeder = o.seeder;
     this.limits = o.limits;
+    this.closeGraceMs = o.closeGraceMs ?? WS_CLOSE_GRACE_MS;
     this.log = o.logger.child({ component: 'ws-bridge' });
     this.wss = new WebSocketServer({
       noServer: true,
@@ -134,15 +160,29 @@ export class WsBridge {
       }
     }, this.limits.pingIntervalMs);
 
-    const cleanup = (): void => {
+    // The stream ending is NOT the socket closing: the socket stays in `sockets` until its own
+    // `close`, and gets `closeGraceMs` to finish the closing handshake the duplex starts.
+    let graceTimer: ReturnType<typeof setTimeout> | null = null;
+    const stopTimers = (): void => {
       clearTimeout(handshakeTimer);
       clearInterval(pinger);
-      this.sockets.delete(ws);
     };
-    ws.once('close', cleanup);
+    ws.once('close', () => {
+      stopTimers();
+      if (graceTimer !== null) clearTimeout(graceTimer);
+      this.sockets.delete(ws);
+    });
     noise.once('close', () => {
-      cleanup();
+      stopTimers();
       if (!duplex.destroyed) duplex.destroy();
+      if (ws.readyState === ws.CLOSED) return;
+      graceTimer = setTimeout(() => {
+        this.counters.graceTerminations++;
+        this.log.info('ws: closing handshake not completed within grace — terminating', {
+          graceMs: this.closeGraceMs,
+        });
+        ws.terminate();
+      }, this.closeGraceMs);
     });
     this.log.debug('ws: connection accepted', { connections: this.sockets.size });
   }

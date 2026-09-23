@@ -328,6 +328,48 @@ describe('WS bridge: one WebSocket = one replication stream + pay/1', () => {
     await until(() => r.gateway.stats().wsConnections === 0, 3000);
   });
 
+  it('a cut viewer that never answers the close frame stays counted, and gateway.close() does not wait for it (F1)', async () => {
+    const r = await rig({ windowBlocks: 4 });
+    const { entry } = await putFixture(r, 20);
+    const v = await viewer();
+    const vcore = await v.seeder.blobs.openCoreByKey(Buffer.from(entry.coreKey, 'hex'));
+    // The gateway-side Noise stream of the session: once it has closed, the bridge has seen the
+    // cut (its own close listener was registered first, at the upgrade).
+    let noise: { readonly destroyed: boolean; once: (e: 'close', cb: () => void) => unknown };
+    const opened = new Promise<void>((resolve) => {
+      const off = r.gateway.seeder.on((e) => {
+        if (e.type === 'session-open') {
+          noise = r.gateway.seeder.session(e.session.noiseKeyHex)!.stream.noiseStream;
+          off();
+          resolve();
+        }
+      });
+    });
+    const { ws } = connectViewer(v, r);
+    const cutSeen = new Promise<void>((resolve) => {
+      const off = r.gateway.seeder.on((e) => {
+        if (e.type === 'session-cut') {
+          ws.pause(); // a viewer that never reads, so never answers the close frame
+          off();
+          resolve();
+        }
+      });
+    });
+    const fetch = fetchInBackground(vcore.blobs.createReadStream(entry.blob, { wait: true }));
+    await within(opened, CUT_WITHIN_MS, 'no session opened');
+    await within(cutSeen, CUT_WITHIN_MS, 'the gateway never cut the viewer');
+    await within(onceClosed(noise!), 2_000, "the session's Noise stream did not close");
+
+    // The socket is still open, so it is still counted (maxConnections) and owned by close() …
+    expect(r.gateway.stats().wsConnections).toBe(1);
+    // … which therefore terminates it: no wait for the 5 s grace, nor ws's 30 s closeTimeout.
+    const t0 = Date.now();
+    await within(r.gateway.close(), 3_000, 'gateway.close() waited on the cut socket');
+    expect(Date.now() - t0).toBeLessThan(3_000);
+    ws.resume();
+    await fetch.cancel();
+  });
+
   it('HELLO discloses the gateway price = ceil(base × (100 + markupPercent) / 100), and pay/1 is attached to the protomux', async () => {
     // Base policy is 2 sats/block (helpers.basePolicy); 150 % markup → ceil(2 × 2.5) = 5.
     const r = await rig({ windowBlocks: 100, raw: { markupPercent: 150 } });

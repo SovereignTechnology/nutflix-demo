@@ -173,6 +173,46 @@ describe('WsDuplex', () => {
     expect(outcome).toBe(1000);
   });
 
+  it('a destroy during a stalled write still starts the closing handshake, and stays graceful', async () => {
+    // F2 (docs/lanes/L3-flake.md): streamx defers `_destroy` until an in-flight `_write` calls
+    // back, and ours calls back only once `ws` has flushed the frame — never, while the peer
+    // does not read. The close must start at the destroy anyway (`_predestroy`).
+    const { server, serverWs, client } = await pair({ highWaterMark: 4096 });
+    server.on('error', () => undefined);
+    let bytes = 0;
+    client.on('message', (d) => {
+      bytes += (d as Buffer).byteLength;
+    });
+    const clientClosed = new Promise<number>((r) =>
+      client.once('close', (code) => {
+        r(code);
+      }),
+    );
+    client.pause(); // the peer stops reading
+    const chunk = Buffer.alloc(256 * 1024, 7);
+    // Queue until ws holds bytes in userland: the kernel buffers are full and a `_write` is
+    // waiting on `ws.send`'s callback.
+    for (let i = 0; i < 400 && serverWs.bufferedAmount === 0; i++) {
+      server.write(chunk);
+      await new Promise((r) => setTimeout(r, 5));
+    }
+    expect(serverWs.bufferedAmount).toBeGreaterThan(0);
+
+    server.destroy(); // the cut, mid-write
+    expect(serverWs.readyState).toBe(WebSocket.CLOSING); // the close frame is queued NOW …
+    client.resume();
+    const code = await Promise.race([
+      clientClosed,
+      new Promise<'stalled'>((r) => {
+        setTimeout(() => {
+          r('stalled');
+        }, 5000);
+      }),
+    ]);
+    expect(code).toBe(1000); // … behind the frames already handed to the socket
+    expect(bytes).toBeGreaterThan(0);
+  });
+
   it('write backpressure: `write()` returns false once the socket buffer is full and drains later', async () => {
     const { server, client } = await pair({ highWaterMark: 4096 });
     const chunk = Buffer.alloc(64 * 1024, 7);
