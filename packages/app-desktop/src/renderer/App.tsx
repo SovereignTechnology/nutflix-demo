@@ -1,17 +1,21 @@
 /**
  * The desktop shell (design §4): header, sidebar, the routed screen, the mini-player and ONE
- * shell `ToastStack`. Every prop the screens expect from a shell (docs/status.md "Shell
- * contract the screens expect") is wired here:
+ * shell `ToastStack` (fed by Settings and Library through `onToast`; it outlives the screens,
+ * and a toast's action closes that toast before it runs, once). Every prop the screens expect
+ * from a shell (docs/status.md "Shell contract the screens expect") is wired here:
  *
  *   Home      `tab`, `hoverPreview` from Settings
  *   Watch     `videoId`, `startAtSec` (route `t`), `onMiniPlayer` → coordinator, `resumeSession`
  *             (expand / back to a handed-off video), `playlist` (extras)
- *   Shorts    `videoId`, `onPlaybackStart` → pause the mini-player (SE-3)
+ *   Shorts    `videoId`, `onPlaybackStart` → pause the mini-player (SE-3); when the mini
+ *             resumes, the coordinator pauses the short's session AND its element, and the
+ *             short's element-pause handler shows it paused (as Watch does)
  *   Channel   `pubkey`, `tab`; `seedingVideos` deliberately undefined in Stage 1 (v5 lookup)
  *   Search    `q`, `filters` + `onFiltersChange` kept in the history entry
- *   Library   `tab`, `playlistId` (extras); Library keeps its own toast stack (no `onToast` prop)
+ *   Library   `tab`, `playlistId` (extras), `onToast` → shell stack
  *   Studio    `tab`, `resolveFile` = identity (SE-1: the preload tokenises the File),
- *             `ffmpeg` + `onRecheckFfmpeg` from `desktop.ffmpeg`; kept mounted across tabs
+ *             `ffmpeg` + `onRecheckFfmpeg` from `desktop.ffmpeg`; kept mounted across tabs;
+ *             no `onToast` — Studio raises no toasts (its notices are in-place state)
  *   Wallet    `intent` (extras)
  *   Settings  `onSettingsChange` → theme + hoverPreview, `onToast` → shell stack;
  *             `onChangeSigner` omitted (no signer flow in Stage 1)
@@ -127,14 +131,37 @@ export function Shell({ adapter, coordinator, router, probeFfmpeg }: ShellProps)
   // ---- toasts --------------------------------------------------------------------------------
   const [toasts, setToasts] = useState<readonly ToastItem[]>([]);
   const toastSeq = useRef(0);
-  const pushToast = useCallback((t: ToastItem): void => {
-    toastSeq.current += 1;
-    const item: ToastItem = { ...t, id: `shell-${String(toastSeq.current)}` };
-    setToasts((prev) => [...prev, item].slice(-MAX_SHELL_TOASTS));
-  }, []);
   const dismissToast = useCallback((id: string): void => {
     setToasts((prev) => prev.filter((t) => t.id !== id));
   }, []);
+  const pushToast = useCallback(
+    (t: ToastItem): void => {
+      toastSeq.current += 1;
+      const id = `shell-${String(toastSeq.current)}`;
+      const action = t.action;
+      let used = false;
+      // Ids are re-minted here, so a screen's own dismiss cannot reach this stack: an action
+      // (Undo, Retry) closes its toast itself — as the screens' own stacks do — and runs once.
+      const item: ToastItem =
+        action === undefined
+          ? { ...t, id }
+          : {
+              ...t,
+              id,
+              action: {
+                label: action.label,
+                onClick: () => {
+                  if (used) return;
+                  used = true;
+                  dismissToast(id);
+                  action.onClick();
+                },
+              },
+            };
+      setToasts((prev) => [...prev, item].slice(-MAX_SHELL_TOASTS));
+    },
+    [dismissToast],
+  );
 
   // ---- ffmpeg probe for Studio -------------------------------------------------------------
   const [ffmpeg, setFfmpeg] = useState<FfmpegStatus | undefined>(undefined);
@@ -259,7 +286,9 @@ export function Shell({ adapter, coordinator, router, probeFfmpeg }: ShellProps)
       );
       break;
     case 'library':
-      screen = <Library {...common} tab={route.tab} playlistId={extras.playlistId} />;
+      screen = (
+        <Library {...common} tab={route.tab} playlistId={extras.playlistId} onToast={pushToast} />
+      );
       break;
     case 'studio':
       screen = (

@@ -220,6 +220,47 @@ describe('every screen prop the shell owes (status.md "Shell contract")', () => 
     expect(props('Library')).toMatchObject({ tab: 'playlists', playlistId: 'ceramics-binge' });
   });
 
+  it("Library: onToast is the shell's (the same one Settings gets); an action closes its toast and runs once", async () => {
+    const m = await mount({ name: 'library' });
+    const onToast = props('Library')['onToast'] as (t: unknown) => void;
+    expect(typeof onToast).toBe('function');
+    await go(m, { name: 'settings' });
+    expect(props('Settings')['onToast']).toBe(onToast);
+    await go(m, { name: 'library' });
+    expect(props('Library')['onToast']).toBe(onToast);
+
+    const undo = vi.fn();
+    act(() => {
+      onToast({
+        id: 'library-toast-1',
+        tone: 'info',
+        title: 'Removed from Watch later',
+        action: { label: 'Undo', onClick: undo },
+      });
+    });
+    await flush();
+    const stack = (): Element => {
+      const el = m.container.querySelector('.nf-shell__toasts');
+      if (el === null) throw new Error('no shell toast stack');
+      return el;
+    };
+    expect(stack().textContent).toContain('Removed from Watch later');
+    const action = stack().querySelector<HTMLButtonElement>('.nf-toast__action');
+    if (action === null) throw new Error('no toast action');
+    act(() => {
+      action.click();
+      action.click(); // a double click before the re-render still runs it once
+    });
+    await flush();
+    expect(undo).toHaveBeenCalledTimes(1);
+    expect(stack().querySelectorAll('.nf-toast')).toHaveLength(0);
+  });
+
+  it('Studio gets no onToast (it raises no toasts)', async () => {
+    await mount({ name: 'studio' });
+    expect('onToast' in props('Studio')).toBe(false);
+  });
+
   it('Studio: resolveFile = identity (SE-1), ffmpeg + onRecheckFfmpeg from desktop.ffmpeg, mounted across tabs', async () => {
     const m = await mount({ name: 'studio', tab: 'upload' });
     const p = props('Studio');

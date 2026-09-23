@@ -2,12 +2,14 @@
 /**
  * The shell in jsdom with the real `@sovit/ui` screens over `MockNetworkAdapter` (design §4,
  * §6 L6-A): Watch→Watch, Watch→Home, Shorts-over-mini-player (≤ 1 unpaused session, none
- * leaked — counted at the MOCK, where a session lives until closed), expand/dismiss, theme at
- * boot and on change, the header chip, back/forward.
+ * leaked — counted at the MOCK, where a session lives until closed; the short's element pause
+ * when the mini resumes), expand/dismiss, theme at boot and on change, the header chip,
+ * back/forward, and the one shell toast stack (a Library toast and its Undo). Media elements
+ * behave like a browser's: `play()`/`pause()` queue a `play`/`pause` event on a change.
  */
 import { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi, type MockInstance } from 'vitest';
 import { mocks } from '@sovit/core';
 import type { NostrEventId } from '@sovit/core';
 import type { FfmpegStatus, Route } from '@sovit/ui';
@@ -36,7 +38,15 @@ interface Mounted extends ShellModel {
   live(): number;
   tick(): void;
   playSpy: ReturnType<typeof vi.fn>;
+  /** Every session the MOCK handed out, with its (inner) pause/resume counted. */
+  readonly sessions: readonly RecordedSession[];
   probe: ReturnType<typeof vi.fn>;
+}
+
+interface RecordedSession {
+  readonly videoId: NostrEventId;
+  readonly pause: MockInstance;
+  readonly resume: MockInstance;
 }
 
 let mounted: Mounted[] = [];
@@ -45,9 +55,32 @@ let mediaPauses = 0;
 
 beforeEach(() => {
   mediaPauses = 0;
-  vi.spyOn(HTMLMediaElement.prototype, 'play').mockImplementation(() => Promise.resolve());
-  vi.spyOn(HTMLMediaElement.prototype, 'pause').mockImplementation(() => {
+  // Browser-like media: `play()` / `pause()` flip the element's paused state and QUEUE a
+  // `play` / `pause` event (a media element task) only when it changes, so the screens' and
+  // the mini-player's element handlers run as they do in Chromium.
+  const paused = new WeakMap<HTMLMediaElement, boolean>();
+  const queue = (el: HTMLMediaElement, type: 'play' | 'pause'): void => {
+    setTimeout(() => {
+      el.dispatchEvent(new Event(type));
+    }, 0);
+  };
+  vi.spyOn(HTMLMediaElement.prototype, 'play').mockImplementation(function (
+    this: HTMLMediaElement,
+  ) {
+    if (paused.get(this) ?? true) {
+      paused.set(this, false);
+      queue(this, 'play');
+    }
+    return Promise.resolve();
+  });
+  vi.spyOn(HTMLMediaElement.prototype, 'pause').mockImplementation(function (
+    this: HTMLMediaElement,
+  ) {
     mediaPauses += 1;
+    if (!(paused.get(this) ?? true)) {
+      paused.set(this, true);
+      queue(this, 'pause');
+    }
   });
   document.documentElement.removeAttribute('data-theme');
 });
@@ -86,10 +119,17 @@ async function mount(
   });
   if (opts.theme !== undefined) await base.updateSettings({ theme: opts.theme });
   const playSpy = vi.fn();
+  const sessions: RecordedSession[] = [];
   const origPlay = base.play.bind(base);
-  base.play = (id: NostrEventId, r?: string) => {
+  base.play = async (id: NostrEventId, r?: string) => {
     playSpy(id, r);
-    return origPlay(id, r);
+    const session = await origPlay(id, r);
+    sessions.push({
+      videoId: id,
+      pause: vi.spyOn(session, 'pause'),
+      resume: vi.spyOn(session, 'resume'),
+    });
+    return session;
   };
   const model = createShellModel(base, initial);
   const probe = vi.fn((recheck: boolean): Promise<FfmpegStatus> =>
@@ -125,6 +165,7 @@ async function mount(
       });
     },
     playSpy,
+    sessions,
     probe,
   };
   mounted.push(m);
@@ -286,15 +327,77 @@ describe('Shorts over the mini-player (SE-3)', () => {
     invariant(m);
   });
 
-  it('resuming the mini-player pauses the short', async () => {
+  it("resuming the mini-player pauses the short's session AND element; the short stays paused and says so", async () => {
     const m = await mount({ name: 'watch', videoId: V1 });
     await playWatch(m);
     await go(m, { name: 'shorts' });
     await click(q(m, '.nf-shorts button[aria-label^="Play — "]'));
+    const short = must(
+      m.sessions.find((s) => s.videoId !== V1),
+      "the short's session",
+    );
+    const shortUi = (): HTMLElement => q(m, '.nf-shorts article[aria-current="true"]');
+    expect(shortUi().textContent).not.toContain('Paused — not paying');
+    const before = mediaPauses;
     await click(q(m, 'aside[aria-label="Mini-player"] button[aria-label="Play"]'));
     expect(m.coordinator.snapshot().mini?.paused).toBe(false);
     expect(m.coordinator.snapshot()).toMatchObject({ open: 2, unpaused: 1 });
+    // The coordinator paused the short's session and its <video>; the element's `pause`
+    // reached Shorts, which shows it paused — its own `session.pause()` was a no-op at the
+    // coordinator (the mock saw ONE pause) and nothing resumed it: no pause → resume loop.
+    expect(mediaPauses).toBeGreaterThan(before);
+    expect(short.pause).toHaveBeenCalledTimes(1);
+    expect(short.resume).not.toHaveBeenCalled();
+    expect(shortUi().textContent).toContain('Paused — not paying');
+    expect(shortUi().querySelector('.nf-shorts__controls button')?.getAttribute('aria-label')).toBe(
+      'Play (space)',
+    );
+    await flush();
+    expect(short.pause).toHaveBeenCalledTimes(1);
+    expect(short.resume).not.toHaveBeenCalled();
+    expect(m.coordinator.snapshot().mini?.paused).toBe(false);
     invariant(m);
+
+    // The short's own Resume takes the payment back: the mini pauses, still one paying.
+    await click(q(m, '.nf-shorts article[aria-current="true"] .nf-shorts__play'));
+    expect(short.resume).toHaveBeenCalledTimes(1);
+    expect(m.coordinator.snapshot().mini?.paused).toBe(true);
+    expect(m.coordinator.snapshot()).toMatchObject({ open: 2, unpaused: 1 });
+    expect(shortUi().textContent).not.toContain('Paused — not paying');
+    expect(q(m, 'aside[aria-label="Mini-player"]').textContent).toContain('Paused — not paying');
+    invariant(m);
+  });
+});
+
+describe('one shell toast stack (Settings and Library hand theirs over)', () => {
+  it('a Library toast lands in the shell stack; its Undo works and closes it, even after leaving', async () => {
+    const m = await mount({ name: 'library', tab: 'watch-later' });
+    const saved = (): Promise<string[]> =>
+      m.base.library.watchLater().then((list) => list.map((v) => v.id));
+    const [id] = await saved();
+    expect(id).toBeDefined();
+    expect(m.container.querySelector('.nf-library__toasts')).toBeNull();
+    const shellToasts = (): HTMLElement[] => [
+      ...m.container.querySelectorAll<HTMLElement>('.nf-shell__toasts .nf-toast'),
+    ];
+
+    await click(q(m, '.nf-library__remove'));
+    expect(await saved()).toEqual([]);
+    expect(shellToasts()).toHaveLength(1);
+    expect(shellToasts()[0]?.textContent).toContain('Removed from Watch later');
+    await click(q(m, '.nf-shell__toasts .nf-toast__action'));
+    expect(shellToasts()).toHaveLength(0);
+    expect(await saved()).toEqual([id]);
+    expect(m.container.querySelectorAll('.nf-library__item')).toHaveLength(1);
+
+    // The shell's stack outlives the screen: Undo still works from another route.
+    await click(q(m, '.nf-library__remove'));
+    await go(m, { name: 'home' });
+    expect(m.container.querySelector('.nf-library')).toBeNull();
+    expect(shellToasts()).toHaveLength(1);
+    await click(q(m, '.nf-shell__toasts .nf-toast__action'));
+    expect(shellToasts()).toHaveLength(0);
+    expect(await saved()).toEqual([id]);
   });
 });
 
