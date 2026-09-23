@@ -159,6 +159,10 @@ Lane-specific `{{lane_specific_done}}` examples: L4/L5 — "a PNG per component/
 
 ### 5.3 Fable 5.1 (high) — Stage 2 session
 
+> **Superseded 2026-09-23:** the prompt to use is `docs/prompts/stage-2-security.md`. It adds
+> PART 0 (the contracts v5 bump and the mock fixes) and cites ADR 0007, the L6 desktop design and
+> the v5 input list. The text below is the original from 2026-09-04.
+
 ```
 You are the security implementer and reviewer for the Nutflix monorepo. Everything except the audit surface has been built by other agents against interfaces and a MockPaymentEngine. Your job, in this single session:
 

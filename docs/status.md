@@ -247,11 +247,13 @@ v4 (2026-09-23) was a small additive bump: reactions (`likes`/`dislikes`/`myReac
 
 1. **an internal session handoff (not published) §4.4 is stale** where it describes the flat
    `markupSatsPerBlock`; ADR 0005 supersedes it. (This file is correct.)
-2. **`types/holepunch.d.ts` is duplicated** (seeder + gateway) and the two copies have
-   **diverged** — the gateway's adds `userData`/`end()`, the seeder's adds `hyperdht` and more
-   doc comments. Deduping needs a shared ambient-types package (`declare module` blocks are not
+2. **`types/holepunch.d.ts` exists in three diverged copies** (seeder, gateway, and since L6-C
+   the desktop worker's `src/worker/types/holepunch.d.ts`, a superset of the other two) — the
+   gateway's adds `userData`/`end()`, the seeder's adds `hyperdht` and more doc comments. Deduping needs a shared ambient-types package (`declare module` blocks are not
    emitted by `tsc` and cannot be re-exported), which is more than the "only if trivial" the
-   brief allowed. **Left as is, deliberately.**
+   brief allowed. **Left as is, deliberately** (re-checked 2026-09-23 with the third copy: still
+   not cheap — a shared ambient-types workspace package means a `package.json` + lockfile change
+   and a tsconfig reference in three packages, for types that only ever widen).
 3. **DONE 2026-09-23 (UI-fixes).** ~~**L4 `VideoCardSkeleton` bug** (found by L5-Home): `.nf-card__text` has no `flex-grow`, so
    skeleton text lines render at 0 px. L5-Home works around it in `Home.css`; the rule belongs
    in `VideoCard.css`. Fix in the next lane that touches `packages/ui/src/components/`.~~
@@ -327,7 +329,7 @@ v4 (2026-09-23) was a small additive bump: reactions (`likes`/`dislikes`/`myReac
 **0006 = NFX suite** (on the unmerged `spec/nfx-suite-m0`), **0008 = nfx master plan** (written in
 `~/Projects/nfx`, forked from `spec/nfx-suite-m0`). This repo never uses either number, so a later
 merge between the two histories cannot produce two ADRs with one number. **The next ADR here is
-0009.** Taken so far: 0001–0005, 0007.
+0010.** Taken so far: 0001–0005, 0007, 0009.
 
 ### Inputs from Cameron — ANSWERED 2026-09-23 (ADR 0007)
 
@@ -338,6 +340,12 @@ merge between the two histories cannot produce two ADRs with one number. **The n
 | Un-like / dislikes | **Always show dislikes.** Contracts v4: `VideoStats.likes/dislikes/myReaction`, `unreact()` (NIP-09) so un-like is never a `-` — L5-fixes |
 | Library privacy copy | **Watch later is encrypted; playlists can be public or private** — L5-fixes |
 | Pear direction / nutflix-2f | **Ignore it here; continue the plan** (L6 = Electron + `pear-runtime` Bare worker, ADR 0003) |
+
+### Inputs from Cameron — ANSWERED 2026-09-23 (ADR 0009)
+
+| Question | Answer |
+|---|---|
+| First-run relays (the host ships damus, nos.lol, primal; a fresh install contacts them) | **Keep the three defaults** — works out of the box; the privacy cost is accepted for v0 and revisited in Stage 3 (ADR 0009) |
 
 **Nothing is currently blocked on Cameron.** `spec/nfx-suite-m0` (ADR 0006) stays unmerged.
 
