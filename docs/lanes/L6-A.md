@@ -297,7 +297,9 @@ links, session topics, SE-1 uploads with progress, `wc-gone`, images, a ≤ 1-un
 The coordinator/shell suites were mutation-checked: removing "a new session pauses the others", the
 post-commit sweep or the watch→watch remount rule each fails at least one test.
 
-`npm run ci`: see the commit message / final report for the exit code and repo-wide counts.
+`npm run ci` on the branch (after the last code commit): **exit 0** — lint, build, **97 test files,
+1717 passed / 27 skipped** repo-wide, check:locked OK, check:native OK (42), lint:electron OK
+(81 files, 2 window constructors — the app's and the fidelity spike's — 0 violations).
 
 ## Open questions / decisions
 
