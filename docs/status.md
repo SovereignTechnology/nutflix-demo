@@ -2,10 +2,11 @@
 
 Kept current by the orchestrator after every merge (execution plan §5.1).
 
-**If you are an agent picking this up cold:** all nine L5 screens are merged (2026-09-23,
-section "Orchestrator actions — 2026-09-23" below). **Next is L6** (desktop shell), then the
-Stage 1 exit. Background and hard rules: an internal session handoff (not published) §1–§3, §4.2,
-§5 (its §4.1 is done). Read "Inputs from Cameron — OPEN" below before starting L6.
+**If you are an agent picking this up cold:** all nine L5 screens are merged and contracts
+are v4 (2026-09-23, section "Orchestrator actions — 2026-09-23" below). **Next: L4-fixes and
+L5-fixes (ADR 0007), then L6** (desktop shell), then the Stage 1 exit. Cameron's 2026-09-23
+answers: ADR 0007 and "Inputs from Cameron — ANSWERED 2026-09-23" below. Background and hard
+rules: an internal session handoff (not published) §1–§3, §4.2, §5 (its §4.1 is done).
 
 ## Stage 0 — scaffold, contracts, spikes: **DONE 2026-09-04**
 
@@ -16,7 +17,7 @@ Stage 1 exit. Background and hard rules: an internal session handoff (not publis
 | CI skeleton | `ci/gitlab-ci.yml` — parked until a runner is registered (README caveat) |
 | `docs/vendor/` (75 files) + `MANIFEST.txt` | done — `scripts/vendor-docs.sh` refreshes |
 | `SECURITY.md` threat model + invariants + locked dirs | done |
-| Contracts | **v3, FROZEN** (ADR 0004) — Signer, Wallet, PaymentEngine, PayProtocol, NetworkAdapter, Manifest/NIP-71/HyperblobRef, Media |
+| Contracts | **v4, FROZEN** (ADR 0004, ADR 0007) — Signer, Wallet, PaymentEngine, PayProtocol, NetworkAdapter, Manifest/NIP-71/HyperblobRef, Media |
 | Mocks | `MockPaymentEngine` (honest + 6 cheat modes), `MockWallet`, `MockNetworkAdapter` (12 fixture videos, 5 channels, error/latency switches) |
 | Spikes | S-A (A4), S-B (A8 PASS), S-C (transcode → subprocess+ffmpeg) — `docs/spikes/` |
 | Assumption resolutions | ADR 0003 |
@@ -75,7 +76,7 @@ present and 647 / 31 without one — that suite `skipIf`s when no binary is foun
 | **L5-Search** | `lane/L5-Search` | **merged 2026-09-23** (36 tests, 32 PNGs) | `5eaa808` + wiring `b9f2f01` |
 | **L5-Wallet** | `lane/L5-Wallet` | **merged 2026-09-23** (55 tests, 54 PNGs) | `2dee7bb` + wiring `611624e` |
 | **L5-Studio** | `lane/L5-Studio` | **merged 2026-09-23** (54 tests, 50 PNGs) | `65e1579` + wiring `f2ef017` |
-| L6 desktop-shell | `lane/L6` | **NOT STARTED — on hold** (Inputs — OPEN #5). No worktree on the dev laptop and no cached Electron binary here (`node node_modules/electron/install.js`) | — |
+| L6 desktop-shell | `lane/L6` | **NEXT** (after L4-fixes / L5-fixes). No worktree on the dev laptop and no cached Electron binary here (`node node_modules/electron/install.js`) | — |
 | L7 web-shell | `lane/L7` | **NOT STARTED** — out of scope if ADR 0006 (unmerged, "Pear-runtime-only v0") is adopted | — |
 
 Lane reports: `docs/lanes/L1.md`, `L2.md` (incl. v3 section), `L3.md` (incl. markup section),
@@ -182,14 +183,15 @@ Lane reports: `docs/lanes/L1.md`, `L2.md` (incl. v3 section), `L3.md` (incl. mar
 - **Channel** `seedingVideos?` (from a kind-10019 lookup); **Search** `filters` +
   `onFiltersChange`; **Library** own `ToastStack` (→ `onToast` if the shell owns toasts).
 
-### Open contract-change requests (CONTRACTS_VERSION = 3, FROZEN)
+### Open contract-change requests (CONTRACTS_VERSION = 4, FROZEN — ADR 0007)
 
-None. Recorded for the Stage 2 (v4) bump:
+v4 (2026-09-23) was a small additive bump: reactions (`likes`/`dislikes`/`myReaction`,
+`unreact`). Recorded for the Stage 2 bump, **now v5**:
 
 1. `BlockRange.core` and `recordUpload`'s `core` become **required** (ADR 0004).
 2. **`PRICE` carries no core** — per-core prices need it (L3 observation).
-3. **Q1 rounding rule becomes contract text**: `seederSats = ceil(amount × seederPct / 100)`,
-   `creatorSats = amount − seederSats` (ADR 0005).
+3. **Per-PAY split becomes contract text** — ADR 0007 (minimum PAY + creator carry), replacing
+   ADR 0005 Q1's bare `ceil`.
 4. BUD-09 reports reach `BlossomAuth` as a synthetic `Nostr <base64(kind-1984)>` header under
    verb `report`; Stage 2 may prefer a second method on the interface.
 5. **From the L5 lanes (2026-09-23), all non-blocking, worked around with screen props** — full
@@ -280,22 +282,17 @@ None. Recorded for the Stage 2 (v4) bump:
 | L3 Blossom defaults | All four confirmed as built (unauthenticated `/list`, `/mirror` off, `DELETE` 405, `--dev-mocks` kept) |
 | Electron pin | **Approved** — `electron@44.2.0` devDep of app-desktop |
 
-### Inputs from Cameron — OPEN (2026-09-23)
+### Inputs from Cameron — ANSWERED 2026-09-23 (ADR 0007)
 
-1. **Creator share at small PAYs (ADR 0005 erratum).** `creatorSats = floor(amount × c / 100)`
-   is 0 whenever `amount × c < 100`. At the default 4-block window and 1 sat/block, any split
-   with creator < 25 % pays the creator nothing per PAY. Keep, carry the remainder across PAYs,
-   round the creator up instead, or set a minimum PAY? Needed before the v4 contract text.
-2. **Price on Home cards vs Watch.** Cards say "from <cheapest rendition>"; Watch/Shorts charge
-   the manifest's first rendition (priced exactly). Make the card show the default rendition's
-   price (recommended), or make the cheapest the default?
-3. **Un-like** sends a NIP-25 `-` (dislike) until v4 adds `unreact`. Accept, or hide un-like?
-4. **Library privacy copy** (`TAB_HINT`): "history is encrypted to your key", "likes are public",
-   "watch later is free" — confirm.
-5. **Pear direction.** A separate session (2026-09-23) is planning how nutflix could stop
-   relying on Pear. L6 as specified (Electron + `pear-runtime` Bare worker, ADR 0003) is on
-   hold until that direction is settled. `spec/nfx-suite-m0` (ADR 0006: TS impl = Pear-only v0
-   prototype) is **unmerged on purpose**.
+| Question | Answer |
+|---|---|
+| Creator share at small PAYs (ADR 0005 erratum) | **Minimum PAY size + carry the creator's fractional remainder** across PAYs. Design and proposed parameters (`minPaySats` 10, window ≥ one min PAY) in ADR 0007; implemented in Stage 2 (contracts v5) |
+| Home card price vs Watch | **Default rendition's price** on every card (no "from") — L4-fixes |
+| Un-like / dislikes | **Always show dislikes.** Contracts v4: `VideoStats.likes/dislikes/myReaction`, `unreact()` (NIP-09) so un-like is never a `-` — L5-fixes |
+| Library privacy copy | **Watch later is encrypted; playlists can be public or private** — L5-fixes |
+| Pear direction / nutflix-2f | **Ignore it here; continue the plan** (L6 = Electron + `pear-runtime` Bare worker, ADR 0003) |
+
+**Nothing is currently blocked on Cameron.** `spec/nfx-suite-m0` (ADR 0006) stays unmerged.
 
 ## Stage 2 — audit surface (single Fable 5.1 session): NOT STARTED
 ## Stage 3 — integration and polish: NOT STARTED
