@@ -1,207 +1,203 @@
-# Lane L3-flake: the `ws-bridge` cut-test timeout
+# Lane L3-flake: the `ws-bridge` cut-test timeout, and the WS close path behind it
 
-Branch `lane/L3-flake`, based on main @ `1fa4c59`. Allowlist:
-`packages/gateway/src/__tests__/ws-bridge.integration.test.ts`, `docs/lanes/L3-flake.md`.
+Branch `lane/L3-flake`, based on main @ `1fa4c59`. The allowlist was widened twice as the
+diagnosis moved into the source:
 
-**Status: diagnosed, NOT fixed. The fix is outside this lane's allowlist.** The flake comes from a
-bug in `packages/gateway/src/ws/ws-duplex.ts`, not from the test. The test's `await closed` is
-catching a real stall: the gateway holds a half-closed socket for 30 s after a cut. A test-only
-change could only hide that, either by waiting out the 30 s or by dropping the "socket closed"
-assertion, so this lane changes no test code. This document is the whole deliverable. The
-proposed patch is below, and it was validated in this worktree without editing the source (see
-Evidence).
+- `packages/gateway/src/__tests__/ws-bridge.integration.test.ts`
+- `packages/gateway/src/ws/ws-duplex.ts`
+- `packages/gateway/src/__tests__/ws-duplex.test.ts`
+- `packages/gateway/src/ws/bridge.ts`
+- `packages/gateway/src/__tests__/ws-bridge.hardening.test.ts` (new)
+- `docs/lanes/L3-flake.md`
 
-## Symptom
+| Commit | What |
+|---|---|
+| `03d7517` | Diagnosis only, while the source was out of scope. |
+| `7bc03a0` | **The flake fix:** `WsDuplex` drops frames that arrive after a destroy, where it used to pause the closing socket. Adds a deterministic regression test and makes both cut tests event-driven with bounded waits. |
+| `e0fb4c8` | **F1 + F2**, the production follow-ups found while checking the bug's reach. F1: the bridge tracks a socket until its own `close` and terminates it 5 s after its stream ends. F2: the close starts at the destroy even mid-write. Adds five hardening tests. |
+| this commit | This document. |
 
-`packages/gateway` → `ws-bridge.integration.test.ts` fails with `Test timed out in 20000ms` under
-CPU load. Two tests fail this way, not just one:
+## 1. The flake
 
-- "a non-paying WS client is cut by the seeder window exactly as over hyperswarm (S-A finding 3)"
-- "sessions without a pay/1 factory still replicate and are still cut (no factory = no HELLO)".
-  This is the one L5-Settings hit.
+### Symptom
 
-Every failure reports a test duration of **30.15–30.32 s**, which is `ws`'s default
-`closeTimeout` (30 000 ms) plus setup. That number is what points away from Hypercore.
+Under CPU load, two tests in `ws-bridge.integration.test.ts` failed with
+`Test timed out in 20000ms`:
 
-## Root cause
+- "a non-paying WS client is cut …"
+- "sessions without a pay/1 factory … are still cut", the one L5-Settings hit.
 
-It is not the Hypercore `REQUEST_TIMEOUT`. With instrumentation, the viewer's `get` rejects at
-2.50–2.53 s after the cut every time, on passing and failing runs alike. The hang is the
-`await closed` that follows it, and it happens in this order:
+Every failure took **30.15–30.32 s**, which is `ws`'s default `closeTimeout` plus setup.
 
-1. The seeder cuts the viewer inside the `upload` gate. That destroys the Noise stream, and the
-   bridge destroys the gateway-side `WsDuplex`. `_destroy` resumes the socket and calls
-   `ws.close(1000)`, so the server socket is now CLOSING and a close frame is on the wire.
-2. **The viewer has requests in flight.** It keeps sending frames until it reads that close
-   frame.
-3. Each late frame reaches `WsDuplex`'s `message` handler and is `push()`ed into the destroyed
-   duplex. **streamx's `destroy()` sets `_readableState.highWaterMark = 0`**
-   (`node_modules/streamx/index.js` `destroy()`), so every later `push()` returns `false`, and the
-   handler calls **`ws.pause()`**. `_destroy`'s one-shot `resume()` has already run, so nothing
-   resumes the socket again.
-4. The paused server socket never reads the viewer's close-frame reply, so the closing handshake
-   cannot finish. `ws`'s `closeTimeout` finally `destroy()`s the TCP socket 30 s later, and only
-   then does the viewer's `close` fire, which is what the test's `closed` promise waits for.
+### Root cause
 
-The failure is a race between the server's close frame and the viewer's next request. Load
-widens the window: a starved viewer event loop reads the close frame later, so more requests
-cross it. On a real network the window is a full RTT, so **in production this is probably the
-common case, not a test artefact.**
+It was not the Hypercore `REQUEST_TIMEOUT`, which ended 2.5 s after the cut on passing and
+failing runs alike. It was the `await closed` after it:
 
-### Production impact (gateway, today)
+1. The seeder cuts the viewer. The bridge destroys the gateway-side `WsDuplex`, and `_destroy`
+   calls `ws.close(1000)`, so the socket is CLOSING.
+2. The viewer still has requests in flight and keeps sending until it reads the close frame.
+3. **streamx's `destroy()` sets the readable `highWaterMark` to 0**, so each late frame's
+   `push()` returned `false`. `WsDuplex` then `pause()`d the socket, after `_destroy`'s one-shot
+   `resume()` had already run.
+4. The paused socket never read the viewer's close reply. The handshake stalled until
+   `closeTimeout` destroyed the socket 30 s later.
 
-After such a cut the server-side socket stays open and paused for 30 s. It has **already been
-removed from `WsBridge.sockets`**: `cleanup()` runs on the Noise stream's `close`. So for those
-30 s it is:
+Load widens the window between the close frame and the viewer reading it. On a real network the
+window is a full RTT, so production hit this on most cuts.
 
-- not counted against `ws.maxConnections`;
+### Fix (`7bc03a0`)
+
+- **`ws-duplex.ts`:** the `message` handler starts with `if (this.destroying) return;`. A
+  destroyed duplex has no reader, so late frames are dropped and never pause the socket.
+  - The pause exists only for read backpressure. `_destroy`/`_read` still resume.
+  - No other gateway code pauses a WebSocket; `http/body.ts` pauses HTTP requests only.
+- **Regression test (`ws-duplex.test.ts`)**, deterministic with no load:
+  1. The client pauses.
+  2. The server duplex is destroyed.
+  3. The client sends a frame.
+  4. The test awaits the server handling that frame on its own.
+  5. The client resumes.
+
+  It asserts the socket is not paused and the client sees close code 1000 within 5 s.
+- **Both cut tests (`ws-bridge.integration.test.ts`)** now wait on the gateway's `session-cut`
+  event instead of the viewer's `get` timing out.
+  - Hypercore arms a request's timer before the socket even opens, so a slow setup used to leave
+    nothing cut and a `closed` that never resolved.
+  - The viewer fetches in the background with no timeout. The test asserts the fetch is still
+    outstanding after the cut, cancels it, and asserts it ends in an error.
+  - Every wait is bounded, with a message naming what stalled: cut 8 s; `await closed` **5 s**,
+    naming the closing-handshake stall; the viewer's replication stream closing 2 s.
+  - The viewer's block count is taken after its stream has closed and the count has been stable
+    for 500 ms.
+  - No timeout was raised and no assertion was dropped. The non-paying test drops from about
+    2.8 s to about 0.55 s.
+
+## 2. F1 and F2: what a cut left behind (`e0fb4c8`)
+
+Checking the bug's reach on the `7bc03a0` code turned up two more problems. A viewer that never
+answers the close frame still had these effects:
+
+- `wsConnections` = 0 while `server.getConnections()` = 1: an open socket invisible to the
+  bridge;
+- `gateway.close()` took **29 510 ms**.
+
+**F1 (`bridge.ts`):** the bridge dropped a socket from `sockets` when its **replication stream**
+closed (a cut, a handshake timeout, a remote Noise close), not when the **WebSocket** closed.
+While the socket stayed open it was:
+
+- not counted against `maxConnections`;
 - not pinged;
-- not terminated by `bridge.close()`.
+- not terminated by `close()`.
 
-The failing tests' 30.2 s durations (vitest's 20 s timeout, then an `afterEach` that ran until
-about 30 s) fit `gateway.close()` → `server.close()` also waiting on that socket. That last point
-is inferred from the timings, not traced.
+**F2 (`ws-duplex.ts`):** streamx defers `_destroy` until an in-flight `_write` calls back, and
+`WsDuplex._write` waits for `ws.send` to flush. A cut while the peer had stopped reading
+therefore never started the close. No closeTimer was armed, and the socket stayed **OPEN
+indefinitely**: it was still open at +33 s, and closed only once the peer read again.
 
-A malicious peer that never answers a close frame can already hold a socket this way, so the bug
-gives an attacker nothing new. What it changes is that **honest** cut viewers do it too.
+Together, one malicious viewer could hold an **unbounded, uncounted** socket: file-descriptor
+exhaustion that gets around `maxConnections`.
 
-## Proposed fix (needs `ws-duplex.ts` and `ws-duplex.test.ts` in an allowlist)
+### Fix (decision: 5 s grace)
 
-`packages/gateway/src/ws/ws-duplex.ts`, first line of the `message` handler:
+- **F1, `bridge.ts`:**
+  - A socket stays in `sockets` (counted, and owned by `close()`) until its own `close`.
+  - When its stream ends, the handshake and ping timers stop and a grace timer starts. If the
+    WebSocket has not closed within **`WS_CLOSE_GRACE_MS = 5_000`**, it is `terminate()`d and
+    counted in `stats().graceTerminations`. The timer is cleared on `close`, so honest closes
+    never reach it.
+  - The constant is exported from `ws/bridge.ts`. `WsBridgeOptions.closeGraceMs` overrides it,
+    for tests. Nothing else is configurable: `config.ts` was out of scope, and the gateway uses
+    the default.
+- **F2, `ws-duplex.ts`:** the close starts in `_predestroy`, which runs synchronously in
+  `destroy()` and is not deferred by an active write. `_destroy` repeats it, idempotently. The
+  close frame queues behind every frame already handed to `ws.send`, so the close stays graceful
+  and "the viewer holds ≤ window blocks" is unchanged.
+- **Together:** a socket is gone at most 5 s after its stream ends, even if the peer never
+  reads and never answers.
+- **Honest viewers are unchanged:** they close cleanly with 1000 in milliseconds and the grace
+  never fires.
 
-```ts
-ws.on('message', (data, isBinary) => {
-  // After a destroy (a seeder-side cut) the peer keeps sending until it reads our close
-  // frame. Drop those frames, and never pause for them: streamx's destroy() sets
-  // highWaterMark = 0, so push() returns false for every later frame, and a paused socket
-  // never reads the peer's close reply. The closing handshake then stalls until ws's
-  // closeTimeout (30 s), with the socket already gone from WsBridge.sockets.
-  if (this.destroying) return;
-  // … existing text-frame check and push/pause unchanged …
-});
-```
+### Tests: each fails on `7bc03a0` and passes on `e0fb4c8`
 
-(`destroying` is streamx's public getter and is true for both destroying and destroyed.)
-`_destroy`'s existing `resume()` stays, because it still covers a pause from real backpressure
-before the destroy. With this guard, frames arriving between `destroy()` and a deferred
-`_destroy` (for example while `_write` waits on `ws.send`'s callback) are dropped as well, where
-today they pause the socket and rely on the later resume.
+The hardening tests are **deterministic with no load**. A fake seeder hands the bridge a streamx
+`Duplex` as the "replication stream", so the test performs the cut and puts bytes on the wire
+itself. Upgrades come in through a real `http` server, with an injected 300 ms grace, and the
+test watches the server-side TCP sockets directly.
 
-A deterministic regression test for `packages/gateway/src/__tests__/ws-duplex.test.ts`. It needs
-no load, because it forces the ordering with events instead of timing:
+| Test | On `7bc03a0` | On `e0fb4c8` |
+|---|---|---|
+| hardening: a peer that never answers the close frame stays counted until the grace, then is terminated | ✗ `expected +0 to be 1` (uncounted) | ✓ terminated at ≥ 300 ms, `graceTerminations` 1 |
+| hardening: `close()` terminates a cut socket that is still closing (default 5 s grace) | ✗ `expected +0 to be 1` | ✓ socket gone within 2 s |
+| hardening: a cut during a stalled write is still gone by the grace | ✗ `expected +0 to be 1` | ✓ |
+| hardening: maxConnections, a cut-but-not-closed socket still holds its slot until it closes | ✗ `expected 'open' to contain '503'` | ✓ 503, then the slot frees on close |
+| hardening: an honest peer closes 1000 in ms and the grace never fires | ✗ only `graceTerminations` (new stat) `undefined`; the behaviour already held | ✓ |
+| ws-duplex: a destroy during a stalled write still starts the closing handshake, and stays graceful | ✗ `expected 1 to be 2` (OPEN, not CLOSING) | ✓ CLOSING at once, data then 1000 |
+| integration: a real cut viewer that never answers stays counted, and `gateway.close()` does not wait | ✗ `expected +0 to be 1` (and about 29.5 s to close) | ✓ `gateway.close()` < 3 s |
 
-```ts
-it('a frame arriving after destroy does not stall the closing handshake', async () => {
-  const wss = new WebSocketServer({ port: 0, host: '127.0.0.1' });
-  await new Promise<void>((r) => wss.once('listening', () => r()));
-  const port = (wss.address() as { port: number }).port;
-  const serverSide = new Promise<{ ws: WebSocket; duplex: WsDuplex }>((resolve) =>
-    wss.once('connection', (ws) => {
-      const duplex = new WsDuplex(ws);
-      duplex.on('error', () => undefined);
-      resolve({ ws, duplex });
-    }),
-  );
-  const client = new WebSocket(`ws://127.0.0.1:${port}`);
-  await new Promise<void>((r) => client.once('open', () => r()));
-  const { ws: server, duplex } = await serverSide;
-  const clientClosed = new Promise<number>((r) => client.once('close', (code) => r(code)));
-  const lateFrameSeen = new Promise<void>((r) => server.once('message', () => r()));
-  client.pause(); // the viewer has not read the close frame yet …
-  duplex.destroy(); // … when the seeder-side cut closes the socket …
-  client.send(Buffer.from([1, 2, 3])); // … so its next request crosses it on the wire
-  await lateFrameSeen; // the server handled that frame on its own (not coalesced with the reply)
-  client.resume(); // the viewer now reads the close frame and replies
-  const outcome = await Promise.race([
-    clientClosed,
-    new Promise<'stalled'>((r) => setTimeout(() => r('stalled'), 3000)), // ≪ 30 s closeTimeout
-  ]);
-  client.terminate();
-  for (const c of wss.clients) c.terminate(); // else wss.close() waits out the stalled socket
-  await new Promise<void>((r) => wss.close(() => r()));
-  expect(outcome).toBe(1000);
-});
-```
+In summary: 7 failed / 14 passed on `7bc03a0`, and 21/21 on `e0fb4c8`. The whole gateway project
+passed 77, with 13 skipped (the existing `BlossomAuth` Stage-2 skips), 3 runs out of 3.
 
-The `client.pause()` / `await lateFrameSeen` pair matters. Without it, the late frame and the
-close reply can arrive in one TCP read and get parsed together even after the `pause()`, and the
-test then passes without the fix. That was the first attempt here.
+## 3. Evidence
 
-### Test-side hardening for the same re-issue (in this lane's file)
+Load came from 16 `node -e 'for(;;){}'` busy loops on 8 cores plus other agents' jobs. Only this
+lane's own loops were started and killed. Logs are in `/tmp/claude-1000/nutflix-L3-flake/`.
 
-These are worth doing together with the fix. Neither one fixes the flake on its own.
+### Flake fix (`7bc03a0`)
 
-- **Bound `await closed` in both cut tests well under 30 s**, for example 10 s, and fail with a
-  message naming the closing-handshake stall. A regression then fails loudly and specifically
-  instead of as a generic 20 s vitest timeout.
-- **Wait for the gateway's `session-cut` event (`r.gateway.seeder.on`) instead of the viewer's
-  `get` timing out.** There is a second, latent hang with the same shape. Hypercore arms the
-  request timer when the request is created (`lib/replicator.js` `setTimeout(r, ms)`), which is
-  before the WebSocket even opens. If setup takes longer than the `get` timeout (2.5 s, or 1.5 s
-  in the sibling test), the viewer abandons the fetch before the gateway has uploaded
-  `window + 1` blocks. There is then no cut, and `closed` never resolves.
-  - Reproduced with `timeout` ≤ 10 ms: `uploads=0`, no cut, 20 s timeout.
-  - It was not the observed failure: at load average 20, connect-to-cut took 0.3–0.6 s.
-  - Consuming `vcore.blobs.createReadStream(entry.blob, { wait: true })` with no timeout,
-    awaiting the cut event, and then destroying the stream keeps "the viewer never obtained the
-    blob" and drops the 2.5 s fixed wait.
-  - The `countBlocks` checks (`> 0`, `≤ window`) should then run after a bounded quiescence wait
-    (viewer `raw` closed, and the block count stable), not after `settle(150)`. The old test only
-    got its quiescence from the 2.5 s timer.
+- **Regression test on the unfixed `ws-duplex.ts`:** it fails in 6 ms (`isPaused` true), or after
+  5 s with `'stalled'` if that check is removed. On the fix: close 1000 in 2–3 ms.
+- **Isolation:** 10/10 green, 14/14 tests, 1.9–2.1 s per run.
+- **Slow setup:** delaying the viewer's connect by 3 s after starting its fetch still passes. The
+  old test hung here.
 
-**Fallback if the source must not change:** raise both cut tests' timeouts above 30 s, for
-example to 45 s, with a comment. That is deterministic, because the `ws` closeTimeout always
-fires, but it masks the production stall and costs 30 s on each hit. Not recommended.
+### A/B under load, 10 rounds, interleaved (`ab3.sh`)
 
-## Evidence
+Three arms, run back to back in each round so they see the same load. The 1-min load average
+was 14.5–20.5 throughout.
 
-All runs are in this worktree, with `vitest run --project gateway
-src/__tests__/ws-bridge.integration.test.ts`. The instrumentation was a temporary block in the
-(allowlisted) test file and has been reverted; the tree is clean. Load came from 16
-`node -e 'for(;;){}'` busy loops on 8 cores plus other agents' jobs, giving a 1-min load average
-of 14.5–24.
+| Arm | Code | Runs failed | Tests failed | Cut-test durations |
+|---|---|---|---|---|
+| **before** | `03d7517`: original test + source | **4 / 10** | 5, every one a 20 s vitest timeout at **30 152–30 288 ms** (2 non-paying, 3 no-pay/1) | when passing: non-paying 2.8–2.9 s, no-pay/1 1.6–1.7 s |
+| **after** | `e0fb4c8`: integration + hardening + duplex tests | **0 / 10** | 0 (21/21 in every run) | non-paying 0.66–0.92 s, no-pay/1 0.18–0.32 s |
+| hardened tests, old source | `7bc03a0` cut tests on `03d7517` source | 7 / 10 | 7, **every one the named message**, no 20 s test timeout | the failing test reports about 25.2 s |
 
-- **Isolation, unmodified:** 7/7 pass in 5.8 s.
-- **Trace of a failure** (non-paying test; `+ms` since file start):
-  ```
-  +612   SERVER ws.close() readyState=1            ← _destroy after the cut
-  +617   SERVER ws.pause() readyState=2 (×14)      ← late viewer frames, push() → false
-  +624   client ws.close()                         ← viewer read the close frame, replied
-  +2867  get settled: REQUEST_TIMEOUT, uploads=5, cut logged   ← 2.5 s, as designed
-  +2867  awaiting closed
-  +30618 closed resolved                            ← server closeTimeout destroyed the socket
-  ```
-  A passing run shows no server `pause()` while CLOSING, and `closed` resolves at the same
-  moment the `get` settles.
-- **Interleaved A/B, 10 pairs at the same load.** Arm B simulates the fix by monkeypatching
-  `WsDuplex.prototype.push` to drop frames while `destroying` (no source edit):
+The failures in the hardened-tests arm read "the WebSocket did not close after the cut — closing
+handshake stalled … (waited 5000 ms)". Each one is then followed by an `afterEach` hook timeout,
+because on the old source `gateway.close()` waits out the stalled socket, which is F1 itself.
+This arm shows the hardening does its job: a regression is reported by name at 5 s instead of as
+an anonymous 20 s timeout.
 
-  | arm | runs failed | test timeouts | server `pause()` while CLOSING | late frames dropped |
-  |---|---|---|---|---|
-  | unmodified | **5 / 10** | 6 (4 non-paying, 2 no-pay/1), all 30.18–30.32 s | yes, in every failing run | — |
-  | simulated fix | **0 / 10** | 0 | 0 | in 7 / 10 runs (1–15 frames each) |
+The **after** arm also ran the five new hardening tests and the two new duplex tests under the
+same load: 10/10 green, so the short injected grace does not make them load-sensitive.
 
-  The "late frames dropped" column shows that the fixed arm hit the race repeatedly and got
-  through it. It was not simply lucky. Across all three simulated-fix batches (10 + 8 + 10
-  runs), the result was **28/28 green** at load 16.8–24. The unmodified arm also failed at a
-  similar rate in the earlier exploratory runs, for example 3 of 6 runs of the non-paying test
-  alone.
-- **Deterministic regression test above, no load:** 3/3 fail without the fix (`stalled` after
-  3 s) and 3/3 pass with the simulated fix (clean close code 1000 in 5–10 ms).
-- **`npm run ci` on this doc-only commit, exit 1**, which is expected because nothing is fixed.
-  Ambient load was 14–17 from other agents' jobs, with none of this lane's busy loops running.
-  Lint, prettier and build were green, and the tests came out at
-  `1 failed | 1014 passed | 27 skipped`. The failure was "sessions without a pay/1 factory …"
-  at **30 218 ms**, the same closeTimeout signature.
-- **Latent `get`-timeout hang:** `timeout: 10`, `3` and `1` ms each produced `uploads=0`, no
-  `session cut`, and a 20 s timeout. `timeout: 30` still passed, with connect-to-cut in < 34 ms
-  when idle.
+Earlier data for the flake fix alone (`7bc03a0`, the first A/B in this lane): unmodified 5/10
+failed, simulated fix 28/28 green.
 
-## What this lane did not do
+### CI
 
-- It did not change the test. Every allowlisted fix either masks the bug or weakens what the test
-  proves.
-- It did not edit `ws-duplex.ts`, even temporarily. The fix was validated by the prototype
-  monkeypatch from the test file only.
-- It did not change `vitest.config` or serialise suites. Serialising would only shrink the race
-  window, and a real RTT reopens it.
+`npm run ci > /tmp/claude-1000/nutflix-L3-flake/ci.log 2>&1; echo exit=$?` on `e0fb4c8`, with
+the load average at about 0.4: **exit=0**.
+
+- lint, prettier, build, `check:locked`, `check:native` and `lint:electron` all passed;
+- vitest: **73 files, 1023 passed, 27 skipped**.
+
+Compared with the pre-lane run (72 files, 1014 passed + 1 flake failure): 1 new file
+(`ws-bridge.hardening.test.ts`) and 8 new tests (5 hardening, 2 duplex, 1 integration), with the
+flake gone.
+
+### Diagnosis record (`03d7517`)
+
+- Trace of a failing run: the server sent its close at +612 ms, then called `pause()` 14 times
+  while CLOSING. The viewer replied to the close at +624 ms, and `closed` resolved only at
+  +30 618 ms.
+- A simulated fix (a monkeypatch that drops frames while `destroying`) went 28/28 green, while
+  the unmodified code failed 5/10.
+
+## 4. Not done / notes
+
+- `WS_CLOSE_GRACE_MS` is not re-exported from `packages/gateway/src/index.ts`, which is outside
+  this lane. Add it there if any consumer needs it.
+- The grace is not configurable through `GatewayConfig`, because `config.ts` and `gateway.ts`
+  are out of scope. It is a constant by decision.
+- No test timeout was raised, no assertion was dropped, and no suites were serialised.
