@@ -17,7 +17,7 @@ lightningcss-linux-x64-musl@1.32.0 | node_modules/@tailwindcss/node/node_modules
 @tailwindcss/oxide-linux-x64-gnu@4.3.3 | node_modules/@tailwindcss/oxide-linux-x64-gnu | .node,platform-pkg | scripts=none | dev-only | via @sovit/ui>@tailwindcss/vite>@tailwindcss/oxide>@tailwindcss/oxide-linux-x64-gnu
 @tailwindcss/oxide-linux-x64-musl@4.3.3 | node_modules/@tailwindcss/oxide-linux-x64-musl | .node,platform-pkg | scripts=none | dev-only | via @sovit/ui>@tailwindcss/vite>@tailwindcss/oxide>@tailwindcss/oxide-linux-x64-musl
 bare-broadcast-channel@0.2.0 | node_modules/bare-broadcast-channel | .bare,addon,prebuilds | scripts=none | runtime | via @sovit/app-desktop>pear-runtime>bare-worker>bare-broadcast-channel
-bare-buffer@3.7.1 | node_modules/bare-buffer | .bare,addon,prebuilds | scripts=none | runtime | via @sovit/app-desktop>bare-fs>bare-buffer
+bare-buffer@3.7.1 | node_modules/bare-buffer | .bare,addon,prebuilds | scripts=none | runtime | via @sovit/app-desktop>bare-encoding>bare-buffer
 bare-channel@5.2.4 | node_modules/bare-channel | .bare,addon,prebuilds | scripts=none | runtime | via @sovit/app-desktop>pear-runtime>bare-worker>bare-channel
 bare-dns@2.2.0 | node_modules/bare-dns | .bare,addon,prebuilds | scripts=none | runtime | via @sovit/app-desktop>bare-http1>bare-tcp>bare-dns
 bare-fs@4.8.1 | node_modules/bare-fs | .bare,addon,prebuilds | scripts=none | runtime | via @sovit/app-desktop>bare-fs

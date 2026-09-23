@@ -26,6 +26,7 @@
     "@sovit/gateway": "0.0.0",
     "@sovit/seeder": "0.0.0",
     "@sovit/ui": "0.0.0",
+    "bare-encoding": "1.0.3",
     "bare-fs": "4.8.1",
     "bare-http1": "4.6.1",
     "bare-os": "3.9.3",

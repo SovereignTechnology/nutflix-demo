@@ -259,9 +259,17 @@ confirm dialog (Stage 2).
 2. **No cross-process pay/1** → D1.
 3. **Blob server prefetches the whole range** (v) → L6-C builds the gated wrapper first and tests
    "downloaded ≤ window"; fallback: own `bare-http1` range server.
-4. **Code under Bare 1.31** (seeder barrel fixed; unknown globals — `TextDecoder`, `URL`,
-   `crypto`; ESM workspace symlinks) → L6-C day-1 probe; fallback: esbuild-bundle the worker
-   JS with `conditions: ['bare']`, native addons external.
+4. **Code under Bare 1.31** — **mostly retired 2026-09-23 by an orchestrator probe** with the
+   real `bare` (bare-sidecar prebuild): Bare has `URL`, `Buffer`, `queueMicrotask`, timers, but
+   **no `TextEncoder`/`TextDecoder`, `crypto`, `AbortController`, `process`**. nostr-tools and
+   core's media pipeline construct a `TextDecoder` at module load, so `@sovit/core` (and the
+   seeder, which imports core) crash on import. With **`bare-encoding/global` imported first**
+   (pinned `bare-encoding@1.0.3`, holepunch, zero deps, audited) all of `@sovit/core` (incl.
+   `MockPaymentEngine`), `@sovit/seeder` (bare entry, no Node adapters),
+   `@sovit/gateway/upstream` and `hyperdht/testnet.js` load under Bare, ESM workspace symlinks
+   included. **The worker entry's first import must be `bare-encoding/global`.** Still open for
+   L6-C: runtime use of `crypto`/`AbortController` (pin `bare-crypto`/`bare-abort-controller` if
+   hit — both holepunch). Worker-side `src/ipc/` code uses `b4a`, never the globals.
 5. **`contextBridge` fidelity / Electron 44 specifics** (Maps; `File` → `webUtils` in a
    sandboxed preload; seeking through `protocol.handle` + `net.fetch`; ESM `utilityProcess`;
    `utilityProcess` spawning bare-sidecar) → L6-A day-1 fidelity page; fallback: run the host
