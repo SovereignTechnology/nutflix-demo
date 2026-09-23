@@ -423,6 +423,165 @@ describe('Shorts — playback and payment', () => {
   });
 });
 
+/**
+ * A browser-like media element: `pause()` / `play()` flip a per-element paused flag and fire
+ * `pause` / `play` only on a change — SYNCHRONOUSLY, inside the call. (A browser queues a task
+ * instead; synchronous is the harder case for the screen's echo guard.)
+ */
+function echoingMedia(): { pauseEvents: number; playEvents: number } {
+  const fired = { pauseEvents: 0, playEvents: 0 };
+  const paused = new WeakMap<HTMLMediaElement, boolean>();
+  vi.spyOn(HTMLMediaElement.prototype, 'pause').mockImplementation(function (
+    this: HTMLMediaElement,
+  ) {
+    if (paused.get(this) ?? true) return;
+    paused.set(this, true);
+    fired.pauseEvents += 1;
+    this.dispatchEvent(new Event('pause'));
+  });
+  mediaPlay.mockImplementation(function (this: HTMLMediaElement) {
+    if (paused.get(this) ?? true) {
+      paused.set(this, false);
+      fired.playEvents += 1;
+      this.dispatchEvent(new Event('play'));
+    }
+    return Promise.resolve();
+  });
+  return fired;
+}
+
+const pauseControl = (r: Rendered): HTMLButtonElement =>
+  active(r).querySelector<HTMLButtonElement>('.nf-shorts__controls button')!;
+
+describe('Shorts — the element pausing on its own (PiP, media keys, OS, a shell)', () => {
+  it('an outside pause pauses the session exactly once and says so; an outside play resumes it', async () => {
+    const adapter = adapterWith();
+    const { sessions } = instrument(adapter);
+    const { r } = mount(adapter);
+    await flush();
+    click(playButton(r));
+    await flush();
+    const video = active(r).querySelector('video')!;
+    fire(video, new Event('pause'));
+    expect(sessions[0]!.pause).toHaveBeenCalledTimes(1);
+    expect(active(r).textContent).toContain('Paused — not paying');
+    expect(pauseControl(r).getAttribute('aria-label')).toBe('Play (space)');
+    fire(video, new Event('pause')); // a second one changes nothing
+    expect(sessions[0]!.pause).toHaveBeenCalledTimes(1);
+    expect(sessions[0]!.resume).not.toHaveBeenCalled();
+
+    fire(video, new Event('play'));
+    expect(sessions[0]!.resume).toHaveBeenCalledTimes(1);
+    expect(active(r).textContent).not.toContain('Paused — not paying');
+    expect(pauseControl(r).getAttribute('aria-label')).toBe('Pause (space)');
+    fire(video, new Event('play'));
+    expect(sessions[0]!.resume).toHaveBeenCalledTimes(1);
+    expect(sessions[0]!.pause).toHaveBeenCalledTimes(1);
+    // Same session, same element: an outside pause is a pause, not a stop.
+    expect(sessions[0]!.close).not.toHaveBeenCalled();
+    expect(active(r).querySelector('video')).toBe(video);
+  });
+
+  it("the element's echo of the screen's own pause / resume never pauses twice or loops", async () => {
+    const fired = echoingMedia();
+    const adapter = adapterWith();
+    const { sessions } = instrument(adapter);
+    const { r } = mount(adapter);
+    await flush();
+    click(playButton(r));
+    await flush();
+    expect(mediaPlay).toHaveBeenCalledTimes(1); // started once the session bound
+    expect(sessions[0]!.resume).not.toHaveBeenCalled(); // its `play` event is an echo
+    click(pauseControl(r));
+    expect(sessions[0]!.pause).toHaveBeenCalledTimes(1);
+    expect(sessions[0]!.resume).not.toHaveBeenCalled();
+    expect(active(r).textContent).toContain('Paused — not paying');
+    click(active(r).querySelector<HTMLButtonElement>('.nf-shorts__play')!); // Resume
+    expect(sessions[0]!.resume).toHaveBeenCalledTimes(1);
+    expect(sessions[0]!.pause).toHaveBeenCalledTimes(1);
+    keydown(document.body, ' '); // Space pauses
+    keydown(document.body, ' '); // … and resumes
+    await flush();
+    expect(sessions[0]!.pause).toHaveBeenCalledTimes(2);
+    expect(sessions[0]!.resume).toHaveBeenCalledTimes(2);
+    expect(active(r).textContent).not.toContain('Paused — not paying');
+    // The element really did echo every command (so the guard, not silence, kept it at one).
+    expect(fired).toEqual({ pauseEvents: 2, playEvents: 3 });
+  });
+
+  it('the end of a short is not an outside pause: one pause, Replay, and only Replay resumes', async () => {
+    const adapter = adapterWith();
+    const { sessions } = instrument(adapter);
+    const { r } = mount(adapter);
+    await flush();
+    click(playButton(r));
+    await flush();
+    const video = active(r).querySelector('video')!;
+    // A browser fires `pause` (with `ended` already true) and then `ended`.
+    Object.defineProperty(video, 'ended', { configurable: true, get: () => true });
+    fire(video, new Event('pause'));
+    expect(sessions[0]!.pause).not.toHaveBeenCalled();
+    fire(video, new Event('ended'));
+    expect(sessions[0]!.pause).toHaveBeenCalledTimes(1);
+    expect(active(r).textContent).not.toContain('Paused — not paying');
+    const replay = active(r).querySelector<HTMLButtonElement>('.nf-shorts__play')!;
+    expect(replay.getAttribute('aria-label')).toBe('Replay');
+    // Later pauses (a shell pausing page media) and a media-key play after the end do nothing.
+    Object.defineProperty(video, 'ended', { configurable: true, get: () => false });
+    fire(video, new Event('pause'));
+    fire(video, new Event('play'));
+    expect(sessions[0]!.pause).toHaveBeenCalledTimes(1);
+    expect(sessions[0]!.resume).not.toHaveBeenCalled();
+    click(replay);
+    expect(sessions[0]!.resume).toHaveBeenCalledTimes(1);
+  });
+
+  it('moving on — Next, keys, a swipe — and unmounting are never an outside pause', async () => {
+    const fired = echoingMedia();
+    const adapter = adapterWith();
+    const { sessions } = instrument(adapter);
+    const { r } = mount(adapter);
+    await flush();
+    const playActive = async (): Promise<void> => {
+      click(playButton(r));
+      await flush();
+      expect(r.all('video')).toHaveLength(1);
+    };
+
+    await playActive(); // S0
+    click(r.get('button[aria-label="Next short (j)"]'));
+    await flush();
+    await playActive(); // S1
+    keydown(document, 'k');
+    await flush();
+    await playActive(); // S0 again
+    vi.useFakeTimers();
+    const feed = r.get('.nf-shorts__feed');
+    Object.defineProperty(feed, 'clientHeight', { configurable: true, value: 800 });
+    feed.scrollTop = 1600;
+    fire(feed, new Event('scroll'));
+    act(() => {
+      vi.advanceTimersByTime(200);
+    });
+    vi.useRealTimers();
+    await flush();
+    expect(activeId(r)).toBe(S2.id);
+    await playActive(); // S2
+    unmountTracked(r);
+
+    expect(sessions.map((s) => s.session.videoId)).toEqual([S0.id, S1.id, S0.id, S2.id]);
+    // The element paused (and fired `pause`) on each of the three moves — on unmount React
+    // has already detached it, so its removal pauses it with no handler left to hear …
+    expect(fired.pauseEvents).toBe(3);
+    for (const s of sessions) {
+      // … but each session was only closed, never paused as if from outside.
+      expect(s.close).toHaveBeenCalledTimes(1);
+      expect(s.pause).not.toHaveBeenCalled();
+      expect(s.resume).not.toHaveBeenCalled();
+    }
+  });
+});
+
 describe('Shorts — moving between shorts', () => {
   it('keyboard: ArrowDown/j next, ArrowUp/k previous, ignored while typing; Space plays', async () => {
     const adapter = adapterWith();
