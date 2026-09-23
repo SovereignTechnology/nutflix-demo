@@ -288,6 +288,13 @@ v4 (2026-09-23) was a small additive bump: reactions (`likes`/`dislikes`/`myReac
 | L3 Blossom defaults | All four confirmed as built (unauthenticated `/list`, `/mirror` off, `DELETE` 405, `--dev-mocks` kept) |
 | Electron pin | **Approved** — `electron@44.2.0` devDep of app-desktop |
 
+### ADR numbering — reserved numbers (Cameron, 2026-09-23)
+
+**0006 = NFX suite** (on the unmerged `spec/nfx-suite-m0`), **0008 = nfx master plan** (written in
+`~/Projects/nfx`, forked from `spec/nfx-suite-m0`). This repo never uses either number, so a later
+merge between the two histories cannot produce two ADRs with one number. **The next ADR here is
+0009.** Taken so far: 0001–0005, 0007.
+
 ### Inputs from Cameron — ANSWERED 2026-09-23 (ADR 0007)
 
 | Question | Answer |

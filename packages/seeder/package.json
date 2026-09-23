@@ -10,6 +10,7 @@
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
+      "bare": "./dist/portable.js",
       "default": "./dist/index.js"
     }
   },

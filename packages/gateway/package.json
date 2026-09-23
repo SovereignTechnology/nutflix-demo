@@ -11,6 +11,10 @@
     ".": {
       "types": "./dist/index.d.ts",
       "default": "./dist/index.js"
+    },
+    "./upstream": {
+      "types": "./dist/upstream/payer.d.ts",
+      "default": "./dist/upstream/payer.js"
     }
   },
   "files": [
