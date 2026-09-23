@@ -26,8 +26,8 @@ rules: an internal session handoff (not published) §1–§3, §4.2, §5 (its §
 
 ## Stage 1 — parallel lanes
 
-`main` is green: **72 test files, 1014 passed / 27 skipped** (`npm run ci`, 2026-09-23, all nine
-L5 screens merged). On the dev laptop L8's real-ffmpeg suite ran against the **system**
+`main` is green: **73 test files, 1039 passed / 27 skipped** (`npm run ci`, 2026-09-23, after
+the L5 screens, contracts v4, UI-fixes and L3-flake). On the dev laptop L8's real-ffmpeg suite ran against the **system**
 `/usr/bin/ffmpeg` 6.1.1 (it resolves `NUTFLIX_FFMPEG`, then `/tmp/opencode/ffmpeg/`, then PATH),
 not the pinned dev build. On 2026-09-05 the tree reported 651 passed / 27 skipped with an ffmpeg
 present and 647 / 31 without one — that suite `skipIf`s when no binary is found; both are green.
@@ -44,6 +44,7 @@ present and 647 / 31 without one — that suite `skipIf`s when no binary is foun
 > revision `n8.1.2-50-g1a748fe2cd`, different build bytes), verified against the release's own
 > `checksums.sha256`, the GitHub API asset `digest`, and a passing run of the suite.
 >
+> **RESOLVED 2026-09-23 (lane L3-flake, `docs/lanes/L3-flake.md`) — it was a real bug.** Old note:
 > **Known flake (intermittent, not a regression):** `packages/gateway` →
 > `ws-bridge.integration.test.ts` → "a non-paying WS client is cut by the seeder window" times
 > out at 20 s under full-suite CPU load — it waits on Hypercore's `REQUEST_TIMEOUT` after a cut
@@ -77,7 +78,7 @@ present and 647 / 31 without one — that suite `skipIf`s when no binary is foun
 | **L5-Wallet** | `lane/L5-Wallet` | **merged 2026-09-23** (55 tests, 54 PNGs) | `2dee7bb` + wiring `611624e` |
 | **L5-Studio** | `lane/L5-Studio` | **merged 2026-09-23** (54 tests, 50 PNGs) | `65e1579` + wiring `f2ef017` |
 | **UI-fixes** (ADR 0007) | `lane/UI-fixes` | **merged 2026-09-23** (ui 456 → 472 tests, 534 PNGs) | see git log |
-| **L3-flake** | `lane/L3-flake` | **in progress** — root cause is a real `ws-duplex.ts` bug (late frames pause a closing socket → held 30 s, uncounted); fix re-issued | — |
+| **L3-flake** | `lane/L3-flake` | **merged 2026-09-23** — real bug, not a flake: late WS frames paused a closing socket (30 s stall); cut sockets left `maxConnections` accounting (F1) and a cut mid-stalled-write never started the close (F2). Fixed + 8 deterministic tests; A/B under load 4/10 → 0/10 failures | see git log |
 | L6 desktop-shell | `lane/L6` | **NEXT** (after L4-fixes / L5-fixes). No worktree on the dev laptop and no cached Electron binary here (`node node_modules/electron/install.js`) | — |
 | L7 web-shell | `lane/L7` | **NOT STARTED** — out of scope if ADR 0006 (unmerged, "Pear-runtime-only v0") is adopted | — |
 
@@ -245,7 +246,7 @@ v4 (2026-09-23) was a small additive bump: reactions (`likes`/`dislikes`/`myReac
    folder (prune per file, not per directory); it waits with no timeout for every lazy thumbnail
    and hangs on long pages; its default Chromium path does not exist on latitude — lanes used
    `NUTFLIX_CHROMIUM=~/.cache/ms-playwright/chromium-1234/chrome-linux64/chrome`.~~
-8. **Root-caused 2026-09-23 (lane L3-flake): a real bug, not a flaky test** — `ws-duplex.ts` pauses an already-closing socket on late frames, so it is held 30 s and uncounted by `maxConnections`; fix in progress. Original note: **The gateway `ws-bridge` "non-paying WS client is cut" flake is now frequent** (≥ 5 hits
+8. **DONE 2026-09-23 (lane L3-flake): a real bug, not a flaky test** — `ws-duplex.ts` paused an already-closing socket on late frames (30 s stall); cut sockets are now tracked until their own close and terminated after `WS_CLOSE_GRACE_MS` = 5 s. Still load-sensitive: the seeder's "cut inside `upload` leaves EXACTLY windowBlocks" test (hit once at load ~20, green in isolation). Original note: **The gateway `ws-bridge` "non-paying WS client is cut" flake is now frequent** (≥ 5 hits
    this session at load 6–8; always green on re-run). Needs the durable fix in that test
    (L3's directory): raise its timeout or serialise it against the ffmpeg/Storybook load.
 9. Worktrees of merged lanes (`L5-*`) are archaeology — remove when convenient (branches stay);
