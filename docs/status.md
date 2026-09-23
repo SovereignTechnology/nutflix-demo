@@ -165,6 +165,12 @@ Lane reports: `docs/lanes/L1.md`, `L2.md` (incl. v3 section), `L3.md` (incl. mar
 
 ### Shell contract the screens expect (L6 must honour)
 
+**Security requirements first — `docs/reviews/2026-09-23-pre-push-l5-v4.md` SE-1…SE-5:** Studio
+uploads take an opaque main-minted file token, never a renderer-supplied path (SE-1, High); one
+app-wide playback coordinator owns every `PlaySession` — at most one paying, hand-offs adopted
+or closed, never leaked (SE-2/SE-3); `autoTopUp.belowSats <= 0` means disabled (SE-4);
+`unreact` = NIP-09 deletion of the viewer's own reaction ids, never a `-` (SE-5).
+
 - **Watch mini-player:** `onMiniPlayer(session, videoId, handoff)` transfers ownership of a live
   `PlaySession` to the shell (it must `close()` it on dismiss); hand it back via
   `resumeSession`. Watch also hands off on unmount while live — a shell that remounts Watch
