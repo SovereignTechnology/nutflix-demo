@@ -2,7 +2,7 @@
  * Every component renders under jsdom (no browser) and its props-in/callbacks-out contract
  * holds. Data comes from `@sovit/core` mocks — allowed in tests, never in component source.
  */
-import { createElement, type ReactElement } from 'react';
+import { createElement, createRef, type ReactElement } from 'react';
 import { describe, expect, it, vi } from 'vitest';
 import { mocks } from '@sovit/core';
 import type { NostrPubkey, Profile, Sats, UnixSeconds } from '@sovit/core';
@@ -12,14 +12,18 @@ import { ChannelRow, ChannelRowSkeleton } from '../ChannelRow/ChannelRow.js';
 import { EMPTY_STATE_PRESETS, EmptyState, ErrorState } from '../EmptyState/EmptyState.js';
 import { MintChip } from '../MintChip/MintChip.js';
 import { PeerMeter } from '../PeerMeter/PeerMeter.js';
+import { ReactionButtons } from '../ReactionButtons/ReactionButtons.js';
+import { reactionStateOf, reactionStep } from '../ReactionButtons/reaction.js';
 import { SatsBadge } from '../SatsBadge/SatsBadge.js';
 import { Sheet } from '../Sheet/Sheet.js';
 import { Skeleton, SkeletonLines } from '../Skeleton/Skeleton.js';
 import { Toast, ToastStack } from '../Toast/Toast.js';
 import { VideoCard, VideoCardSkeleton } from '../VideoCard/VideoCard.js';
 import * as components from '../index.js';
+import { ICON_NAMES, Icon } from '../shared/Icon.js';
 import {
   cheapestRenditionSats,
+  defaultRenditionSats,
   formatDuration,
   formatRelativeTime,
   formatSats,
@@ -73,6 +77,16 @@ describe('formatting helpers', () => {
     );
     expect(cheapestRenditionSats([], video.price)).toBeUndefined();
   });
+
+  it('defaultRenditionSats is the FIRST rendition — what play(id) streams (ADR 0007 c)', () => {
+    const first = video.renditions[0];
+    if (!first) throw new Error('rendition missing');
+    const expected = renditionPriceSats(first, video.price);
+    expect(defaultRenditionSats(video.renditions, video.price)).toBe(expected);
+    // the fixture's first rendition is not its cheapest: the card must not show the cheapest
+    expect(cheapestRenditionSats(video.renditions, video.price)?.sats).not.toBe(expected);
+    expect(defaultRenditionSats([], video.price)).toBeUndefined();
+  });
 });
 
 describe('component exports', () => {
@@ -111,12 +125,15 @@ describe('VideoCard', () => {
       ...extra,
     });
 
-  it('shows title, duration, "from" price, channel with NIP-05 check, and meta', () => {
+  it('shows title, duration, the default rendition price, channel with NIP-05 check, and meta', () => {
     const r = render(el());
     expect(r.get('.nf-card__title').textContent).toBe(video.title);
     expect(r.get('.nf-card__duration').textContent).toBe(formatDuration(video.durationSec ?? 0));
     const price = r.get('.nf-card__price');
-    expect(price.getAttribute('aria-label')).toMatch(/^from [\d,.]+k? sats$/);
+    const sats = defaultRenditionSats(video.renditions, video.price) ?? -1;
+    // exactly what Watch/Shorts charge, compact on the chip, and never "from"
+    expect(price.getAttribute('aria-label')).toBe(`${formatSatsCompact(sats)} sats`);
+    expect(price.textContent).not.toContain('from');
     expect(r.get('.nf-card__channel-name').textContent).toBe('Orbital Mechanics');
     expect(r.container.querySelector('.nf-card__verified')).toBeTruthy();
     expect(r.get('.nf-card__meta').textContent).toContain('96 paid views');
@@ -125,6 +142,18 @@ describe('VideoCard', () => {
     expect(r.get('.nf-card__placeholder').getAttribute('src')).toBe(
       video.renditions[0]?.placeholder,
     );
+    r.unmount();
+  });
+
+  it('names the thumbnail button with the title AND the price (the badge inside is hidden by it)', () => {
+    const r = render(el());
+    const sats = defaultRenditionSats(video.renditions, video.price) ?? -1;
+    expect(r.get('.nf-card__thumb').getAttribute('aria-label')).toBe(
+      `${video.title}, ${formatSats(sats)}`,
+    );
+    r.rerender(el({ video: { ...video, renditions: [] } }));
+    expect(r.get('.nf-card__thumb').getAttribute('aria-label')).toBe(video.title);
+    expect(r.container.querySelector('.nf-card__price')).toBeNull();
     r.unmount();
   });
 
@@ -150,7 +179,129 @@ describe('VideoCard', () => {
     const s = render(createElement(VideoCardSkeleton));
     expect(s.get('.nf-card--skeleton').getAttribute('aria-busy')).toBe('true');
     expect(s.all('.nf-skeleton').length).toBeGreaterThan(2);
+    expect(s.container.querySelector('.nf-card__avatar')).toBeTruthy();
+    // hideChannel matches a channel-page card: no avatar circle, same text lines
+    s.rerender(createElement(VideoCardSkeleton, { hideChannel: true }));
+    expect(s.container.querySelector('.nf-card__avatar')).toBeNull();
+    expect(s.all('.nf-card__text .nf-skeleton')).toHaveLength(3);
+    s.rerender(createElement(VideoCardSkeleton, { layout: 'list' }));
+    expect(s.get('.nf-card--skeleton').classList.contains('nf-card--list')).toBe(true);
+    expect(s.container.querySelector('.nf-card__avatar')).toBeNull();
     s.unmount();
+  });
+});
+
+describe('ReactionButtons + reactionStep (ADR 0007 b)', () => {
+  const at = (
+    likes: number | undefined,
+    dislikes: number | undefined,
+    mine?: 'like' | 'dislike',
+  ): { likes: number | undefined; dislikes: number | undefined; mine: typeof mine } => ({
+    likes,
+    dislikes,
+    mine,
+  });
+
+  it('maps every transition to exactly one adapter call and the optimistic counts', () => {
+    // neutral → like / dislike
+    expect(reactionStep(at(10, 2), 'like')).toEqual({
+      call: { method: 'react', content: '+' },
+      next: at(11, 2, 'like'),
+    });
+    expect(reactionStep(at(10, 2), 'dislike')).toEqual({
+      call: { method: 'react', content: '-' },
+      next: at(10, 3, 'dislike'),
+    });
+    // switching is ONE react with the new content
+    expect(reactionStep(at(11, 2, 'like'), 'dislike')).toEqual({
+      call: { method: 'react', content: '-' },
+      next: at(10, 3, 'dislike'),
+    });
+    expect(reactionStep(at(10, 3, 'dislike'), 'like')).toEqual({
+      call: { method: 'react', content: '+' },
+      next: at(11, 2, 'like'),
+    });
+    // pressing the active one withdraws it: unreact, never a '-'
+    expect(reactionStep(at(11, 2, 'like'), 'like')).toEqual({
+      call: { method: 'unreact' },
+      next: at(10, 2),
+    });
+    expect(reactionStep(at(10, 3, 'dislike'), 'dislike')).toEqual({
+      call: { method: 'unreact' },
+      next: at(10, 2),
+    });
+    // unknown counts stay unknown; counts never go negative
+    expect(reactionStep(at(undefined, undefined), 'like').next).toEqual(
+      at(undefined, undefined, 'like'),
+    );
+    expect(reactionStep(at(0, 0, 'like'), 'like').next).toEqual(at(0, 0));
+  });
+
+  it('reactionStateOf reads VideoStats v4 and drops myReaction when signed out', () => {
+    const stats = { likes: 5, dislikes: 1, myReaction: 'like' as const };
+    expect(reactionStateOf(stats, true)).toEqual(at(5, 1, 'like'));
+    expect(reactionStateOf(stats, false)).toEqual(at(5, 1));
+    expect(reactionStateOf(undefined, true)).toEqual(at(undefined, undefined));
+  });
+
+  it('renders both counts, pressed state, accessible names; presses call onReact unless busy', () => {
+    const onReact = vi.fn();
+    const r = render(createElement(ReactionButtons, { likes: 1284, dislikes: 1, onReact }));
+    const like = r.get('.nf-reactions__like');
+    const dislike = r.get('.nf-reactions__dislike');
+    expect(r.get('[role="group"]').getAttribute('aria-label')).toBe('Like or dislike');
+    expect(like.getAttribute('aria-label')).toBe('Like, 1,284 likes');
+    expect(dislike.getAttribute('aria-label')).toBe('Dislike, 1 dislike');
+    expect(like.textContent).toBe('1,284');
+    expect(dislike.textContent).toBe('1');
+    expect(like.getAttribute('aria-pressed')).toBe('false');
+    expect(like.querySelector('svg')?.getAttribute('aria-hidden')).toBe('true');
+    click(like);
+    click(dislike);
+    expect(onReact.mock.calls).toEqual([['like'], ['dislike']]);
+    r.rerender(
+      createElement(ReactionButtons, {
+        likes: 0,
+        dislikes: 0,
+        mine: 'dislike',
+        onReact,
+        busy: true,
+      }),
+    );
+    expect(r.get('.nf-reactions__dislike').getAttribute('aria-pressed')).toBe('true');
+    expect(r.get('.nf-reactions__dislike').getAttribute('title')).toBe('Remove your dislike');
+    expect(r.get('.nf-reactions__like').textContent).toBe('0'); // zero is still shown
+    expect(r.get('[role="group"]').getAttribute('aria-busy')).toBe('true');
+    click(r.get('.nf-reactions__like'));
+    expect(onReact).toHaveBeenCalledTimes(2); // ignored while busy, but still focusable
+    expect(r.get('.nf-reactions__like').hasAttribute('disabled')).toBe(false);
+    r.rerender(createElement(ReactionButtons, { likes: undefined, dislikes: undefined, onReact }));
+    expect(r.get('.nf-reactions__like').getAttribute('aria-label')).toBe('Like');
+    expect(r.get('.nf-reactions__like').textContent).toBe('');
+    r.unmount();
+  });
+});
+
+describe('Icon', () => {
+  it('has the v4 icons, decorative and currentColor', () => {
+    for (const name of [
+      'thumbUp',
+      'thumbDown',
+      'comment',
+      'share',
+      'clock',
+      'lock',
+      'playlist',
+    ] as const) {
+      expect(ICON_NAMES).toContain(name);
+      const r = render(createElement(Icon, { name }));
+      const svg = r.get('svg');
+      expect(svg.getAttribute('aria-hidden')).toBe('true');
+      expect(svg.getAttribute('fill')).toBe('currentColor');
+      expect(svg.getAttribute('viewBox')).toBe('0 0 24 24');
+      expect(r.get('path').getAttribute('d')?.length).toBeGreaterThan(10);
+      r.unmount();
+    }
   });
 });
 
@@ -367,6 +518,49 @@ describe('Sheet', () => {
     click(r.get('[data-testid="sheet-backdrop"]'));
     click(r.get('button[aria-label="Close"]'));
     expect(onClose).toHaveBeenCalledTimes(3);
+    r.unmount();
+  });
+
+  it('initialFocus: first form field, a selector or a ref instead of Close; bad input falls back', () => {
+    const form = createElement(
+      'form',
+      null,
+      createElement('input', { type: 'hidden', name: 'h' }),
+      createElement('input', { type: 'text', id: 'title' }),
+      createElement('textarea', { id: 'desc' }),
+    );
+    const open = (initialFocus: string | undefined): ReturnType<typeof render> =>
+      render(
+        createElement(
+          Sheet,
+          { open: true, onClose: () => undefined, title: 'New', initialFocus },
+          form,
+        ),
+      );
+    let r = open('first-field');
+    expect(document.activeElement?.id).toBe('title');
+    r.unmount();
+    r = open('#desc');
+    expect(document.activeElement?.id).toBe('desc');
+    r.unmount();
+    for (const bad of ['#missing', '[[not a selector']) {
+      r = open(bad);
+      expect(document.activeElement?.getAttribute('aria-label')).toBe('Close');
+      r.unmount();
+    }
+    const ref = createRef<HTMLButtonElement>();
+    r = render(
+      createElement(
+        Sheet,
+        { open: true, onClose: () => undefined, title: 'T', initialFocus: ref },
+        createElement('button', { type: 'button', ref, id: 'target' }, 'go'),
+      ),
+    );
+    expect(document.activeElement?.id).toBe('target');
+    r.unmount();
+    // default is unchanged: Close first
+    r = open(undefined);
+    expect(document.activeElement?.getAttribute('aria-label')).toBe('Close');
     r.unmount();
   });
 

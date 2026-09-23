@@ -5,11 +5,12 @@ import { SatsBadge } from '../SatsBadge/SatsBadge.js';
 import { Skeleton } from '../Skeleton/Skeleton.js';
 import { Icon } from '../shared/Icon.js';
 import {
-  cheapestRenditionSats,
   cx,
+  defaultRenditionSats,
   formatDuration,
   formatPaidViews,
   formatRelativeTime,
+  formatSats,
 } from '../shared/format.js';
 
 export type VideoCardLayout = 'grid' | 'list';
@@ -40,7 +41,9 @@ export interface VideoCardProps {
  * YouTube-style video card: 16:9 thumbnail with blur-up placeholder, duration badge, price
  * badge, two-line title, channel row (avatar · name · NIP-05 check), meta line
  * ("12 paid views · 3 hours ago"). Price is on the card because the network shows the price
- * before playback ever starts (build-plan §6.1 Watch/Home).
+ * before playback ever starts (build-plan §6.1 Watch/Home). It is the DEFAULT rendition's price
+ * (the manifest's first — what `play(id)` streams and Watch/Shorts charge), never "from" the
+ * cheapest (ADR 0007 c), and it is part of the thumbnail button's accessible name.
  */
 export function VideoCard({
   video,
@@ -59,7 +62,7 @@ export function VideoCard({
   const [loaded, setLoaded] = useState(false);
   const rendition = video.renditions[0];
   const placeholder = rendition?.placeholder;
-  const price = cheapestRenditionSats(video.renditions, video.price);
+  const price = defaultRenditionSats(video.renditions, video.price);
   const channelName = channel?.displayName ?? channel?.name ?? '';
   const isShort = video.kind === 22;
 
@@ -72,7 +75,12 @@ export function VideoCard({
       className={cx('nf-card', `nf-card--${layout}`, isShort && 'nf-card--short', className)}
       aria-label={video.title}
     >
-      <button type="button" className="nf-card__thumb" onClick={open} aria-label={video.title}>
+      <button
+        type="button"
+        className="nf-card__thumb"
+        onClick={open}
+        aria-label={price === undefined ? video.title : `${video.title}, ${formatSats(price)}`}
+      >
         {placeholder ? (
           <img className="nf-card__placeholder" src={placeholder} alt="" aria-hidden="true" />
         ) : null}
@@ -94,15 +102,14 @@ export function VideoCard({
         {video.durationSec !== undefined ? (
           <span className="nf-card__duration">{formatDuration(video.durationSec)}</span>
         ) : null}
-        {price ? (
+        {price !== undefined ? (
           <SatsBadge
             className="nf-card__price"
-            sats={price.sats}
+            sats={price}
             variant="price"
             size="sm"
             overlay
             compact
-            {...(price.from ? { prefix: 'from' } : {})}
           />
         ) : null}
         {progress !== undefined && progress > 0 ? (
@@ -163,14 +170,19 @@ export function VideoCard({
   );
 }
 
+export interface VideoCardSkeletonProps {
+  readonly layout?: VideoCardLayout;
+  /** Matches a `VideoCard` with `hideChannel` (channel page grids): no avatar circle. */
+  readonly hideChannel?: boolean;
+  readonly className?: string;
+}
+
 /** Same footprint as `VideoCard` while data loads. */
 export function VideoCardSkeleton({
   layout = 'grid',
+  hideChannel = false,
   className,
-}: {
-  readonly layout?: VideoCardLayout;
-  readonly className?: string;
-}): ReactElement {
+}: VideoCardSkeletonProps): ReactElement {
   return (
     <div
       className={cx('nf-card', `nf-card--${layout}`, 'nf-card--skeleton', className)}
@@ -180,7 +192,7 @@ export function VideoCardSkeleton({
         <Skeleton variant="block" aspectRatio="16 / 9" />
       </div>
       <div className="nf-card__body">
-        {layout === 'grid' ? (
+        {layout === 'grid' && !hideChannel ? (
           <span className="nf-card__avatar">
             <Skeleton variant="circle" />
           </span>

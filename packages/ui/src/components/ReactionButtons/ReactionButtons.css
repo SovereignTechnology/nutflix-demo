@@ -1,0 +1,58 @@
+.nf-reactions {
+  display: inline-flex;
+  min-width: 0;
+}
+
+/* One pill split in two (YouTube's like | dislike), a hairline between the halves. */
+.nf-reactions--segmented {
+  align-items: stretch;
+}
+
+.nf-reactions--segmented .nf-button {
+  border-radius: 0;
+}
+
+.nf-reactions--segmented .nf-reactions__like {
+  position: relative;
+  padding-right: var(--nf-space-12);
+  border-top-left-radius: var(--nf-radius-full);
+  border-bottom-left-radius: var(--nf-radius-full);
+}
+
+.nf-reactions--segmented .nf-reactions__like::after {
+  content: '';
+  position: absolute;
+  top: 8px;
+  right: 0;
+  bottom: 8px;
+  width: 1px;
+  background: var(--nf-color-border);
+}
+
+.nf-reactions--segmented .nf-reactions__dislike {
+  padding-left: var(--nf-space-12);
+  border-top-right-radius: var(--nf-radius-full);
+  border-bottom-right-radius: var(--nf-radius-full);
+}
+
+.nf-reactions--segmented .nf-reactions__dislike.nf-button--icon-only {
+  width: auto;
+  padding-right: var(--nf-space-16);
+}
+
+.nf-reactions--segmented .nf-button:focus-visible {
+  position: relative;
+  z-index: 1;
+}
+
+/* Two pills in a column: inherits the surrounding rail's spacing and alignment. */
+.nf-reactions--stacked {
+  flex-direction: column;
+  align-items: inherit;
+  gap: inherit;
+}
+
+.nf-reactions__like .nf-button__label,
+.nf-reactions__dislike .nf-button__label {
+  font-variant-numeric: tabular-nums;
+}

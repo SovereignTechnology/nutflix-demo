@@ -35,7 +35,7 @@ export const Default: Story = {
 };
 
 export const MultiplePrices: Story = {
-  name: 'Multiple renditions (from price)',
+  name: 'Multiple renditions (default rendition price)',
   args: {
     video: v1,
     channel: channelFor(v1),
@@ -93,6 +93,17 @@ export const ListLayout: Story = {
 
 export const Skeleton: Story = {
   render: () => <VideoCardSkeleton />,
+};
+
+export const SkeletonNoChannel: Story = {
+  name: 'Skeleton (channel page, no channel row)',
+  render: () => <VideoCardSkeleton hideChannel />,
+};
+
+export const SkeletonList: Story = {
+  name: 'Skeleton (list layout)',
+  parameters: { nf: { width: 420 } },
+  render: () => <VideoCardSkeleton layout="list" />,
 };
 
 export const Grid: Story = {

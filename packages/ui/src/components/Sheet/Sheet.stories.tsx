@@ -46,6 +46,29 @@ export const Bottom: Story = {
   args: { ...Right.args, side: 'bottom' },
 };
 
+export const FormFirstField: Story = {
+  name: 'Form (focus lands in the first field)',
+  args: {
+    open: true,
+    inline: true,
+    title: 'New playlist',
+    initialFocus: 'first-field',
+    onClose: () => undefined,
+    children: (
+      <label className="nf-story-col">
+        <span>Title</span>
+        <input type="text" defaultValue="" />
+      </label>
+    ),
+    footer: (
+      <>
+        <Button variant="ghost">Cancel</Button>
+        <Button variant="primary">Create</Button>
+      </>
+    ),
+  },
+};
+
 export const Untitled: Story = {
   args: { open: true, inline: true, onClose: () => undefined, children: body },
 };

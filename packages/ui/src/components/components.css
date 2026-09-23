@@ -12,6 +12,7 @@
 @import './Skeleton/Skeleton.css';
 @import './VideoCard/VideoCard.css';
 @import './ChannelRow/ChannelRow.css';
+@import './ReactionButtons/ReactionButtons.css';
 @import './PeerMeter/PeerMeter.css';
 @import './EmptyState/EmptyState.css';
 @import './Sheet/Sheet.css';

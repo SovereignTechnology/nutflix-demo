@@ -5,6 +5,7 @@ import {
   type KeyboardEvent,
   type ReactElement,
   type ReactNode,
+  type RefObject,
 } from 'react';
 import { IconButton } from '../Button/Button.js';
 import { cx } from '../shared/format.js';
@@ -22,10 +23,42 @@ export interface SheetProps {
   readonly children?: ReactNode;
   readonly footer?: ReactNode;
   readonly className?: string;
+  /**
+   * What receives focus when the sheet opens. Default: the first focusable element (the
+   * Close button). Pass `'first-field'` for the first enabled form field — a form sheet
+   * should land in its first input, not on Close — a CSS selector resolved inside the panel,
+   * or a ref. Falls back to the default when nothing matches.
+   */
+  readonly initialFocus?: string | RefObject<HTMLElement | null> | undefined;
 }
 
 const FOCUSABLE =
   'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
+
+/** `initialFocus="first-field"`: the first enabled, visible-to-AT form control. */
+const FIRST_FIELD =
+  'input:not([disabled]):not([type="hidden"]):not([aria-hidden="true"]), select:not([disabled]), textarea:not([disabled])';
+
+function initialTarget(
+  panel: HTMLElement,
+  initialFocus: SheetProps['initialFocus'],
+): HTMLElement | null {
+  if (initialFocus !== undefined) {
+    if (typeof initialFocus === 'string') {
+      const selector = initialFocus === 'first-field' ? FIRST_FIELD : initialFocus;
+      let el: HTMLElement | null = null;
+      try {
+        el = panel.querySelector<HTMLElement>(selector);
+      } catch {
+        // an invalid selector must not break the sheet: fall back to the default below
+      }
+      if (el !== null) return el;
+    } else if (initialFocus.current !== null && panel.contains(initialFocus.current)) {
+      return initialFocus.current;
+    }
+  }
+  return panel.querySelector<HTMLElement>(FOCUSABLE);
+}
 
 /**
  * Modal sheet: backdrop, `role="dialog"` + `aria-modal`, Escape and backdrop click close,
@@ -42,17 +75,23 @@ export function Sheet({
   children,
   footer,
   className,
+  initialFocus,
 }: SheetProps): ReactElement | null {
   const titleId = useId();
   const panelRef = useRef<HTMLDivElement>(null);
   const restoreRef = useRef<Element | null>(null);
 
+  // Read once per open: the target is chosen when the sheet opens, not on every render.
+  const initialFocusRef = useRef(initialFocus);
+  initialFocusRef.current = initialFocus;
+
   useEffect(() => {
     if (!open) return;
     restoreRef.current = document.activeElement;
     const panel = panelRef.current;
-    const first = panel?.querySelector<HTMLElement>(FOCUSABLE);
-    (first ?? panel)?.focus();
+    // Children's effects have run by now, so a ref passed in is already attached.
+    const target = panel === null ? null : initialTarget(panel, initialFocusRef.current);
+    (target ?? panel)?.focus();
     return () => {
       const prev = restoreRef.current;
       if (prev instanceof HTMLElement) prev.focus();

@@ -93,7 +93,23 @@ export function renditionRatePerMin(
   return Math.ceil((renditionPriceSats(rendition, policy) * 60) / durationSec) as Sats;
 }
 
-/** Cheapest rendition price — what a card shows before playback ("from N sats"). */
+/**
+ * Price of the default rendition — the manifest's first, which is what `play(id)` streams and
+ * Watch/Shorts charge. Every card-like price shows this figure, with no "from" (ADR 0007 c),
+ * so the price on a card equals the price quoted on the watch page.
+ */
+export function defaultRenditionSats(
+  renditions: readonly Rendition[],
+  policy: PricePolicy,
+): Sats | undefined {
+  const first = renditions[0];
+  return first === undefined ? undefined : renditionPriceSats(first, policy);
+}
+
+/**
+ * Cheapest rendition price and whether others cost more. Not a card price any more (cards
+ * show `defaultRenditionSats`, ADR 0007 c); kept for Home's hover-preview cost.
+ */
 export function cheapestRenditionSats(
   renditions: readonly Rendition[],
   policy: PricePolicy,

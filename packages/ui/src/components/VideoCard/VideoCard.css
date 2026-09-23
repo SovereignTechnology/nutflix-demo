@@ -120,6 +120,12 @@
   min-width: 0;
 }
 
+/* Beside a fixed-width thumbnail the body takes the rest of the row, so the skeleton's
+   percentage-width lines (and long titles) have a width to resolve against. */
+.nf-card--list .nf-card__body {
+  flex: 1 1 auto;
+}
+
 .nf-card__avatar {
   flex: none;
   padding: 0;
@@ -132,6 +138,7 @@
 
 .nf-card__text {
   display: flex;
+  flex: 1 1 auto;
   flex-direction: column;
   gap: 2px;
   min-width: 0;
