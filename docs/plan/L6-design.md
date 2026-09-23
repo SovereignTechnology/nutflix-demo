@@ -13,7 +13,15 @@ screens expect" section of `docs/status.md`.
   until Stage 2 (`pay-protocol/` is locked; L3's dev `PayProtocol` sends nothing). A documented
   dev-only double, fenced like L3's `--dev-mocks` (refuses a non-loopback swarm bootstrap).
 - **D2 — Never construct `new PearRuntime()` in Stage 1** (it joins the updater topic on the
-  public DHT); only the static `PearRuntime.run()` (bare-sidecar) is used.
+  public DHT). **Amended after L6-0:** the host spawns the worker with **`bare-sidecar`
+  directly** (pinned `0.5.4`) — exactly what `PearRuntime.run()` does internally — because
+  `import 'pear-runtime'` in the Node host loads corestore, hyperswarm and three native addons
+  (239 modules) that `run` never uses. `pear-runtime` stays a dependency for Stage 3 OTA.
+- **D5 (after L6-0) — `wallet.p2pkPubkey` and `wallet.keyset` stay unbridged** with `send`/
+  `receive` (`EXCLUDED_METHODS`): the UI never calls them; least privilege.
+- **D6 — the worker entry's first import is `bare-encoding/global`** (Bare has no
+  `TextEncoder`/`TextDecoder`; core's media pipeline, the seeder's json-store and L8's Bare
+  process runner all use them).
 - **D3 — The renderer never receives `wallet.send` / `wallet.receive`**: the bridge exposes stubs
   that reject `forbidden:` (a compromised renderer could otherwise mint locked proofs).
 - **D4 — Never `--no-sandbox`.** Electron cannot launch on the dev laptop until Cameron applies a
