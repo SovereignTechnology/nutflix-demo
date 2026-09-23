@@ -160,6 +160,11 @@ stream stopped and nothing more is being paid for" + Retry.
 
 ### Side rail and actions
 
+> **Superseded 2026-09-23 (lane UI-fixes, contracts v4, ADR 0007):** like and dislike are two
+> icon buttons with both counts from `stats().likes`/`.dislikes`, pressed state from
+> `stats().myReaction`; pressing the active one calls `unreact(id)` — **never** `react(id, '-')`.
+> See `docs/lanes/UI-fixes.md`.
+
 - **Like · N** (`Button`, `pressed` when liked): `react(id, '+')` / `react(id, '-')` (see the
   contract request), count = `stats.reactions` ± the viewer's own toggles; liked state from
   `library.liked()`.
@@ -286,8 +291,8 @@ function that clicks/keys like a viewer — the screen has no prop that starts p
 
 ## Things I was unsure about / judgement calls
 
-- **Un-like sends `react(id, '-')`** (a NIP-25 *dislike*), because v3 has no way to retract a
-  reaction — same as the Watch lane. Contract request filed (`unreact(videoId)`, v4).
+- ~~**Un-like sends `react(id, '-')`**~~ — **resolved 2026-09-23:** contracts v4 added
+  `unreact(videoId)` and lane UI-fixes switched Shorts and Watch to it (ADR 0007).
 - **Space starts a paid session from the keyboard.** It is an explicit action on the active
   short whose price is on screen; the alternative (mouse/touch only) would make Shorts
   unplayable from a keyboard. `j`/`k` never start anything.

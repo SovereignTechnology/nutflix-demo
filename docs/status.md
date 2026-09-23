@@ -76,6 +76,8 @@ present and 647 / 31 without one — that suite `skipIf`s when no binary is foun
 | **L5-Search** | `lane/L5-Search` | **merged 2026-09-23** (36 tests, 32 PNGs) | `5eaa808` + wiring `b9f2f01` |
 | **L5-Wallet** | `lane/L5-Wallet` | **merged 2026-09-23** (55 tests, 54 PNGs) | `2dee7bb` + wiring `611624e` |
 | **L5-Studio** | `lane/L5-Studio` | **merged 2026-09-23** (54 tests, 50 PNGs) | `65e1579` + wiring `f2ef017` |
+| **UI-fixes** (ADR 0007) | `lane/UI-fixes` | **merged 2026-09-23** (ui 456 → 472 tests, 534 PNGs) | see git log |
+| **L3-flake** | `lane/L3-flake` | **in progress** — root cause is a real `ws-duplex.ts` bug (late frames pause a closing socket → held 30 s, uncounted); fix re-issued | — |
 | L6 desktop-shell | `lane/L6` | **NEXT** (after L4-fixes / L5-fixes). No worktree on the dev laptop and no cached Electron binary here (`node node_modules/electron/install.js`) | — |
 | L7 web-shell | `lane/L7` | **NOT STARTED** — out of scope if ADR 0006 (unmerged, "Pear-runtime-only v0") is adopted | — |
 
@@ -224,26 +226,26 @@ v4 (2026-09-23) was a small additive bump: reactions (`likes`/`dislikes`/`myReac
    doc comments. Deduping needs a shared ambient-types package (`declare module` blocks are not
    emitted by `tsc` and cannot be re-exported), which is more than the "only if trivial" the
    brief allowed. **Left as is, deliberately.**
-3. **L4 `VideoCardSkeleton` bug** (found by L5-Home): `.nf-card__text` has no `flex-grow`, so
+3. **DONE 2026-09-23 (UI-fixes).** ~~**L4 `VideoCardSkeleton` bug** (found by L5-Home): `.nf-card__text` has no `flex-grow`, so
    skeleton text lines render at 0 px. L5-Home works around it in `Home.css`; the rule belongs
-   in `VideoCard.css`. Fix in the next lane that touches `packages/ui/src/components/`.
+   in `VideoCard.css`. Fix in the next lane that touches `packages/ui/src/components/`.~~
 4. **Each L5 merge needs two wiring lines** from the orchestrator: the export in
    `packages/ui/src/screens/index.ts` and the `@import` in `packages/ui/src/screens/screens.css`.
 5. `packages/seeder` still ships **no self-executing entry point**, but
    `deploy/systemd/nutflix-seeder.service` points at `dist/index.js --config`. Documented in
    `deploy/systemd/README.md`; a shell (L6 worker or a Stage 2 service entry) must call
    `runDaemon()`, or the seeder needs a `bin`.
-6. **L4 component fixes owed** (hit by 4 lanes, each worked around in its own CSS): list-layout
+6. **DONE 2026-09-23 (UI-fixes)** except the text-field component (still none). ~~**L4 component fixes owed** (hit by 4 lanes, each worked around in its own CSS): list-layout
    `.nf-card__body` also needs `flex-grow` (item 3 is one level of it); `VideoCardSkeleton` needs
    a `hideChannel` option; `Sheet` focuses Close first; **a11y bug: `VideoCard`'s thumbnail
    button has `aria-label={title}`, so screen readers never hear the `SatsBadge` price** (put the
    price in the label); no text-field component; missing icons (lock, clock, thumbs-up, comment,
-   share, playlist).
-7. **`scripts/screenshots.ts`:** a partial `--filter` deletes the other PNGs in that screen's
+   share, playlist).~~
+7. **DONE 2026-09-23 (UI-fixes)** — Playwright-Chromium fallback, per-file prune, 10 s image wait. ~~**`scripts/screenshots.ts`:** a partial `--filter` deletes the other PNGs in that screen's
    folder (prune per file, not per directory); it waits with no timeout for every lazy thumbnail
    and hangs on long pages; its default Chromium path does not exist on latitude — lanes used
-   `NUTFLIX_CHROMIUM=~/.cache/ms-playwright/chromium-1234/chrome-linux64/chrome`.
-8. **The gateway `ws-bridge` "non-paying WS client is cut" flake is now frequent** (≥ 5 hits
+   `NUTFLIX_CHROMIUM=~/.cache/ms-playwright/chromium-1234/chrome-linux64/chrome`.~~
+8. **Root-caused 2026-09-23 (lane L3-flake): a real bug, not a flaky test** — `ws-duplex.ts` pauses an already-closing socket on late frames, so it is held 30 s and uncounted by `maxConnections`; fix in progress. Original note: **The gateway `ws-bridge` "non-paying WS client is cut" flake is now frequent** (≥ 5 hits
    this session at load 6–8; always green on re-run). Needs the durable fix in that test
    (L3's directory): raise its timeout or serialise it against the ffmpeg/Storybook load.
 9. Worktrees of merged lanes (`L5-*`) are archaeology — remove when convenient (branches stay);

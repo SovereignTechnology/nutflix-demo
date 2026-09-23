@@ -1,5 +1,8 @@
 # Contract request — L5-Shorts (against `CONTRACTS_VERSION = 3`)
 
+**Status: DONE in contracts v4 (2026-09-23, ADR 0007)** — `NetworkAdapter.unreact(videoId)`, plus
+`VideoStats.likes`/`dislikes`/`myReaction`; Shorts and Watch use it since lane UI-fixes.
+
 **Not blocking.** The Shorts screen works within v3 with the workaround below; this records a
 gap so it can be decided before the real adapters (L6/L7) implement `react`.
 

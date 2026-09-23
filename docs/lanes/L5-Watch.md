@@ -167,7 +167,8 @@ carry the session back into the screen, which is why the callback exists.
   50% to seeders, 50% to the creator"). The Player's own (profile-less) overlay is not used.
 - **Channel row + actions**: `ChannelRow` (NIP-05, Subscribe via `adapter.subscribe`/
   `unsubscribe`, "N sats to creator" from `VideoStats.satsToCreator`), Like (`adapter.react
-  '+'/'-'`, pressed state + count), Nutzap (accent) → `Sheet` with 21/100/1 000/custom, the
+  '+'/'-'`, pressed state + count — **superseded 2026-09-23 by lane UI-fixes / ADR 0007:** Like and
+  Dislike buttons with both counts; pressing the active one calls `unreact`, never `react '-'`), Nutzap (accent) → `Sheet` with 21/100/1 000/custom, the
   creator's mints as selectable `MintChip`s with balances (default: first funded), an optional
   public note, a `SatsBadge` before "Send nutzap", and the no-balance preset + Top up when the
   mint cannot cover it. Overflow menu: Save to / Remove from Watch later
