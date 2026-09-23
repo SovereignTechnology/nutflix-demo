@@ -4,7 +4,7 @@
  * stale plays, rendition lineage, the header rate. `live()` counts the MOCK's open sessions
  * (each registers one tick driver until closed) — the ground truth for "none leaked".
  */
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { mocks } from '@sovit/core';
 import type { NostrEventId, PlaySession } from '@sovit/core';
 import type { WatchHandoff } from '@sovit/ui';
@@ -146,7 +146,11 @@ describe('PlaybackCoordinator', () => {
     t.c.handOff(s1, V1, handoffOf(s1, V1));
     t.c.screenMounted(2);
     t.c.routeCommitted({ name: 'shorts' });
-    await t.a.play(VIDEOS.find((v) => v.kind === 22)!.id);
+    const basePlay = vi.spyOn(t.base, 'play');
+    const short = await t.a.play(VIDEOS.find((v) => v.kind === 22)!.id);
+    const inner = await (basePlay.mock.results[0]!.value as Promise<PlaySession>);
+    const innerPause = vi.spyOn(inner, 'pause');
+    const innerResume = vi.spyOn(inner, 'resume');
     t.c.pauseMini();
     expect(t.c.snapshot()).toMatchObject({ open: 2, unpaused: 1 });
     expect(t.c.snapshot().mini?.paused).toBe(true);
@@ -154,6 +158,15 @@ describe('PlaybackCoordinator', () => {
     t.c.resumeMini();
     expect(t.c.snapshot()).toMatchObject({ open: 2, unpaused: 1 });
     expect(t.c.snapshot().mini?.paused).toBe(false);
+    expect(t.mediaPauses.n).toBe(1);
+    expect(innerPause).toHaveBeenCalledTimes(1);
+    // Shorts hears its element pause and pauses its own session (as Watch does): a no-op
+    // here — the short stays paused, the mini keeps paying, nothing resumes (no loop).
+    short.pause();
+    expect(t.c.snapshot()).toMatchObject({ open: 2, unpaused: 1 });
+    expect(t.c.snapshot().mini?.paused).toBe(false);
+    expect(innerPause).toHaveBeenCalledTimes(1);
+    expect(innerResume).not.toHaveBeenCalled();
     expect(t.mediaPauses.n).toBe(1);
   });
 

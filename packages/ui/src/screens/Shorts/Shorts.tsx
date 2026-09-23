@@ -19,7 +19,11 @@
  *    back charging more than that price (a different rendition or policy) it is closed at
  *    once and the new price is shown for fresh consent;
  *  - pause = `PlaySession.pause()` (stop paying, and the UI says so); the end of a short
- *    pauses the session too, so nothing is paid past the last frame.
+ *    pauses the session too, so nothing is paid past the last frame;
+ *  - the `<video>` element pausing on its own (PiP window, media keys, the OS, a shell
+ *    pausing page media) pauses the session as well, and playing it from outside while
+ *    paused resumes it — as Watch does. Never for the end of a short, and never for the
+ *    element of a session the screen already released (moving on, unmount).
  *
  * Talks ONLY to `NetworkAdapter`; renders ONLY `@sovit/ui` components + semantic HTML.
  * Posters and avatars pass through `adapter.image(url, sha256)` (T16) with a `Skeleton`
@@ -351,6 +355,12 @@ export function Shorts({
   const playbackRef = useRef(playback);
   playbackRef.current = playback;
   const videoElRef = useRef<HTMLVideoElement | null>(null);
+  /**
+   * What the screen last told the bound session, written BEFORE the element is told, so the
+   * element's echo of the screen's own `pause()`/`play()` is recognised synchronously (a
+   * `pause`/`play` event can never pause twice or start a pause → resume loop).
+   */
+  const payRef = useRef<'paying' | 'paused' | 'ended'>('paying');
   const [muted, setMuted] = useState(false);
   const mutedRef = useRef(muted);
   mutedRef.current = muted;
@@ -746,6 +756,7 @@ export function Shorts({
           }
           const b: Binding = { videoId: video.id, session };
           bindingRef.current = b;
+          payRef.current = 'paying';
           spendUnsubRef.current = session.onSpend((s) => {
             if (!aliveRef.current || bindingRef.current?.session !== session) return;
             setPlayback((prev) => (prev.videoId === video.id ? { ...prev, spend: s } : prev));
@@ -770,7 +781,8 @@ export function Shorts({
 
   const pausePlayback = useCallback((): void => {
     const b = bindingRef.current;
-    if (b === null) return;
+    if (b === null || payRef.current !== 'paying') return;
+    payRef.current = 'paused'; // before the element hears about it (its echo is ignored)
     b.session.pause(); // stops paying — not merely a media pause
     safePause(videoElRef.current);
     setPlayback((prev) => ({ ...prev, status: 'paused' }));
@@ -788,6 +800,7 @@ export function Shorts({
         // see safePlay
       }
     }
+    payRef.current = 'paying'; // before the element hears about it (its echo is ignored)
     b.session.resume();
     safePlay(el);
     setPlayback((prev) => ({ ...prev, status: 'playing', ...(replay ? { currentTime: 0 } : {}) }));
@@ -810,9 +823,41 @@ export function Shorts({
   const endPlayback = useCallback((): void => {
     const b = bindingRef.current;
     if (b === null) return;
-    b.session.pause(); // buffer = money — never pay past the end
+    const wasPaying = payRef.current === 'paying';
+    payRef.current = 'ended';
+    if (wasPaying) b.session.pause(); // buffer = money — never pay past the end
     setPlayback((prev) => ({ ...prev, status: 'ended' }));
   }, []);
+
+  /**
+   * The bound element paused on its own — PiP window, media keys, the OS, or the desktop
+   * shell pausing page media when its mini-player resumes: stop paying too, and show it (as
+   * Watch does). Ignored for the end of the short (`ended` pauses the session itself), for an
+   * element that is not the bound session's (moving on and unmount release the session
+   * before its element goes away), and for the echo of the screen's own pause.
+   */
+  const elementPaused = useCallback(
+    (videoId: NostrEventId, el: HTMLVideoElement): void => {
+      if (el.ended || el !== videoElRef.current) return;
+      if (bindingRef.current?.videoId !== videoId || payRef.current !== 'paying') return;
+      pausePlayback();
+    },
+    [pausePlayback],
+  );
+
+  /**
+   * The bound element was played from outside (PiP window, media keys) while the screen had
+   * it paused: pay again. Not after the end (Replay is an explicit action), and not for the
+   * echo of the screen's own resume.
+   */
+  const elementPlayed = useCallback(
+    (videoId: NostrEventId, el: HTMLVideoElement): void => {
+      if (el !== videoElRef.current || bindingRef.current?.videoId !== videoId) return;
+      if (payRef.current !== 'paused') return;
+      resumePlayback();
+    },
+    [resumePlayback],
+  );
 
   const mediaFailed = useCallback(
     (videoId: NostrEventId): void => {
@@ -1346,6 +1391,12 @@ export function Shorts({
                         }
                       : prev,
                   );
+                }}
+                onPause={(e) => {
+                  elementPaused(video.id, e.currentTarget);
+                }}
+                onPlay={(e) => {
+                  elementPlayed(video.id, e.currentTarget);
                 }}
                 onEnded={endPlayback}
                 onError={() => {

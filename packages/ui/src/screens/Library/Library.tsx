@@ -84,6 +84,13 @@ export interface LibraryProps extends ScreenProps {
   readonly now?: UnixSeconds | number | undefined;
   /** IANA zone the history days are cut in. Default: the viewer's own. Stories pin `'UTC'`. */
   readonly timeZone?: string | undefined;
+  /**
+   * Hand toasts to the shell's `ToastStack` instead of rendering one here. The shell's stack
+   * outlives this screen, so an outcome that lands after the viewer navigated away (a removal
+   * confirmed late, a failed Undo) still reaches them, and its action still works. Omitted:
+   * the screen renders its own inline stack.
+   */
+  readonly onToast?: ((toast: ToastItem) => void) | undefined;
   readonly className?: string | undefined;
 }
 
@@ -218,6 +225,7 @@ export function Library({
   playlistId,
   now,
   timeZone,
+  onToast,
   className,
 }: LibraryProps): ReactElement {
   const id = useId();
@@ -511,14 +519,20 @@ export function Library({
   }, [shownPlaylist, resolveVideos]);
 
   // ---- toasts (Undo / rollback notices) ---------------------------------------------------
+  // With `onToast` every toast goes to the shell (even after unmount) and this screen renders
+  // no stack; without it, its own inline stack, and nothing is raised after unmount.
   const [toasts, setToasts] = useState<readonly ToastItem[]>([]);
+  const onToastRef = useRef(onToast);
+  onToastRef.current = onToast;
   const toastSeq = useRef(0);
   const nextToastId = (): string => {
     toastSeq.current += 1;
     return `library-toast-${toastSeq.current}`;
   };
   const pushToast = useCallback((item: ToastItem): void => {
-    setToasts((prev) => [...prev.slice(-2), item]);
+    const shell = onToastRef.current;
+    if (shell) shell(item);
+    else if (alive.current) setToasts((prev) => [...prev.slice(-2), item]);
   }, []);
   const dismissToast = useCallback((toastId: string): void => {
     setToasts((prev) => prev.filter((t) => t.id !== toastId));
@@ -534,10 +548,17 @@ export function Library({
   const removeFromWatchLater = (video: VideoManifest): void => {
     const index = slicesRef.current['watch-later'].data.findIndex((v) => v.id === video.id);
     if (index < 0) return;
+    sendRemoval(video, index);
+  };
+
+  /**
+   * Optimistic removal of the row at `index`. List updates only while mounted; the toasts go
+   * through `pushToast`, which drops them after unmount unless the shell owns the stack.
+   */
+  const sendRemoval = (video: VideoManifest, index: number): void => {
     setWatchLaterList((prev) => prev.filter((v) => v.id !== video.id));
     adapter.library.setWatchLater(video.id, false).then(
       () => {
-        if (!alive.current) return;
         const toastId = nextToastId();
         pushToast({
           id: toastId,
@@ -554,8 +575,7 @@ export function Library({
         });
       },
       (err: unknown) => {
-        if (!alive.current) return;
-        setWatchLaterList((prev) => insertAt(prev, index, video));
+        if (alive.current) setWatchLaterList((prev) => insertAt(prev, index, video));
         const toastId = nextToastId();
         pushToast({
           id: toastId,
@@ -566,7 +586,9 @@ export function Library({
             label: 'Retry',
             onClick: () => {
               dismissToast(toastId);
-              removeFromWatchLater(video);
+              // A shell toast can outlive the screen: then the list is gone, not the video.
+              if (alive.current) removeFromWatchLater(video);
+              else sendRemoval(video, index);
             },
           },
         });
@@ -579,8 +601,7 @@ export function Library({
     adapter.library.setWatchLater(video.id, true).then(
       () => undefined,
       (err: unknown) => {
-        if (!alive.current) return;
-        setWatchLaterList((prev) => prev.filter((v) => v.id !== video.id));
+        if (alive.current) setWatchLaterList((prev) => prev.filter((v) => v.id !== video.id));
         pushToast({
           id: nextToastId(),
           tone: 'error',
@@ -615,12 +636,13 @@ export function Library({
       })
       .then(
         (saved) => {
-          if (!alive.current) return;
-          updateSlice('playlists', (s) => ({
-            ...s,
-            data: [saved, ...s.data.filter((p) => p.id !== saved.id)],
-          }));
-          setCreate((c) => ({ ...c, open: false, busy: false }));
+          if (alive.current) {
+            updateSlice('playlists', (s) => ({
+              ...s,
+              data: [saved, ...s.data.filter((p) => p.id !== saved.id)],
+            }));
+            setCreate((c) => ({ ...c, open: false, busy: false }));
+          }
           pushToast({
             id: nextToastId(),
             tone: 'success',
@@ -1362,7 +1384,14 @@ export function Library({
           />
         ) : null}
       </Sheet>
-      <ToastStack toasts={toasts} onDismiss={dismissToast} inline className="nf-library__toasts" />
+      {onToast ? null : (
+        <ToastStack
+          toasts={toasts}
+          onDismiss={dismissToast}
+          inline
+          className="nf-library__toasts"
+        />
+      )}
       {miniPlayer !== undefined && miniPlayer !== null ? (
         <div className="nf-library__mini">{miniPlayer}</div>
       ) : null}

@@ -63,7 +63,9 @@ export interface CoordinatorOptions {
   /**
    * Pause the page's own `<video>` elements (not the mini-player's) — used when the
    * mini-player resumes over a screen whose session the coordinator just paused, so the
-   * screen's element follows its (now paused) session. Default: none.
+   * screen's element follows its (now paused) session. Watch and Shorts hear that element
+   * pause, call their (already paused, so no-op) `session.pause()` and show "Paused — not
+   * paying". Default: none.
    */
   readonly pauseScreenMedia?: () => void;
 }
