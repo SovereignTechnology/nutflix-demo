@@ -83,7 +83,7 @@ for n in 01 02 03 04 06 09; do fetch "BUD-$n.md" "$BUD/$n.md"; done
 
 # ---- NIPs -------------------------------------------------------------------------
 NIP=https://raw.githubusercontent.com/nostr-protocol/nips/master
-for n in 01 05 07 22 25 44 46 50 51 56 60 61 65 71 92; do fetch "NIP-$n.md" "$NIP/$n.md"; done
+for n in 01 05 07 09 22 25 44 46 50 51 56 60 61 65 71 92; do fetch "NIP-$n.md" "$NIP/$n.md"; done
 
 # ---- NUTs -------------------------------------------------------------------------
 NUT=https://raw.githubusercontent.com/cashubtc/nuts/main

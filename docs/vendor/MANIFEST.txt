@@ -75,3 +75,4 @@ pear-stream-stored-video.md	a851d130c63ab183	2026-09-04	https://raw.githubuserco
 pear-workers.md	0bf0243cbdf3047d	2026-09-04	https://raw.githubusercontent.com/holepunchto/pear-docs/published/content/explanation/workers.mdx
 protomux.md	8f7dda6314a3432f	2026-09-04	npm:protomux@3.11.0
 sodium-native.md	2b12854ad479dd94	2026-09-04	npm:sodium-native@5.1.0
+NIP-09.md	365b39e602bf7acf	2026-09-23	https://raw.githubusercontent.com/nostr-protocol/nips/master/09.md
