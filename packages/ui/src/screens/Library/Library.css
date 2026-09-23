@@ -77,21 +77,6 @@
 }
 
 /*
- * L4 workaround (same as Home, reported in docs/lanes/L5-Home.md): `.nf-card__text` is a flex
- * item with no `flex-grow`, so skeleton text lines collapse to 0 px and list-layout titles do
- * not take the row's free width. Letting the text column grow fixes both.
- */
-.nf-library .nf-card__text {
-  flex: 1 1 auto;
-}
-
-/* Same gap one level up in list layout: the body must grow for the skeleton lines to show. */
-.nf-library .nf-card--list .nf-card__body {
-  flex: 1 1 auto;
-  min-width: 0;
-}
-
-/*
  * Shorts in a list row are cropped to 16:9 like every other row (YouTube's playlist lists do
  * the same): a 9:16 frame narrow enough to keep the row height clipped the price badge.
  */

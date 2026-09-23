@@ -55,6 +55,7 @@ import {
   IconButton,
   Markdown,
   MintChip,
+  ReactionButtons,
   SatsBadge,
   Sheet,
   Skeleton,
@@ -66,9 +67,13 @@ import {
   isTextEntryTarget,
   mintHost,
   parseMarkdown,
+  reactionStateOf,
+  reactionStep,
   renditionPriceSats,
   shortPubkey,
   toPlainText,
+  type MyReaction,
+  type ReactionState,
   type ToastItem,
 } from '../../components/index.js';
 import type { ScreenProps } from '../shared/route.js';
@@ -537,7 +542,6 @@ export function Shorts({
   // ---- identity, library, wallet, settings (once per adapter) ----------------------------
   const [me, setMe] = useState<Me>('pending');
   const [subs, setSubs] = useState<ReadonlySet<NostrPubkey>>(new Set());
-  const [liked, setLiked] = useState<ReadonlySet<NostrEventId>>(new Set());
   const [balances, setBalances] = useState<ReadonlyMap<MintUrl, Sats> | undefined>(undefined);
   useEffect(() => {
     let cancelled = false;
@@ -549,12 +553,6 @@ export function Shorts({
         adapter.subscriptions().then(
           (list) => {
             if (!cancelled) setSubs(new Set(list));
-          },
-          () => undefined,
-        );
-        adapter.library.liked().then(
-          (list) => {
-            if (!cancelled) setLiked(new Set(list.map((v) => v.id)));
           },
           () => undefined,
         );
@@ -611,12 +609,28 @@ export function Shorts({
     stats: new Set<string>(),
   });
 
+  // Like / dislike shown per short: fresh stats (v4 likes / dislikes / myReaction), or the
+  // optimistic state of the viewer's last press until stats are read again.
+  const [reactionOverride, setReactionOverride] = useState<Readonly<Record<string, ReactionState>>>(
+    {},
+  );
+  const reactingRef = useRef(new Set<string>());
+
   const loadStats = useCallback(
     (videoId: NostrEventId): void => {
       requested.current.stats.add(videoId);
       adapter.stats(videoId).then(
         (s) => {
-          if (aliveRef.current) setStats((prev) => ({ ...prev, [videoId]: s }));
+          if (!aliveRef.current) return;
+          setStats((prev) => ({ ...prev, [videoId]: s }));
+          // Fresh stats already include the viewer's reaction; drop a settled override.
+          if (!reactingRef.current.has(videoId)) {
+            setReactionOverride((prev) =>
+              videoId in prev
+                ? Object.fromEntries(Object.entries(prev).filter(([k]) => k !== videoId))
+                : prev,
+            );
+          }
         },
         () => undefined,
       );
@@ -857,34 +871,46 @@ export function Shorts({
       return s;
     });
   }, []);
-  const [likeDelta, setLikeDelta] = useState<Readonly<Record<string, number>>>({});
+  const reactionOf = (videoId: NostrEventId): ReactionState =>
+    reactionOverride[videoId] ?? reactionStateOf(stats[videoId], me !== 'pending' && me !== null);
 
-  const toggleLike = (video: VideoManifest): void => {
+  // ADR 0007 b: `reactionStep` picks the call — like / dislike from neutral or switching is ONE
+  // `react('+' | '-')`, pressing the active one again is `unreact` (never a `-`, which would
+  // publish a dislike). Counts move at once and roll back with a toast if the call fails.
+  const pressReaction = (video: VideoManifest, pressed: MyReaction): void => {
     if (me === 'pending') return;
     if (me === null) {
       promptSignIn();
       return;
     }
-    const key = `like:${video.id}`;
-    if (busy.has(key)) return;
-    const next = !liked.has(video.id);
+    const key = `react:${video.id}`;
+    if (reactingRef.current.has(video.id)) return;
+    const before = reactionOf(video.id);
+    const { call, next } = reactionStep(before, pressed);
+    reactingRef.current.add(video.id);
     markBusy(key, true);
-    adapter.react(video.id, next ? '+' : '-').then(
+    setReactionOverride((prev) => ({ ...prev, [video.id]: next }));
+    (call.method === 'unreact'
+      ? adapter.unreact(video.id)
+      : adapter.react(video.id, call.content)
+    ).then(
       () => {
+        reactingRef.current.delete(video.id);
         if (!aliveRef.current) return;
         markBusy(key, false);
-        setLiked((prev) => {
-          const s = new Set(prev);
-          if (next) s.add(video.id);
-          else s.delete(video.id);
-          return s;
-        });
-        setLikeDelta((prev) => ({ ...prev, [video.id]: (prev[video.id] ?? 0) + (next ? 1 : -1) }));
       },
       () => {
+        reactingRef.current.delete(video.id);
         if (!aliveRef.current) return;
         markBusy(key, false);
-        pushToast({ tone: 'error', title: 'Could not register your like' });
+        setReactionOverride((prev) => ({ ...prev, [video.id]: before }));
+        pushToast({
+          tone: 'error',
+          title:
+            call.method === 'unreact'
+              ? `Could not remove your ${before.mine ?? 'reaction'}`
+              : `Could not register your ${pressed}`,
+        });
       },
     );
   };
@@ -1274,9 +1300,8 @@ export function Shorts({
     const titleId = `${id}-title-${String(index)}`;
     const descId = `${id}-desc-${String(index)}`;
     const thumb = thumbs[video.id];
-    const isLiked = liked.has(video.id);
-    const likes = Math.max(0, (st?.reactions ?? 0) + (likeDelta[video.id] ?? 0));
-    const comments = st?.comments ?? 0;
+    const reaction = reactionOf(video.id);
+    const comments = st?.comments;
     const subscribed = subs.has(video.author);
     const isMine = me !== 'pending' && me !== null && me === video.author;
     const open = active && descOpen;
@@ -1445,25 +1470,30 @@ export function Shorts({
             ) : null}
           </div>
           <div className="nf-shorts__rail" role="group" aria-label="Actions for this short">
-            <Button
-              variant={isLiked ? 'primary' : 'secondary'}
-              pressed={isLiked}
-              loading={busy.has(`like:${video.id}`)}
-              title={isLiked ? 'Remove your like' : 'Like this short'}
-              onClick={() => {
-                toggleLike(video);
+            <ReactionButtons
+              layout="stacked"
+              likes={reaction.likes}
+              dislikes={reaction.dislikes}
+              mine={reaction.mine}
+              busy={busy.has(`react:${video.id}`)}
+              onReact={(pressed) => {
+                pressReaction(video, pressed);
               }}
-            >
-              {likes > 0 ? `Like · ${formatInteger(likes)}` : 'Like'}
-            </Button>
+            />
             <Button
               variant="secondary"
+              icon="comment"
+              aria-label={
+                comments === undefined
+                  ? 'Comments'
+                  : `Comments, ${formatInteger(comments)} ${comments === 1 ? 'comment' : 'comments'}`
+              }
               title="Read and write comments on the watch page"
               onClick={() => {
                 openComments(video);
               }}
             >
-              {comments > 0 ? `Comments · ${formatInteger(comments)}` : 'Comments'}
+              {comments === undefined ? null : formatInteger(comments)}
             </Button>
             <Button
               variant="accent"

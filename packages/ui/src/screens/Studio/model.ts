@@ -199,6 +199,8 @@ export function renditionKbps(r: Rendition, durationSec: number | undefined): nu
 /**
  * ADR 0005 Q1 (contract text at v4): for a payment of `amount` sats the seeder share is
  * `ceil(amount × seeder / 100)` and the creator takes the remainder. Display only.
+ * ADR 0007 (a) replaces this in Stage 2 (contracts v5) with a carried creator remainder and a
+ * minimum PAY size; the upload form already says so beside the table this feeds.
  */
 export function splitPayment(
   amount: number,

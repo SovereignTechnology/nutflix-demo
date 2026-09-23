@@ -151,16 +151,23 @@ const SIGNED_OUT_TITLE: Readonly<Record<LibraryTab, string>> = {
   liked: 'Sign in to see the videos you liked',
 };
 
-/** One-line fact under the chip bar per tab (the Library-specific thing worth a line). */
+/**
+ * One-line fact under the chip bar per tab: who can see the list (ADR 0007 d). History and
+ * Watch later are private NIP-51 lists encrypted to the viewer's key; playlists are either;
+ * likes are public reactions.
+ */
 const TAB_HINT: Readonly<
-  Record<
-    LibraryTab,
-    { readonly icon: 'key' | 'bolt' | 'people'; readonly text: string } | undefined
-  >
+  Record<LibraryTab, { readonly icon: 'lock' | 'playlist' | 'people'; readonly text: string }>
 > = {
-  history: { icon: 'key', text: 'Only you can see your history — it is encrypted to your key' },
-  'watch-later': { icon: 'bolt', text: 'Saving is free — you pay only for what you play' },
-  playlists: undefined,
+  history: { icon: 'lock', text: 'Only you can see your history — it is encrypted to your key' },
+  'watch-later': {
+    icon: 'lock',
+    text: 'Watch later is private — encrypted to your key. Saving is free; you pay only for what you play',
+  },
+  playlists: {
+    icon: 'playlist',
+    text: 'Playlists can be public or private — private ones are encrypted to your key',
+  },
   liked: { icon: 'people', text: 'Likes are public Nostr reactions' },
 };
 
@@ -760,7 +767,7 @@ export function Library({
           : 'Public: anyone can see it on your channel'
       }
     >
-      <Icon name={isPrivate ? 'key' : 'people'} size={14} />
+      <Icon name={isPrivate ? 'lock' : 'people'} size={14} />
       {isPrivate ? 'Private' : 'Public'}
     </span>
   );
@@ -1339,7 +1346,12 @@ export function Library({
       >
         {renderBody()}
       </div>
-      <Sheet open={create.open} onClose={closeCreate} title="New playlist">
+      <Sheet
+        open={create.open}
+        onClose={closeCreate}
+        title="New playlist"
+        initialFocus="first-field"
+      >
         {create.open ? (
           <PlaylistForm
             key={create.gen}

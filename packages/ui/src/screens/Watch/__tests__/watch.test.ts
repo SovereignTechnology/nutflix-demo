@@ -501,16 +501,12 @@ describe('Watch — navigation and actions', () => {
     expect(navigate).toHaveBeenLastCalledWith({ name: 'channel', pubkey: VIDEO.author });
   });
 
-  it('like toggles through adapter.react; subscribe through adapter.subscribe', async () => {
+  it('subscribe goes through adapter.subscribe', async () => {
     const adapter = new MockNetworkAdapter();
-    const react = vi.spyOn(adapter, 'react');
     const subscribe = vi.spyOn(adapter, 'subscribe');
     const { r } = mount(adapter);
     keep(r);
     await flush();
-    click(r.get('button[aria-label="Remove your like"]')); // VIDEO is pre-liked
-    await flush();
-    expect(react).toHaveBeenCalledWith(VIDEO.id, '-');
     click(r.get('.nf-channel__actions button'));
     await flush();
     expect(subscribe).toHaveBeenCalledWith(VIDEO.author);
@@ -656,6 +652,202 @@ describe('Watch — comments', () => {
     expect(r.all('textarea')).toHaveLength(0);
     click(r.all('.nf-watch__comments button').find((b) => b.textContent === 'Connect signer')!);
     expect(navigate).toHaveBeenLastCalledWith({ name: 'settings' });
+  });
+});
+
+describe('Watch — likes and dislikes (ADR 0007 b)', () => {
+  const likeBtn = (r: Rendered): HTMLElement => r.get('.nf-watch__reactions .nf-reactions__like');
+  const dislikeBtn = (r: Rendered): HTMLElement =>
+    r.get('.nf-watch__reactions .nf-reactions__dislike');
+  /** [likes, dislikes, pressed like, pressed dislike] as rendered. */
+  const shown = (r: Rendered): [string, string, string | null, string | null] => [
+    likeBtn(r).textContent,
+    dislikeBtn(r).textContent,
+    likeBtn(r).getAttribute('aria-pressed'),
+    dislikeBtn(r).getAttribute('aria-pressed'),
+  ];
+
+  it('always shows both buttons with their counts, pressed from stats().myReaction', async () => {
+    const adapter = new MockNetworkAdapter();
+    const stats = await adapter.stats(VIDEO.id);
+    expect(stats.myReaction).toBe('like'); // VIDEO is pre-liked in the mock
+    const { r } = mount(adapter);
+    keep(r);
+    await flush();
+    expect(shown(r)).toEqual([
+      formatInteger(stats.likes),
+      formatInteger(stats.dislikes),
+      'true',
+      'false',
+    ]);
+    expect(likeBtn(r).getAttribute('aria-label')).toBe(`Like, ${formatInteger(stats.likes)} likes`);
+    expect(dislikeBtn(r).getAttribute('aria-label')).toBe(
+      `Dislike, ${formatInteger(stats.dislikes)} dislikes`,
+    );
+    // the old single "Like · N" button is gone
+    expect(r.all('button').some((b) => b.textContent.startsWith('Like'))).toBe(false);
+  });
+
+  it('every transition: one adapter call each, counts follow; un-like is unreact, never react("-")', async () => {
+    const adapter = new MockNetworkAdapter();
+    const base = await adapter.stats(VIDEO.id); // liked: likes includes mine
+    const L = base.likes;
+    const D = base.dislikes;
+    const react = vi.spyOn(adapter, 'react');
+    const unreact = vi.spyOn(adapter, 'unreact');
+    const calls = (): string[] => [
+      ...react.mock.calls.map((c) => `react ${c[1]}`),
+      ...unreact.mock.calls.map(() => 'unreact'),
+    ];
+    const { r } = mount(adapter);
+    keep(r);
+    await flush();
+    const n = formatInteger;
+
+    // liked → press Like again: withdraw it (NIP-09), NOT a dislike
+    click(likeBtn(r));
+    await flush();
+    expect(unreact).toHaveBeenLastCalledWith(VIDEO.id);
+    expect(react).not.toHaveBeenCalled();
+    expect(shown(r)).toEqual([n(L - 1), n(D), 'false', 'false']);
+
+    // neutral → Dislike: react('-')
+    click(dislikeBtn(r));
+    await flush();
+    expect(react).toHaveBeenLastCalledWith(VIDEO.id, '-');
+    expect(shown(r)).toEqual([n(L - 1), n(D + 1), 'false', 'true']);
+
+    // dislike → Like: ONE react('+') switches it
+    click(likeBtn(r));
+    await flush();
+    expect(react).toHaveBeenLastCalledWith(VIDEO.id, '+');
+    expect(shown(r)).toEqual([n(L), n(D), 'true', 'false']);
+
+    // like → Dislike: ONE react('-') switches it
+    click(dislikeBtn(r));
+    await flush();
+    expect(react).toHaveBeenLastCalledWith(VIDEO.id, '-');
+    expect(shown(r)).toEqual([n(L - 1), n(D + 1), 'false', 'true']);
+
+    // dislike → press Dislike again: unreact
+    click(dislikeBtn(r));
+    await flush();
+    expect(shown(r)).toEqual([n(L - 1), n(D), 'false', 'false']);
+
+    // neutral → Like: react('+')
+    click(likeBtn(r));
+    await flush();
+    expect(shown(r)).toEqual([n(L), n(D), 'true', 'false']);
+
+    expect(react.mock.calls.map((c) => c[1])).toEqual(['-', '+', '-', '+']);
+    expect(unreact).toHaveBeenCalledTimes(2);
+    expect(calls()).toHaveLength(6); // exactly one call per press
+    // the adapter agrees with what the screen shows
+    const after = await adapter.stats(VIDEO.id);
+    expect([after.likes, after.dislikes, after.myReaction]).toEqual([L, D, 'like']);
+  });
+
+  it('counts move before the adapter answers and roll back with a toast when it fails', async () => {
+    const adapter = new MockNetworkAdapter();
+    const base = await adapter.stats(VIDEO.id);
+    let fail: (e: Error) => void = () => undefined;
+    const unreact = vi.spyOn(adapter, 'unreact').mockImplementation(
+      () =>
+        new Promise<void>((_, reject) => {
+          fail = reject;
+        }),
+    );
+    const react = vi.spyOn(adapter, 'react');
+    const { r } = mount(adapter);
+    keep(r);
+    await flush();
+    click(likeBtn(r)); // un-like
+    await flush();
+    expect(unreact).toHaveBeenCalledTimes(1);
+    // optimistic: already neutral and one fewer like, while the call is in flight
+    expect(shown(r)).toEqual([
+      formatInteger(base.likes - 1),
+      formatInteger(base.dislikes),
+      'false',
+      'false',
+    ]);
+    expect(r.get('.nf-watch__reactions').getAttribute('aria-busy')).toBe('true');
+    click(dislikeBtn(r)); // ignored while in flight
+    expect(react).not.toHaveBeenCalled();
+    await act(async () => {
+      fail(new Error('relay-down: no relays reachable'));
+      await Promise.resolve();
+    });
+    await flush();
+    expect(shown(r)).toEqual([
+      formatInteger(base.likes),
+      formatInteger(base.dislikes),
+      'true',
+      'false',
+    ]);
+    expect(r.get('.nf-toast').textContent).toContain('Could not remove your like');
+    expect(r.get('.nf-watch__reactions').getAttribute('aria-busy')).toBeNull();
+  });
+
+  it('a failed like rolls back too', async () => {
+    const adapter = new MockNetworkAdapter();
+    await adapter.unreact(VIDEO.id); // start neutral
+    const base = await adapter.stats(VIDEO.id);
+    vi.spyOn(adapter, 'react').mockRejectedValue(new Error('relay timed out'));
+    const { r } = mount(adapter);
+    keep(r);
+    await flush();
+    click(likeBtn(r));
+    await flush();
+    expect(shown(r)).toEqual([
+      formatInteger(base.likes),
+      formatInteger(base.dislikes),
+      'false',
+      'false',
+    ]);
+    expect(r.get('.nf-toast').textContent).toContain('Could not register your like');
+  });
+
+  it('signed out: counts shown, nothing pressed, a press asks to connect a signer', async () => {
+    const adapter = new MockNetworkAdapter({ signedIn: false });
+    const react = vi.spyOn(adapter, 'react');
+    const unreact = vi.spyOn(adapter, 'unreact');
+    const { r, navigate } = mount(adapter);
+    keep(r);
+    await flush();
+    const stats = await adapter.stats(VIDEO.id);
+    expect(shown(r)).toEqual([
+      formatInteger(stats.likes),
+      formatInteger(stats.dislikes),
+      'false',
+      'false',
+    ]);
+    click(likeBtn(r));
+    click(dislikeBtn(r));
+    await flush();
+    expect(react).not.toHaveBeenCalled();
+    expect(unreact).not.toHaveBeenCalled();
+    const toast = r.get('.nf-toast');
+    expect(toast.textContent).toContain('Sign in to do that');
+    click(
+      Array.from(toast.querySelectorAll('button')).find((b) => b.textContent === 'Connect signer')!,
+    );
+    expect(navigate).toHaveBeenLastCalledWith({ name: 'settings' });
+  });
+
+  it('stats failing still shows both buttons, without counts', async () => {
+    const adapter = new MockNetworkAdapter();
+    vi.spyOn(adapter, 'stats').mockRejectedValue(new Error('relay timed out'));
+    const react = vi.spyOn(adapter, 'react');
+    const { r } = mount(adapter);
+    keep(r);
+    await flush();
+    expect(likeBtn(r).getAttribute('aria-label')).toBe('Like');
+    expect(dislikeBtn(r).getAttribute('aria-label')).toBe('Dislike');
+    click(likeBtn(r));
+    await flush();
+    expect(react).toHaveBeenCalledWith(VIDEO.id, '+');
+    expect(likeBtn(r).getAttribute('aria-pressed')).toBe('true');
   });
 });
 

@@ -16,6 +16,7 @@ import type {
   VideoManifest,
   Page,
 } from '@sovit/core';
+import { formatSats, renditionPriceSats } from '../../../components/index.js';
 import { click, keydown, render, type Rendered } from '../../../components/testing/render.js';
 import type { Route } from '../../shared/route.js';
 import {
@@ -141,6 +142,8 @@ describe('Channel — structure and loading', () => {
     expect(r.get('.nf-channelpage__banner .nf-skeleton')).toBeTruthy();
     expect(r.get('.nf-channelpage__avatar-skeleton .nf-skeleton--circle')).toBeTruthy();
     expect(r.all('.nf-card--skeleton').length).toBe(8);
+    // channel cards hide the channel row, so their skeletons have no avatar circle either
+    expect(r.all('.nf-card--skeleton .nf-card__avatar')).toHaveLength(0);
     expect(cards(r)).toHaveLength(0);
     expect(r.get('.nf-channelpage__actions .nf-skeleton')).toBeTruthy();
   });
@@ -716,9 +719,12 @@ describe('Channel — playlists (NIP-51 video sets)', () => {
     const play = thumb.querySelector('.nf-channelpage__playlist-play')!;
     expect(price.compareDocumentPosition(play) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     expect(play.getAttribute('aria-hidden')).toBe('true');
-    expect(thumb.getAttribute('aria-label')).toMatch(
-      /^Play all: Orbital mechanics — start here\. First video (from )?[\d,]+ sats?$/,
+    // the default rendition's price — what play(id) charges — never "from" (ADR 0007 c)
+    const charged = renditionPriceSats(first.renditions[0]!, first.price);
+    expect(thumb.getAttribute('aria-label')).toBe(
+      `Play all: Orbital mechanics — start here. First video ${formatSats(charged)}`,
     );
+    expect(price.textContent).not.toContain('from');
     click(thumb);
     expect(navigate).toHaveBeenLastCalledWith({ name: 'watch', videoId: first.id });
     click(row.querySelector('.nf-channelpage__playlist-open')!);

@@ -15,6 +15,7 @@ import type {
   UploadProgress,
   VideoManifest,
 } from '@sovit/core';
+import { formatSats, renditionPriceSats } from '../../../components/index.js';
 import { click, fire, keydown, render, type Rendered } from '../../../components/testing/render.js';
 import type { Route } from '../../shared/route.js';
 import { STUDIO_TABS, Studio, type StudioProps } from '../Studio.js';
@@ -281,6 +282,11 @@ describe('Studio — details form', () => {
     expect(rows[0]?.querySelectorAll('td')[1]?.textContent).toBe('0 sats');
     expect(rows[1]?.querySelectorAll('td')[0]?.textContent).toBe('5 sats');
     expect(r.get('.nf-studio__form').textContent).toContain('share is rounded up');
+    // ADR 0007: the coming carry + minimum-payment rule, beside today's per-payment table
+    const next = r.get('.nf-studio__split-next').textContent;
+    expect(next).toContain('carries over to the next payment');
+    expect(next).toContain('minimum size');
+    expect(next).toContain('full share, less under 1 sat');
     typeInto(r.get('input[name="seeder"]'), '0');
     expect(r.get('.nf-studio__warn').textContent).toContain('nobody is paid');
   });
@@ -599,10 +605,15 @@ describe('Studio — videos', () => {
       expect(image).toHaveBeenCalledWith(img?.url, img?.sha256);
       expect(stats).toHaveBeenCalledWith(v.id);
     }
-    rows.forEach((row) => {
+    rows.forEach((row, i) => {
       const price = row.querySelector('.nf-sats--price');
       const view = Array.from(row.querySelectorAll('button')).find((b) => b.textContent === 'View');
       expect(price && view && precedes(price, view)).toBe(true);
+      // price to watch = the default rendition's, never "from" (ADR 0007 c)
+      const v = page.items[i]!;
+      expect(price?.getAttribute('aria-label')).toBe(
+        formatSats(renditionPriceSats(v.renditions[0]!, v.price)),
+      );
     });
     const first = page.items[0]!;
     expect(rows[0]?.textContent).toContain(`${(await a.stats(first.id)).paidViews}`);
@@ -709,6 +720,9 @@ describe('Studio — analytics', () => {
     const head = r.get('.nf-studio__video-head');
     const price = head.querySelector('.nf-sats--price');
     expect(price && precedes(price, button(r, 'View video'))).toBe(true);
+    expect(price?.getAttribute('aria-label')).toBe(
+      formatSats(renditionPriceSats(first.renditions[0]!, first.price)),
+    );
     click(button(r, 'View video'));
     expect(navigate).toHaveBeenLastCalledWith({ name: 'watch', videoId: first.id });
     const select = r.get('select') as HTMLSelectElement;

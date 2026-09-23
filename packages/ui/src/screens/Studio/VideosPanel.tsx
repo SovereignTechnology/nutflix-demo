@@ -11,7 +11,7 @@ import {
   ErrorState,
   SatsBadge,
   Skeleton,
-  cheapestRenditionSats,
+  defaultRenditionSats,
   formatDuration,
   formatInteger,
   formatRelativeTime,
@@ -145,7 +145,8 @@ export function VideosPanel({
         <tbody>
           {videos.items.map((v) => {
             const image = v.renditions[0]?.image;
-            const price = cheapestRenditionSats(v.renditions, v.price);
+            // What a viewer is charged to watch: the default rendition, no "from" (ADR 0007 c).
+            const price = defaultRenditionSats(v.renditions, v.price);
             const s = stats[v.id];
             return (
               <tr key={v.id}>
@@ -176,15 +177,7 @@ export function VideosPanel({
                   </div>
                 </td>
                 <td className="nf-studio__muted">{formatRelativeTime(v.publishedAt, now)}</td>
-                <td>
-                  {price ? (
-                    <SatsBadge
-                      sats={price.sats}
-                      size="sm"
-                      {...(price.from ? { prefix: 'from' } : {})}
-                    />
-                  ) : null}
-                </td>
+                <td>{price !== undefined ? <SatsBadge sats={price} size="sm" /> : null}</td>
                 <td className="nf-studio__num">
                   {s === undefined ? (
                     <Skeleton variant="text" width={40} />

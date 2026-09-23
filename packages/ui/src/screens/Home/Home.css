@@ -83,16 +83,6 @@
 }
 
 /*
- * L4 workaround (reported in docs/lanes/L5-Home.md): `.nf-card__text` is a flex item with no
- * `flex-grow`, so `VideoCardSkeleton`'s percentage-width text lines collapse to 0 px and the
- * skeleton shows only a thumbnail + circle. Letting the text column grow inside this grid
- * restores the three placeholder lines; real cards are unaffected (their text already fills).
- */
-.nf-home__item .nf-card__text {
-  flex: 1 1 auto;
-}
-
-/*
  * Hover-preview affordance: sits on the thumbnail's top-left corner (the card's thumb is
  * its first child, full width, 16:9), never intercepts the pointer so the card's own hover
  * state and click keep working. Only rendered while the setting is on and the card is

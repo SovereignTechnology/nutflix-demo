@@ -292,13 +292,8 @@
   min-width: 0;
 }
 
-/*
- * Same L4 skeleton quirk as Home (see L5-Home.md): `.nf-card__text` needs a grow rule or the
- * skeleton's percentage-width lines collapse to 0 px. Harmless for real rows.
- */
+/* Search rows breathe a little more between title, channel and meta than L4's 2 px. */
 .nf-search__item .nf-card__text {
-  flex: 1 1 auto;
-  min-width: 0;
   gap: var(--nf-space-4);
 }
 

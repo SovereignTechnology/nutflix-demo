@@ -23,6 +23,7 @@ import {
   renditionPriceSats,
   renditionRatePerMin,
   type PlayerState,
+  type ReactionState,
 } from '../../components/index.js';
 
 /** Progress is recorded roughly every 5 s while playing (build-plan §6.2 "Resume"). */
@@ -314,7 +315,11 @@ export interface VideoData {
   readonly avatarSrc: string | undefined;
   readonly thumbSrc: string | undefined;
   readonly subscribed: boolean;
-  readonly liked: boolean;
+  /**
+   * Like / dislike buttons: both counts and the viewer's own reaction, from `stats()` (v4),
+   * then optimistic while a `react` / `unreact` is in flight (ADR 0007 b).
+   */
+  readonly reaction: ReactionState;
   /** `undefined` = unknown (signed out or the read failed). */
   readonly watchLater: boolean | undefined;
   /** Wallet balances when the read succeeded; `undefined` = unknown (never blocks play). */

@@ -115,6 +115,14 @@ const buttonByText = (root: ParentNode, text: string): HTMLButtonElement =>
   Array.from(root.querySelectorAll<HTMLButtonElement>('button')).find((b) =>
     b.textContent.includes(text),
   )!;
+const likeButton = (r: Rendered): HTMLButtonElement =>
+  active(r).querySelector<HTMLButtonElement>('.nf-shorts__rail .nf-reactions__like')!;
+const dislikeButton = (r: Rendered): HTMLButtonElement =>
+  active(r).querySelector<HTMLButtonElement>('.nf-shorts__rail .nf-reactions__dislike')!;
+const commentsButton = (r: Rendered): HTMLButtonElement =>
+  Array.from(active(r).querySelectorAll<HTMLButtonElement>('.nf-shorts__rail button')).find((b) =>
+    (b.getAttribute('aria-label') ?? '').startsWith('Comments'),
+  )!;
 
 let mediaPlay: Mock = vi.fn();
 beforeEach(() => {
@@ -596,8 +604,15 @@ describe('Shorts — gates and errors', () => {
       keydown(document.body, ' ');
       await flush();
       expect(play).not.toHaveBeenCalled();
-      // Social actions ask to sign in instead of failing.
-      click(buttonByText(active(r), 'Like'));
+      // Social actions ask to sign in instead of failing; nothing is pressed while signed out.
+      expect(likeButton(r).getAttribute('aria-pressed')).toBe('false');
+      expect(dislikeButton(r).getAttribute('aria-pressed')).toBe('false');
+      const react = vi.spyOn(adapter, 'react');
+      const unreact = vi.spyOn(adapter, 'unreact');
+      click(likeButton(r));
+      click(dislikeButton(r));
+      expect(react).not.toHaveBeenCalled();
+      expect(unreact).not.toHaveBeenCalled();
       expect(r.get('.nf-toast').textContent).toContain('Sign in to do that');
       click(buttonByText(r.get('.nf-toast'), 'Connect signer'));
       expect(navigate).toHaveBeenLastCalledWith({ name: 'settings' });
@@ -690,24 +705,110 @@ describe('Shorts — gates and errors', () => {
 });
 
 describe('Shorts — actions', () => {
-  it('like toggles through react(+/-) and the count follows', async () => {
+  it('like and dislike are icon buttons with both counts, pressed from stats().myReaction', async () => {
     const adapter = adapterWith();
-    const react = vi.spyOn(adapter, 'react');
+    await adapter.react(S1.id, '-'); // the second short starts disliked
     const { r } = mount(adapter);
     await flush();
-    const stats = await adapter.stats(S0.id);
-    const like = (): HTMLButtonElement => buttonByText(active(r), 'Like');
-    expect(like().textContent).toBe(`Like · ${String(stats.reactions)}`);
-    expect(like().getAttribute('aria-pressed')).toBe('false');
-    click(like());
+    const s0 = await adapter.stats(S0.id);
+    expect(likeButton(r).textContent).toBe(String(s0.likes));
+    expect(dislikeButton(r).textContent).toBe(String(s0.dislikes));
+    expect(likeButton(r).getAttribute('aria-label')).toBe(`Like, ${String(s0.likes)} likes`);
+    expect(likeButton(r).querySelector('svg')).not.toBeNull();
+    expect(likeButton(r).getAttribute('aria-pressed')).toBe('false');
+    expect(dislikeButton(r).getAttribute('aria-pressed')).toBe('false');
+    // comments: icon + count, named for assistive tech; no text pills left in the rail
+    expect(commentsButton(r).textContent).toBe(String(s0.comments));
+    expect(commentsButton(r).querySelector('svg')).not.toBeNull();
+    const pills = Array.from(active(r).querySelectorAll('.nf-shorts__rail button')).map(
+      (b) => b.textContent,
+    );
+    expect(pills.some((t) => t.startsWith('Like') || t.startsWith('Comments'))).toBe(false);
+    keydown(document.body, 'ArrowDown');
+    await flush();
+    expect(activeId(r)).toBe(S1.id);
+    expect(dislikeButton(r).getAttribute('aria-pressed')).toBe('true');
+  });
+
+  it('every transition is one adapter call; un-like is unreact, never react("-")', async () => {
+    const adapter = adapterWith();
+    const react = vi.spyOn(adapter, 'react');
+    const unreact = vi.spyOn(adapter, 'unreact');
+    const { r } = mount(adapter);
+    await flush();
+    const { likes: L, dislikes: D } = await adapter.stats(S0.id); // neutral
+    const shown = (): [string, string, string | null, string | null] => [
+      likeButton(r).textContent,
+      dislikeButton(r).textContent,
+      likeButton(r).getAttribute('aria-pressed'),
+      dislikeButton(r).getAttribute('aria-pressed'),
+    ];
+    const n = (x: number): string => String(x);
+
+    click(likeButton(r)); // neutral → like
     await flush();
     expect(react).toHaveBeenLastCalledWith(S0.id, '+');
-    expect(like().getAttribute('aria-pressed')).toBe('true');
-    expect(like().textContent).toBe(`Like · ${String(stats.reactions + 1)}`);
-    click(like());
+    expect(shown()).toEqual([n(L + 1), n(D), 'true', 'false']);
+
+    click(likeButton(r)); // like → neutral: unreact, NOT a dislike
+    await flush();
+    expect(unreact).toHaveBeenLastCalledWith(S0.id);
+    expect(react).toHaveBeenCalledTimes(1);
+    expect(shown()).toEqual([n(L), n(D), 'false', 'false']);
+
+    click(dislikeButton(r)); // neutral → dislike
     await flush();
     expect(react).toHaveBeenLastCalledWith(S0.id, '-');
-    expect(like().textContent).toBe(`Like · ${String(stats.reactions)}`);
+    expect(shown()).toEqual([n(L), n(D + 1), 'false', 'true']);
+
+    click(likeButton(r)); // dislike → like: one react('+')
+    await flush();
+    expect(react).toHaveBeenLastCalledWith(S0.id, '+');
+    expect(shown()).toEqual([n(L + 1), n(D), 'true', 'false']);
+
+    click(dislikeButton(r)); // like → dislike: one react('-')
+    await flush();
+    expect(react).toHaveBeenLastCalledWith(S0.id, '-');
+    expect(shown()).toEqual([n(L), n(D + 1), 'false', 'true']);
+
+    click(dislikeButton(r)); // dislike → neutral: unreact
+    await flush();
+    expect(shown()).toEqual([n(L), n(D), 'false', 'false']);
+
+    expect(react.mock.calls.map((c) => c[1])).toEqual(['+', '-', '+', '-']);
+    expect(unreact).toHaveBeenCalledTimes(2);
+    const after = await adapter.stats(S0.id);
+    expect([after.likes, after.dislikes, after.myReaction]).toEqual([L, D, undefined]);
+  });
+
+  it('optimistic counts roll back with a toast when the adapter fails', async () => {
+    const adapter = adapterWith();
+    let fail: (e: Error) => void = () => undefined;
+    const react = vi.spyOn(adapter, 'react').mockImplementation(
+      () =>
+        new Promise<void>((_, reject) => {
+          fail = reject;
+        }),
+    );
+    const { r } = mount(adapter);
+    await flush();
+    const { likes: L, dislikes: D } = await adapter.stats(S0.id);
+    click(dislikeButton(r));
+    await flush();
+    expect(react).toHaveBeenCalledWith(S0.id, '-');
+    expect(dislikeButton(r).textContent).toBe(String(D + 1));
+    expect(dislikeButton(r).getAttribute('aria-pressed')).toBe('true');
+    click(likeButton(r)); // ignored while in flight
+    expect(react).toHaveBeenCalledTimes(1);
+    await act(async () => {
+      fail(new Error('relay timed out'));
+      await Promise.resolve();
+    });
+    await flush();
+    expect(likeButton(r).textContent).toBe(String(L));
+    expect(dislikeButton(r).textContent).toBe(String(D));
+    expect(dislikeButton(r).getAttribute('aria-pressed')).toBe('false');
+    expect(r.get('.nf-toast').textContent).toContain('Could not register your dislike');
   });
 
   it('subscribe, channel → channel route, comments → watch route', async () => {
@@ -729,7 +830,7 @@ describe('Shorts — actions', () => {
     expect(navigate).toHaveBeenLastCalledWith({ name: 'channel', pubkey: S0.author });
     const name = CHANNELS.find((c) => c.pubkey === S0.author)!.profile.displayName!;
     expect(active(r).querySelector('.nf-shorts__channel-name')!.textContent).toBe(name);
-    click(buttonByText(active(r), 'Comments'));
+    click(commentsButton(r));
     expect(navigate).toHaveBeenLastCalledWith({ name: 'watch', videoId: S0.id });
   });
 
