@@ -145,4 +145,23 @@ describe('parseDaemonEnv', () => {
       },
     });
   });
+
+  it('shares the config-file override rules: decimal digits only, an empty assignment is unset', () => {
+    const p = new FakeProcess();
+    p.vars.set(ENV_DATA_DIR, '');
+    expect(parseDaemonEnv(p)).toMatchObject({ ok: false });
+    p.vars.set(ENV_DATA_DIR, '/d');
+    for (const junk of ['1e3', '0x10', '1.5', '-1', ' 5', '99999999999999999999']) {
+      p.vars.set(ENV_DISK_CAP, junk);
+      expect(parseDaemonEnv(p), junk).toMatchObject({ ok: false });
+    }
+    p.vars.set(ENV_DISK_CAP, ''); // was Number('') = 0; now "unset" → the 50 GiB default
+    p.vars.set(ENV_MAX_STREAMS, '');
+    expect(parseDaemonEnv(p)).toEqual({
+      ok: true,
+      config: { dataDir: '/d', diskCapBytes: 50 * 1024 ** 3, swarm: {} },
+    });
+    p.vars.set(ENV_MAX_STREAMS, '2.5');
+    expect(parseDaemonEnv(p)).toMatchObject({ ok: false });
+  });
 });

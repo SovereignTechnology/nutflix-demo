@@ -1,10 +1,20 @@
 /**
  * Daemon runner: create + start a Seeder, install signal hooks, tell systemd we are READY.
  *
- * There is no self-executing `main()` here on purpose: a real `PaymentEngineSeeder`
- * arrives in Stage 2 (`core/src/payment/`, locked) and the shell that owns it (L6 desktop
- * worker, or the gateway/service entry) calls `runDaemon()` with it. Config comes from
- * `parseDaemonEnv()` so the systemd unit only needs environment assignments.
+ * The self-executing entry is `cli/main.ts` (behind `index.ts`'s main-module guard), which
+ * the canonical unit runs as `node --jitless …/dist/index.js --config /etc/nutflix/seeder.json`.
+ * It parses the config file (`cli/config-file.ts`), asks `cli/providers.ts` for the runtime
+ * deps and calls `runDaemon()` with them. In Stage 1 there are no providers (the real
+ * `PaymentEngineSeeder` is `core/src/payment/`, locked until Stage 2), so `main()` refuses to
+ * start with exit 78. Other shells that own an engine (the L6 desktop worker, the gateway)
+ * keep calling `runDaemon()` / `Seeder.create()` directly.
+ *
+ * This module stays runtime-portable (it is exported from `portable.ts`, the `bare`
+ * condition): no `node:` imports here — `main.ts` holds those.
+ *
+ * `parseDaemonEnv()` is the env-only config builder for embedders. `main()` does not use it:
+ * it reads the same `NUTFLIX_SEEDER_*` variables as OVERRIDES on top of the config file,
+ * with the same parsing rules (`cli/env.ts`; env wins over the file).
  */
 import type { SeederProcess } from '../adapters/process.js';
 import type { SeederConfig } from '../config.js';
@@ -12,26 +22,41 @@ import { installShutdownHooks, sdNotify } from '../host/systemd.js';
 import type { Logger } from '../log/logger.js';
 import { Seeder } from '../seeder.js';
 import type { SeederDeps } from '../seeder.js';
+import {
+  DEFAULT_DISK_CAP_BYTES,
+  ENV_DATA_DIR,
+  ENV_DISK_CAP,
+  ENV_MAX_STREAMS,
+  envValue,
+  parseDecimal,
+} from './env.js';
 
-export const ENV_DATA_DIR = 'NUTFLIX_SEEDER_DATA_DIR' as const;
-export const ENV_DISK_CAP = 'NUTFLIX_SEEDER_DISK_CAP_BYTES' as const;
-export const ENV_MAX_STREAMS = 'NUTFLIX_SEEDER_MAX_STREAMS' as const;
+export { ENV_DATA_DIR, ENV_DISK_CAP, ENV_MAX_STREAMS };
 
 export type DaemonEnv =
   | { readonly ok: true; readonly config: SeederConfig }
   | { readonly ok: false; readonly error: string };
 
+/**
+ * Env-only config: `NUTFLIX_SEEDER_DATA_DIR` (required), `NUTFLIX_SEEDER_DISK_CAP_BYTES`
+ * (default 50 GiB), `NUTFLIX_SEEDER_MAX_STREAMS`; swarm on. Numbers are decimal digits only
+ * and an empty assignment counts as unset (`cli/env.ts`) — the same rules the daemon's
+ * config-file overrides use.
+ */
 export function parseDaemonEnv(proc: Pick<SeederProcess, 'env'>): DaemonEnv {
-  const dataDir = proc.env(ENV_DATA_DIR);
-  if (dataDir === undefined || dataDir === '')
-    return { ok: false, error: `${ENV_DATA_DIR} is required` };
-  const capRaw = proc.env(ENV_DISK_CAP);
-  const cap = capRaw === undefined ? 50 * 1024 ** 3 : Number(capRaw);
-  if (!Number.isFinite(cap) || cap < 0)
+  const env = (name: string): string | undefined => proc.env(name);
+  const dataDir = envValue(env, ENV_DATA_DIR);
+  if (dataDir === undefined) return { ok: false, error: `${ENV_DATA_DIR} is required` };
+  const capRaw = envValue(env, ENV_DISK_CAP);
+  const cap = capRaw === undefined ? DEFAULT_DISK_CAP_BYTES : parseDecimal(capRaw);
+  if (cap === undefined || !Number.isSafeInteger(cap))
     return { ok: false, error: `${ENV_DISK_CAP} must be a byte count` };
-  const maxRaw = proc.env(ENV_MAX_STREAMS);
-  const maxStreams = maxRaw === undefined ? undefined : Number(maxRaw);
-  if (maxStreams !== undefined && !(Number.isInteger(maxStreams) && maxStreams > 0))
+  const maxRaw = envValue(env, ENV_MAX_STREAMS);
+  const maxStreams = maxRaw === undefined ? undefined : parseDecimal(maxRaw);
+  if (
+    maxRaw !== undefined &&
+    (maxStreams === undefined || !Number.isSafeInteger(maxStreams) || maxStreams < 1)
+  )
     return { ok: false, error: `${ENV_MAX_STREAMS} must be a positive integer` };
   return {
     ok: true,
