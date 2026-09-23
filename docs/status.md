@@ -80,7 +80,8 @@ present and 647 / 31 without one — that suite `skipIf`s when no binary is foun
 | **UI-fixes** (ADR 0007) | `lane/UI-fixes` | **merged 2026-09-23** (ui 456 → 472 tests, 534 PNGs) | see git log |
 | **L3-flake** | `lane/L3-flake` | **merged 2026-09-23** — real bug, not a flake: late WS frames paused a closing socket (30 s stall); cut sockets left `maxConnections` accounting (F1) and a cut mid-stalled-write never started the close (F2). Fixed + 8 deterministic tests; A/B under load 4/10 → 0/10 failures | see git log |
 | **L6-0 IPC foundation** | `lane/L6-0` | **merged 2026-09-23** (app-desktop 13 → 422 tests; 49-method table exact against v4) | see git log |
-| L6 desktop-shell | `lane/L6-{A,B,C}` | **NEXT** — design `docs/plan/L6-design.md`. No worktree on the dev laptop and no cached Electron binary here (`node node_modules/electron/install.js`) | — |
+| **L6-B host** | `lane/L6-B` | **merged 2026-09-23** (app-desktop 422 → 674 tests; real `DesktopNetworkAdapter`, SE-4/SE-5, T16 image fetch with DNS-answer checks, 48+12-path conformance vs the mock) | see git log |
+| L6 desktop-shell | `lane/L6-{A,C}` | **in progress** — design `docs/plan/L6-design.md`. No worktree on the dev laptop and no cached Electron binary here (`node node_modules/electron/install.js`) | — |
 | L7 web-shell | `lane/L7` | **NOT STARTED** — out of scope if ADR 0006 (unmerged, "Pear-runtime-only v0") is adopted | — |
 
 Lane reports: `docs/lanes/L1.md`, `L2.md` (incl. v3 section), `L3.md` (incl. markup section),
@@ -215,9 +216,15 @@ v4 (2026-09-23) was a small additive bump: reactions (`likes`/`dislikes`/`myReac
    `studio.ffmpeg()` + `Settings.ffmpegPath`, `firstPaidAt` (Studio); `pendingMintQuotes()` —
    an unpaid invoice is forgotten when the fund sheet closes (Wallet); per-video resume lookup,
    `nostr:` ref → profile resolution, throughput for Auto quality, session-closed flag (Watch).
-6. **`UploadInput.file` doc** says "Desktop: absolute path", but under SE-1 the desktop shell
+6. **From L6-B (`docs/contract-requests/L6-B.md`):** `NostrKind.Deletion = 5`;
+   `VideoStats.seedersOnline` must be able to say "unknown" (the host reports 0 on real relays in
+   Stage 1, so Watch/Shorts block Play there — plus a worker request that counts a core's
+   seeders); `SignerStatus` "none"; which balance `autoTopUp` compares; `satsByRendition` source;
+   upload abort (`studio.cancel`). L1: reaction/comment-like counts ignore NIP-09 deletions (the
+   host filters them); `trendingFeed` has no kinds filter; NIP-05 fetch policy.
+7. **`UploadInput.file` doc** says "Desktop: absolute path", but under SE-1 the desktop shell
    passes a main-minted file token across IPC (L6-0) — fix the contract text at v5.
-7. **`Route` changes (orchestrator-owned `screens/shared/route.ts`, not contracts):** `library`
+8. **`Route` changes (orchestrator-owned `screens/shared/route.ts`, not contracts):** `library`
    gets `playlist?`, `watch` gets a playlist/list param, `search` gets filters, `studio` gets
    `videoId`, `wallet` gets an intent.
 
