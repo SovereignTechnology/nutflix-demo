@@ -67,10 +67,69 @@ export function devFixturePolicy(): PricePolicy {
 
 export interface FixtureInput {
   readonly title: string;
+  readonly description?: string;
   readonly bytes: Uint8Array;
   readonly durationSec: number;
   /** Rendition label (default `360p`). */
   readonly label?: string;
+}
+
+/**
+ * The §5(b) fixture seam (L6-A's `e2e/stage1.e2e.ts`): with `--dev-fixtures`, the environment
+ * variable `NUTFLIX_DEV_FIXTURES_JSON` may list the MP4 files to publish, as
+ * `[{ "path": "/abs/a.mp4", "title": "…", "description": "…" }, …]` — inherited by the host
+ * and the worker from the Electron process. Without it the worker makes its own clip.
+ */
+export const DEV_FIXTURES_ENV = 'NUTFLIX_DEV_FIXTURES_JSON';
+export const MAX_DEV_FIXTURES = 8;
+/** Largest fixture file read into the fixture seeders (dev only). */
+export const MAX_DEV_FIXTURE_BYTES = 512 * 1024 * 1024;
+
+export interface DevFixtureSpec {
+  readonly path: string;
+  readonly title: string;
+  readonly description?: string;
+}
+
+// eslint-disable-next-line no-control-regex -- refusing control characters is the point
+const CONTROL = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/;
+
+/**
+ * Parses the seam strictly: an array of 1…8 objects with an absolute `path` (no NUL), a
+ * `title` of 1…200 printable characters and an optional `description` ≤ 16 KiB. Anything else
+ * → `null` (the caller logs and falls back); unknown keys are ignored.
+ */
+export function parseDevFixturesEnv(raw: string | undefined): DevFixtureSpec[] | null {
+  if (raw === undefined || raw === '') return null;
+  let v: unknown;
+  try {
+    v = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  if (!Array.isArray(v) || v.length === 0 || v.length > MAX_DEV_FIXTURES) return null;
+  const out: DevFixtureSpec[] = [];
+  for (const item of v as unknown[]) {
+    if (typeof item !== 'object' || item === null) return null;
+    const { path, title, description } = item as Record<string, unknown>;
+    if (
+      typeof path !== 'string' ||
+      path.length < 2 ||
+      path.length > 4096 ||
+      path.includes('\u0000') ||
+      !(path.startsWith('/') || /^[A-Za-z]:[\\/]/.test(path))
+    )
+      return null;
+    if (typeof title !== 'string' || title.length < 1 || title.length > 200 || CONTROL.test(title))
+      return null;
+    if (
+      description !== undefined &&
+      (typeof description !== 'string' || description.length > 16_384 || CONTROL.test(description))
+    )
+      return null;
+    out.push(description === undefined ? { path, title } : { path, title, description });
+  }
+  return out;
 }
 
 export interface FixtureSeeder {
@@ -280,6 +339,8 @@ export function fixtureManifest(
     `hyper://${e.coreKey}/${String(blob.blockOffset)}-${String(blob.blockLength)}` +
     (blob.byteOffset > 0 ? `+${String(blob.byteOffset)}` : '');
   const durationSec = Math.max(1, Math.round(f.durationSec));
+  const content =
+    f.description ?? 'Development fixture served by in-process seeders (--dev-fixtures). UNSIGNED.';
   const rendition: Rendition = {
     label: f.label ?? '360p',
     mime: 'video/mp4',
@@ -291,7 +352,6 @@ export function fixtureManifest(
     fallbacks: [],
   };
   const createdAt = Math.floor(nowMs / 1000) as UnixSeconds;
-  const content = 'Development fixture served by in-process seeders (--dev-fixtures). UNSIGNED.';
   const tags: string[][] = [
     ['title', f.title],
     ['published_at', String(createdAt)],

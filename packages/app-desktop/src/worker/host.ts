@@ -45,7 +45,7 @@ import type {
 import { WORKER_V } from '../ipc/worker-protocol.js';
 import { randomHex, sodiumCrypto, sodiumSha256 } from './crypto.js';
 import type { LoopbackPayHub } from './dev/loopback-pay.js';
-import type { DevTestnet, FixtureNet } from './dev/fixtures-net.js';
+import type { DevTestnet, FixtureInput, FixtureNet } from './dev/fixtures-net.js';
 import { probeFfmpeg } from './ffmpeg.js';
 import { createWorkerLogger } from './log.js';
 import type { LogEvent } from './log.js';
@@ -348,8 +348,14 @@ export class WorkerHost {
     if (live === null) return;
     const log = live.log;
     try {
-      const { generateDevClip, startFixtureNet, syntheticBytes } =
-        await import('./dev/fixtures-net.js');
+      const {
+        DEV_FIXTURES_ENV,
+        MAX_DEV_FIXTURE_BYTES,
+        generateDevClip,
+        parseDevFixturesEnv,
+        startFixtureNet,
+        syntheticBytes,
+      } = await import('./dev/fixtures-net.js');
       const hub = this.hub;
       if (hub === null) throw new Error('internal: fixtures without the dev pay hub');
       const fs = this.o.runtime.seederFs;
@@ -358,17 +364,39 @@ export class WorkerHost {
       await this.o.runtime.mediaFs(live.storage).rm(root, { recursive: true });
       const dir = fs.join(root, randomHex(8));
       await fs.mkdir(dir, { recursive: true });
-      let bytes: Uint8Array | null = null;
       if (this.ffmpeg === null) await this.probe(false);
       const paths = this.ffmpeg;
-      if (paths !== null) {
-        const clip = fs.join(dir, 'testsrc.mp4');
-        if (await generateDevClip(this.o.runtime.runner, paths.ffmpeg, clip))
-          bytes = await fs.readFile(clip);
+      const fixtures: FixtureInput[] = [];
+      // The §5(b) seam: files named by the environment (L6-A's e2e), else our own clip.
+      const raw = this.o.runtime.env(DEV_FIXTURES_ENV);
+      const specs = parseDevFixturesEnv(raw);
+      if (raw !== undefined && specs === null)
+        log.warn('DEV FIXTURES: ignoring a malformed fixture list', { variable: DEV_FIXTURES_ENV });
+      for (const spec of specs ?? []) {
+        const st = await fs.stat(spec.path);
+        if (st === null || !st.isFile || st.size < 1 || st.size > MAX_DEV_FIXTURE_BYTES) {
+          log.warn('DEV FIXTURES: skipping an unreadable fixture file', { title: spec.title });
+          continue;
+        }
+        fixtures.push({
+          title: spec.title,
+          ...(spec.description !== undefined ? { description: spec.description } : {}),
+          bytes: await fs.readFile(spec.path),
+          durationSec: await this.durationOf(spec.path, paths),
+        });
       }
-      if (bytes === null) {
-        log.warn('DEV FIXTURES: no ffmpeg — serving synthetic, unplayable bytes');
-        bytes = syntheticBytes(8 * 65536);
+      if (fixtures.length === 0) {
+        let bytes: Uint8Array | null = null;
+        if (paths !== null) {
+          const clip = fs.join(dir, 'testsrc.mp4');
+          if (await generateDevClip(this.o.runtime.runner, paths.ffmpeg, clip))
+            bytes = await fs.readFile(clip);
+        }
+        if (bytes === null) {
+          log.warn('DEV FIXTURES: no ffmpeg — serving synthetic, unplayable bytes');
+          bytes = syntheticBytes(8 * 65536);
+        }
+        fixtures.push({ title: 'Dev fixture: test pattern (6 s)', bytes, durationSec: 6 });
       }
       this.fixtures = await startFixtureNet({
         baseDir: dir,
@@ -377,12 +405,30 @@ export class WorkerHost {
         hub,
         bootstrap,
         logger: log,
-        fixtures: [{ title: 'Dev fixture: test pattern (6 s)', bytes, durationSec: 6 }],
+        fixtures,
         now: this.now,
       });
       this.o.emit({ op: 'ev', e: 'dev.fixtures', videos: this.fixtures.videos });
     } catch (err) {
       log.error('dev fixtures failed to start', { error: err });
+    }
+  }
+
+  /** A fixture file's duration by ffprobe (L8's probe), 6 s when that is not possible. */
+  private async durationOf(path: string, binaries: media.FfmpegPaths | null): Promise<number> {
+    if (binaries === null || this.live === null) return 6;
+    try {
+      const probe = await media
+        .createMediaPipeline({
+          runner: this.o.runtime.runner,
+          fs: this.o.runtime.mediaFs(this.live.tmpDir),
+          sha256: sodiumSha256,
+          binaries,
+        })
+        .probe(path);
+      return probe.durationSec > 0 ? probe.durationSec : 6;
+    } catch {
+      return 6;
     }
   }
 

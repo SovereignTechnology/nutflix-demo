@@ -196,6 +196,31 @@ describe('ViewerPayer', () => {
     expect(r.payer.stats().owed).toBe(0);
   });
 
+  it('never pays at a mint the video does not accept (the host debits its wallet there)', async () => {
+    // Our wallet has a: the seeder's first mint we share is a, which the video lists.
+    const r = rig();
+    r.proto.hello({ acceptedMints: [mocks.MINTS.b, mocks.MINTS.a] });
+    r.download(0);
+    await settle();
+    expect(r.proto.sent[0]?.seederProofs.mint).toBe(mocks.MINTS.a);
+    const onlyB = new ViewerPayer({
+      pay: (range, s, p) => new mocks.MockPaymentEngine().pay(range, s, p),
+      ownMints: [mocks.MINTS.b],
+      credit: new CreditPool(4),
+      logger: silentLogger,
+      policyFor: () => policy,
+    });
+    // A wallet with only b: the shared mint is b, which the video (mints: [a]) does not accept.
+    const core = fakeCore(9);
+    onlyB.attachCore(core);
+    const proto = new FakeProto();
+    onlyB.attachPeer(NOISE, proto);
+    proto.hello({ acceptedMints: [mocks.MINTS.b, mocks.MINTS.a] });
+    core.emit('download', 0, 65_536, { remotePublicKey: peerKey });
+    await settle();
+    expect(proto.sent).toHaveLength(0);
+  });
+
   it('never pays a block twice', async () => {
     const r = rig();
     r.proto.hello();

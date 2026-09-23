@@ -19,7 +19,8 @@
  *   - **policy**: always the MANIFEST policy of the core (what the user was shown and agreed
  *     to: price, split, creator P2PK). A seeder whose HELLO asks more per block than the
  *     manifest is not paid (never pay more than the price shown); the HELLO's own split is
- *     ignored (a seeder cannot re-route the creator's share).
+ *     ignored (a seeder cannot re-route the creator's share); the mint paid at must be one
+ *     the video lists (the host's wallet is debited there).
  */
 import type {
   AckMessage,
@@ -216,6 +217,14 @@ export class ViewerPayer {
   private resolvePolicy(core: CoreKeyHex, hello: HelloMessage): PricePolicy | null {
     const policy = this.o.policyFor(core);
     if (policy === null) return null;
+    // UpstreamPayer pays at the seeder's first accepted mint our wallet also has; it must be
+    // one the VIDEO accepts too (the creator's share is spendable only there, and the host
+    // debits its wallet at that mint).
+    const mint = hello.acceptedMints.find((m) => this.o.ownMints.includes(m));
+    if (mint === undefined || !policy.mints.includes(mint)) {
+      this.log.warn('no mint shared by seeder, wallet and video — not paying', { core });
+      return null;
+    }
     if (hello.satsPerBlock > policy.satsPerBlock) {
       this.log.warn('seeder asks more than the manifest price — not paying', {
         core,
