@@ -1,0 +1,296 @@
+/**
+ * Guards for the host ⇄ worker protocol (`./worker-protocol.ts`). Same rules as `./guards.ts`:
+ * total, exact keys, capped. Complete by construction — a method or event without a guard is
+ * a compile error.
+ *
+ *   worker side:  `isHostToWorker(msg)` on every decoded frame; then `validateHostResult[m]`
+ *                 on the result of each of its own requests.
+ *   host side:    `isWorkerToHost(msg)` on every decoded frame; then `validateWorkerResult[m]`
+ *                 on the result of each of its own requests.
+ */
+import type { UploadProgress } from '@sovit/core';
+import type { Guard } from './protocol.js';
+import { IMAGE_MIMES, LIMITS } from './protocol.js';
+import {
+  arrayOf,
+  bool,
+  int,
+  isAbsolutePath,
+  isCoreKey,
+  isCount,
+  isEventId,
+  isHyperblobRef,
+  isImageMime,
+  isInvoice,
+  isLabel,
+  isMintUrl,
+  isMsgId,
+  isPeerSpend,
+  isPositiveSats,
+  isPricePolicy,
+  isPubkey,
+  isSats,
+  isSeederStatusWire,
+  isSessionId,
+  isSha256,
+  isUploadId,
+  isVideoManifest,
+  isWireError,
+  literal,
+  matches,
+  num,
+  obj,
+  oneOf,
+  renditionDraftGuards,
+  safe,
+  text,
+  union,
+  uploadMetaGuards,
+} from './guards.js';
+import type {
+  HostMethod,
+  HostMethodTable,
+  HostToWorker,
+  PublishDraft,
+  WorkerEvent,
+  WorkerEventName,
+  WorkerMethod,
+  WorkerMethodTable,
+  WorkerToHost,
+} from './worker-protocol.js';
+import { WORKER_V } from './worker-protocol.js';
+
+const anyValue = (_x: unknown): _x is unknown => true;
+
+const isSeeding = obj({ enabled: bool, diskCapBytes: int(0, LIMITS.maxDiskCapBytes) });
+const isPrefetch = num(0, LIMITS.maxPrefetchSec);
+const isPort = int(1, 65535);
+const isSid = obj({ sid: isSessionId });
+
+const isDev = safe(
+  (x: unknown): x is NonNullable<WorkerMethodTable['init'][0]['dev']> =>
+    obj(
+      { mocks: bool, fixtures: bool },
+      { bootstrap: arrayOf(obj({ host: literal('127.0.0.1'), port: isPort }), 16, 1) },
+    )(x) &&
+    // The --dev-mocks fence (D1): a custom (testnet) bootstrap only together with mock payments.
+    (x.bootstrap === undefined || x.mocks),
+);
+
+const isInit = obj(
+  {
+    v: literal(WORKER_V),
+    storage: isAbsolutePath,
+    seeding: isSeeding,
+    prefetchSeconds: isPrefetch,
+  },
+  { ffmpeg: obj({ ffmpeg: isAbsolutePath, ffprobe: isAbsolutePath }), dev: isDev },
+);
+
+const isPlayOpen = obj(
+  {
+    sid: isSessionId,
+    videoId: isEventId,
+    rendition: obj(
+      { label: isLabel, hyper: isHyperblobRef, size: isCount },
+      { bitrateKbps: num(0, 1e7) },
+    ),
+    policy: isPricePolicy,
+    prefetchSeconds: isPrefetch,
+  },
+  { durationSec: num(0, 1e7) },
+);
+
+const isThumbnailHex = obj({
+  hex: matches(/^(?:[0-9a-f]{2})+$/, 2 * LIMITS.maxThumbnailBytes),
+  type: isImageMime,
+});
+
+const isUploadMeta = obj(uploadMetaGuards, {
+  mirrorTo: arrayOf(matches(/^https:\/\/[\x21-\x7e]+$/, LIMITS.maxServerUrl), 16),
+});
+
+const isStudioUpload = obj(
+  { uploadId: isUploadId, path: isAbsolutePath, name: text(1, 1024), meta: isUploadMeta },
+  { thumbnailChoice: union(int(0, 63), isThumbnailHex) },
+);
+
+/** Arguments of every host → worker request. */
+export const validateWorkerArgs: {
+  readonly [M in WorkerMethod]: Guard<WorkerMethodTable[M][0]>;
+} = {
+  init: safe(isInit),
+  'play.open': safe(isPlayOpen),
+  'play.pause': safe(isSid),
+  'play.resume': safe(isSid),
+  'play.prefetch': safe(obj({ sid: isSessionId, seconds: isPrefetch })),
+  'play.close': safe(isSid),
+  'seeder.status': safe(obj({}) as Guard<Record<string, never>>),
+  'seeder.configure': safe(isSeeding),
+  'seeder.melt': safe(obj({ mint: isMintUrl, bolt11: isInvoice })),
+  'seeder.unban': safe(obj({ pubkey: isPubkey })),
+  'studio.ffmpeg': safe(obj({ recheck: bool }, { path: isAbsolutePath })),
+  'studio.upload': safe(isStudioUpload),
+};
+
+const isUndefined = (x: unknown): x is undefined => x === undefined;
+/** JSON has no `undefined`: a void result arrives as an absent `r`, i.e. `undefined`. */
+const isVoid = isUndefined;
+
+const isLoopbackLink = matches(
+  /^http:\/\/127\.0\.0\.1:[1-9][0-9]{0,4}\/[\x21-\x7e]*$/,
+  LIMITS.maxUrl,
+) as Guard<WorkerMethodTable['play.open'][1]['link']>;
+
+const isFfmpegStatus = obj(
+  { found: bool },
+  {
+    path: text(1, LIMITS.maxPath),
+    version: text(0, LIMITS.maxLabel),
+    os: oneOf(['macos', 'windows', 'linux'] as const),
+  },
+);
+
+/** Results of every host → worker request (checked by the host). */
+export const validateWorkerResult: {
+  readonly [M in WorkerMethod]: Guard<WorkerMethodTable[M][1]>;
+} = {
+  init: isVoid,
+  'play.open': safe(obj({ key: isCoreKey, link: isLoopbackLink })),
+  'play.pause': isVoid,
+  'play.resume': isVoid,
+  'play.prefetch': isVoid,
+  'play.close': isVoid,
+  'seeder.status': safe(isSeederStatusWire),
+  'seeder.configure': isVoid,
+  'seeder.melt': safe(obj({ paid: bool })),
+  'seeder.unban': isVoid,
+  'studio.ffmpeg': safe(isFfmpegStatus),
+  'studio.upload': safe(isVideoManifest),
+};
+
+const isRenditionDraft = obj(renditionDraftGuards.req, renditionDraftGuards.opt);
+
+const publishDraftShape = obj(
+  {
+    uploadId: isUploadId,
+    meta: isUploadMeta,
+    durationSec: num(0, 1e7),
+    blockSize: int(1, 2 ** 31),
+    renditions: arrayOf(isRenditionDraft, 16, 1),
+    thumbnail: union(
+      obj({ kind: literal('candidate'), path: isAbsolutePath, sha256: isSha256 }),
+      obj({ kind: literal('custom'), sha256: isSha256, type: oneOf(IMAGE_MIMES) }),
+    ),
+    codec: oneOf(['h264', 'vp9', 'av1'] as const),
+  },
+  {
+    storyboard: obj({
+      path: isAbsolutePath,
+      vttPath: isAbsolutePath,
+      sha256: isSha256,
+      cols: int(1, 1000),
+      rows: int(1, 1000),
+      intervalSec: num(0, 1e6),
+    }),
+  },
+);
+
+const isPublishDraft: Guard<PublishDraft> = publishDraftShape;
+
+/** Arguments of every worker → host request (checked by the host). */
+export const validateHostArgs: { readonly [M in HostMethod]: Guard<HostMethodTable[M][0]> } = {
+  'studio.publish': safe(isPublishDraft),
+};
+
+/** Results of every worker → host request (checked by the worker). */
+export const validateHostResult: {
+  readonly [M in HostMethod]: Guard<HostMethodTable[M][1]>;
+} = {
+  'studio.publish': safe(isVideoManifest),
+};
+
+const isPercent = num(0, 100);
+
+/** Worker-side `UploadProgress`: thumbnail candidates are absolute paths. */
+export const isWorkerUploadProgress: Guard<UploadProgress> = safe(
+  union(
+    obj({ stage: oneOf(['probing', 'publishing'] as const) }),
+    obj({
+      stage: oneOf(['transcoding', 'writing'] as const),
+      rendition: isLabel,
+      percent: isPercent,
+    }),
+    obj({ stage: literal('thumbnails'), candidates: arrayOf(isAbsolutePath, 64) }),
+    obj({
+      stage: literal('mirroring'),
+      server: matches(/^https:\/\/[\x21-\x7e]+$/, LIMITS.maxServerUrl),
+      ok: bool,
+    }),
+    obj({ stage: literal('done'), video: isVideoManifest }),
+    obj({ stage: literal('error'), message: text(0, LIMITS.maxErrorMessage, { multiline: true }) }),
+  ),
+);
+
+type Guarded<G> = { -readonly [K in keyof G]: G[K] extends Guard<infer T> ? T : never };
+
+/** An exact-keys event guard; the table below checks it against `WorkerEvent`. */
+function ev<const E extends WorkerEventName, G extends Readonly<Record<string, Guard<unknown>>>>(
+  e: E,
+  fields: G,
+): Guard<{ op: 'ev'; e: E } & Guarded<G>> {
+  const g = obj({ op: literal('ev'), e: literal(e), ...fields });
+  return safe(g as unknown as Guard<{ op: 'ev'; e: E } & Guarded<G>>);
+}
+
+/** Every worker event (checked by the host). */
+export const validateWorkerEvent: {
+  readonly [E in WorkerEventName]: Guard<Extract<WorkerEvent, { readonly e: E }>>;
+} = {
+  ready: ev('ready', { v: literal(WORKER_V), port: isPort }),
+  spend: ev('spend', {
+    sid: isSessionId,
+    mint: isMintUrl,
+    amount: isPositiveSats,
+    total: isSats,
+    ratePerMin: isSats,
+  }),
+  peers: ev('peers', { sid: isSessionId, peers: arrayOf(isPeerSpend, LIMITS.maxArray) }),
+  'seeder.status': ev('seeder.status', { status: isSeederStatusWire }),
+  'upload.progress': ev('upload.progress', {
+    uploadId: isUploadId,
+    progress: isWorkerUploadProgress,
+  }),
+  'dev.fixtures': ev('dev.fixtures', { videos: arrayOf(isVideoManifest, LIMITS.maxArray) }),
+  log: ev('log', {
+    level: oneOf(['debug', 'info', 'warn', 'error'] as const),
+    msg: text(0, LIMITS.maxString, { multiline: true }),
+  }),
+};
+
+function own<T extends object>(table: T, k: unknown): k is keyof T & string {
+  return typeof k === 'string' && Object.prototype.hasOwnProperty.call(table, k);
+}
+
+const isRes = union(
+  obj({ op: literal('res'), id: isMsgId, ok: literal(true) }, { r: anyValue }),
+  obj({ op: literal('res'), id: isMsgId, ok: literal(false), e: isWireError }),
+);
+
+const isReqEnvelope = obj({ op: literal('req'), id: isMsgId, m: anyValue, a: anyValue });
+
+/** Everything the worker may receive: a request with valid arguments, or a response. */
+export const isHostToWorker: Guard<HostToWorker> = safe((x): x is HostToWorker => {
+  if (isRes(x)) return true;
+  if (!isReqEnvelope(x) || !own(validateWorkerArgs, x.m)) return false;
+  return (validateWorkerArgs[x.m] as Guard<unknown>)(x.a);
+});
+
+/** Everything the host may receive: a request with valid arguments, a response, or an event. */
+export const isWorkerToHost: Guard<WorkerToHost> = safe((x): x is WorkerToHost => {
+  if (isRes(x)) return true;
+  if (isReqEnvelope(x)) return own(validateHostArgs, x.m) && validateHostArgs[x.m](x.a);
+  if (typeof x !== 'object' || x === null) return false;
+  const e: unknown = (x as { e?: unknown }).e;
+  return own(validateWorkerEvent, e) && (validateWorkerEvent[e] as Guard<unknown>)(x);
+});

@@ -1,0 +1,692 @@
+/**
+ * Hand-written, composable runtime guards for everything that crosses a process boundary
+ * (design §2 "Rules"). No dependencies, no `URL`/`TextEncoder` globals: the same code runs in
+ * main, host, preload and the Bare worker.
+ *
+ * Every guard is TOTAL — it returns `false` for anything that is not exactly the expected
+ * shape and never throws (the exported validators are additionally wrapped in `safe`, so a
+ * hostile getter or Proxy cannot escape as an exception). Objects must be plain (prototype
+ * `Object.prototype` or `null`) with no unknown keys; optional properties are absent, never
+ * present-as-`undefined` (every package compiles with `exactOptionalPropertyTypes`). Strings
+ * and arrays have hard caps (`LIMITS`); a value over a cap is rejected, never truncated.
+ * Optional TRAILING call arguments may be absent or `undefined` (JS parameter semantics).
+ */
+import type {
+  CashuP2pkPubkey,
+  CoreKeyHex,
+  HyperblobId,
+  HyperblobRef,
+  MeltQuote,
+  MintQuote,
+  MintUrl,
+  NostrEvent,
+  NostrEventId,
+  NostrPubkey,
+  PeerSpend,
+  PeerWindow,
+  PricePolicy,
+  RelayUrl,
+  Rendition,
+  Sats,
+  Sha256Hex,
+  UnixSeconds,
+  VideoManifest,
+} from '@sovit/core';
+import type {
+  AnyCallMsg,
+  ErrorCode,
+  FileToken,
+  GrantFileMsg,
+  Guard,
+  HostIn,
+  HostOut,
+  ImageMime,
+  Method,
+  MethodTable,
+  NfMediaImgUrl,
+  ReplyMsg,
+  SeederStatusWire,
+  SessionId,
+  SubMsg,
+  Topic,
+  UploadId,
+  EventMsg,
+  WireError,
+  WireMap,
+} from './protocol.js';
+import { ERROR_CODES, IMAGE_MIMES, IPC_V, LIMITS } from './protocol.js';
+
+export type { Guard };
+
+// ---- primitives ---------------------------------------------------------------------------
+
+/** Wraps a guard so nothing it touches (getters, Proxies) can make it throw. */
+export function safe<T>(g: Guard<T>): Guard<T> {
+  return (x: unknown): x is T => {
+    try {
+      return g(x);
+    } catch {
+      return false;
+    }
+  };
+}
+
+export type PlainObject = Readonly<Record<string, unknown>>;
+
+/** A plain data object (structured clone / JSON produce exactly these). */
+export function isPlainObject(x: unknown): x is PlainObject {
+  if (typeof x !== 'object' || x === null || Array.isArray(x)) return false;
+  const proto: unknown = Object.getPrototypeOf(x);
+  return proto === Object.prototype || proto === null;
+}
+
+function hasOwn(o: object, k: string): boolean {
+  return Object.prototype.hasOwnProperty.call(o, k);
+}
+
+export const bool: Guard<boolean> = (x): x is boolean => typeof x === 'boolean';
+
+/** A finite number in `[min, max]`. */
+export function num(min: number, max: number): Guard<number> {
+  return (x): x is number => typeof x === 'number' && Number.isFinite(x) && x >= min && x <= max;
+}
+
+/** A safe integer in `[min, max]`. */
+export function int(min: number, max: number): Guard<number> {
+  return (x): x is number =>
+    typeof x === 'number' && Number.isSafeInteger(x) && x >= min && x <= max;
+}
+
+// C0 controls and DEL; `multiline` text additionally allows \t \n \r.
+// eslint-disable-next-line no-control-regex -- matching control characters is the point
+const CONTROL = /[\u0000-\u001f\u007f]/;
+// eslint-disable-next-line no-control-regex -- matching control characters is the point
+const CONTROL_EXCEPT_WS = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/;
+
+/**
+ * A string of `min`..`max` UTF-16 code units with no control characters (`multiline` allows
+ * tab, LF and CR).
+ */
+export function text(min: number, max: number, opts: { multiline?: boolean } = {}): Guard<string> {
+  const bad = opts.multiline === true ? CONTROL_EXCEPT_WS : CONTROL;
+  return (x): x is string =>
+    typeof x === 'string' && x.length >= min && x.length <= max && !bad.test(x);
+}
+
+/** A string of at most `max` code units matching `re` (anchor `re` yourself). */
+export function matches(re: RegExp, max: number): Guard<string> {
+  return (x): x is string => typeof x === 'string' && x.length <= max && re.test(x);
+}
+
+/** One of `values` (strict equality). */
+export function oneOf<const T extends string | number | boolean>(values: readonly T[]): Guard<T> {
+  return (x): x is T => (values as readonly unknown[]).includes(x);
+}
+
+export function literal<const T extends string | number | boolean | null>(value: T): Guard<T> {
+  return (x): x is T => x === value;
+}
+
+export function nullable<T>(g: Guard<T>): Guard<T | null> {
+  return (x): x is T | null => x === null || g(x);
+}
+
+export function union<T extends readonly unknown[]>(
+  ...gs: { readonly [K in keyof T]: Guard<T[K]> }
+): Guard<T[number]> {
+  return (x): x is T[number] => gs.some((g) => g(x));
+}
+
+/**
+ * A dense array of `min`..`max` elements, each passing `g`. Holes read as `undefined` and so
+ * fail every element guard that does not admit `undefined`.
+ */
+export function arrayOf<T>(g: Guard<T>, max: number, min = 0): Guard<readonly T[]> {
+  return (x): x is readonly T[] => {
+    if (!Array.isArray(x) || x.length < min || x.length > max) return false;
+    // for-of reads holes through the array iterator, i.e. as `undefined`.
+    for (const v of x as readonly unknown[]) if (!g(v)) return false;
+    return true;
+  };
+}
+
+type GuardMap<T> = { readonly [K in keyof T]-?: Guard<T[K]> };
+type NoKeys = Record<never, never>;
+
+/**
+ * An exact-keys plain object: every `req` key present and valid, `opt` keys absent or valid
+ * (never `undefined`), nothing else.
+ */
+export function obj<R extends object, O extends object = NoKeys>(
+  req: GuardMap<R>,
+  opt?: GuardMap<O>,
+): Guard<R & Partial<O>> {
+  const reqKeys = Object.keys(req) as (keyof R & string)[];
+  const optKeys = opt === undefined ? [] : (Object.keys(opt) as (keyof O & string)[]);
+  const known = new Set<string>([...reqKeys, ...optKeys]);
+  return (x): x is R & Partial<O> => {
+    if (!isPlainObject(x)) return false;
+    for (const k of Object.keys(x)) if (!known.has(k)) return false;
+    for (const k of reqKeys) if (!hasOwn(x, k) || !req[k](x[k])) return false;
+    if (opt !== undefined) for (const k of optKeys) if (hasOwn(x, k) && !opt[k](x[k])) return false;
+    return true;
+  };
+}
+
+type OptionalTail<O extends readonly unknown[]> = { [K in keyof O]?: O[K] | undefined };
+
+/**
+ * A call-argument tuple: the `req` positions present and valid, then up to `opt.length`
+ * trailing positions each absent, `undefined`, or valid. Longer arrays are rejected.
+ */
+export function tuple<const R extends readonly unknown[], const O extends readonly unknown[] = []>(
+  req: { readonly [K in keyof R]: Guard<R[K]> },
+  opt?: { readonly [K in keyof O]: Guard<O[K]> },
+): Guard<[...R, ...OptionalTail<O>]> {
+  const r = req as readonly Guard<unknown>[];
+  const o = (opt ?? []) as readonly Guard<unknown>[];
+  return (x): x is [...R, ...OptionalTail<O>] => {
+    if (!Array.isArray(x) || x.length < r.length || x.length > r.length + o.length) return false;
+    const args = x as readonly unknown[];
+    if (!r.every((g, i) => g(args[i]))) return false;
+    return o.every((g, i) => {
+      const v = args[r.length + i];
+      return v === undefined || g(v);
+    });
+  };
+}
+
+/** A genuine `Uint8Array` (not a look-alike) of at most `max` bytes. */
+export function bytes(max: number): Guard<Uint8Array> {
+  return (x): x is Uint8Array =>
+    ArrayBuffer.isView(x) &&
+    Object.prototype.toString.call(x) === '[object Uint8Array]' &&
+    (x as Uint8Array).byteLength <= max;
+}
+
+/** A `WireMap` of at most `max` entries with unique keys. */
+export function wireMap<K extends string, V>(
+  key: Guard<K>,
+  value: Guard<V>,
+  max: number = LIMITS.maxArray,
+): Guard<WireMap<K, V>> {
+  const entry = (e: unknown): e is readonly [K, V] =>
+    Array.isArray(e) && e.length === 2 && key(e[0]) && value(e[1]);
+  const entries = arrayOf(entry, max);
+  return (x): x is WireMap<K, V> => {
+    if (!isPlainObject(x) || Object.keys(x).length !== 1 || !hasOwn(x, '$map')) return false;
+    const list: unknown = x['$map'];
+    if (!entries(list)) return false;
+    return new Set(list.map((e) => e[0])).size === list.length;
+  };
+}
+
+/** Narrows a string guard to a branded type (brands are compile-time only). */
+export function branded<B extends string>(g: Guard<string>): Guard<B> {
+  return g as Guard<B>;
+}
+
+// ---- ids, hex, money ------------------------------------------------------------------------
+
+const HEX64 = /^[0-9a-f]{64}$/;
+const HEX32 = /^[0-9a-f]{32}$/;
+
+export const isHex64 = matches(HEX64, 64);
+export const isPubkey = branded<NostrPubkey>(isHex64);
+export const isEventId = branded<NostrEventId>(isHex64);
+export const isSha256 = branded<Sha256Hex>(isHex64);
+export const isCoreKey = branded<CoreKeyHex>(isHex64);
+/** NUT-11 P2PK key: 33-byte compressed secp256k1 (same check as core's manifest builder). */
+export const isCashuP2pk = branded<CashuP2pkPubkey>(matches(/^0[23][0-9a-f]{64}$/, 66));
+export const isSessionId = safe(branded<SessionId>(matches(HEX32, 32)));
+export const isUploadId = safe(branded<UploadId>(matches(HEX32, 32)));
+export const isFileToken = safe(
+  matches(/^nf-file:[0-9a-f]{32}$/, 40) as Guard<FileToken>,
+) satisfies Guard<FileToken>;
+
+export const isSats = int(0, LIMITS.maxSats) as Guard<Sats>;
+export const isPositiveSats = int(1, LIMITS.maxSats) as Guard<Sats>;
+/** Unix seconds, 0 … year 36812. */
+export const isUnixSeconds = int(0, 2 ** 40) as Guard<UnixSeconds>;
+/** Safe integers of either sign (counters that may legitimately go negative). */
+export const isSafeInt = int(Number.MIN_SAFE_INTEGER, Number.MAX_SAFE_INTEGER);
+export const isCount = int(0, Number.MAX_SAFE_INTEGER);
+/** A message id / subId / request id: a non-negative 31-bit integer. */
+export const isMsgId = int(0, 0x7fffffff);
+/** A webContents id. */
+export const isWcId = int(1, 0x7fffffff);
+
+// ---- URLs -----------------------------------------------------------------------------------
+//
+// Consistent with packages/ui/src/screens/Settings/model.ts (`validateRelayUrl`,
+// `validateMintUrl`) and Studio/model.ts (`normalizeHttpsUrl`), which it does NOT import:
+// `@sovit/ui` has a root export only (React + DOM), and these guards must not depend on the
+// `URL` global. They accept the NORMALISED output of those validators — scheme `wss:` (relays)
+// or `https:` (mints, Blossom mirrors), no user-info, no fragment, no query for mints/mirrors,
+// no trailing slash, at most 512 chars, an ASCII (IDNA-encoded) host — plus the same shapes
+// with an upper-case scheme. Loopback and LAN hosts pass (legitimate desktop setups; the host
+// decides what it proxies). guards.test.ts cross-checks against the real validators.
+
+const LABEL = '[A-Za-z0-9_](?:[A-Za-z0-9_-]{0,61}[A-Za-z0-9_])?';
+const HOST = `(?:${LABEL}(?:\\.${LABEL})*|\\[[0-9A-Fa-f:.]{2,45}\\])`;
+const PORT = '(?::[0-9]{1,5})?';
+const PCHAR = "[A-Za-z0-9\\-._~!$&'()*+,;=:@%]";
+/** Empty, or `/…` not ending in `/`. */
+const PATH_NO_TRAILING = `(?:/[A-Za-z0-9\\-._~!$&'()*+,;=:@%/]*${PCHAR})?`;
+const QUERY = "(?:\\?[A-Za-z0-9\\-._~!$&'()*+,;=:@%/?]*)?";
+
+const RELAY_RE = new RegExp(`^[Ww][Ss][Ss]://${HOST}${PORT}${PATH_NO_TRAILING}${QUERY}$`);
+const HTTPS_SERVER_RE = new RegExp(`^[Hh][Tt][Tt][Pp][Ss]://${HOST}${PORT}${PATH_NO_TRAILING}$`);
+/** `image()` sources: any https URL without user-info or whitespace/controls (the host re-checks). */
+const IMAGE_RE = new RegExp(
+  `^[Hh][Tt][Tt][Pp][Ss]://${HOST}${PORT}(?:[/?#][^\\s\\u0000-\\u001f\\u007f]*)?$`,
+);
+const NF_IMG_RE = /^nf-media:\/\/img\/[A-Za-z0-9_-]{1,128}$/;
+
+export const isRelayUrl = safe(branded<RelayUrl>(matches(RELAY_RE, LIMITS.maxServerUrl)));
+export const isMintUrl = safe(branded<MintUrl>(matches(HTTPS_SERVER_RE, LIMITS.maxServerUrl)));
+/** A Blossom server (Studio mirrors): same rule as a mint. */
+export const isBlossomServer = safe(matches(HTTPS_SERVER_RE, LIMITS.maxServerUrl));
+export const isNfMediaImgUrl = matches(NF_IMG_RE, 150) as Guard<NfMediaImgUrl>;
+export const isImageSource: Guard<string> = safe(
+  (x): x is string => matches(IMAGE_RE, LIMITS.maxUrl)(x) || isNfMediaImgUrl(x),
+);
+
+// ---- text fields ----------------------------------------------------------------------------
+
+export const isTitle = text(1, LIMITS.maxString);
+export const isBody = text(0, LIMITS.maxBody, { multiline: true });
+export const isCommentBody = text(1, LIMITS.maxBody, { multiline: true });
+export const isCursor = text(0, LIMITS.maxString);
+export const isLabel = text(1, LIMITS.maxLabel);
+export const isTag = text(1, LIMITS.maxTag);
+export const isTags = arrayOf(isTag, LIMITS.maxArray);
+/** NIP-25 content: `+`, `-`, empty, or an emoji / `:shortcode:`. */
+export const isReaction = text(0, 64);
+/** A Lightning invoice as the screens pass it (shape only; the mint decodes it). */
+export const isInvoice = matches(/^[\x21-\x7e]+$/, LIMITS.maxString);
+export const isImageMime = oneOf<ImageMime>(IMAGE_MIMES);
+export const isPageLimit = int(1, LIMITS.maxPage);
+
+// ---- contract shapes (arguments) ------------------------------------------------------------
+
+const isFeedQuery = obj(
+  { source: oneOf(['subscriptions', 'trending', 'tags', 'author', 'shorts'] as const) },
+  { tags: isTags, author: isPubkey, cursor: isCursor, limit: isPageLimit },
+);
+
+const isSearchFilters = obj(
+  {},
+  {
+    since: isUnixSeconds,
+    until: isUnixSeconds,
+    minDurationSec: num(0, 1e7),
+    maxDurationSec: num(0, 1e7),
+    tags: isTags,
+    author: isPubkey,
+  },
+);
+
+const isSearchQuery = obj(
+  { text: text(0, LIMITS.maxString, { multiline: true }) },
+  { cursor: isCursor, filters: isSearchFilters },
+);
+
+const isSavePlaylist = obj(
+  {
+    title: isTitle,
+    videoIds: arrayOf(isEventId, LIMITS.maxPlaylistItems),
+    isPrivate: bool,
+  },
+  { description: isBody, id: isLabel },
+);
+
+const isMintQuote: Guard<MintQuote> = obj({
+  mint: isMintUrl,
+  quoteId: isLabel,
+  amount: isSats,
+  bolt11: isInvoice,
+  expiry: isUnixSeconds,
+  state: oneOf(['UNPAID', 'PAID', 'ISSUED'] as const),
+});
+
+const isMeltQuote: Guard<MeltQuote> = obj({
+  mint: isMintUrl,
+  quoteId: isLabel,
+  amount: isSats,
+  feeReserve: isSats,
+  expiry: isUnixSeconds,
+  state: oneOf(['UNPAID', 'PENDING', 'PAID'] as const),
+});
+
+const isHistoryOpts = obj({}, { limit: isPageLimit, mint: isMintUrl });
+
+const isSplit = (x: unknown): x is { readonly seeder: number; readonly creator: number } =>
+  obj({ seeder: int(0, 100), creator: int(0, 100) })(x) && x.seeder + x.creator === 100;
+
+const isThumbnailBytes = obj({
+  bytes: bytes(LIMITS.maxThumbnailBytes),
+  type: isImageMime,
+});
+
+/** Studio's `UploadInput` minus `file`/`thumbnailChoice` — shared with the worker protocol. */
+export const uploadMetaGuards = {
+  title: isTitle,
+  description: isBody,
+  tags: isTags,
+  kind: oneOf([21, 22] as const),
+  mints: arrayOf(isMintUrl, 32, 1),
+  satsPerBlock: isSats,
+  split: isSplit,
+} as const;
+
+const isUploadInputWire = obj(
+  { ...uploadMetaGuards, uploadId: isUploadId, file: isFileToken },
+  {
+    thumbnailChoice: union(int(0, 63), isThumbnailBytes),
+    mirrorTo: arrayOf(isBlossomServer, 16),
+  },
+);
+
+const isRelayConfig = obj({ url: isRelayUrl, read: bool, write: bool });
+
+const isSettingsPatch = obj(
+  {},
+  {
+    relays: arrayOf(isRelayConfig, LIMITS.maxArray),
+    defaultMints: arrayOf(isMintUrl, LIMITS.maxArray),
+    seeding: obj({ enabled: bool, diskCapBytes: int(0, LIMITS.maxDiskCapBytes) }),
+    prefetchSeconds: num(0, LIMITS.maxPrefetchSec),
+    hoverPreview: bool,
+    theme: oneOf(['dark', 'light', 'system'] as const),
+    // SE-4: `belowSats: 0` is the v4 "off" sentinel; the host treats `<= 0` as disabled.
+    autoTopUp: obj({
+      belowSats: int(0, LIMITS.maxAutoTopUpSats) as Guard<Sats>,
+      fromMint: isMintUrl,
+    }),
+  },
+);
+
+const isPrefetchSeconds = num(0, LIMITS.maxPrefetchSec);
+const isPositionSec = num(0, 1e7);
+
+/**
+ * Argument validators for every method — a missing or mistyped entry is a compile error.
+ * Main runs them on every renderer call (after the sender-frame check); the host runs them
+ * again.
+ */
+export const validateArgs: { readonly [M in Method]: Guard<MethodTable[M][0]> } = wrapAll({
+  signer: tuple([]),
+  me: tuple([]),
+  profile: tuple([isPubkey]),
+  feed: tuple([isFeedQuery]),
+  video: tuple([isEventId]),
+  stats: tuple([isEventId]),
+  related: tuple([isEventId], [isPageLimit]),
+  search: tuple([isSearchQuery]),
+  comments: tuple([isEventId, oneOf(['new', 'top'] as const)], [isCursor]),
+  comment: tuple([isEventId, isCommentBody], [isEventId]),
+  react: tuple([isEventId, isReaction]),
+  unreact: tuple([isEventId]),
+  nutzap: tuple(
+    [isEventId, isPositiveSats, isMintUrl],
+    [text(0, LIMITS.maxString, { multiline: true })],
+  ),
+  subscribe: tuple([isPubkey]),
+  unsubscribe: tuple([isPubkey]),
+  subscriptions: tuple([]),
+  report: tuple([isEventId, text(0, LIMITS.maxString, { multiline: true })]),
+  'library.history': tuple([], [isCursor]),
+  'library.recordProgress': tuple([isEventId, isPositionSec]),
+  'library.watchLater': tuple([]),
+  'library.setWatchLater': tuple([isEventId, bool]),
+  'library.playlists': tuple([], [isPubkey]),
+  'library.savePlaylist': tuple([isSavePlaylist]),
+  'library.liked': tuple([]),
+  play: tuple([isEventId], [isLabel]),
+  image: tuple([isImageSource], [isSha256]),
+  'session.pause': tuple([isSessionId]),
+  'session.resume': tuple([isSessionId]),
+  'session.setPrefetchSeconds': tuple([isSessionId, isPrefetchSeconds]),
+  'session.switchRendition': tuple([isSessionId, isLabel]),
+  'session.close': tuple([isSessionId]),
+  'wallet.mints': tuple([]),
+  'wallet.balance': tuple([isMintUrl]),
+  'wallet.balances': tuple([]),
+  'wallet.mintQuote': tuple([isMintUrl, isPositiveSats]),
+  'wallet.pollQuote': tuple([isMintQuote]),
+  'wallet.meltQuote': tuple([isMintUrl, isInvoice]),
+  'wallet.melt': tuple([isMeltQuote]),
+  'wallet.history': tuple([], [isHistoryOpts]),
+  'studio.upload': tuple([isUploadInputWire]),
+  'studio.myVideos': tuple([], [isCursor]),
+  'studio.analytics': tuple([isEventId]),
+  'seeder.status': tuple([]),
+  'seeder.setEnabled': tuple([bool]),
+  'seeder.melt': tuple([isMintUrl, isInvoice]),
+  'seeder.unban': tuple([isPubkey]),
+  settings: tuple([]),
+  updateSettings: tuple([isSettingsPatch]),
+  'desktop.ffmpeg': tuple([obj({ recheck: bool })]),
+});
+
+function wrapAll<T extends Record<string, Guard<unknown>>>(table: T): T {
+  const out: Record<string, Guard<unknown>> = {};
+  for (const [k, g] of Object.entries(table)) out[k] = safe(g);
+  return Object.freeze(out) as T;
+}
+
+/** The runtime method list (same keys as `MethodTable`). */
+export const METHODS: readonly Method[] = Object.freeze(Object.keys(validateArgs) as Method[]);
+
+export function isMethod(x: unknown): x is Method {
+  return typeof x === 'string' && Object.prototype.hasOwnProperty.call(validateArgs, x);
+}
+
+// ---- errors ---------------------------------------------------------------------------------
+
+export const isErrorCode = oneOf<ErrorCode>(ERROR_CODES);
+
+export const isWireError: Guard<WireError> = safe(
+  (x): x is WireError =>
+    obj({ code: isErrorCode, message: text(0, LIMITS.maxErrorMessage, { multiline: true }) })(x) &&
+    x.message.startsWith(`${x.code}: `),
+);
+
+// ---- renderer ⇄ main messages ---------------------------------------------------------------
+
+const isV = literal(IPC_V);
+
+/** A complete call: envelope, known method, and arguments valid for that method. */
+export const isCallMsg: Guard<AnyCallMsg> = safe((x): x is AnyCallMsg => {
+  if (
+    !obj({ v: isV, id: isMsgId, method: isMethod, args: (a): a is unknown => Array.isArray(a) })(x)
+  )
+    return false;
+  return validateArgs[x.method](x.args);
+});
+
+export const isTopic: Guard<Topic> = safe(
+  union(
+    obj({ t: oneOf(['seeder.status', 'notifications', 'wallet.change'] as const) }),
+    obj({ t: oneOf(['session.peers', 'session.spend'] as const), sid: isSessionId }),
+    obj({ t: literal('upload.progress'), uploadId: isUploadId }),
+  ),
+);
+
+export const isSubMsg: Guard<SubMsg> = safe(
+  union(
+    obj({ v: isV, op: literal('sub'), subId: isMsgId, topic: isTopic }),
+    obj({ v: isV, op: literal('unsub'), subId: isMsgId }),
+  ),
+);
+
+/** An absolute path (POSIX, drive-letter or UNC), no NUL, within `LIMITS.maxPath`. */
+export const isAbsolutePath: Guard<string> = safe(
+  (x): x is string =>
+    typeof x === 'string' &&
+    x.length > 1 &&
+    x.length <= LIMITS.maxPath &&
+    !x.includes('\u0000') &&
+    (x.startsWith('/') || /^[A-Za-z]:[\\/]/.test(x) || x.startsWith('\\\\')),
+);
+
+export const isGrantFileMsg: Guard<GrantFileMsg> = safe(obj({ v: isV, path: isAbsolutePath }));
+
+const anyValue = (_x: unknown): _x is unknown => true;
+
+export const isReplyMsg: Guard<ReplyMsg> = safe(
+  union(
+    obj({ v: isV, id: isMsgId, ok: literal(true), result: anyValue }),
+    obj({ v: isV, id: isMsgId, ok: literal(false), error: isWireError }),
+  ),
+);
+
+export const isEventMsg: Guard<EventMsg> = safe(obj({ v: isV, subId: isMsgId, payload: anyValue }));
+
+// ---- main ⇄ host ------------------------------------------------------------------------------
+
+const isUploadFile = obj({ path: isAbsolutePath, name: text(1, 1024), size: isCount });
+
+/** Main → host. Calls and subs are re-validated in full (the host runs the guards again). */
+export const isHostIn: Guard<HostIn> = safe(
+  union(
+    obj({ kind: literal('call'), wc: isWcId, msg: isCallMsg }, { file: isUploadFile }),
+    obj({ kind: literal('sub'), wc: isWcId, msg: isSubMsg }),
+    obj({ kind: literal('wc-gone'), wc: isWcId }),
+    obj({ kind: literal('image'), req: isMsgId, id: matches(/^[A-Za-z0-9_-]{1,128}$/, 128) }),
+  ),
+);
+
+/** Host → main. Main is the more privileged side; it checks shapes before acting on them. */
+export const isHostOut: Guard<HostOut> = safe(
+  union(
+    obj({ kind: oneOf(['reply', 'sub-reply'] as const), wc: isWcId, msg: isReplyMsg }),
+    obj({ kind: literal('event'), wc: isWcId, msg: isEventMsg }),
+    obj({
+      kind: literal('media-link'),
+      token: matches(/^[A-Za-z0-9_-]{16,128}$/, 128),
+      url: nullable(
+        matches(/^http:\/\/127\.0\.0\.1:[1-9][0-9]{0,4}\/[\x21-\x7e]*$/, LIMITS.maxUrl),
+      ),
+    }),
+    obj({
+      kind: literal('image'),
+      req: isMsgId,
+      bytes: nullable(bytes(LIMITS.maxThumbnailBytes)),
+      type: nullable(isImageMime),
+    }),
+  ),
+);
+
+// ---- data shapes the host receives from the worker (reused by worker-guards.ts) ---------------
+
+const isHyperblobId: Guard<HyperblobId> = obj({
+  byteOffset: isCount,
+  blockOffset: isCount,
+  blockLength: isCount,
+  byteLength: isCount,
+});
+export const isHyperblobRef: Guard<HyperblobRef> = obj({ core: isCoreKey, blob: isHyperblobId });
+
+export const isPricePolicy: Guard<PricePolicy> = obj({
+  satsPerBlock: isSats,
+  blockSize: int(1, 2 ** 31),
+  mints: arrayOf(isMintUrl, 32),
+  split: isSplit,
+  creatorP2pk: isCashuP2pk,
+});
+
+const isMaybeHashedUrl = obj({ url: text(1, LIMITS.maxUrl) }, { sha256: isSha256 });
+
+export const renditionDraftGuards = {
+  req: {
+    label: isLabel,
+    mime: text(1, 128),
+    sha256: isSha256,
+    size: isCount,
+    hyper: isHyperblobRef,
+    hyperUrl: text(1, LIMITS.maxUrl),
+    fallbacks: arrayOf(text(1, LIMITS.maxUrl), 32),
+  },
+  opt: {
+    width: isCount,
+    height: isCount,
+    bitrateKbps: num(0, 1e7),
+    placeholder: text(1, 65536),
+  },
+} as const;
+
+export const isRendition: Guard<Rendition> = obj(renditionDraftGuards.req, {
+  ...renditionDraftGuards.opt,
+  image: isMaybeHashedUrl,
+  captions: arrayOf(
+    obj({ lang: text(1, 64), url: text(1, LIMITS.maxUrl) }, { sha256: isSha256 }),
+    64,
+  ),
+  storyboard: obj(
+    {
+      url: text(1, LIMITS.maxUrl),
+      cols: int(1, 1000),
+      rows: int(1, 1000),
+      intervalSec: num(0, 1e6),
+    },
+    { sha256: isSha256 },
+  ),
+});
+
+const isNostrEvent: Guard<NostrEvent> = obj({
+  id: isEventId,
+  pubkey: isPubkey,
+  kind: int(0, 65535),
+  created_at: isUnixSeconds,
+  tags: arrayOf(arrayOf(text(0, LIMITS.maxBody, { multiline: true }), 64, 1), 4096),
+  content: text(0, 262144, { multiline: true }),
+  sig: matches(/^[0-9a-f]{128}$/, 128),
+});
+
+export const isVideoManifest: Guard<VideoManifest> = obj(
+  {
+    id: isEventId,
+    kind: oneOf([21, 22] as const),
+    author: isPubkey,
+    title: isTitle,
+    description: isBody,
+    publishedAt: isUnixSeconds,
+    tags: isTags,
+    renditions: arrayOf(isRendition, 16, 1),
+    price: isPricePolicy,
+    blossomServers: arrayOf(text(1, LIMITS.maxUrl), 32),
+    event: isNostrEvent,
+  },
+  { durationSec: num(0, 1e7) },
+);
+
+export const isPeerSpend: Guard<PeerSpend> = obj(
+  { pubkey: isPubkey, sats: isSats, ratePerMin: isSats, blocks: isCount },
+  { latencyMs: num(0, 1e7) },
+);
+
+const isPeerWindow: Guard<PeerWindow> = obj({
+  peer: isPubkey,
+  uploaded: isCount,
+  paid: isCount,
+  outstanding: isSafeInt,
+  windowBlocks: isCount,
+  banned: bool,
+  lastActivity: isUnixSeconds,
+});
+
+export const isSeederStatusWire: Guard<SeederStatusWire> = obj({
+  enabled: bool,
+  pubkey: isPubkey,
+  videos: isCount,
+  bytesStored: isCount,
+  diskCapBytes: isCount,
+  peers: arrayOf(isPeerWindow, 4096),
+  earned: obj({ total: isSats, unswapped: isSats, byMint: wireMap(isMintUrl, isSats) }),
+  banned: arrayOf(
+    obj({ pubkey: isPubkey, reason: text(0, LIMITS.maxLabel), at: isUnixSeconds }),
+    4096,
+  ),
+});
