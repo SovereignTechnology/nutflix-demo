@@ -16,6 +16,7 @@ import type {
   VideoManifest,
 } from '@sovit/core';
 import { click, keydown, render, type Rendered } from '../../../components/testing/render.js';
+import type { ToastItem } from '../../../components/index.js';
 import type { Route } from '../../shared/route.js';
 import { LIBRARY_TABS, Library, type HistoryEntry, type LibraryProps } from '../Library.js';
 
@@ -473,6 +474,177 @@ describe('Library — Watch later', () => {
     expect(titles(r, '.nf-library__list')).toEqual([vid(7).title, vid(9).title]);
     expect(r.get('.nf-toast').textContent).toContain('Removed from Watch later');
     expect(errors).not.toHaveBeenCalled();
+  });
+});
+
+describe("Library — toasts: own inline stack, or the shell's (onToast)", () => {
+  /** Watch later with vid(3), vid(7), vid(9); `setWatchLater` answered by the test. */
+  function watchLater(answer: (id: NostrEventId, on: boolean) => Promise<void>): {
+    readonly adapter: NetworkAdapter;
+    readonly setWatchLater: ReturnType<typeof vi.fn<Lib['setWatchLater']>>;
+  } {
+    const setWatchLater = vi.fn<Lib['setWatchLater']>(answer);
+    return { adapter: patched(seeded(), { library: { setWatchLater } }), setWatchLater };
+  }
+  const lastToast = (onToast: ReturnType<typeof vi.fn<(t: ToastItem) => void>>): ToastItem =>
+    onToast.mock.calls.at(-1)![0];
+
+  it('without onToast: the screen renders its own inline stack', async () => {
+    const { adapter } = watchLater(() => Promise.resolve());
+    const { r } = mount(adapter, { tab: 'watch-later' });
+    await flush();
+    expect(r.all('.nf-library__toasts')).toHaveLength(1);
+    click(r.all('.nf-library__remove')[0]!);
+    await flush();
+    expect(r.get('.nf-library__toasts .nf-toast').textContent).toContain(
+      'Removed from Watch later',
+    );
+  });
+
+  it('with onToast: every toast goes to the shell, the screen renders no stack, actions work', async () => {
+    let fail = false;
+    const { adapter, setWatchLater } = watchLater(() =>
+      fail ? Promise.reject(new Error('relay-down: no relays reachable')) : Promise.resolve(),
+    );
+    const onToast = vi.fn<(t: ToastItem) => void>();
+    const errors = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    const { r } = mount(adapter, { tab: 'watch-later', onToast });
+    await flush();
+    expect(r.all('.nf-toasts')).toHaveLength(0);
+
+    // Removed → Undo, through the shell's toast.
+    click(r.all('.nf-library__remove')[1]!);
+    await flush();
+    expect(onToast).toHaveBeenCalledTimes(1);
+    const removed = lastToast(onToast);
+    expect(removed).toMatchObject({
+      tone: 'info',
+      title: 'Removed from Watch later',
+      description: vid(7).title,
+      action: { label: 'Undo' },
+    });
+    expect(r.all('.nf-toast')).toHaveLength(0);
+    act(() => {
+      removed.action!.onClick();
+    });
+    expect(titles(r, '.nf-library__list')).toEqual([vid(3).title, vid(7).title, vid(9).title]);
+    expect(setWatchLater).toHaveBeenLastCalledWith(vid(7).id, true);
+
+    // A failed removal rolls back and hands the shell a sticky error with Retry.
+    fail = true;
+    click(r.all('.nf-library__remove')[0]!);
+    await flush();
+    expect(titles(r, '.nf-library__list')).toEqual([vid(3).title, vid(7).title, vid(9).title]);
+    const failed = lastToast(onToast);
+    expect(failed).toMatchObject({
+      tone: 'error',
+      title: 'Could not remove from Watch later',
+      action: { label: 'Retry' },
+    });
+    fail = false;
+    act(() => {
+      failed.action!.onClick();
+    });
+    await flush();
+    expect(setWatchLater).toHaveBeenLastCalledWith(vid(3).id, false);
+    expect(titles(r, '.nf-library__list')).toEqual([vid(7).title, vid(9).title]);
+    expect(lastToast(onToast).title).toBe('Removed from Watch later');
+
+    // A new playlist's confirmation goes to the shell too.
+    click(buttonByText(r, 'Playlists'));
+    await flush();
+    click(buttonByText(r, 'New playlist'));
+    await flush();
+    typeInto(r.get('[role="dialog"] input[type="text"]') as HTMLInputElement, 'Kiln builds');
+    click(buttonByText(r, 'Create'));
+    await flush();
+    expect(lastToast(onToast)).toMatchObject({
+      tone: 'success',
+      title: 'Private playlist created',
+    });
+    expect(onToast).toHaveBeenCalledTimes(4);
+    expect(r.all('.nf-toast')).toHaveLength(0);
+    expect(errors).not.toHaveBeenCalled();
+  });
+
+  it('with onToast: an outcome after unmount still reaches the shell, and its action works', async () => {
+    const pending: ReturnType<typeof deferred<undefined>>[] = [];
+    const { adapter, setWatchLater } = watchLater(() => {
+      const d = deferred<undefined>();
+      pending.push(d);
+      return d.promise;
+    });
+    const onToast = vi.fn<(t: ToastItem) => void>();
+    const errors = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    const { r } = mount(adapter, { tab: 'watch-later', onToast });
+    await flush();
+    click(r.all('.nf-library__remove')[0]!);
+    click(r.all('.nf-library__remove')[0]!); // vid(7), now first
+    rendered.splice(rendered.indexOf(r), 1);
+    r.unmount(); // the viewer navigated away before the relay answered
+
+    // One removal confirmed late → Undo still puts it back on the relay.
+    pending[0]!.resolve(undefined);
+    await flush();
+    const removed = lastToast(onToast);
+    expect(removed.title).toBe('Removed from Watch later');
+    removed.action!.onClick();
+    expect(setWatchLater).toHaveBeenLastCalledWith(vid(3).id, true);
+    // … and if that Undo fails, the shell hears it.
+    pending[2]!.reject(new Error('relay-down: no relays reachable'));
+    await flush();
+    expect(lastToast(onToast)).toMatchObject({ tone: 'error', title: 'Could not put it back' });
+
+    // The other failed late → its Retry still sends the removal (the list is gone, not the video).
+    pending[1]!.reject(new Error('relay-down: no relays reachable'));
+    await flush();
+    const failed = lastToast(onToast);
+    expect(failed.title).toBe('Could not remove from Watch later');
+    failed.action!.onClick();
+    expect(setWatchLater).toHaveBeenLastCalledWith(vid(7).id, false);
+    pending[3]!.resolve(undefined);
+    await flush();
+    expect(lastToast(onToast).title).toBe('Removed from Watch later');
+    expect(onToast).toHaveBeenCalledTimes(4);
+    expect(errors).not.toHaveBeenCalled();
+  });
+
+  it('without onToast: nothing is raised after unmount (unchanged)', async () => {
+    const pending = deferred<undefined>();
+    const { adapter } = watchLater(() => pending.promise);
+    const errors = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    const { r } = mount(adapter, { tab: 'watch-later' });
+    await flush();
+    click(r.all('.nf-library__remove')[0]!);
+    rendered.splice(rendered.indexOf(r), 1);
+    r.unmount();
+    pending.reject(new Error('relay-down: no relays reachable'));
+    await flush();
+    expect(r.container.childElementCount).toBe(0);
+    expect(errors).not.toHaveBeenCalled();
+  });
+
+  it('uses the latest onToast (a shell may pass a new callback on every render)', async () => {
+    const pending = deferred<undefined>();
+    const { adapter } = watchLater(() => pending.promise);
+    const first = vi.fn<(t: ToastItem) => void>();
+    const second = vi.fn<(t: ToastItem) => void>();
+    const navigate = vi.fn<(to: Route) => void>();
+    const props: LibraryProps = {
+      adapter,
+      navigate,
+      now: FIXTURE_NOW,
+      timeZone: 'UTC',
+      tab: 'watch-later',
+    };
+    const r = keep(render(createElement(Library, { ...props, onToast: first })));
+    await flush();
+    click(r.all('.nf-library__remove')[0]!);
+    r.rerender(createElement(Library, { ...props, onToast: second }));
+    pending.resolve(undefined);
+    await flush();
+    expect(first).not.toHaveBeenCalled();
+    expect(second).toHaveBeenCalledTimes(1);
   });
 });
 
