@@ -287,21 +287,6 @@
   min-width: 0;
 }
 
-/*
- * L4 workaround (reported in docs/lanes/L5-Home.md): `.nf-card__text` is a flex item with no
- * `flex-grow`, so `VideoCardSkeleton`'s percentage-width lines collapse to 0 px. Letting the
- * text column grow inside these grids restores the placeholder lines.
- */
-.nf-channelpage__item .nf-card__text {
-  flex: 1 1 auto;
-}
-
-/* Channel cards hide the channel row (`hideChannel`); the skeletons must match or the
-   grid jumps when the page arrives. */
-.nf-channelpage__item .nf-card--skeleton .nf-card__avatar {
-  display: none;
-}
-
 /* Shorts tab: 9:16 cards in a narrower grid. Kind-22 cards turn 9:16 by themselves; the
    skeleton gets the same shape here so a loading tab does not jump. */
 .nf-channelpage__shorts-grid {

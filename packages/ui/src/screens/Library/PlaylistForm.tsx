@@ -1,9 +1,10 @@
 /**
  * "New playlist" form, shown inside L4's `Sheet` by the Library screen. Title (required),
  * description (optional, rendered later through `Markdown` only) and the private toggle —
- * private NIP-51 sets are encrypted to the viewer's key, so the default is private.
+ * private NIP-51 sets are encrypted to the viewer's key, so the default is private. The Library
+ * opens it in a `Sheet` with `initialFocus="first-field"`, so focus lands in Title.
  */
-import { useEffect, useId, useRef, useState, type ReactElement } from 'react';
+import { useId, useState, type ReactElement } from 'react';
 import { Button, ErrorState } from '../../components/index.js';
 import { describeLibraryError } from './libraryFormat.js';
 
@@ -27,7 +28,6 @@ export interface PlaylistFormProps {
 
 export function PlaylistForm({ busy, error, onSubmit, onCancel }: PlaylistFormProps): ReactElement {
   const id = useId();
-  const titleRef = useRef<HTMLInputElement | null>(null);
   const [title, setTitle] = useState('');
   const [description, setDescription] = useState('');
   const [isPrivate, setPrivate] = useState(true);
@@ -37,17 +37,6 @@ export function PlaylistForm({ busy, error, onSubmit, onCancel }: PlaylistFormPr
     trimmed.length > 0 &&
     trimmed.length <= PLAYLIST_TITLE_MAX &&
     description.length <= PLAYLIST_DESCRIPTION_MAX;
-
-  // The Sheet focuses its first control (Close) when it opens; the title field is where the
-  // user wants to be, so take focus once the Sheet's own effect has run.
-  useEffect(() => {
-    const t = setTimeout(() => {
-      titleRef.current?.focus();
-    }, 0);
-    return () => {
-      clearTimeout(t);
-    };
-  }, []);
 
   const failure = error === undefined ? undefined : describeLibraryError(error);
 
@@ -66,7 +55,6 @@ export function PlaylistForm({ busy, error, onSubmit, onCancel }: PlaylistFormPr
           Title
         </label>
         <input
-          ref={titleRef}
           id={`${id}-title`}
           className="nf-library__input"
           type="text"

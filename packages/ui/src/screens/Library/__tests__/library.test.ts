@@ -633,6 +633,35 @@ describe('Library — Playlists', () => {
   });
 });
 
+describe('Library — privacy hints (ADR 0007 d)', () => {
+  it('each tab says who can see it; private lists carry the lock icon', async () => {
+    const adapter = seeded();
+    const hints: Record<string, string> = {};
+    const icons: Record<string, string | null | undefined> = {};
+    for (const t of LIBRARY_TABS) {
+      const { r } = mount(adapter, { tab: t.id });
+      await flush();
+      const hint = r.get('.nf-library__hint');
+      hints[t.id] = hint.textContent;
+      icons[t.id] = hint.querySelector('svg path')?.getAttribute('d');
+      expect(hint.querySelector('svg')?.getAttribute('aria-hidden')).toBe('true');
+    }
+    expect(hints['history']).toContain('encrypted to your key');
+    expect(hints['watch-later']).toContain('private');
+    expect(hints['watch-later']).toContain('encrypted to your key');
+    expect(hints['playlists']).toContain('public or private');
+    expect(hints['liked']).toContain('public');
+    // the lock marks the two private lists; playlists and likes use their own icons
+    expect(icons['history']).toBe(icons['watch-later']);
+    expect(icons['playlists']).not.toBe(icons['history']);
+    expect(icons['liked']).not.toBe(icons['history']);
+    const { r } = mount(adapter, { tab: 'playlists' });
+    await flush();
+    const priv = r.get('.nf-library__visibility--private svg path').getAttribute('d');
+    expect(priv).toBe(icons['history']);
+  });
+});
+
 describe('Library — Liked', () => {
   it('shows liked videos in a grid (shorts shelved) with prices; opening routes by kind', async () => {
     const { r, navigate } = mount(seeded(), { tab: 'liked' });

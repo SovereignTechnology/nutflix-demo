@@ -9,9 +9,14 @@
  *   … screenshots -- --filter videocard           # only stories whose id contains the text
  *   … screenshots -- --themes light               # default: light,dark
  *
- * Uses playwright-core against the LOCAL ungoogled-chromium (ADR 0005 dependency approval):
- * no browser download, no `--no-sandbox` — the AppArmor profile grants the binary userns.
- * Override the binary with NUTFLIX_CHROMIUM=/path/to/chrome.
+ * Uses playwright-core against a LOCAL Chromium (ADR 0005 dependency approval): no browser
+ * download, no `--no-sandbox`. The binary is NUTFLIX_CHROMIUM when set, else the ungoogled-chromium
+ * path below, else the newest already-installed `~/.cache/ms-playwright/chromium-*` build. It is
+ * always a plain `launch()` with Playwright's own throwaway profile — never a real browser profile.
+ *
+ * Pruning is per FILE: a PNG is deleted only when no story in the current index produces it, so
+ * a `--filter` / `--themes` run never deletes PNGs it did not regenerate. Lazy images get a
+ * bounded wait (IMAGE_WAIT_MS per story, then the PNG is taken anyway with a warning).
  */
 import { spawnSync } from 'node:child_process';
 import {
@@ -25,6 +30,7 @@ import {
 } from 'node:fs';
 import { createServer, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
+import { homedir } from 'node:os';
 import { dirname, extname, join, normalize, resolve, sep } from 'node:path';
 import process from 'node:process';
 import { fileURLToPath } from 'node:url';
@@ -42,6 +48,41 @@ function outDirFor(title: string): string {
   return join(SCREENS_ROOT, group?.toLowerCase() === 'screens' ? leaf : 'components');
 }
 const DEFAULT_CHROMIUM = '/home/gateway/Applications/ungoogled-chromium/current/chrome';
+/** Upper bound on waiting for fonts + images per story; a hung lazy image cannot stall the run. */
+const IMAGE_WAIT_MS = 10_000;
+/** Themes a PNG may carry; used to recognise our own files when pruning. */
+const KNOWN_THEMES: readonly string[] = ['light', 'dark'];
+
+/**
+ * NUTFLIX_CHROMIUM wins. Otherwise the ungoogled-chromium path, then the newest Playwright
+ * build already on disk (`~/.cache/ms-playwright/chromium-<revision>/chrome-linux64/chrome`,
+ * highest revision first). Nothing is downloaded.
+ */
+function findChromium(): string {
+  const fromEnv = process.env['NUTFLIX_CHROMIUM'];
+  if (fromEnv !== undefined && fromEnv !== '') {
+    if (!existsSync(fromEnv)) throw new Error(`NUTFLIX_CHROMIUM=${fromEnv} does not exist`);
+    return fromEnv;
+  }
+  if (existsSync(DEFAULT_CHROMIUM)) return DEFAULT_CHROMIUM;
+  const cache = join(homedir(), '.cache', 'ms-playwright');
+  const builds = existsSync(cache)
+    ? readdirSync(cache)
+        .map((d) => /^chromium-(\d+)$/.exec(d))
+        .filter((m): m is RegExpExecArray => m !== null)
+        .map((m) => ({ rev: Number(m[1]), bin: join(cache, m[0], 'chrome-linux64', 'chrome') }))
+        .filter((b) => existsSync(b.bin))
+        .sort((a, b) => b.rev - a.rev)
+    : [];
+  const newest = builds[0];
+  if (newest === undefined) {
+    throw new Error(
+      `no chromium: ${DEFAULT_CHROMIUM} is missing and ${cache} has no chromium-*/chrome-linux64/chrome; set NUTFLIX_CHROMIUM`,
+    );
+  }
+  log(`using ${newest.bin} (${DEFAULT_CHROMIUM} not found)`);
+  return newest.bin;
+}
 
 interface StoryEntry {
   readonly type: string;
@@ -137,18 +178,24 @@ function kebab(s: string): string {
     .toLowerCase();
 }
 
+/** Where a story's PNG goes for a theme: `<dir>/<Component>--<state>--<theme>.png`. */
+function pngPath(story: StoryEntry, theme: string): string {
+  const component = story.title.split('/').pop() ?? story.title;
+  const state = kebab(story.id.slice(story.id.lastIndexOf('--') + 2));
+  return join(outDirFor(story.title), `${component}--${state}--${theme}.png`);
+}
+
 async function main(): Promise<void> {
   const args = parseArgs(process.argv.slice(2));
-  const executablePath = process.env['NUTFLIX_CHROMIUM'] ?? DEFAULT_CHROMIUM;
-  if (!existsSync(executablePath)) throw new Error(`chromium not found at ${executablePath}`);
+  const executablePath = findChromium();
 
   const staticDir = args.staticDir ?? buildStorybook();
   const indexPath = join(staticDir, 'index.json');
   const index = JSON.parse(readFileSync(indexPath, 'utf8')) as {
     entries: Record<string, StoryEntry>;
   };
-  const stories = Object.values(index.entries)
-    .filter((e) => e.type === 'story')
+  const allStories = Object.values(index.entries).filter((e) => e.type === 'story');
+  const stories = allStories
     .filter((e) => (args.filter ? e.id.includes(args.filter) : true))
     .sort((a, b) => a.id.localeCompare(b.id));
   if (stories.length === 0) throw new Error('no stories in index.json');
@@ -174,9 +221,8 @@ async function main(): Promise<void> {
         log(`page error: ${err.message}`);
       });
       for (const story of stories) {
-        const component = story.title.split('/').pop() ?? story.title;
-        const state = kebab(story.id.slice(story.id.lastIndexOf('--') + 2));
-        const file = `${component}--${state}--${theme}.png`;
+        const target = pngPath(story, theme);
+        const file = target.slice(target.lastIndexOf(sep) + 1);
         const url = `${origin}/iframe.html?id=${encodeURIComponent(story.id)}&viewMode=story&globals=theme:${theme}`;
         await p.goto(url, { waitUntil: 'load' });
         const frame = p.locator('[data-nf-story]').first();
@@ -186,11 +232,14 @@ async function main(): Promise<void> {
           content:
             '*, *::before, *::after { animation: none !important; transition: none !important; caret-color: transparent !important; }',
         });
-        await p.evaluate(async () => {
-          await document.fonts.ready;
+        // Lazy images below the fold would never load on their own; ask for them now, and
+        // never wait longer than IMAGE_WAIT_MS — a stuck image must not hang the run.
+        const pending = await p.evaluate(async (limitMs: number): Promise<number> => {
           const imgs = Array.from(document.images);
-          await Promise.all(
-            imgs.map(
+          for (const img of imgs) if (img.loading === 'lazy') img.loading = 'eager';
+          const settled = Promise.all([
+            document.fonts.ready,
+            ...imgs.map(
               (img) =>
                 new Promise<void>((done) => {
                   if (img.complete) {
@@ -205,13 +254,21 @@ async function main(): Promise<void> {
                   });
                 }),
             ),
-          );
-        });
+          ]).then(() => 0);
+          const timeout = new Promise<number>((done) => {
+            setTimeout(() => {
+              done(imgs.filter((img) => !img.complete).length);
+            }, limitMs);
+          });
+          return Promise.race([settled, timeout]);
+        }, IMAGE_WAIT_MS);
+        if (pending > 0) {
+          log(`  warning: ${file}: ${pending} image(s) still loading after ${IMAGE_WAIT_MS} ms`);
+        }
         await p.waitForTimeout(120);
         const dir = outDirFor(story.title);
         mkdirSync(dir, { recursive: true });
         dirs.add(dir);
-        const target = join(dir, file);
         await frame.screenshot({ path: target, type: 'png' });
         written.add(target);
         log(`  ${file}`);
@@ -223,13 +280,21 @@ async function main(): Promise<void> {
     server.close();
   }
 
-  // Prune PNGs from earlier runs that no story produces any more (only our own naming, only
-  // in directories this run wrote to — a `--filter` run never touches other screens' PNGs).
+  // Prune per FILE: delete a PNG (our own `A--b--<theme>.png` naming, only in directories this
+  // run wrote to) only when NO story in the whole index produces it for any theme — i.e. its
+  // story was renamed or removed. PNGs of stories a `--filter` or `--themes` run skipped stay.
+  const expected = new Set<string>();
+  for (const story of allStories) {
+    for (const theme of new Set([...KNOWN_THEMES, ...args.themes])) {
+      expected.add(pngPath(story, theme));
+    }
+  }
   let pruned = 0;
   for (const dir of dirs) {
     for (const f of readdirSync(dir)) {
-      if (f.endsWith('.png') && f.includes('--') && !written.has(join(dir, f))) {
-        unlinkSync(join(dir, f));
+      const path = join(dir, f);
+      if (f.endsWith('.png') && f.includes('--') && !expected.has(path)) {
+        unlinkSync(path);
         pruned += 1;
       }
     }

@@ -60,8 +60,8 @@ import {
   Skeleton,
   VideoCard,
   VideoCardSkeleton,
-  cheapestRenditionSats,
   cx,
+  defaultRenditionSats,
   formatInteger,
   formatSats,
   parseMarkdown,
@@ -631,7 +631,7 @@ export function Channel({
     >
       {Array.from({ length: count }, (_, i) => (
         <li key={i} className="nf-channelpage__item">
-          <VideoCardSkeleton />
+          <VideoCardSkeleton hideChannel />
         </li>
       ))}
     </ul>
@@ -720,7 +720,7 @@ export function Channel({
           {videos.more === 'loading'
             ? Array.from({ length: 4 }, (_, i) => (
                 <li key={`more-${String(i)}`} className="nf-channelpage__item" aria-hidden="true">
-                  <VideoCardSkeleton />
+                  <VideoCardSkeleton hideChannel />
                 </li>
               ))
             : null}
@@ -760,10 +760,11 @@ export function Channel({
         </span>
       );
     }
+    // The first video's DEFAULT rendition — what play(id) charges — with no "from" (ADR 0007 c).
     const price = firstVideo
-      ? cheapestRenditionSats(firstVideo.renditions, firstVideo.price)
+      ? defaultRenditionSats(firstVideo.renditions, firstVideo.price)
       : undefined;
-    if (!firstVideo || !price) {
+    if (!firstVideo || price === undefined) {
       // empty set, or its first video is gone: nothing to play, so nothing play-shaped
       return (
         <span className="nf-channelpage__playlist-thumb" aria-hidden="true">
@@ -776,7 +777,7 @@ export function Channel({
     }
     const image = thumbOf(firstVideo);
     const thumb = imageFor(image?.url, image?.sha256);
-    const priceText = `${price.from ? 'from ' : ''}${formatSats(price.sats)}`;
+    const priceText = formatSats(price);
     return (
       <button
         type="button"
@@ -798,13 +799,12 @@ export function Channel({
         {/* price first (DOM order), then the play affordance */}
         <SatsBadge
           className="nf-channelpage__playlist-price"
-          sats={price.sats}
+          sats={price}
           variant="price"
           size="sm"
           overlay
           compact
           label={`First video ${priceText}`}
-          {...(price.from ? { prefix: 'from' } : {})}
         />
         {count}
         <span className="nf-channelpage__playlist-play" aria-hidden="true">
@@ -872,7 +872,8 @@ export function Channel({
           const firstVideo = first === undefined ? undefined : firstVideos[first];
           // Same rule as the thumbnail: the title only plays once the price is known.
           const playTarget =
-            firstVideo && cheapestRenditionSats(firstVideo.renditions, firstVideo.price)
+            firstVideo &&
+            defaultRenditionSats(firstVideo.renditions, firstVideo.price) !== undefined
               ? firstVideo
               : undefined;
           const titleId = `${id}-pl-${String(i)}`;

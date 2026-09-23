@@ -2,9 +2,10 @@
  * Watch screen (build-plan §6.1 row "Watch", §6.2 player behaviours).
  *
  * Layout follows YouTube (design brief: "clean, like the mainstream sites"): a 16:9 stage,
- * title, channel row (Subscribe + "sats to creator"), like / nutzap / overflow (save, keyboard
- * shortcuts, report), the description and NIP-22 comments through the Markdown subset only,
- * and an "Up next" rail (optional playlist panel, related videos, a Shorts shelf).
+ * title, channel row (Subscribe + "sats to creator"), like + dislike with both counts / nutzap /
+ * overflow (save, keyboard shortcuts, report), the description and NIP-22 comments through the
+ * Markdown subset only, and an "Up next" rail (optional playlist panel, related videos, a
+ * Shorts shelf).
  *
  * Money rules (build-plan §6.2 "buffer = money", execution plan Stage-2 "price shown vs price
  * charged"):
@@ -53,6 +54,7 @@ import {
   IconButton,
   Markdown,
   Player,
+  ReactionButtons,
   SatsBadge,
   Skeleton,
   SkeletonLines,
@@ -67,6 +69,9 @@ import {
   keyboardAction,
   shortPubkey,
   mintHost,
+  reactionStateOf,
+  reactionStep,
+  type MyReaction,
   type PlayerAction,
   type PlayerState,
   type TimeRange,
@@ -515,12 +520,11 @@ export function Watch({
           return;
         }
         const signedIn = me !== null;
-        const [statsR, profileR, subsR, likedR, laterR, historyR, settingsR, balancesR] =
+        const [statsR, profileR, subsR, laterR, historyR, settingsR, balancesR] =
           await Promise.allSettled([
             adapter.stats(video.id),
             adapter.profile(video.author),
             signedIn ? adapter.subscriptions() : Promise.resolve(null),
-            signedIn ? adapter.library.liked() : Promise.resolve(null),
             signedIn ? adapter.library.watchLater() : Promise.resolve(null),
             signedIn ? adapter.library.history() : Promise.resolve(null),
             prefetchSeconds !== undefined ? Promise.resolve(null) : adapter.settings(),
@@ -532,7 +536,6 @@ export function Watch({
         const stats = ok(statsR);
         const profile = ok(profileR) ?? null;
         const subs = ok(subsR) ?? null;
-        const liked = ok(likedR) ?? null;
         const later = ok(laterR) ?? null;
         const history = ok(historyR) ?? null;
         const settings = ok(settingsR) ?? null;
@@ -558,7 +561,8 @@ export function Watch({
           avatarSrc: undefined,
           thumbSrc: undefined,
           subscribed: subs?.includes(video.author) ?? false,
-          liked: liked?.some((v) => v.id === video.id) ?? false,
+          // v4: likes, dislikes and my own reaction come with the stats (ADR 0007 b)
+          reaction: reactionStateOf(stats, signedIn),
           watchLater: later === null ? undefined : later.some((v) => v.id === video.id),
           balances,
           resumeSec,
@@ -1343,35 +1347,54 @@ export function Watch({
     [adapter, patchData, promptSignIn, pushToast],
   );
 
-  const [likeBusy, setLikeBusy] = useState(false);
-  const toggleLike = useCallback((): void => {
-    const data = dataRef.current;
-    if (data === null) return;
-    if (meRef.current === null) {
-      promptSignIn();
-      return;
-    }
-    const next = !data.liked;
-    setLikeBusy(true);
-    adapter.react(data.video.id, next ? '+' : '-').then(
-      () => {
-        if (!aliveRef.current) return;
-        setLikeBusy(false);
-        const s = dataRef.current?.stats;
-        patchData({
-          liked: next,
-          ...(s !== undefined
-            ? { stats: { ...s, reactions: Math.max(0, s.reactions + (next ? 1 : -1)) } }
-            : {}),
-        });
-      },
-      () => {
-        if (!aliveRef.current) return;
-        setLikeBusy(false);
-        pushToast('error', 'Could not register the reaction');
-      },
-    );
-  }, [adapter, patchData, promptSignIn, pushToast]);
+  // Like / dislike (ADR 0007 b). `reactionStep` decides the call: like / dislike from neutral
+  // or switching is ONE `react('+' | '-')`; pressing the active one again is `unreact` — never
+  // a `-`, which would publish a dislike. Counts move optimistically and roll back on failure.
+  const reactingRef = useRef<NostrEventId | null>(null);
+  const [reacting, setReacting] = useState<NostrEventId | null>(null);
+  const pressReaction = useCallback(
+    (pressed: MyReaction): void => {
+      const data = dataRef.current;
+      if (data === null) return;
+      if (meRef.current === null) {
+        promptSignIn();
+        return;
+      }
+      const videoId = data.video.id;
+      if (reactingRef.current === videoId) return;
+      const before = data.reaction;
+      const { call, next } = reactionStep(before, pressed);
+      reactingRef.current = videoId;
+      setReacting(videoId);
+      patchData({ reaction: next });
+      const done = (): void => {
+        if (reactingRef.current === videoId) reactingRef.current = null;
+        setReacting((cur) => (cur === videoId ? null : cur));
+      };
+      (call.method === 'unreact'
+        ? adapter.unreact(videoId)
+        : adapter.react(videoId, call.content)
+      ).then(
+        () => {
+          if (!aliveRef.current) return;
+          done();
+        },
+        () => {
+          if (!aliveRef.current) return;
+          done();
+          // Roll back only if the viewer is still on this video; its data was reloaded otherwise.
+          if (dataRef.current?.video.id === videoId) patchData({ reaction: before });
+          pushToast(
+            'error',
+            call.method === 'unreact'
+              ? `Could not remove your ${before.mine ?? 'reaction'}`
+              : `Could not register your ${pressed}`,
+          );
+        },
+      );
+    },
+    [adapter, patchData, promptSignIn, pushToast],
+  );
 
   const toggleWatchLater = useCallback((): void => {
     const data = dataRef.current;
@@ -1809,18 +1832,14 @@ export function Watch({
                     : ''}
                 </span>
               ) : null}
-              <Button
-                variant="secondary"
-                size="md"
-                pressed={data.liked}
-                loading={likeBusy}
-                aria-label={data.liked ? 'Remove your like' : 'Like this video'}
-                onClick={toggleLike}
-                className="nf-watch__like"
-              >
-                {data.liked ? 'Liked' : 'Like'}
-                {(stats?.reactions ?? 0) > 0 ? ` · ${formatInteger(stats?.reactions ?? 0)}` : ''}
-              </Button>
+              <ReactionButtons
+                likes={data.reaction.likes}
+                dislikes={data.reaction.dislikes}
+                mine={data.reaction.mine}
+                busy={reacting === video.id}
+                onReact={pressReaction}
+                className="nf-watch__reactions"
+              />
               <Button variant="accent" size="md" icon="bolt" onClick={openNutzap}>
                 Nutzap
               </Button>

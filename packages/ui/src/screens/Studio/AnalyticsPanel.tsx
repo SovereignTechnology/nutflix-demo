@@ -11,7 +11,7 @@ import {
   ErrorState,
   SatsBadge,
   Skeleton,
-  cheapestRenditionSats,
+  defaultRenditionSats,
   formatInteger,
   formatRelativeTime,
 } from '../../components/index.js';
@@ -134,7 +134,8 @@ export function AnalyticsPanel({
 
   const current = data !== null && data.for === video.id ? data : null;
   const image = video.renditions[0]?.image;
-  const price = cheapestRenditionSats(video.renditions, video.price);
+  // Price to watch = the default rendition's (ADR 0007 c); "Sats by rendition" below is earnings.
+  const price = defaultRenditionSats(video.renditions, video.price);
   const stats = current?.ok ? current.value : undefined;
   const rows = stats ? renditionRows(video, stats.satsByRendition) : [];
   const maxSats = rows.reduce((a, r) => Math.max(a, r.sats), 0);
@@ -176,9 +177,7 @@ export function AnalyticsPanel({
             {video.price.split.creator}%
           </span>
           <div className="nf-studio__inline">
-            {price ? (
-              <SatsBadge sats={price.sats} size="sm" {...(price.from ? { prefix: 'from' } : {})} />
-            ) : null}
+            {price !== undefined ? <SatsBadge sats={price} size="sm" /> : null}
             <Button
               variant="secondary"
               size="sm"

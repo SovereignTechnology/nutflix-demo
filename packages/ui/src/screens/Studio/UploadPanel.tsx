@@ -579,6 +579,14 @@ function DetailsForm(props: UploadPanelProps): ReactElement {
             {split !== undefined && price !== undefined ? (
               <SplitExamples satsPerBlock={price} split={split} />
             ) : null}
+            {/* ADR 0007 (a), lands with the Stage 2 payment code: the creator's fractional
+                remainder carries across PAYs and PAYs have a minimum size. The table above
+                stays today's per-payment rule (ADR 0005 Q1) until then. */}
+            <p className="nf-studio__hint nf-studio__split-next">
+              Coming in the next payments update: the fraction of a sat you are owed carries over to
+              the next payment, and payments have a minimum size — so over a whole video you get
+              your full share, less under 1 sat.
+            </p>
             {split?.seeder === 0 ? (
               <p className="nf-studio__warn">
                 With 0% for seeders nobody is paid to stream this video, so it only plays while your

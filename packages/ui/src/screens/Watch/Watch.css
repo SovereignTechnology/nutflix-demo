@@ -965,15 +965,6 @@
   min-width: 0;
 }
 
-/* Same L4 workaround as Home (docs/lanes/L5-Home.md), one level up for the list layout: the
-   card body AND its text column must grow, or `VideoCardSkeleton`'s percentage lines
-   collapse to 0 px beside the thumbnail. */
-.nf-watch__item .nf-card--list .nf-card__body,
-.nf-watch__item .nf-card__text {
-  flex: 1 1 auto;
-  min-width: 0;
-}
-
 /* A short in a list row (playlist / related): crop to the row's 16:9 instead of a 9:16 tower. */
 .nf-watch__list .nf-card--list.nf-card--short .nf-card__thumb {
   aspect-ratio: 16 / 9;
