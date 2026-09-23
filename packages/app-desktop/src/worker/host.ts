@@ -266,7 +266,9 @@ export class WorkerHost {
     }
     const fs = runtime.seederFs;
     await fs.mkdir(a.storage, { recursive: true });
+    // Studio work dirs (transcodes, thumbnail candidates) live here; a previous run's are dead.
     const tmpDir = fs.join(a.storage, 'tmp');
+    await runtime.mediaFs(a.storage).rm(tmpDir, { recursive: true });
     await fs.mkdir(tmpDir, { recursive: true });
     this.seeding = a.seeding;
     if (a.ffmpeg !== undefined) this.ffmpeg = a.ffmpeg;
@@ -351,7 +353,10 @@ export class WorkerHost {
       const hub = this.hub;
       if (hub === null) throw new Error('internal: fixtures without the dev pay hub');
       const fs = this.o.runtime.seederFs;
-      const dir = fs.join(live.storage, 'dev-fixtures', randomHex(8));
+      // Fixture seeders are rebuilt every run: drop the previous runs' stores first.
+      const root = fs.join(live.storage, 'dev-fixtures');
+      await this.o.runtime.mediaFs(live.storage).rm(root, { recursive: true });
+      const dir = fs.join(root, randomHex(8));
       await fs.mkdir(dir, { recursive: true });
       let bytes: Uint8Array | null = null;
       if (this.ffmpeg === null) await this.probe(false);
