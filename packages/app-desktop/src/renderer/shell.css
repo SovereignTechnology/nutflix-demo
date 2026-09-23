@@ -1,0 +1,224 @@
+/*
+ * Desktop shell layout (lane L6-A). Loaded with <link rel="stylesheet"> after @sovit/ui's
+ * ui.css (CSP style-src 'self': nothing is injected). L4 tokens only.
+ */
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  overflow: hidden;
+}
+
+.nf-shell {
+  display: grid;
+  grid-template-rows: 56px minmax(0, 1fr);
+  height: 100%;
+  background: var(--nf-color-bg);
+  color: var(--nf-color-text);
+}
+
+/* ---- header ----------------------------------------------------------------------------- */
+
+.nf-shell__header {
+  display: grid;
+  grid-template-columns: auto minmax(0, 640px) auto;
+  justify-content: space-between;
+  align-items: center;
+  gap: var(--nf-space-16);
+  padding: 0 var(--nf-space-16);
+  border-bottom: 1px solid var(--nf-color-border);
+  background: var(--nf-color-bg);
+}
+
+.nf-shell__header-start,
+.nf-shell__header-end {
+  display: flex;
+  align-items: center;
+  gap: var(--nf-space-8);
+  min-width: 0;
+}
+
+.nf-shell__brand {
+  margin-left: var(--nf-space-8);
+  padding: var(--nf-space-4) var(--nf-space-8);
+  border: 0;
+  border-radius: var(--nf-radius-md);
+  background: none;
+  color: var(--nf-color-text);
+  font: inherit;
+  font-size: var(--nf-text-xl);
+  line-height: var(--nf-line-xl);
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  cursor: pointer;
+}
+
+.nf-shell__brand:hover {
+  background: var(--nf-color-bg-hover);
+}
+
+.nf-shell__search {
+  display: flex;
+  align-items: center;
+  gap: var(--nf-space-4);
+  min-width: 0;
+}
+
+.nf-shell__search-input {
+  flex: 1 1 auto;
+  min-width: 0;
+  height: var(--nf-size-control);
+  padding: 0 var(--nf-space-16);
+  border: 1px solid var(--nf-color-border-strong);
+  border-radius: var(--nf-radius-full);
+  background: var(--nf-color-bg-subtle);
+  color: var(--nf-color-text);
+  font: inherit;
+}
+
+.nf-shell__search-input:focus-visible {
+  outline: 2px solid var(--nf-color-focus);
+  outline-offset: 0;
+}
+
+.nf-shell__avatar {
+  display: inline-flex;
+  padding: 0;
+  border: 0;
+  border-radius: var(--nf-radius-full);
+  background: none;
+  cursor: pointer;
+}
+
+/* ---- body: sidebar + screen -------------------------------------------------------------- */
+
+.nf-shell__body {
+  display: grid;
+  grid-template-columns: 220px minmax(0, 1fr);
+  min-height: 0;
+}
+
+.nf-shell__sidebar {
+  overflow-y: auto;
+  padding: var(--nf-space-8);
+  border-right: 1px solid var(--nf-color-border);
+}
+
+.nf-shell__nav {
+  margin: 0;
+  padding: var(--nf-space-8) 0;
+  list-style: none;
+}
+
+.nf-shell__nav + .nf-shell__nav {
+  border-top: 1px solid var(--nf-color-border);
+}
+
+.nf-shell__nav-item {
+  display: flex;
+  align-items: center;
+  gap: var(--nf-space-16);
+  width: 100%;
+  height: 40px;
+  padding: 0 var(--nf-space-12);
+  border: 0;
+  border-radius: var(--nf-radius-md);
+  background: none;
+  color: var(--nf-color-text);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.nf-shell__nav-item:hover {
+  background: var(--nf-color-bg-hover);
+}
+
+.nf-shell__nav-item[aria-current='page'] {
+  background: var(--nf-color-bg-active);
+  font-weight: 600;
+}
+
+/* The screen area has a definite height (Shorts fills it); screens scroll inside it. */
+.nf-shell__main {
+  min-width: 0;
+  min-height: 0;
+  height: 100%;
+  overflow-y: auto;
+}
+
+.nf-shell[data-route='shorts'] .nf-shell__main {
+  overflow: hidden;
+}
+
+/* Narrow windows: icons-only sidebar. */
+@media (max-width: 960px) {
+  .nf-shell__body {
+    grid-template-columns: 72px minmax(0, 1fr);
+  }
+  .nf-shell__nav-item span {
+    display: none;
+  }
+  .nf-shell__nav-item {
+    justify-content: center;
+    padding: 0;
+  }
+}
+
+/* ---- mini-player (shell level, survives navigation) ---------------------------------------- */
+
+.nf-shell__mini {
+  position: fixed;
+  right: var(--nf-space-16);
+  bottom: var(--nf-space-16);
+  z-index: var(--nf-z-mini-player);
+  width: 400px;
+  max-width: calc(100vw - 2 * var(--nf-space-16));
+  overflow: hidden;
+  border-radius: var(--nf-radius-lg);
+  background: var(--nf-color-bg-elevated);
+  box-shadow: var(--nf-shadow-md);
+}
+
+.nf-shell__mini-media {
+  aspect-ratio: 16 / 9;
+  background: #000;
+}
+
+.nf-shell__mini-media video {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+}
+
+.nf-shell__mini-bar {
+  display: flex;
+  align-items: center;
+  gap: var(--nf-space-4);
+  padding: var(--nf-space-8) var(--nf-space-8) var(--nf-space-8) var(--nf-space-12);
+}
+
+.nf-shell__mini-text {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.nf-shell__mini-title {
+  overflow: hidden;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.nf-shell__mini-status {
+  color: var(--nf-color-text-secondary);
+  font-size: var(--nf-text-xs);
+  line-height: var(--nf-line-xs);
+}

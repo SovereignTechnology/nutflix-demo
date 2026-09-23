@@ -1,0 +1,19 @@
+{
+  // Electron end-to-end suites (lane L6-A). Not part of `tsc -b` (the package solution does
+  // not reference it): these files run under plain Node with type stripping, only with
+  // NUTFLIX_E2E=1, and never in `npm test`. This config exists so eslint's project service
+  // type-checks them.
+  "extends": "../../../tsconfig.base.json",
+  "compilerOptions": {
+    "composite": false,
+    "incremental": false,
+    "declaration": false,
+    "declarationMap": false,
+    "sourceMap": false,
+    "noEmit": true,
+    "allowImportingTsExtensions": true,
+    "lib": ["ES2023", "DOM"],
+    "types": ["node"]
+  },
+  "include": ["./**/*.ts"]
+}

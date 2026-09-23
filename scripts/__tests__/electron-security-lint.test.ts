@@ -74,12 +74,16 @@ describe('scripts/electron-security-lint.mjs', () => {
     ).toBe(1);
   });
 
-  it('packages/app-desktop/src passes today (no Electron code yet) and reports zero windows', () => {
+  // Lane L6-A added the app's one window (src/main/window.ts). Exactly one: a second window or
+  // webPreferences object in src/ must be a deliberate, reviewed change that updates this test.
+  it('packages/app-desktop/src passes: exactly one window, literal posture (lane L6-A)', () => {
     const r = runNode('electron-security-lint.mjs', [
       join(repoRoot, 'packages', 'app-desktop', 'src'),
     ]);
     expect(r.status, r.stderr).toBe(0);
-    expect(r.stderr).toMatch(/0 window constructor\(s\)/);
+    expect(r.stderr).toMatch(
+      / 1 window constructor\(s\), 1 webPreferences object\(s\), 0 violations/,
+    );
   });
 
   it('usage errors exit 2', () => {

@@ -1,0 +1,849 @@
+/**
+ * `DesktopNetworkAdapter` — the real contracts-v4 `NetworkAdapter` of the desktop shell, running
+ * in the host `utilityProcess` (design §1 Host row, §6 L6-B).
+ *
+ *   reads     L1 (`NostrClient` over a `PoolLike`: `SimplePoolAdapter` in production) — every
+ *             event through `verifyIncoming`; or `FixtureCatalog` behind `--dev-fixtures`
+ *   writes    need a `Signer` (seam in `./identity.ts`); Stage 1 has none → `no-signer: …`
+ *   unreact   NIP-09 kind-5 of the viewer's OWN kind-7 ids on the video, never a `-` (SE-5)
+ *   play      worker `play.open` → a `HostPlaySession` (host-minted sid; the blob-server link
+ *             goes to main as `media-link`, never into a result)
+ *   money     `MockWallet` behind `--dev-mocks`, debited from the worker's `spend` events;
+ *             nothing executes an auto top-up (SE-4)
+ *   settings  atomic JSON in userData
+ *   images    `./images/images.ts` (T16)
+ *
+ * The D3/D5 methods (`wallet.send/receive/p2pkPubkey/keyset`) exist here because the contract
+ * has them, but nothing on the IPC path routes to them (`dispatch.ts` has no entry).
+ */
+import { randomBytes } from 'node:crypto';
+import { basename } from 'node:path';
+
+import type {
+  Comment,
+  FeedQuery,
+  MintUrl,
+  NetworkAdapter,
+  Notification,
+  NostrEventId,
+  NostrPubkey,
+  Page,
+  Playlist,
+  PlaySession,
+  Profile,
+  Sats,
+  SearchFilters,
+  SeederStatus,
+  Settings,
+  Sha256Hex,
+  SignerStatus,
+  UnixSeconds,
+  Unsubscribe,
+  UploadInput,
+  UploadProgress,
+  VideoManifest,
+  VideoStats,
+  Wallet,
+} from '@sovit/core';
+import { NostrKind, manifest, nostr } from '@sovit/core';
+
+import { toHex } from '../ipc/codec.js';
+import { IpcError } from '../ipc/errors.js';
+import type { FfmpegStatus, ImageMime, NfMediaImgUrl, UploadId } from '../ipc/protocol.js';
+import { IMAGE_MIMES } from '../ipc/protocol.js';
+import { rehydrate } from '../ipc/wiremap.js';
+import type {
+  PublishDraft,
+  ThumbnailHex,
+  UploadMeta,
+  WorkerEvent,
+} from '../ipc/worker-protocol.js';
+import type { CatalogSource, SearchQuery } from './catalog/catalog.js';
+import { NostrCatalog } from './catalog/catalog.js';
+import type { FixtureCatalog } from './catalog/fixture-catalog.js';
+import { fail, hostError } from './errors.js';
+import type { IdentityProvider } from './identity.js';
+import type { ImageService } from './images/images.js';
+import type { Logger } from './log.js';
+import { redact } from './log.js';
+import type { DesktopConfig, SettingsStore } from './settings/settings.js';
+import { autoTopUpDue } from './settings/settings.js';
+import type { WorkerCall } from './sessions.js';
+import { HostPlaySession, SessionRegistry } from './sessions.js';
+import { buildUnreactDeletion, fetchReactionSummary, ownReactionIds } from './social/reactions.js';
+import type { WalletProvider } from './wallet.js';
+import { DEV_BALANCE_SATS } from './wallet.js';
+
+interface HistoryItem {
+  readonly video: VideoManifest;
+  readonly positionSec: number;
+  readonly at: UnixSeconds;
+}
+type AnalyticsResult = VideoStats & { readonly satsByRendition: ReadonlyMap<string, Sats> };
+
+export interface DesktopAdapterOptions {
+  readonly settings: SettingsStore;
+  readonly desktop: DesktopConfig;
+  /** The relay port: `SimplePoolAdapter` in production, `FakeRelayPool` in tests/offline dev. */
+  readonly pool: nostr.PoolLike;
+  readonly identity: IdentityProvider;
+  readonly wallet: WalletProvider;
+  readonly images: ImageService;
+  /** `WorkerSupervisor.request`, bound. */
+  readonly worker: WorkerCall;
+  /** Sends `HostOut` `media-link` to main (`url: null` revokes). */
+  readonly mediaLink: (token: string, url: string | null) => void;
+  readonly log: Logger;
+  /** `--dev-fixtures` (only ever given together with `--dev-mocks`). */
+  readonly fixtures?: FixtureCatalog;
+  readonly random?: (n: number) => Uint8Array;
+  readonly now?: () => UnixSeconds;
+  /** Relay wait per query, ms. */
+  readonly maxWaitMs?: number;
+}
+
+/** Per page in the in-memory paged lists (history). */
+const LIST_PAGE = 20;
+/** Comments per page (the mock's size). */
+const COMMENTS_PAGE = 20;
+/** Upper bound on comments counted for `stats().comments` (one relay query). */
+const MAX_COMMENTS_COUNTED = 500;
+/** How often (ms) a due-but-not-executed auto top-up is logged per mint. */
+const TOP_UP_LOG_EVERY_MS = 60_000;
+
+/** Watch's report reasons → NIP-56 report types. */
+const REPORT_TYPE_OF: Readonly<Record<string, nostr.ReportType>> = {
+  spam: 'spam',
+  sexual: 'nudity',
+  legal: 'illegal',
+};
+
+export class DesktopNetworkAdapter implements NetworkAdapter {
+  readonly platform = 'desktop' as const;
+  readonly wallet: Wallet;
+
+  private readonly o: DesktopAdapterOptions;
+  private readonly log: Logger;
+  private readonly random: (n: number) => Uint8Array;
+  private readonly now: () => UnixSeconds;
+  readonly sessions = new SessionRegistry();
+  private clientCache: {
+    readonly relays: Settings['relays'];
+    readonly signer: unknown;
+    readonly client: nostr.NostrClient;
+  } | null = null;
+  private readonly nostrCatalog: NostrCatalog;
+  private readonly seederListeners = new Set<(s: SeederStatus) => void>();
+  /** uploadId → the owner (webContents) that started it. */
+  private readonly uploads = new Map<string, { readonly owner: number }>();
+  /** `${owner}:${uploadId}` → progress listeners (subscribed before the upload starts). */
+  private readonly uploadListeners = new Map<string, Set<(p: UploadProgress) => void>>();
+  private readonly topUpLogged = new Map<string, number>();
+  private readonly devCredited = new Set<string>();
+
+  constructor(opts: DesktopAdapterOptions) {
+    this.o = opts;
+    this.log = opts.log.child('adapter');
+    this.random = opts.random ?? ((n) => randomBytes(n));
+    this.now = opts.now ?? nostr.nowSeconds;
+    this.wallet = opts.wallet.wallet;
+    this.nostrCatalog = new NostrCatalog(() => this.client());
+    this.wallet.onChange((e) => {
+      if (e.type === 'balance') this.checkAutoTopUp(e.mint, e.balance);
+    });
+  }
+
+  // ---- plumbing --------------------------------------------------------------------------
+
+  /** The L1 client for the current relays + signer (rebuilt when either changes). */
+  private client(): nostr.NostrClient {
+    const relays = this.o.settings.get().relays;
+    const signer = this.o.identity.signer();
+    const c = this.clientCache;
+    if (c !== null && c.relays === relays && c.signer === signer) return c.client;
+    const client = new nostr.NostrClient({
+      pool: this.o.pool,
+      relays,
+      ...(signer === undefined ? {} : { signer }),
+      now: this.now,
+      ...(this.o.maxWaitMs === undefined ? {} : { maxWaitMs: this.o.maxWaitMs }),
+      onDropped: (reason) => {
+        this.log.debug('dropped an event at the verification boundary', { reason });
+      },
+    });
+    this.clientCache = { relays, signer, client };
+    return client;
+  }
+
+  private catalog(): CatalogSource {
+    return this.o.fixtures ?? this.nostrCatalog;
+  }
+
+  /** L1 errors → the prefixes the screens classify by. */
+  private mapNostrError(e: unknown): Error {
+    if (e instanceof IpcError) return e;
+    if (e instanceof nostr.NoSignerError) return hostError('no-signer', 'no signer connected');
+    if (e instanceof nostr.PublishError)
+      return hostError('relay-down', 'no write relay accepted the event');
+    this.log.warn('relay request failed');
+    return hostError('relay-down', 'relay request failed');
+  }
+
+  /** A relay read. No read relay configured is `relay-down`, like every relay failure. */
+  private async read<T>(fn: (c: nostr.NostrClient) => Promise<T>): Promise<T> {
+    const c = this.client();
+    if (c.readRelays.length === 0) fail('relay-down', 'no read relays configured');
+    try {
+      return await fn(c);
+    } catch (e) {
+      throw this.mapNostrError(e);
+    }
+  }
+
+  /** A catalogue read: the fixture catalogue needs no relay. */
+  private async fromCatalog<T>(fn: (cat: CatalogSource) => Promise<T>): Promise<T> {
+    if (this.o.fixtures) return fn(this.o.fixtures);
+    return this.read(() => fn(this.nostrCatalog));
+  }
+
+  /** A signed write. The signer check comes first: nothing is fetched or built without one. */
+  private async write<T>(fn: (c: nostr.NostrClient, me: NostrPubkey) => Promise<T>): Promise<T> {
+    const signer = this.o.identity.signer();
+    if (signer === undefined) fail('no-signer', 'no signer connected (sign in to do this)');
+    const c = this.client();
+    if (c.writeRelays.length === 0) fail('relay-down', 'no write relays configured');
+    try {
+      const me = await signer.getPublicKey();
+      return await fn(c, me);
+    } catch (e) {
+      throw this.mapNostrError(e);
+    }
+  }
+
+  private hex(bytes: number): string {
+    return toHex(this.random(bytes));
+  }
+
+  private async requireVideo(id: NostrEventId): Promise<VideoManifest> {
+    const v = await this.video(id);
+    if (v === null) fail('not-found', 'video not found');
+    return v;
+  }
+
+  private static ref(v: VideoManifest): nostr.EventRef {
+    return { id: v.id, pubkey: v.author, kind: v.kind };
+  }
+
+  // ---- identity --------------------------------------------------------------------------
+
+  signer(): Promise<SignerStatus> {
+    return this.o.identity.status();
+  }
+
+  me(): Promise<NostrPubkey | null> {
+    return this.o.identity.me();
+  }
+
+  profile(pubkey: NostrPubkey): Promise<Profile | null> {
+    return this.fromCatalog((cat) => cat.profile(pubkey));
+  }
+
+  // ---- catalog ---------------------------------------------------------------------------
+
+  async feed(q: FeedQuery): Promise<Page<VideoManifest>> {
+    const viewer = await this.me();
+    return this.fromCatalog((cat) => cat.feed(q, viewer));
+  }
+
+  video(id: NostrEventId): Promise<VideoManifest | null> {
+    return this.fromCatalog((cat) => cat.video(id));
+  }
+
+  async stats(id: NostrEventId): Promise<VideoStats> {
+    const video = await this.video(id);
+    const viewer = await this.me();
+    const [summary, paid, comments] = await this.read((c) =>
+      Promise.all([
+        fetchReactionSummary(c, id, viewer),
+        nostr.fetchPaidStats(c, id),
+        countComments(c, id),
+      ]),
+    );
+    const seedersOnline = video === null ? 0 : await this.catalog().seedersOnline(video);
+    let emoji = 0;
+    for (const n of summary.emoji.values()) emoji += n;
+    const mine = summary.mine?.kind;
+    return {
+      paidViews: paid.paidViews,
+      satsToCreator: paid.paidSats,
+      reactions: summary.likes + summary.dislikes + emoji,
+      likes: summary.likes,
+      dislikes: summary.dislikes,
+      ...(mine === 'like' || mine === 'dislike' ? { myReaction: mine } : {}),
+      comments,
+      seedersOnline,
+    };
+  }
+
+  related(id: NostrEventId, limit = 6): Promise<readonly VideoManifest[]> {
+    return this.fromCatalog((cat) => cat.related(id, limit));
+  }
+
+  search(q: {
+    readonly text: string;
+    readonly cursor?: string;
+    readonly filters?: SearchFilters;
+  }): Promise<Page<VideoManifest>> {
+    const query: SearchQuery = q;
+    return this.fromCatalog((cat) => cat.search(query));
+  }
+
+  // ---- social ----------------------------------------------------------------------------
+
+  comments(videoId: NostrEventId, sort: 'new' | 'top', cursor?: string): Promise<Page<Comment>> {
+    return this.read((c) =>
+      nostr.fetchComments(c, videoId, { sort, cursor, limit: COMMENTS_PAGE }),
+    );
+  }
+
+  comment(videoId: NostrEventId, content: string, parent?: NostrEventId): Promise<Comment> {
+    return this.write(async (c) => {
+      const video = await this.requireVideo(videoId);
+      let parentRef: nostr.EventRef | undefined;
+      if (parent !== undefined) {
+        const ev = await c.queryOne({ ids: [parent], kinds: [NostrKind.Comment] });
+        const pc = ev === null ? null : nostr.parseComment(ev);
+        if (pc?.rootId !== videoId) fail('not-found', 'parent comment not found');
+        parentRef = { id: pc.id, pubkey: pc.author, kind: NostrKind.Comment };
+      }
+      return nostr.postComment(c, {
+        video: DesktopNetworkAdapter.ref(video),
+        content,
+        ...(parentRef === undefined ? {} : { parent: parentRef }),
+      });
+    });
+  }
+
+  react(videoId: NostrEventId, reaction: string): Promise<void> {
+    return this.write(async (c) => {
+      const video = await this.requireVideo(videoId);
+      await nostr.react(c, DesktopNetworkAdapter.ref(video), reaction);
+      // The private "liked" set mirrors our kind-7 likes for Library › Liked.
+      await nostr.setLiked(c, videoId, nostr.classifyReaction(reaction) === 'like');
+    });
+  }
+
+  /**
+   * SE-5: a NIP-09 deletion request for the viewer's OWN kind-7 events on `videoId` (every one
+   * of them, so an older like cannot resurface), never a `-` reaction. No own reaction → no
+   * event at all.
+   */
+  unreact(videoId: NostrEventId): Promise<void> {
+    return this.write(async (c, me) => {
+      const ids = await ownReactionIds(c, me, videoId);
+      if (ids.length > 0) await c.publish(buildUnreactDeletion(ids, c.now()));
+      await nostr.setLiked(c, videoId, false);
+    });
+  }
+
+  nutzap(_videoId: NostrEventId, _amount: Sats, _mint: MintUrl, _comment?: string): Promise<void> {
+    // Order matters for the screens: signed out is `no-signer`, not a payments error.
+    if (this.o.identity.signer() === undefined)
+      return Promise.reject(hostError('no-signer', 'no signer connected (sign in to zap)'));
+    return Promise.reject(
+      hostError('payments-unavailable', 'nutzaps need the Stage 2 wallet and payment engine'),
+    );
+  }
+
+  subscribe(channel: NostrPubkey): Promise<void> {
+    return this.write(async (c) => {
+      await nostr.setSubscribed(c, channel, true);
+    });
+  }
+
+  unsubscribe(channel: NostrPubkey): Promise<void> {
+    return this.write(async (c) => {
+      await nostr.setSubscribed(c, channel, false);
+    });
+  }
+
+  async subscriptions(): Promise<readonly NostrPubkey[]> {
+    const me = await this.me();
+    if (me === null || this.o.fixtures) return [];
+    return this.read(async (c) => (await nostr.fetchSubscriptions(c, me)).pubkeys);
+  }
+
+  report(videoId: NostrEventId, reason: string): Promise<void> {
+    return this.write(async (c) => {
+      const video = await this.requireVideo(videoId);
+      const known = (nostr.REPORT_TYPES as readonly string[]).includes(reason)
+        ? (reason as nostr.ReportType)
+        : undefined;
+      const type = REPORT_TYPE_OF[reason] ?? known ?? 'other';
+      await nostr.report(c, { target: DesktopNetworkAdapter.ref(video), type, reason });
+    });
+  }
+
+  // ---- library ---------------------------------------------------------------------------
+
+  readonly library: NetworkAdapter['library'] = {
+    history: (cursor?: string): Promise<Page<HistoryItem>> =>
+      this.read(async (c) => {
+        if (!c.hasSigner) return { items: [] };
+        const entries = await nostr.fetchHistory(c);
+        const start = nostr.decodeOffsetCursor(cursor);
+        const slice = entries.slice(start, start + LIST_PAGE);
+        const videos = new Map(
+          (await this.catalogVideos(slice.map((e) => e.videoId))).map((v) => [v.id as string, v]),
+        );
+        const items: HistoryItem[] = slice.flatMap((e) => {
+          const video = videos.get(e.videoId);
+          return video ? [{ video, positionSec: e.positionSec, at: e.at }] : [];
+        });
+        const end = start + slice.length;
+        return end < entries.length ? { items, next: nostr.encodeOffsetCursor(end) } : { items };
+      }),
+    recordProgress: (videoId: NostrEventId, positionSec: number): Promise<void> =>
+      this.write((c) => nostr.recordProgress(c, videoId, positionSec)),
+    watchLater: (): Promise<readonly VideoManifest[]> =>
+      this.read(async (c) =>
+        c.hasSigner ? this.catalogVideos(await nostr.fetchWatchLater(c)) : [],
+      ),
+    setWatchLater: (videoId: NostrEventId, on: boolean): Promise<void> =>
+      this.write((c) => nostr.setWatchLater(c, videoId, on)),
+    playlists: async (author?: NostrPubkey): Promise<readonly Playlist[]> => {
+      const who = author ?? (await this.me());
+      if (who === null) return [];
+      return this.read((c) => nostr.fetchPlaylists(c, who));
+    },
+    savePlaylist: (
+      p: Omit<Playlist, 'id' | 'author'> & { readonly id?: string },
+    ): Promise<Playlist> =>
+      this.write((c) =>
+        nostr.savePlaylist(c, {
+          id: p.id ?? `pl-${this.hex(8)}`,
+          title: p.title,
+          ...(p.description === undefined ? {} : { description: p.description }),
+          videoIds: p.videoIds,
+          isPrivate: p.isPrivate,
+        }),
+      ),
+    liked: (): Promise<readonly VideoManifest[]> =>
+      this.read(async (c) => (c.hasSigner ? this.catalogVideos(await nostr.fetchLiked(c)) : [])),
+  };
+
+  private catalogVideos(ids: readonly NostrEventId[]): Promise<VideoManifest[]> {
+    return ids.length === 0 ? Promise.resolve([]) : this.catalog().videos(ids);
+  }
+
+  // ---- playback --------------------------------------------------------------------------
+
+  play(videoId: NostrEventId, rendition?: string): Promise<PlaySession> {
+    return this.openSession(0, videoId, rendition);
+  }
+
+  /**
+   * Opens a paid session for `owner` (a webContents id; 0 = in-process). Backstop: every other
+   * unpaused session of the same owner is paused before the worker opens this one, and again
+   * once it is registered (two concurrent opens cannot both end up playing).
+   */
+  async openSession(
+    owner: number,
+    videoId: NostrEventId,
+    label?: string,
+    carry?: { readonly prefetchSeconds: number; readonly paused: boolean },
+  ): Promise<HostPlaySession> {
+    const video = await this.requireVideo(videoId);
+    const r =
+      label === undefined ? video.renditions[0] : video.renditions.find((x) => x.label === label);
+    if (r === undefined)
+      fail('not-found', label === undefined ? 'video has no renditions' : 'no such rendition');
+    await this.checkBalance(video);
+    const sid = this.hex(16) as HostPlaySession['sid'];
+    const token = this.hex(32);
+    await this.sessions.pauseOthers({ owner, sid });
+    const prefetchSeconds = carry?.prefetchSeconds ?? this.o.settings.get().prefetchSeconds;
+    const res = await this.o.worker('play.open', {
+      sid,
+      videoId: video.id,
+      rendition: {
+        label: r.label,
+        hyper: r.hyper,
+        size: r.size,
+        ...(r.bitrateKbps === undefined ? {} : { bitrateKbps: r.bitrateKbps }),
+      },
+      ...(video.durationSec === undefined ? {} : { durationSec: video.durationSec }),
+      policy: video.price,
+      prefetchSeconds,
+    });
+    const session = new HostPlaySession(
+      {
+        sid,
+        token,
+        owner,
+        videoId: video.id,
+        title: video.title,
+        rendition: r.label,
+        policy: video.price,
+        prefetchSeconds,
+      },
+      {
+        worker: this.o.worker,
+        mediaLink: this.o.mediaLink,
+        log: this.log,
+        registry: this.sessions,
+        reopen: (from, next) =>
+          this.openSession(from.owner, from.videoId, next, {
+            prefetchSeconds: from.prefetchSeconds,
+            paused: from.paused,
+          }),
+      },
+    );
+    this.sessions.add(session);
+    // Main learns the link BEFORE anyone learns the token (HostOut ordering, protocol.ts).
+    this.o.mediaLink(token, res.link);
+    await this.sessions.pauseOthers(session);
+    if (carry?.paused === true) await session.pauseAsync();
+    return session;
+  }
+
+  private async checkBalance(video: VideoManifest): Promise<void> {
+    if (this.o.wallet.kind === 'unavailable')
+      fail('payments-unavailable', 'no wallet in Stage 1 (run with --dev-mocks for fake sats)');
+    const mints = video.price.mints;
+    const balances = await Promise.all(mints.map((m) => this.wallet.balance(m)));
+    if (mints.length === 0 || balances.every((b) => b <= 0))
+      fail('no-balance', `no balance at ${mints[0] ?? 'any accepted mint'}`);
+  }
+
+  image(url: string, sha256?: Sha256Hex): Promise<NfMediaImgUrl> {
+    return this.o.images.image(url, sha256);
+  }
+
+  // ---- studio ----------------------------------------------------------------------------
+
+  readonly studio: NetworkAdapter['studio'] = {
+    upload: async (
+      input: UploadInput,
+      onProgress: (p: UploadProgress) => void,
+    ): Promise<VideoManifest> => {
+      if (typeof input.file !== 'string')
+        fail('invalid-argument', 'desktop uploads take a file path');
+      const uploadId = this.hex(16) as UploadId;
+      const off = this.onUploadProgress(0, uploadId, onProgress);
+      try {
+        let thumb: number | ThumbnailHex | undefined;
+        const t = input.thumbnailChoice;
+        if (typeof t === 'number') thumb = t;
+        else if (t !== undefined) {
+          if (!(IMAGE_MIMES as readonly string[]).includes(t.type))
+            fail('invalid-argument', 'thumbnail must be JPEG, PNG or WebP');
+          thumb = { hex: toHex(new Uint8Array(await t.arrayBuffer())), type: t.type as ImageMime };
+        }
+        const { file: _file, thumbnailChoice: _t, ...meta } = input;
+        return await this.upload(0, {
+          uploadId,
+          path: input.file,
+          name: basename(input.file),
+          meta,
+          ...(thumb === undefined ? {} : { thumbnailChoice: thumb }),
+        });
+      } finally {
+        off();
+      }
+    },
+    myVideos: async (cursor?: string): Promise<Page<VideoManifest>> => {
+      const me = await this.me();
+      if (me === null) return { items: [] };
+      return this.feed({
+        source: 'author',
+        author: me,
+        ...(cursor === undefined ? {} : { cursor }),
+      });
+    },
+    analytics: async (videoId: NostrEventId): Promise<AnalyticsResult> => {
+      // Real per-rendition sats need Stage 2 receipts; an empty map is the honest answer.
+      const stats = await this.stats(videoId);
+      return { ...stats, satsByRendition: new Map<string, Sats>() };
+    },
+  };
+
+  /**
+   * Starts an upload in the worker (`studio.upload`). Signing is checked FIRST: without a
+   * signer nothing is transcoded, because the result could not be published.
+   */
+  async upload(
+    owner: number,
+    input: {
+      readonly uploadId: UploadId;
+      readonly path: string;
+      readonly name: string;
+      readonly meta: UploadMeta;
+      readonly thumbnailChoice?: number | ThumbnailHex;
+    },
+  ): Promise<VideoManifest> {
+    if (this.o.identity.signer() === undefined)
+      fail('no-signer', 'no signer connected (sign in to publish)');
+    if (this.uploads.has(input.uploadId)) fail('invalid-argument', 'upload id already in use');
+    this.uploads.set(input.uploadId, { owner });
+    try {
+      return await this.o.worker('studio.upload', input);
+    } finally {
+      this.uploads.delete(input.uploadId);
+    }
+  }
+
+  /** Progress for `uploadId` as started by `owner` (may be subscribed before it starts). */
+  onUploadProgress(owner: number, uploadId: string, cb: (p: UploadProgress) => void): Unsubscribe {
+    const key = `${String(owner)}:${uploadId}`;
+    let set = this.uploadListeners.get(key);
+    if (set === undefined) {
+      set = new Set();
+      this.uploadListeners.set(key, set);
+    }
+    set.add(cb);
+    return () => {
+      const s = this.uploadListeners.get(key);
+      s?.delete(cb);
+      if (s?.size === 0) this.uploadListeners.delete(key);
+    };
+  }
+
+  /** Worker → host `studio.publish`: build, sign and publish the NIP-71 event of an upload. */
+  async publishUpload(draft: PublishDraft): Promise<VideoManifest> {
+    if (!this.uploads.has(draft.uploadId)) fail('not-found', 'no such upload in progress');
+    if (this.o.identity.signer() === undefined)
+      fail('no-signer', 'no signer connected (sign in to publish)');
+    const creatorP2pk = await this.wallet.p2pkPubkey();
+    const input: manifest.VideoManifestInput = {
+      kind: draft.meta.kind,
+      title: draft.meta.title,
+      description: draft.meta.description,
+      publishedAt: this.now(),
+      durationSec: draft.durationSec,
+      tags: draft.meta.tags,
+      // Stage 1 hosts no thumbnail (no Blossom upload yet), so renditions carry no `image`.
+      renditions: draft.renditions,
+      price: {
+        satsPerBlock: draft.meta.satsPerBlock,
+        blockSize: draft.blockSize,
+        mints: draft.meta.mints,
+        split: draft.meta.split,
+        creatorP2pk,
+      },
+      blossomServers: draft.meta.mirrorTo ?? [],
+    };
+    return this.write(async (c) => {
+      const { event } = await c.publish(manifest.buildVideoEvent(input));
+      const verified = nostr.verifyIncoming(event);
+      const parsed = verified === null ? null : manifest.parseVideoEvent(verified);
+      if (!parsed?.ok) fail('internal', 'published event did not verify');
+      return parsed.value;
+    });
+  }
+
+  /** `desktop.ffmpeg` (pre-v5 `studio.ffmpeg()`): the worker probes the configured binary. */
+  ffmpeg(recheck: boolean): Promise<FfmpegStatus> {
+    const path = this.o.desktop.ffmpeg?.ffmpeg;
+    return this.o.worker('studio.ffmpeg', { recheck, ...(path === undefined ? {} : { path }) });
+  }
+
+  // ---- seeder ----------------------------------------------------------------------------
+
+  readonly seeder: NetworkAdapter['seeder'] = {
+    status: async (): Promise<SeederStatus> => rehydrate(await this.o.worker('seeder.status', {})),
+    setEnabled: async (on: boolean): Promise<void> => {
+      const prev = this.o.settings.get();
+      await this.updateSettings({ seeding: { ...prev.seeding, enabled: on } });
+    },
+    melt: (mint: MintUrl, bolt11: string): Promise<{ paid: boolean }> =>
+      this.o.worker('seeder.melt', { mint, bolt11 }),
+    unban: (pubkey: NostrPubkey): Promise<void> => this.o.worker('seeder.unban', { pubkey }),
+    onStatus: (cb: (s: SeederStatus) => void): Unsubscribe => {
+      this.seederListeners.add(cb);
+      return () => this.seederListeners.delete(cb);
+    },
+  };
+
+  // ---- settings --------------------------------------------------------------------------
+
+  settings(): Promise<Settings> {
+    return Promise.resolve(this.o.settings.get());
+  }
+
+  /**
+   * Persists atomically, then pushes seeding changes to the worker. A worker that is down gets
+   * the new values in its next `init`, so that failure is logged, not thrown (the setting WAS
+   * saved; rejecting would make the screen show the old value).
+   */
+  async updateSettings(patch: Partial<Settings>): Promise<Settings> {
+    const prev = this.o.settings.get();
+    let next: Settings;
+    try {
+      next = await this.o.settings.update(patch);
+    } catch (e) {
+      if (e instanceof TypeError) fail('invalid-argument', 'invalid settings');
+      this.log.error('settings could not be saved');
+      fail('internal', 'settings could not be saved');
+    }
+    if (
+      next.seeding.enabled !== prev.seeding.enabled ||
+      next.seeding.diskCapBytes !== prev.seeding.diskCapBytes
+    ) {
+      try {
+        await this.o.worker('seeder.configure', next.seeding);
+      } catch {
+        this.log.warn('seeding change not pushed to the worker (applies on its next start)');
+      }
+    }
+    return next;
+  }
+
+  // ---- live ------------------------------------------------------------------------------
+
+  notifications(cb: (n: Notification) => void): Unsubscribe {
+    const state = { closed: false };
+    const isClosed = (): boolean => state.closed;
+    const unsubs: Unsubscribe[] = [];
+    const start = async (): Promise<void> => {
+      const me = await this.me();
+      if (me === null || isClosed() || this.o.fixtures) return;
+      const c = this.client();
+      if (c.readRelays.length === 0) return;
+      const since = this.now();
+      const { pubkeys } = await nostr.fetchSubscriptions(c, me);
+      if (isClosed()) return;
+      unsubs.push(
+        nostr.watchNewVideos(c, pubkeys, since, (video) => {
+          cb({ type: 'new-video', video });
+        }),
+        nostr.watchReplies(c, me, since, (pc) => {
+          cb({ type: 'reply', videoId: pc.rootId, comment: toComment(pc) });
+        }),
+      );
+    };
+    start().catch(() => {
+      this.log.debug('notifications subscription could not start');
+    });
+    return () => {
+      state.closed = true;
+      for (const u of unsubs.splice(0)) u();
+    };
+  }
+
+  // ---- worker events and lifecycle --------------------------------------------------------
+
+  /** Everything the worker announces (already guarded by the supervisor). */
+  onWorkerEvent(ev: WorkerEvent): void {
+    switch (ev.e) {
+      case 'spend': {
+        const s = this.sessions.bySessionId(ev.sid);
+        if (s === undefined) return;
+        if (!s.policy.mints.includes(ev.mint)) {
+          this.log.warn('spend at a mint the video does not accept; ignored');
+          return;
+        }
+        if (this.o.wallet.kind === 'mock')
+          this.o.wallet.wallet.credit(ev.mint, -Number(ev.amount), 'out', `streamed ${s.title}`);
+        s.emitSpend({ total: ev.total, ratePerMin: ev.ratePerMin });
+        return;
+      }
+      case 'peers':
+        this.sessions.bySessionId(ev.sid)?.emitPeers(ev.peers);
+        return;
+      case 'seeder.status': {
+        const status = rehydrate(ev.status);
+        for (const cb of this.seederListeners) cb(status);
+        return;
+      }
+      case 'upload.progress':
+        this.onUploadEvent(ev.uploadId, ev.progress);
+        return;
+      case 'dev.fixtures':
+        this.onDevFixtures(ev.videos);
+        return;
+      case 'ready':
+      case 'log':
+        return;
+    }
+  }
+
+  /** The worker died: its sessions died with it (links revoked, nothing asked of it). */
+  onWorkerDown(): void {
+    this.sessions.dropAll();
+  }
+
+  private onUploadEvent(uploadId: string, p: UploadProgress): void {
+    const rec = this.uploads.get(uploadId);
+    if (rec === undefined) return;
+    let out: UploadProgress = p;
+    if (p.stage === 'thumbnails') {
+      const candidates: string[] = [];
+      for (const path of p.candidates) {
+        try {
+          candidates.push(this.o.images.registerFile(path));
+        } catch {
+          this.log.warn('dropped a thumbnail candidate outside the worker storage');
+        }
+      }
+      out = { stage: 'thumbnails', candidates };
+    } else if (p.stage === 'error') {
+      out = { stage: 'error', message: redact(p.message) };
+    }
+    const set = this.uploadListeners.get(`${String(rec.owner)}:${uploadId}`);
+    if (set) for (const cb of set) cb(out);
+  }
+
+  private onDevFixtures(videos: readonly VideoManifest[]): void {
+    if (!this.o.fixtures) {
+      this.log.warn('dev.fixtures from the worker ignored (no --dev-fixtures)');
+      return;
+    }
+    this.o.fixtures.setLive(videos);
+    if (this.o.wallet.kind !== 'mock') return;
+    // Fake sats at every mint the live fixtures accept, once, so they are playable.
+    for (const v of videos)
+      for (const m of v.price.mints) {
+        if (this.devCredited.has(m)) continue;
+        this.devCredited.add(m);
+        void this.o.wallet.wallet.balance(m).then((b) => {
+          if (b <= 0 && this.o.wallet.kind === 'mock')
+            this.o.wallet.wallet.credit(m, DEV_BALANCE_SATS, 'in', 'dev-mocks fake sats');
+        });
+      }
+  }
+
+  /** SE-4: evaluated, logged, NEVER executed in Stage 1. */
+  private checkAutoTopUp(mint: MintUrl, balance: Sats): void {
+    if (!autoTopUpDue(this.o.settings.get(), mint, balance)) return;
+    const t = Date.now();
+    const last = this.topUpLogged.get(mint) ?? 0;
+    if (t - last < TOP_UP_LOG_EVERY_MS) return;
+    this.topUpLogged.set(mint, t);
+    this.log.info('auto top-up would be due; not executed in Stage 1');
+  }
+}
+
+function toComment(pc: nostr.ParsedComment): Comment {
+  return {
+    id: pc.id,
+    author: pc.author,
+    content: pc.content,
+    createdAt: pc.createdAt,
+    ...(pc.parent === undefined ? {} : { parent: pc.parent }),
+    reactions: 0,
+    event: pc.event,
+  };
+}
+
+/** Comments on `videoId` (one bounded query; exact below `MAX_COMMENTS_COUNTED`). */
+async function countComments(c: nostr.NostrClient, videoId: NostrEventId): Promise<number> {
+  const events = await c.query({
+    kinds: [NostrKind.Comment],
+    '#E': [videoId],
+    limit: MAX_COMMENTS_COUNTED,
+  });
+  let n = 0;
+  for (const ev of events) if (nostr.parseComment(ev)?.rootId === videoId) n++;
+  return n;
+}

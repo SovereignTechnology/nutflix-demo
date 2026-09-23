@@ -1,0 +1,108 @@
+/**
+ * Test support (not a suite): a complete host — `createHost` with a FakeWorker, L1's
+ * `FakeRelayPool`, a temp userData directory and an in-memory `HostOut` log — under plain Node.
+ */
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
+import type { RelayUrl, UnixSeconds } from '@sovit/core';
+import { nostr } from '@sovit/core';
+
+import type { HostOut } from '../../../ipc/protocol.js';
+import type { HostFlags } from '../../flags.js';
+import type { Host } from '../../host.js';
+import { createHost } from '../../host.js';
+import type { IdentityProvider } from '../../identity.js';
+import type { ImageTransport } from '../../images/net.js';
+import { memoryLogger } from '../../log.js';
+import type { FakeWorker, FakeWorkerOptions } from './fake-worker.js';
+import { FakeWorker as FakeWorkerClass, fakeSpawner } from './fake-worker.js';
+
+export const RELAY_A = 'wss://a.test' as RelayUrl;
+export const RELAY_B = 'wss://b.test' as RelayUrl;
+
+export interface Rig {
+  readonly host: Host;
+  readonly pool: nostr.FakeRelayPool;
+  readonly out: HostOut[];
+  readonly worker: () => FakeWorker;
+  readonly spawned: FakeWorker[];
+  readonly log: ReturnType<typeof memoryLogger>;
+  readonly userData: string;
+  /** Resolves once the (current) worker is ready. */
+  ready(): Promise<void>;
+  /** Waits (bounded) until `pred` holds over `out`. */
+  until<T extends HostOut>(pred: (o: HostOut) => o is T, what: string): Promise<T>;
+  close(): Promise<void>;
+}
+
+export interface RigOptions {
+  readonly flags?: Partial<HostFlags>;
+  readonly identity?: IdentityProvider;
+  readonly worker?: FakeWorkerOptions;
+  readonly imageTransport?: ImageTransport;
+  readonly now?: () => UnixSeconds;
+}
+
+/** Polls `check` every few ms until it returns a value, or fails with `what` after `ms`. */
+export async function eventually<T>(
+  check: () => T | undefined | null | false,
+  what: string,
+  ms = 3000,
+): Promise<T> {
+  const until = Date.now() + ms;
+  for (;;) {
+    const v = check();
+    if (v !== undefined && v !== null && v !== false) return v;
+    if (Date.now() > until) throw new Error(`timed out waiting for ${what}`);
+    await new Promise((r) => setTimeout(r, 2));
+  }
+}
+
+export async function rig(o: RigOptions = {}): Promise<Rig> {
+  const userData = await mkdtemp(join(tmpdir(), 'nf-l6b-'));
+  const pool = new nostr.FakeRelayPool();
+  const out: HostOut[] = [];
+  const log = memoryLogger('debug');
+  const spawner = fakeSpawner(() => new FakeWorkerClass(o.worker));
+  let tick = 1_757_000_000;
+  const host = await createHost({
+    userData,
+    flags: { devMocks: false, devFixtures: false, ...o.flags },
+    post: (m) => out.push(m),
+    log,
+    workerEntry: '/nonexistent/worker.js',
+    spawn: spawner.spawn,
+    pool,
+    // A strictly increasing clock: replaceable sets never share a second (see L1's rig).
+    now: o.now ?? (() => tick++ as UnixSeconds),
+    ...(o.identity === undefined ? {} : { identity: o.identity }),
+    imageTransport: o.imageTransport ?? (() => Promise.reject(new Error('no network in tests'))),
+  });
+  // Point the relay list at the fake pool's test relays (defaults are public relays).
+  await host.adapter.updateSettings({
+    relays: [
+      { url: RELAY_A, read: true, write: true },
+      { url: RELAY_B, read: true, write: false },
+    ],
+  });
+  return {
+    host,
+    pool,
+    out,
+    worker: spawner.last,
+    spawned: spawner.spawned,
+    log,
+    userData,
+    ready: async () => {
+      await eventually(() => host.worker.state === 'ready', 'worker ready');
+    },
+    until: <T extends HostOut>(pred: (o: HostOut) => o is T, what: string) =>
+      eventually(() => out.find(pred), what),
+    close: async () => {
+      host.stop();
+      await rm(userData, { recursive: true, force: true });
+    },
+  };
+}

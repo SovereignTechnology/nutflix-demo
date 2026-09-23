@@ -1,0 +1,85 @@
+/**
+ * The host's command line (main passes it to `utilityProcess.fork`). Strict: an unknown or
+ * malformed argument is an error, and the dev fences are enforced here —
+ *   `--dev-fixtures` is REFUSED unless `--dev-mocks` is also on (design §5(a));
+ *   `--dev-bootstrap` (a local hyperdht testnet) needs `--dev-mocks` and loopback only (D1).
+ */
+import { isAbsolute } from 'node:path';
+
+export interface HostFlags {
+  readonly devMocks: boolean;
+  readonly devFixtures: boolean;
+  readonly devBootstrap?: readonly { readonly host: '127.0.0.1'; readonly port: number }[];
+}
+
+export interface HostArgs {
+  readonly userData: string;
+  readonly workerEntry: string;
+  readonly flags: HostFlags;
+}
+
+export class HostArgsError extends Error {
+  override readonly name = 'HostArgsError' as const;
+}
+
+function bootstrapList(v: string): { host: '127.0.0.1'; port: number }[] {
+  const out: { host: '127.0.0.1'; port: number }[] = [];
+  for (const part of v.split(',')) {
+    const m = /^127\.0\.0\.1:([1-9][0-9]{0,4})$/.exec(part);
+    const port = Number(m?.[1]);
+    if (!m || port > 65535) throw new HostArgsError('--dev-bootstrap takes 127.0.0.1:<port>[,…]');
+    out.push({ host: '127.0.0.1', port });
+  }
+  if (out.length === 0 || out.length > 16) throw new HostArgsError('--dev-bootstrap: 1–16 nodes');
+  return out;
+}
+
+export function parseHostArgs(argv: readonly string[]): HostArgs {
+  let userData: string | undefined;
+  let workerEntry: string | undefined;
+  let devMocks = false;
+  let devFixtures = false;
+  let devBootstrap: { host: '127.0.0.1'; port: number }[] | undefined;
+  for (const arg of argv) {
+    const eq = arg.indexOf('=');
+    const key = eq === -1 ? arg : arg.slice(0, eq);
+    const value = eq === -1 ? undefined : arg.slice(eq + 1);
+    switch (key) {
+      case '--user-data-dir':
+      case '--worker-entry': {
+        if (value === undefined || !isAbsolute(value) || value.includes('\u0000'))
+          throw new HostArgsError(`${key} needs an absolute path`);
+        if (key === '--user-data-dir') userData = value;
+        else workerEntry = value;
+        break;
+      }
+      case '--dev-mocks':
+      case '--dev-fixtures':
+        if (value !== undefined) throw new HostArgsError(`${key} takes no value`);
+        if (key === '--dev-mocks') devMocks = true;
+        else devFixtures = true;
+        break;
+      case '--dev-bootstrap':
+        if (value === undefined) throw new HostArgsError('--dev-bootstrap needs a value');
+        devBootstrap = bootstrapList(value);
+        break;
+      default:
+        throw new HostArgsError('unknown host argument');
+    }
+  }
+  if (userData === undefined) throw new HostArgsError('--user-data-dir is required');
+  if (workerEntry === undefined) throw new HostArgsError('--worker-entry is required');
+  if (devFixtures && !devMocks)
+    throw new HostArgsError('--dev-fixtures is refused without --dev-mocks');
+  if (devBootstrap !== undefined && !devMocks)
+    throw new HostArgsError('--dev-bootstrap is refused without --dev-mocks');
+  return {
+    userData,
+    workerEntry,
+    flags: {
+      devMocks,
+      devFixtures,
+      ...(devBootstrap === undefined ? {} : { devBootstrap }),
+    },
+  };
+}
