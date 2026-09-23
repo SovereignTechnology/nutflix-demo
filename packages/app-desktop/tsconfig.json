@@ -1,25 +1,20 @@
 {
-  "extends": "../../tsconfig.base.json",
-  "compilerOptions": {
-    "outDir": "dist",
-    "rootDir": "src",
-    "lib": ["ES2023", "DOM"],
-    "jsx": "react-jsx"
-  },
-  "include": ["src"],
-  "exclude": ["src/**/*.stories.tsx"],
+  // Solution file (L6-0). Each part is its own composite project; all of them use
+  // rootDir "src" + outDir "dist", so every part emits under dist/<part>/ and a relative
+  // import such as "../ipc/protocol.js" resolves identically in src/ and dist/.
+  //
+  //   tsconfig.worker.json    Bare worker + the runtime-neutral shared code (src/ipc,
+  //                           src/index.ts) — no DOM; see that file for why ipc lives there
+  //   tsconfig.host.json      utilityProcess host (Node)
+  //   tsconfig.main.json      Electron main (Node)
+  //   tsconfig.preload.json   sandboxed preload (DOM, bundled to CJS by scripts/bundle.ts)
+  //   tsconfig.renderer.json  renderer (DOM + JSX, bundled by scripts/bundle.ts)
+  "files": [],
   "references": [
-    {
-      "path": "../core"
-    },
-    {
-      "path": "../seeder"
-    },
-    {
-      "path": "../ui"
-    },
-    {
-      "path": "../gateway"
-    }
+    { "path": "./tsconfig.worker.json" },
+    { "path": "./tsconfig.host.json" },
+    { "path": "./tsconfig.main.json" },
+    { "path": "./tsconfig.preload.json" },
+    { "path": "./tsconfig.renderer.json" }
   ]
 }

@@ -1,0 +1,16 @@
+{
+  // Sandboxed preload (lane L6-A): contextBridge surface = NetworkAdapter shape + desktop.ffmpeg.
+  // Runs in the renderer process (DOM: File for webUtils.getPathForFile) with only Electron's
+  // sandboxed require; scripts/bundle.ts bundles it to dist/preload.cjs. tsc output is for
+  // type-checking and tests only.
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "outDir": "dist",
+    "lib": ["ES2023", "DOM", "DOM.Iterable"],
+    "types": []
+  },
+  "include": ["src/preload/**/*"],
+  "exclude": ["src/**/*.stories.tsx"],
+  "references": [{ "path": "./tsconfig.worker.json" }]
+}

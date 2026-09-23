@@ -1,0 +1,13 @@
+{
+  // utilityProcess host (lane L6-B): DesktopNetworkAdapter, nostr, settings, images; spawns the
+  // worker with PearRuntime.run (ambient types in src/types/pear-runtime.d.ts). Node, no DOM.
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "outDir": "dist",
+    "lib": ["ES2023"]
+  },
+  "include": ["src/host/**/*", "src/types/pear-runtime.d.ts", "src/types/__tests__/*.ts"],
+  "exclude": ["src/**/*.stories.tsx"],
+  "references": [{ "path": "./tsconfig.worker.json" }, { "path": "../core" }]
+}
