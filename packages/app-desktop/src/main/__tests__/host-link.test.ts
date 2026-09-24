@@ -5,7 +5,10 @@
  */
 import { describe, expect, it } from 'vitest';
 import type { HostIn, HostOut } from '../../ipc/protocol.js';
-import { hostArgs, parseMainArgs } from '../args.js';
+import { existsSync } from 'node:fs';
+import { dirname, isAbsolute, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { HOST_ENTRY, WORKER_ENTRY, hostArgs, parseMainArgs } from '../args.js';
 import { HostLink, type HostChild } from '../host-link.js';
 import { createLogger, formatLogLine } from '../log.js';
 
@@ -188,10 +191,65 @@ describe('main argv', () => {
     expect(parseMainArgs(['--user-data-dir', '--dev-mocks']).devMocks).toBe(true);
   });
 
-  it('host args carry userData and only the dev flags', () => {
-    expect(hostArgs(parseMainArgs(['--dev-mocks', '--no-sandbox']), '/ud')).toEqual([
-      '--user-data=/ud',
+  const PATHS = { userData: '/ud', workerEntry: '/app/dist/worker/entry.js' };
+
+  it('host args carry userData, the worker entry and only the dev flags', () => {
+    expect(hostArgs(parseMainArgs(['--dev-mocks', '--no-sandbox']), PATHS)).toEqual([
+      '--user-data-dir=/ud',
+      '--worker-entry=/app/dist/worker/entry.js',
       '--dev-mocks',
     ]);
+  });
+});
+
+/**
+ * The two ends of the main → host argv must agree. They drifted once (main sent
+ * `--user-data=`, the host's strict parser wanted `--user-data-dir=` and `--worker-entry=`): the
+ * host exited 2, main respawned it until the budget ran out and reloaded the window each time,
+ * and nothing loaded in Electron (docs/lanes/E2E-fix.md, failure 2). So main's `hostArgs()` is
+ * fed to the host's REAL `parseHostArgs()` — another TypeScript project, imported by path.
+ */
+describe("main → host argv round trip (the host's real parser)", () => {
+  interface HostArgsLike {
+    readonly userData: string;
+    readonly workerEntry: string;
+    readonly flags: { readonly devMocks: boolean; readonly devFixtures: boolean };
+  }
+  const parseHostArgs = async (argv: readonly string[]): Promise<HostArgsLike> => {
+    const path = '../../host/flags.js';
+    const mod = (await import(/* @vite-ignore */ path)) as {
+      parseHostArgs(a: readonly string[]): HostArgsLike;
+    };
+    return mod.parseHostArgs(argv);
+  };
+  const paths = { userData: '/tmp/nf-ud', workerEntry: '/opt/nutflix/dist/worker/entry.js' };
+
+  it.each([
+    [[], { devMocks: false, devFixtures: false }],
+    [['--dev-mocks'], { devMocks: true, devFixtures: false }],
+    [['--dev-mocks', '--dev-fixtures', '--e2e-hooks'], { devMocks: true, devFixtures: true }],
+    [['--dev-mocks', '--no-sandbox', '--whatever=1'], { devMocks: true, devFixtures: false }],
+  ])('main argv %j → the host accepts it with the same meaning', async (argv, flags) => {
+    const parsed = await parseHostArgs(hostArgs(parseMainArgs(argv), paths));
+    expect(parsed.userData).toBe(paths.userData);
+    expect(parsed.workerEntry).toBe(paths.workerEntry);
+    expect(parsed.flags).toEqual(flags);
+  });
+
+  it('the host still refuses the old spelling (so this test would have caught the drift)', async () => {
+    await expect(
+      parseHostArgs(['--user-data=/tmp/nf-ud', '--dev-mocks', '--dev-fixtures']),
+    ).rejects.toThrow(/unknown host argument/);
+  });
+
+  it('the entries main forks and hands the host are where the build puts them', () => {
+    // `dist/` after `npm run build` (CI builds before it tests): the host entry, and the tsc
+    // output of the worker entry (never a bundle, D6).
+    const dist = join(dirname(fileURLToPath(import.meta.url)), '..', '..', '..', 'dist');
+    for (const rel of [HOST_ENTRY, WORKER_ENTRY]) {
+      expect(isAbsolute(join(dist, rel))).toBe(true);
+      expect(existsSync(join(dist, rel)), `${rel} under dist/`).toBe(true);
+    }
+    expect(WORKER_ENTRY).toBe('worker/entry.js');
   });
 });

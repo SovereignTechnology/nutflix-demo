@@ -4,6 +4,7 @@
  * main exits when it is present), the protocols, the three IPC channels, the host spawn, the
  * window, and one message through each path (renderer call → host, host media-link → nf-media).
  */
+import { dirname, join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mocks } from '@sovit/core';
 
@@ -239,7 +240,28 @@ describe('main.ts wiring (fake electron)', () => {
     expect(fx.paths.get('userData')).toBe('/tmp/e2e-ud');
     expect(fx.forks).toHaveLength(1);
     expect(fx.forks[0]?.path).toMatch(/[\\/]host[\\/]main\.js$/);
-    expect(fx.forks[0]?.args).toEqual(['--user-data=/tmp/e2e-ud', '--dev-mocks', '--dev-fixtures']);
+    // The worker entry is resolved next to main's own `dist/` (the sibling of `main/`).
+    const distDir = dirname(dirname(fx.forks[0]?.path ?? ''));
+    expect(fx.forks[0]?.args).toEqual([
+      '--user-data-dir=/tmp/e2e-ud',
+      `--worker-entry=${join(distDir, 'worker', 'entry.js')}`,
+      '--dev-mocks',
+      '--dev-fixtures',
+    ]);
+    // …and the host's real parser accepts exactly that argv (another project, by path).
+    const path = '../../host/flags.js';
+    const flags = (await import(/* @vite-ignore */ path)) as {
+      parseHostArgs(a: readonly string[]): {
+        userData: string;
+        workerEntry: string;
+        flags: Record<string, unknown>;
+      };
+    };
+    expect(flags.parseHostArgs(fx.forks[0]?.args ?? [])).toEqual({
+      userData: '/tmp/e2e-ud',
+      workerEntry: join(distDir, 'worker', 'entry.js'),
+      flags: { devMocks: true, devFixtures: true },
+    });
   });
 
   it('hardens every webContents created', async () => {
