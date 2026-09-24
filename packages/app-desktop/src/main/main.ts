@@ -147,9 +147,16 @@ function start(): void {
   });
   /** e2e only: response status counts of `nf-media:` (numbers, never URLs). */
   const mediaStatuses = new Map<number, number>();
+  /** e2e only: the first byte of every `nf-media:` Range answered 206, in order (numbers). */
+  const mediaRangeStarts: number[] = [];
   protocol.handle(MEDIA_SCHEME, async (req) => {
     const res = await media(req);
-    if (opts.e2eHooks) mediaStatuses.set(res.status, (mediaStatuses.get(res.status) ?? 0) + 1);
+    if (opts.e2eHooks) {
+      mediaStatuses.set(res.status, (mediaStatuses.get(res.status) ?? 0) + 1);
+      const start = /^bytes=(\d{1,15})-/.exec(req.headers.get('range') ?? '')?.[1];
+      if (res.status === 206 && start !== undefined && mediaRangeStarts.length < 4096)
+        mediaRangeStarts.push(Number(start));
+    }
     return res;
   });
   ipcMain.handle(CHANNEL.call, (e, raw: unknown) => gate.call(e, raw));
@@ -185,6 +192,7 @@ function start(): void {
     (globalThis as Record<symbol, unknown>)[Symbol.for('nutflix.e2e')] = Object.freeze({
       mediaLinks: (): number => links.size,
       mediaStatuses: (): Record<number, number> => Object.fromEntries(mediaStatuses),
+      mediaRangeStarts: (): number[] => [...mediaRangeStarts],
       fileTokens: (): number => tokens.count(),
       hostRunning: (): boolean => host?.running ?? false,
     });

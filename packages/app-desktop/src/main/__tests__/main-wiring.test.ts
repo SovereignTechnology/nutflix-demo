@@ -326,6 +326,41 @@ describe('main.ts wiring (fake electron)', () => {
     ]);
   });
 
+  it('--e2e-hooks: nf-media status counts and 206 Range starts, numbers only; absent without the flag', async () => {
+    const E2E_KEY = Symbol.for('nutflix.e2e');
+    const g = globalThis as Record<symbol, unknown>;
+    Reflect.deleteProperty(g, E2E_KEY);
+    await boot();
+    expect(g[E2E_KEY]).toBeUndefined();
+
+    vi.resetModules();
+    await boot(['--e2e-hooks']);
+    const hooks = g[E2E_KEY] as {
+      mediaStatuses(): Record<number, number>;
+      mediaRangeStarts(): number[];
+      mediaLinks(): number;
+    };
+    expect(hooks).toBeDefined();
+    const child = fx.children.at(-1);
+    child?.listeners.get('message')?.[0]?.({
+      kind: 'media-link',
+      token: 'tok0123456789abcdef',
+      url: 'http://127.0.0.1:41000/x',
+    });
+    const media = fx.protocols.get('nf-media');
+    for (const range of ['bytes=0-', 'bytes=1048576-']) {
+      const res = await media?.(
+        new Request('nf-media://play/tok0123456789abcdef', { headers: { range } }),
+      );
+      expect(res?.status).toBe(206);
+    }
+    expect((await media?.(new Request('nf-media://play/unknown-token-0000')))?.status).toBe(404);
+    expect(hooks.mediaStatuses()).toEqual({ 206: 2, 404: 1 });
+    expect(hooks.mediaRangeStarts()).toEqual([0, 1_048_576]);
+    expect(hooks.mediaLinks()).toBe(1);
+    Reflect.deleteProperty(g, E2E_KEY);
+  });
+
   it('drops host messages that fail isHostOut (a non-loopback media link never registers)', async () => {
     await boot();
     const onMessage = fx.children[0]?.listeners.get('message')?.[0];
