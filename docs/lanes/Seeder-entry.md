@@ -194,7 +194,9 @@ child's output. No network: every started seeder has `swarm: null`, and the buil
 gets past the provider refusal. The built-entry block is `describe.skipIf` when `dist/` predates
 the entry (`npm run ci` builds before it tests).
 
-`npm run ci` (worktree root): see the final report for the exit code and repo-wide counts.
+`npm run ci` (worktree root, 2026-09-23): **exit 0**. Lint and prettier clean, `tsc -b` clean,
+**128 files / 2099 passed / 27 skipped**, `check-locked-dirs: OK`, native inventory OK (42),
+electron lint OK. The built-entry block ran (not skipped): `dist/` is built before the tests.
 
 ## 8. For the orchestrator
 
