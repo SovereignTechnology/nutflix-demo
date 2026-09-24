@@ -120,8 +120,8 @@ interface RunOptions {
   readonly env?: Readonly<Record<string, string>>;
   /** Written to stdin, then stdin is closed (default: stdin ignored). */
   readonly input?: string;
-  /** Once the output contains this, send SIGTERM (a daemon that started). */
-  readonly stopWhen?: string;
+  /** Once the output contains all of these, send SIGTERM (a daemon that started). */
+  readonly stopWhen?: string | readonly string[];
   readonly ms?: number;
 }
 
@@ -144,7 +144,8 @@ async function runEntry(script: string, args: readonly string[], o: RunOptions =
   let stopped = false;
   const onData = (b: Buffer): void => {
     out += b.toString('utf8');
-    if (o.stopWhen !== undefined && !stopped && out.includes(o.stopWhen)) {
+    const want = o.stopWhen === undefined ? [] : [o.stopWhen].flat();
+    if (want.length > 0 && !stopped && want.every((w) => out.includes(w))) {
       stopped = true;
       child.kill('SIGTERM');
     }
@@ -299,6 +300,8 @@ describe.skipIf(!built)('built entry (dist/index.js) with the unit node flags', 
         swarm: null,
         relays: [DEAD_RELAY],
         policy: { satsPerBlock: 1, mints: [mintUrl], creatorP2pk: P2PK, creatorPubkey: CREATOR },
+        // Payout looks up the owner's kind 10019 over the ws relay pool at start (dead relay here).
+        payout: { pubkey: '0e'.repeat(32), p2pk: `02${'0d'.repeat(32)}` },
       }),
     );
 
@@ -308,7 +311,7 @@ describe.skipIf(!built)('built entry (dist/index.js) with the unit node flags', 
     await writeFile(path.join(creds, 'seeder-key-passphrase'), `${PASS}\n`, { mode: 0o400 });
     const run = await runEntry(DIST_ENTRY, ['--config', cfgWithMint], {
       env: { CREDENTIALS_DIRECTORY: creds },
-      stopWhen: '"mint loaded"',
+      stopWhen: ['"mint loaded"', 'payout waits'],
       ms: 60_000,
     });
     expect(run.out).toContain('"runtime ready"');
@@ -316,6 +319,8 @@ describe.skipIf(!built)('built entry (dist/index.js) with the unit node flags', 
     // The mint was reached over HTTP under --jitless, and its keyset loaded.
     expect(run.out).toMatch(/"mint loaded".*"keysets":1/);
     expect(mintHits).toBeGreaterThan(0);
+    // No confirmation from the owner's kind 10019: nothing is paid out, the daemon keeps running.
+    expect(run.out).toContain('payout waits');
     expect(run.out).not.toContain('WebAssembly');
     expect(run.out).not.toContain(PASS);
     expect(run.out).toContain('closed cleanly');

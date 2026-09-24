@@ -40,7 +40,8 @@ import { createSeederRuntime } from '../runtime/index.js';
 import { guardedKeyset } from '../runtime/keysets.js';
 import { nodeRawHttp } from '../runtime/mint-http.js';
 import { announceNutzapInfo, nutzapPublisher } from '../runtime/nostr-publish.js';
-import { FileProofStore, HISTORY_LIMIT } from '../runtime/proof-file.js';
+import { FileProofStore, HISTORY_LIMIT, selfCipher } from '../runtime/proof-file.js';
+import type { FileCipher } from '../runtime/proof-file.js';
 import { capturedLogger, tmpDir } from './helpers.js';
 
 const MINT = 'https://mint.runtime.example' as MintUrl;
@@ -49,6 +50,11 @@ const CREATOR_P2PK = `02${'c7'.repeat(32)}` as CashuP2pkPubkey;
 const CREATOR = 'c1'.repeat(32) as NostrPubkey;
 const PASS = 'runtime-unit-passphrase-0123456789';
 const COST = signerMod.minimumCost();
+
+/** The wallet file's cipher: NIP-44 to a test node's own key, as the runtime seals it. */
+const NODE = (await signerMod.LocalSigner.create({ passphrase: Buffer.from(PASS), cost: COST }))
+  .signer;
+const CIPHER: FileCipher = selfCipher(NODE, await NODE.getPublicKey());
 
 const cleanups: (() => Promise<void>)[] = [];
 afterEach(async () => {
@@ -76,7 +82,7 @@ describe('FileProofStore (the wallet file)', () => {
   it('starts empty, commits durably (0600), and a reopen sees exactly the committed state', async () => {
     const dir = await scratch();
     const file = path.join(dir, 'proofs.json');
-    const a = await FileProofStore.open(file);
+    const a = await FileProofStore.open(file, CIPHER);
     expect(await a.mints()).toEqual([]);
     const e1 = await a.commit({
       mint: MINT,
@@ -88,7 +94,7 @@ describe('FileProofStore (the wallet file)', () => {
     await a.commit({ mint: MINT, spent: [proof(2)], added: [proof(4, 8)] });
     expect((await stat(file)).mode & 0o777).toBe(0o600);
 
-    const b = await FileProofStore.open(file);
+    const b = await FileProofStore.open(file, CIPHER);
     expect((await b.proofs(MINT)).map((p) => p.secret).sort()).toEqual([
       'secret-1',
       'secret-3',
@@ -97,18 +103,18 @@ describe('FileProofStore (the wallet file)', () => {
     expect(await b.history()).toEqual([e1]);
     // Spending a mint's last proof drops the mint.
     await b.commit({ mint: MINT, spent: await b.proofs(MINT), added: [] });
-    expect(await (await FileProofStore.open(file)).mints()).toEqual([]);
+    expect(await (await FileProofStore.open(file, CIPHER)).mints()).toEqual([]);
   });
 
   it('serialises concurrent commits: none is lost', async () => {
     const dir = await scratch();
-    const store = await FileProofStore.open(path.join(dir, 'proofs.json'));
+    const store = await FileProofStore.open(path.join(dir, 'proofs.json'), CIPHER);
     await Promise.all(
       Array.from({ length: 20 }, (_, i) =>
         store.commit({ mint: MINT, spent: [], added: [proof(i)] }),
       ),
     );
-    const again = await FileProofStore.open(path.join(dir, 'proofs.json'));
+    const again = await FileProofStore.open(path.join(dir, 'proofs.json'), CIPHER);
     expect(await again.proofs(MINT)).toHaveLength(20);
   });
 
@@ -118,7 +124,9 @@ describe('FileProofStore (the wallet file)', () => {
     const outside = path.join(dir, 'outside.txt');
     await writeFile(outside, 'untouched', { mode: 0o644 });
     await symlink(outside, `${file}.tmp`);
-    await (await FileProofStore.open(file)).commit({ mint: MINT, spent: [], added: [proof(1)] });
+    await (
+      await FileProofStore.open(file, CIPHER)
+    ).commit({ mint: MINT, spent: [], added: [proof(1)] });
     expect(await readFile(outside, 'utf8')).toBe('untouched');
     expect((await lstat(file)).isSymbolicLink()).toBe(false);
     expect((await stat(file)).mode & 0o777).toBe(0o600);
@@ -130,9 +138,77 @@ describe('FileProofStore (the wallet file)', () => {
     expect((await stat(pending)).mode & 0o777).toBe(0o600);
   });
 
+  it('sealed at rest: NIP-44 to the node key — no proof in clear on disk; another key, a flipped byte, a dropped or reordered chunk are all refused and the file left alone', async () => {
+    const dir = await scratch();
+    const file = path.join(dir, 'proofs.json');
+    const store = await FileProofStore.open(file, CIPHER);
+    // Enough proofs for several 60 000-character chunks.
+    const many = Array.from({ length: 700 }, (_, i) => ({
+      ...proof(i),
+      dleq: { e: 'e'.repeat(64), s: 's'.repeat(64), r: 'f'.repeat(64) },
+    }));
+    await store.commit({
+      mint: MINT,
+      spent: [],
+      added: many,
+      history: { direction: 'in', amount: 1400 as Sats, memo: 'swap — é ✓' },
+    });
+    const text = await readFile(file, 'utf8');
+    expect(text).not.toContain('secret-1');
+    expect(text).not.toContain(many[3]!.C);
+    const env = JSON.parse(text) as { v: number; enc: string; chunks: string[] };
+    expect(env).toMatchObject({ v: 2, enc: 'nip44-self' });
+    expect(env.chunks.length).toBeGreaterThan(2);
+    // It reopens with the node key, non-ASCII intact.
+    const again = await FileProofStore.open(file, CIPHER);
+    expect(await again.proofs(MINT)).toHaveLength(700);
+    expect((await again.history())[0]?.memo).toBe('swap — é ✓');
+
+    const refused = async (content: string, cipher: FileCipher = CIPHER): Promise<void> => {
+      await writeFile(file, content, { mode: 0o600 });
+      await expect(FileProofStore.open(file, cipher)).rejects.toThrow(/not sealed to this node/);
+      expect(await readFile(file, 'utf8')).toBe(content);
+    };
+    const other = (
+      await signerMod.LocalSigner.create({ passphrase: Buffer.from(PASS), cost: COST })
+    ).signer;
+    await refused(text, selfCipher(other, await other.getPublicKey()));
+    const flip = [...env.chunks];
+    const c0 = flip[0]!;
+    flip[0] = `${c0.slice(0, 40)}${c0[40] === 'A' ? 'B' : 'A'}${c0.slice(41)}`;
+    await refused(JSON.stringify({ ...env, chunks: flip }));
+    await refused(JSON.stringify({ ...env, chunks: env.chunks.slice(1) }));
+    await refused(
+      JSON.stringify({ ...env, chunks: [env.chunks[1], env.chunks[0], ...env.chunks.slice(2)] }),
+    );
+    await refused(JSON.stringify({ ...env, chunks: env.chunks.slice(0, -1) }));
+  });
+
+  it('an unencrypted (version 1) wallet file is read and resealed at open', async () => {
+    const dir = await scratch();
+    const file = path.join(dir, 'proofs.json');
+    const v1 = {
+      format: 'nutflix-seeder-wallet',
+      v: 1,
+      seq: 0,
+      mints: { [MINT]: [proof(1), proof(2)] },
+      history: [],
+    };
+    await writeFile(file, JSON.stringify(v1), { mode: 0o600 });
+    const store = await FileProofStore.open(file, CIPHER);
+    expect(store.migrated).toBe(true);
+    expect(await store.proofs(MINT)).toHaveLength(2);
+    const text = await readFile(file, 'utf8');
+    expect(text).not.toContain('secret-1');
+    expect(JSON.parse(text)).toMatchObject({ v: 2, enc: 'nip44-self' });
+    const reopened = await FileProofStore.open(file, CIPHER);
+    expect(reopened.migrated).toBe(false);
+    expect(await reopened.proofs(MINT)).toHaveLength(2);
+  });
+
   it('keeps the newest HISTORY_LIMIT history lines, newest first', async () => {
     const dir = await scratch();
-    const store = await FileProofStore.open(path.join(dir, 'proofs.json'));
+    const store = await FileProofStore.open(path.join(dir, 'proofs.json'), CIPHER);
     for (let i = 0; i < HISTORY_LIMIT + 5; i++)
       await store.commit({
         mint: MINT,
@@ -140,7 +216,7 @@ describe('FileProofStore (the wallet file)', () => {
         added: [],
         history: { direction: 'in', amount: i as Sats },
       });
-    const h = await (await FileProofStore.open(path.join(dir, 'proofs.json'))).history();
+    const h = await (await FileProofStore.open(path.join(dir, 'proofs.json'), CIPHER)).history();
     expect(h).toHaveLength(HISTORY_LIMIT);
     expect(h[0]?.amount).toBe(HISTORY_LIMIT + 4);
   }, 60_000);
@@ -161,14 +237,16 @@ describe('FileProofStore (the wallet file)', () => {
       }),
     ]) {
       await writeFile(file, junk, { mode: 0o600 });
-      await expect(FileProofStore.open(file)).rejects.toBeInstanceOf(RuntimeSetupError);
+      await expect(FileProofStore.open(file, CIPHER)).rejects.toBeInstanceOf(RuntimeSetupError);
       expect(await readFile(file, 'utf8')).toBe(junk);
     }
     const good = await scratch();
     const f2 = path.join(good, 'proofs.json');
-    await (await FileProofStore.open(f2)).commit({ mint: MINT, spent: [], added: [proof(1)] });
+    await (
+      await FileProofStore.open(f2, CIPHER)
+    ).commit({ mint: MINT, spent: [], added: [proof(1)] });
     await chmod(f2, 0o640);
-    await expect(FileProofStore.open(f2)).rejects.toThrow(/accessible to group or others/);
+    await expect(FileProofStore.open(f2, CIPHER)).rejects.toThrow(/accessible to group or others/);
   });
 });
 
@@ -645,6 +723,37 @@ describe('createSeederRuntime: one daemon per data directory', () => {
     await writeFile(path.join(creds, PASSPHRASE_CREDENTIAL), PASS, { mode: 0o400 });
     return { config: r.config, creds };
   }
+
+  it('a payout that names this node’s own key is refused before anything moves', async () => {
+    const dir = await scratch();
+    const { config: c, creds } = await config(dir);
+    const own = signerMod.LocalSigner.pubkeyOf(await readFile(c.keyFile));
+    const bad: DaemonConfig = {
+      ...c,
+      payout: {
+        pubkey: own,
+        p2pk: `02${'ab'.repeat(32)}` as CashuP2pkPubkey,
+        thresholdSats: 10,
+        relays: [RELAY],
+      },
+    };
+    const log = capturedLogger();
+    await expect(
+      createSeederRuntime(bad, {
+        credentialsDirectory: creds,
+        logger: log.logger,
+        pool: new nostr.FakeRelayPool(),
+      }),
+    ).rejects.toThrow(/payout names this node’s own key/);
+    // The lock was released: a correct config starts.
+    const ok = await createSeederRuntime(c, {
+      credentialsDirectory: creds,
+      logger: log.logger,
+      pool: new nostr.FakeRelayPool(),
+    });
+    expect(ok.payout).toBeNull();
+    await ok.close();
+  }, 60_000);
 
   it('a lock held by a live process is refused; a second runtime in this process is refused; a lock whose process is gone (or our own pid from before a reboot) is taken over; close() frees it', async () => {
     const dir = await scratch();

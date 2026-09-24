@@ -60,6 +60,12 @@ Every key is checked (`packages/seeder/src/cli/config-file.ts`); an unknown key 
   "identity": { "keyFile": "/var/lib/nutflix-seeder/identity.key" }, // default <dataDir>/identity.key; absolute path.
                                           // passphrase / nsec / secretKey are REFUSED: the passphrase is a systemd credential
   "videoEvents": { "<core key hex>": "<video event id hex>" }, // optional: the nutzap `e` tag per core
+  "payout": {                             // optional (recommended): where the earnings go — see "Payout" below
+    "pubkey": "…64 hex…",                 // ★ your wallet's Nostr pubkey (a dedicated one keeps your main identity out)
+    "p2pk": "02…64 hex…",                 // ★ your wallet's P2PK key: the `pubkey` of your kind 10019
+    "thresholdSats": 1000,                // pay out when a mint's balance reaches this (default 1000)
+    "relays": ["wss://relay.example"]     // relays your wallet reads (default: the top-level relays)
+  },
   "flushEveryBlocks": 64, "flushEveryMs": 60000, // default: the engine's config, else 64 / 60 s
   "logLevel": "info"                      // debug | info | warn | error
 }
@@ -85,7 +91,23 @@ systemd-creds decrypt --name=seeder-key-passphrase /etc/credstore.encrypted/nutf
 
 `--keygen` reads the passphrase from stdin (a terminal is refused: it would echo), writes `keyFile` and logs only the node's public key. Keep a copy of the passphrase somewhere offline (a password manager) and back up `identity.key` (it is encrypted); without both the wallet key is gone. On a host without `LoadCredentialEncrypted=` (systemd < 250) use `LoadCredential=seeder-key-passphrase:/etc/nutflix/seeder-key-passphrase` with a root-owned 0600 file — protected by file mode only.
 
-What the daemon keeps under `<dataDir>/wallet/` (0700; every file 0600): `proofs.json` — the seeder's ecash, **bearer money**: melt it out rather than copying it around; `pending.json` — PAYs accepted but not yet redeemed or nutzapped (a restart finishes them); `seen.jsonl` — accepted proof secrets (a replay cache); `lock` — one daemon per data directory. A `proofs.json` or `pending.json` that does not parse stops the daemon instead of being overwritten: recover what it holds before moving it aside.
+What the daemon keeps under `<dataDir>/wallet/` (0700; every file 0600):
+
+- `proofs.json` — the seeder's ecash, NIP-44 encrypted to the node's key (it opens only with the key file and its passphrase). Inside it is bearer money: let payout move it off the server rather than copying the file around.
+- `pending.json` — PAYs accepted but not yet redeemed or nutzapped (a restart finishes them); its proofs are still locked to the seeder's or the creator's key.
+- `payouts.jsonl` — every payout's proofs (locked to your wallet key) and whether a relay took it; one no relay accepted is published again.
+- `seen.jsonl` (+ `.1`) — accepted proof secrets, a replay cache, rotated.
+- `lock` — one daemon per data directory.
+
+A `proofs.json` or `pending.json` that does not open stops the daemon instead of being overwritten: recover what it holds before moving it aside.
+
+### Payout
+
+With a `payout` block, whenever a mint's balance reaches `thresholdSats` (checked at start and after every flush), the daemon sends the whole balance, less the mint's swap fee, to your wallet: P2PK proofs locked to `payout.p2pk`, published as a NIP-61 nutzap to `payout.pubkey`. Your NIP-60/61 wallet picks it up, and you melt to Lightning from there — the daemon itself never melts, holds only a small balance, and cannot take back what it paid out.
+
+- **Nothing leaves until your wallet's own kind 10019 confirms `payout.p2pk`.** The daemon looks it up on the payout relays. If it names a different key, payouts stop until you fix the config and restart (`payouts stopped` in the journal); if none is found, the money stays on the server and the daemon asks again after the next flush (`payout waits`).
+- **Payouts are public** nutzaps: anyone can see that this seeder paid that pubkey, and how much. Use a dedicated wallet pubkey if that matters.
+- Without a `payout` block the earnings stay in `proofs.json` (the daemon logs a warning at start).
 
 Precedence, per value: **`NUTFLIX_SEEDER_*` env > file > `STATE_DIRECTORY` (fills `dataDir` only) > default**; config path: **`--config` > `NUTFLIX_SEEDER_CONFIG`**. Env overrides: `NUTFLIX_SEEDER_DATA_DIR`, `NUTFLIX_SEEDER_DISK_CAP_BYTES`, `NUTFLIX_SEEDER_MAX_STREAMS` (→ `rateLimits.maxStreams`), `NUTFLIX_SEEDER_LOG_LEVEL`. An empty assignment (`Environment=NAME=`) counts as unset; numbers must be plain decimal digits. None of these is secret, so `Environment=` is acceptable for them — nothing secret belongs in this file or the environment. The file is not secret either (the policy is published in every video manifest); `0640 root:nutflix-seeder` as in the install block keeps it read-only to the daemon.
 

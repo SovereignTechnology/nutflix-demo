@@ -5,7 +5,7 @@ Date: 2026-09-24
 ## Status
 
 Proposed (Stage 3, lane "seeder runtime", branch `stage-3/seeder-runtime`). Implemented and
-tested; §7 lists what Cameron should confirm or overrule. Nothing here changes a core contract.
+tested; §8 records Cameron's answers (2026-09-24). Nothing here changes a core contract.
 
 ## Context
 
@@ -43,32 +43,45 @@ Rejected: a passphrase in `Environment=`/`EnvironmentFile=` (readable via `/proc
 and `systemctl show`); an unencrypted key file (a stolen disk or backup is a stolen wallet key);
 prompting at boot (a server must restart unattended).
 
-## 2. The wallet: a local 0600 file, not NIP-60 on relays
+## 2. The wallet: a local 0600 file, sealed to the node key; not NIP-60 on relays
 
 `FileProofStore` (`runtime/proof-file.ts`) implements the core `ProofStore`: unspent proofs per
-mint plus a bounded history (1000 lines) in `<dataDir>/wallet/proofs.json`. Every `commit()`
+mint plus a bounded history (100 lines) in `<dataDir>/wallet/proofs.json`. Every `commit()`
 builds the next state, writes it to `proofs.json.tmp` (0600), fsyncs, renames over the file and
 fsyncs the directory, and only then makes it live — before the wallet returns the operation's
 result, as the contract requires. Commits are serialised.
 
-A file that exists but does not parse is **not** treated as empty: the first commit would
+**Encrypted at rest** (Cameron, 2026-09-24): the JSON is NIP-44 encrypted to the node's own Nostr
+key through the signer (`nip44Encrypt(ownPubkey, …)`, the scheme NIP-60 uses for wallet events),
+so no key leaves the signer and no cryptography is written here. NIP-44 takes at most 64 KiB per
+message, so the document is cut into 60 000-character chunks, each carrying `index/count` inside
+its ciphertext: a chunk flipped, dropped, swapped or reordered does not open, and the daemon
+refuses to start. An unencrypted file from before is read and resealed at open. This protects a
+stolen disk, a copied data directory and a leaked backup; it cannot protect a live compromise of
+the process, which holds the unlocked key — keeping little on the server does that (§7).
+
+Cost: every commit reseals the whole file, and under the unit's `--jitless` NIP-44 runs at ~3.3 ms
+per KB on the event loop (measured on Node 22: 200 ms per 60 KB chunk; 26 ms with the JIT). A
+typical file — tens of proofs, since payout keeps the balance small, and 100 history lines — is
+~40 KB, so ~130 ms per flush. That is why the history is short; moving crypto off the event loop
+belongs with F5.
+
+A file that exists but does not open is **not** treated as empty: the first commit would
 overwrite it and destroy whatever it still held. The daemon refuses to start and says to recover
 the proofs first.
 
-**Proofs at rest are bearer ecash.** What protects them is the file mode, the unit's
-`StateDirectoryMode=0700`, the dedicated service user, `ProtectHome=` / `ProtectSystem=strict`
-— the same boundary as the process memory that holds them while running.
+`pending.json` (§3) stays plaintext: it is written synchronously before each ACK and the signer
+is asynchronous, and its proofs are still P2PK-locked — the seeder's share to the wallet key in the
+key file, the creator's to the creator — so a copy of it spends nothing.
 
-Rejected for now, open for Cameron (§7):
+Not done, and why:
 
-- **NIP-60 on relays** (what build-plan §6 says for the seeder). Relays are not a durability
-  guarantee for a server's income, and a relay outage would stop redemption. It can be added as
-  a mirror later without changing the local file's role.
-- **Encryption to self at rest** (NIP-44 via the signer). NIP-44 caps a plaintext at 64 KiB
-  (~150 proofs), so it needs chunking; and the key that decrypts it is unlocked in the same
-  process. It would protect a copied file or backup, not a compromised host.
-- **Re-locking swapped proofs to the node's own P2PK key.** Strongest at rest, but every spend
-  then needs a witness and it changes `spend.ts` (the audit surface). Worth doing with NUT-13.
+- **NIP-60 on relays** (what build-plan §6 says for the seeder). Confidentiality would be the same
+  NIP-44, but relays can lose, withhold or replay stale wallet events — money loss for a server —
+  every flush would become relay writes, and the timing of those writes shows when the seeder
+  earns. Possible later as an encrypted backup mirror, never as the source of truth.
+- **Re-locking swapped proofs to the node's own P2PK key.** Strong at rest, but every spend then
+  needs a witness and it changes `spend.ts` (the audit surface). Worth doing with NUT-13.
 
 ## 3. The engine's durable state
 
@@ -148,23 +161,53 @@ gateway and the desktop worker keep their own wiring.
 which still needs them). A failed start releases the runtime too. The Stage 1 start-up warning is
 gone.
 
-## 7. For Cameron
+## 7. Payout: earnings leave for the owner's own wallet (Cameron, 2026-09-24)
 
-1. **Wallet storage** (§2): a local 0600 file now, NIP-60 mirror and encryption at rest later?
-2. **Who is the nutzap recipient** (§5): one `policy.creatorPubkey` per daemon matches one policy
-   per daemon today. Per-core policies will need a per-core creator; a manifest-driven daemon
-   (open the video's event, take author + `p2pk` from it) is the natural next step.
-3. **Paid views** (build-plan §4) count unique payers from kind 9321; the seeder publishes those,
-   so it counts seeders, not viewers — deliberately, since naming viewers in public events would
-   publish who watched what. The metric needs rethinking, not this event.
-4. **Melt-out** (Phase 3 exit) is not wired yet: `cli/melt.ts` exists, but running it beside the
-   daemon would race the wallet file. Options: a control socket into the running daemon, or an
-   automatic melt to a Lightning address above a threshold. Next lane.
+`runtime/payout.ts`, configured by `payout: { pubkey, p2pk, thresholdSats = 1000, relays }`.
+When a mint's balance reaches the threshold (checked at start and after every flush that swapped
+sats in), the whole balance less the swap fee is sent as P2PK proofs locked to the owner's wallet
+key and published as a NIP-61 nutzap to the owner's pubkey; their NIP-60/61 wallet picks it up and
+melts to Lightning when they choose. This replaces melting on the server:
+
+- no Lightning invoices, LNURL client or control socket on the daemon;
+- the server holds only a small balance, and what it paid out is locked to a key it does not
+  hold, so a later compromise cannot take it back.
+
+Safety:
+
+- **The owner's kind 10019 must confirm `payout.p2pk`** before anything leaves (a payout is
+  irreversible and the key is typed into a config file). Signed by `payout.pubkey`, fetched from
+  the payout relays, verified. Another key named there stops payouts until restart; none found
+  keeps the money on the server and asks again next run. A relay can withhold or serve a stale
+  10019 — both stop payouts, neither misdirects them.
+- The runtime refuses a payout that names the node's own keys.
+- Each locked set is appended to `<dataDir>/wallet/payouts.jsonl` (0600, fsynced) before it is
+  published; a set no relay accepted is published again on the next run, also after a restart.
+  The proofs in it are locked to the owner, so the file is safe at rest.
+- Residual (F31 class): a crash between the mint's swap and that append loses the payout. NUT-13
+  deterministic outputs close it.
+
+Privacy: a payout is a public nutzap, so it links the seeder's pubkey to the owner's and shows
+amounts. Operators who mind use a dedicated wallet pubkey for `payout.pubkey`.
+
+## 8. For Cameron — answered 2026-09-24
+
+1. **Melt-out** → payout to the owner's wallet instead (§7); the owner melts from their wallet.
+   Melting on the daemon stays possible later (a control socket), not planned.
+2. **Wallet storage** → a local file, now NIP-44 encrypted to the node key (§2); no NIP-60 on the
+   server.
+3. **Nutzap recipient** → one `policy.creatorPubkey` per daemon for now; a manifest-driven daemon
+   (author and `p2pk` from each video's event) is the later step.
+4. **Paid views** → counting nutzap senders now counts seeders, deliberately: naming viewers would
+   publish who watched what. Recommended: show sats to the creator per video (already in the
+   nutzaps and in trending) and drop the view count until a private count exists — a change to the
+   `VideoStats` contract, trending and three screens, for the UI polish lane (Cameron reviews it).
 
 ## Consequences
 
 - `nutflix-seeder.service` can run for real: `--keygen` once, `systemd-creds encrypt` once,
-  `systemctl enable --now`. deploy/systemd/README.md has the steps.
+  `systemctl enable --now`, and a `payout` block to get the earnings out. deploy/systemd/README.md
+  has the steps.
 - F10 and F12 (and the F11 / F31 hooks) are wired for the daemon; F24 is done for the daemon (the
   desktop's `KeyStore` is still open).
 - New: `runtime/` (Node only, never reachable from `portable.ts`: entry-hygiene.test.ts),

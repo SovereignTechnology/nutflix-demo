@@ -63,7 +63,26 @@ export interface DaemonConfig {
   readonly creatorPubkey: NostrPubkey;
   /** Core key → the video's event id: the nutzap's `e` tag, so paid views count per video. */
   readonly videoEvents: ReadonlyMap<CoreKeyHex, NostrEventId>;
+  /**
+   * Where the seeder's earnings go (`runtime/payout.ts`): above `thresholdSats` at a mint, the
+   * balance is sent to the owner's wallet as a NIP-61 nutzap locked to `p2pk`. `null` = earnings
+   * stay in the wallet file.
+   */
+  readonly payout: PayoutConfig | null;
 }
+
+export interface PayoutConfig {
+  /** The owner's Nostr pubkey: the nutzap's `p`, whose wallet picks it up. */
+  readonly pubkey: NostrPubkey;
+  /** The owner's wallet P2PK key (their kind 10019 `pubkey`): what the proofs are locked to. */
+  readonly p2pk: CashuP2pkPubkey;
+  readonly thresholdSats: number;
+  /** Relays the owner's wallet reads. Default: `relays`. */
+  readonly relays: readonly RelayUrl[];
+}
+
+/** Default payout threshold: below it a swap fee is a large share of the payout. */
+export const DEFAULT_PAYOUT_THRESHOLD_SATS = 1000;
 
 export type DaemonConfigResult =
   | { readonly ok: true; readonly config: DaemonConfig }
@@ -197,7 +216,9 @@ const TOP_KEYS = [
   'identity',
   'relays',
   'videoEvents',
+  'payout',
 ] as const;
+const PAYOUT_KEYS = ['pubkey', 'p2pk', 'thresholdSats', 'relays'] as const;
 const POLICY_KEYS = [
   'satsPerBlock',
   'blockSize',
@@ -346,12 +367,13 @@ function relayError(u: unknown): string | null {
   return null;
 }
 
-function relaysSection(c: Checker, raw: Obj): RelayUrl[] {
-  const P = '$.relays';
+function relaysSection(c: Checker, raw: Obj, P = '$.relays'): RelayUrl[] {
   const out: RelayUrl[] = [];
-  if (!c.required(raw, 'relays', '$', 'at least one relay for nutzaps and the kind 10019'))
+  const key = P.slice(P.lastIndexOf('.') + 1);
+  const parent = P.slice(0, P.lastIndexOf('.'));
+  if (!c.required(raw, key, parent, 'at least one relay for nutzaps and the kind 10019'))
     return out;
-  const v = get(raw, 'relays');
+  const v = get(raw, key);
   if (!Array.isArray(v)) {
     c.add(P, 'expected array of relay URLs');
     return out;
@@ -367,6 +389,41 @@ function relaysSection(c: Checker, raw: Obj): RelayUrl[] {
     else out.push(u as RelayUrl);
   });
   return out;
+}
+
+function payoutSection(c: Checker, raw: Obj, relays: readonly RelayUrl[]): PayoutConfig | null {
+  const P = '$.payout';
+  const o = c.obj(raw, 'payout', '$');
+  if (o === undefined) return null;
+  c.keys(o, P, PAYOUT_KEYS);
+  let pubkey: string | undefined;
+  if (c.required(o, 'pubkey', P, "the owner's Nostr pubkey")) {
+    const v = get(o, 'pubkey');
+    if (typeof v !== 'string' || !HEX64.test(v))
+      c.add(`${P}.pubkey`, 'expected 64 lower-case hex chars (x-only Nostr pubkey)');
+    else pubkey = v;
+  }
+  let p2pk: string | undefined;
+  if (c.required(o, 'p2pk', P, "the owner's wallet P2PK key (their kind 10019 pubkey)")) {
+    const v = get(o, 'p2pk');
+    if (typeof v !== 'string' || !P2PK.test(v))
+      c.add(
+        `${P}.p2pk`,
+        'expected 33-byte compressed pubkey: 02 or 03 then 64 lower-case hex chars',
+      );
+    else if (pubkey !== undefined && v.slice(2) === pubkey)
+      c.add(`${P}.p2pk`, 'must not be the key payout.pubkey names (NIP-61)');
+    else p2pk = v;
+  }
+  const threshold = c.int(o, 'thresholdSats', P, 1) ?? DEFAULT_PAYOUT_THRESHOLD_SATS;
+  const own = get(o, 'relays') === undefined ? relays : relaysSection(c, o, `${P}.relays`);
+  if (pubkey === undefined || p2pk === undefined) return null;
+  return {
+    pubkey: pubkey as NostrPubkey,
+    p2pk: p2pk as CashuP2pkPubkey,
+    thresholdSats: threshold,
+    relays: own,
+  };
 }
 
 function videoEventsSection(c: Checker, raw: Obj): Map<CoreKeyHex, NostrEventId> {
@@ -478,6 +535,7 @@ export function validateDaemonConfig(
   const keyFile = identitySection(c, raw, dataDir);
   const relays = relaysSection(c, raw);
   const videoEvents = videoEventsSection(c, raw);
+  const payout = payoutSection(c, raw, relays);
   const flushEveryBlocks = c.int(raw, 'flushEveryBlocks', '$', 1);
   const flushEveryMs = c.int(raw, 'flushEveryMs', '$', 1);
 
@@ -516,6 +574,7 @@ export function validateDaemonConfig(
       relays,
       creatorPubkey: priced.creatorPubkey,
       videoEvents,
+      payout,
     },
   };
 }

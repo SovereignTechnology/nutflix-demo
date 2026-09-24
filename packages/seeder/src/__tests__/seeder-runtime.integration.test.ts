@@ -7,10 +7,12 @@
  *     file's wallet P2PK (the `Seeder.onSessionReady` hook: `session.mux` is null at
  *     `session-open` on a swarm connection);
  *   - the viewer's PAYs are ACKed by the real engine; a flush swaps the seeder share into the
- *     0600 wallet file with the key file's wallet key, and publishes the creator share as one
- *     kind 9321 that the creator redeems;
+ *     0600 wallet file (NIP-44 sealed to the node key) with the key file's wallet key, and
+ *     publishes the creator share as one kind 9321 that the creator redeems;
  *   - F12 on disk: PAYs accepted but not flushed when the process dies are in `pending.json`,
- *     and a new runtime on the same data directory redeems them.
+ *     and a new runtime on the same data directory redeems them;
+ *   - payout: a flush that takes the balance over the threshold sends it to the owner's wallet
+ *     as a nutzap locked to the owner's key, which the owner redeems.
  */
 import { mkdir, readFile, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
@@ -92,8 +94,10 @@ async function daemon(
   mint: mocks.TestMint,
   pool: nostr.PoolLike,
   videoEvents: Map<CoreKeyHex, NostrEventId>,
+  extra: Record<string, unknown> = {},
 ): Promise<DaemonNode> {
   const r = validateDaemonConfig({
+    ...extra,
     dataDir,
     blockSize: BLOCK,
     diskCapBytes: 1 << 22,
@@ -231,6 +235,10 @@ async function setup(): Promise<{ dataDir: string; creds: string }> {
   return { dataDir, creds };
 }
 
+function proofsOf(ev: { readonly tags: readonly (readonly string[])[] }): never[] {
+  return ev.tags.filter((t) => t[0] === 'proof').map((t) => JSON.parse(t[1]!) as never);
+}
+
 const POLICY: PricePolicy = {
   satsPerBlock: 2 as Sats,
   blockSize: BLOCK,
@@ -320,10 +328,11 @@ describe('the seeder daemon runtime over hyperswarm', () => {
     expect(await d.rt.wallet.balance(MINT)).toBe(8);
     const walletFile = path.join(dataDir, 'wallet', 'proofs.json');
     expect((await stat(walletFile)).mode & 0o777).toBe(0o600);
-    const onDisk = JSON.parse(await readFile(walletFile, 'utf8')) as {
-      mints: Record<string, { amount: number }[]>;
-    };
-    expect(onDisk.mints[MINT]!.reduce((a, p) => a + p.amount, 0)).toBe(8);
+    // Sealed at rest to the node's key: the envelope only, no proof in clear.
+    const onDisk = await readFile(walletFile, 'utf8');
+    expect(JSON.parse(onDisk)).toMatchObject({ v: 2, enc: 'nip44-self' });
+    expect(onDisk).not.toContain('"secret"');
+    expect(onDisk).not.toContain('"C"');
     expect((JSON.parse(await readFile(pendingFile, 'utf8')) as { items: unknown[] }).items).toEqual(
       [],
     );
@@ -391,5 +400,61 @@ describe('the seeder daemon runtime over hyperswarm', () => {
     expect(await again.rt.engine.flush()).toEqual({ swapped: 8, nutzapped: 8, failed: 0 });
     expect(await again.rt.wallet.balance(MINT)).toBe(8);
     expect(pool.published.filter((p) => p.event.kind === NostrKind.NutzapPayout)).toHaveLength(1);
+  });
+  it('payout: the flush takes the balance over the threshold and the owner receives it as a nutzap locked to their key', async () => {
+    const mint = new mocks.TestMint({ url: MINT, seed: new Uint8Array(32).fill(0x53) });
+    const pool = new nostr.FakeRelayPool();
+    const { dataDir, creds } = await setup();
+    const ownerSk = new Uint8Array(32).fill(0x0f);
+    const ownerP2pk = Buffer.from(getPubKeyFromPrivKey(ownerSk)).toString('hex');
+    // The owner's NIP-61 wallet has published its kind 10019 naming that key.
+    const { signer: ownerSigner } = await signerMod.LocalSigner.create({
+      passphrase: Buffer.from(PASS),
+      cost: signerMod.minimumCost(),
+    });
+    const owner = await ownerSigner.getPublicKey();
+    pool.store(
+      await ownerSigner.signEvent({
+        kind: NostrKind.NutzapInfo,
+        created_at: Math.floor(Date.now() / 1000),
+        content: '',
+        tags: [
+          ['relay', RELAY],
+          ['mint', MINT, 'sat'],
+          ['pubkey', ownerP2pk],
+        ],
+      }),
+    );
+    const d = await daemon(dataDir, creds, mint, pool, new Map(), {
+      payout: { pubkey: owner, p2pk: ownerP2pk, thresholdSats: 5 },
+    });
+    const v = await viewer(mint);
+    const { core, vcore } = await connect(d, v, 8);
+    await payRange(v, vcore, core, 0, 3);
+    await payRange(v, vcore, core, 4, 7);
+    expect(await d.seeder.flushNow()).toMatchObject({ swapped: 8 });
+    const toOwner = (): nostr.Nutzap[] =>
+      pool.published
+        .filter((p) => p.event.kind === NostrKind.NutzapPayout)
+        .map((p) => nostr.parseNutzap(p.event)!)
+        .filter((z) => z.recipient === owner);
+    await until(() => toOwner().length === 1, 'the payout nutzap to the owner');
+    expect(toOwner()[0]).toMatchObject({ sender: d.rt.pubkey, mint: MINT, claimedAmount: 8 });
+    expect(await d.rt.wallet.balance(MINT)).toBe(0);
+    const ownerWallet = new walletMod.CashuWallet({
+      mints: new walletMod.CashuMintConnections({ request: () => mint.request }),
+      store: new walletMod.MemoryProofStore(),
+      key: walletMod.memoryWalletKey(ownerSk),
+    });
+    expect(await ownerWallet.receive({ mint: MINT, proofs: proofsOf(toOwner()[0]!.event) })).toBe(
+      8,
+    );
+    const log = await readFile(path.join(dataDir, 'wallet', 'payouts.jsonl'), 'utf8');
+    expect(
+      log
+        .split('\n')
+        .filter(Boolean)
+        .map((l) => (JSON.parse(l) as { t: string }).t),
+    ).toEqual(['sent', 'published']);
   });
 });

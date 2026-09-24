@@ -1,12 +1,15 @@
 /**
  * `FileProofStore` — the daemon wallet's `ProofStore` (`@sovit/core` wallet): the unspent proofs
- * per mint plus a bounded history, in one JSON file, 0600, rewritten atomically and fsynced on
- * every `commit()` (`files.ts`) before the wallet hands an operation's result back.
+ * per mint plus a bounded history, in one file, 0600, rewritten atomically and fsynced on every
+ * `commit()` (`files.ts`) before the wallet hands an operation's result back.
  *
- * The proofs are bearer ecash once the seeder has swapped them: whoever reads the file can spend
- * them. What protects them is the file mode, the unit's `StateDirectoryMode=0700`, the dedicated
- * service user and `ProtectHome=`/`ProtectSystem=` — the same boundary as the process memory that
- * holds them. ADR 0011 records this and the alternatives (NIP-60 on relays, encryption to self).
+ * Encrypted at rest (ADR 0011 §2): the JSON is NIP-44 encrypted to the node's own Nostr key — the
+ * scheme NIP-60 uses for wallet events — through the signer (`selfCipher`), so no key leaves it and
+ * no cryptography is written here. NIP-44 takes at most 64 KiB per message, so the JSON is cut into
+ * chunks that each carry `index/count` inside the ciphertext: a chunk swapped, dropped or
+ * reordered does not decrypt to a wallet. This protects a stolen disk, a copied data directory or
+ * a leaked backup; it does not protect a live compromise of the process, which holds the key.
+ * The proofs inside are bearer ecash.
  *
  * A file that exists but does not parse is NOT treated as empty: the first commit would overwrite
  * it and destroy whatever it still held. `load()` throws and the daemon refuses to start.
@@ -18,7 +21,7 @@ import type {
   UnixSeconds,
   WalletHistoryEntry,
 } from '@sovit/core';
-import type { wallet as walletMod } from '@sovit/core';
+import type { NostrPubkey, Signer, wallet as walletMod } from '@sovit/core';
 
 import { RuntimeSetupError, assertPrivate, readTextIfExists, writeFileAtomic } from './files.js';
 
@@ -27,8 +30,76 @@ type WalletTx = walletMod.WalletTx;
 
 const FORMAT = 'nutflix-seeder-wallet';
 const VERSION = 1;
-/** History lines kept (newest first when read); the proofs themselves are never dropped. */
-export const HISTORY_LIMIT = 1000;
+/** The encrypted envelope around a VERSION-1 wallet document. */
+const ENCRYPTED_VERSION = 2;
+const ENC = 'nip44-self';
+/** Characters per chunk; the plaintext is ASCII (see `toAscii`), so also bytes. NIP-44 max: 65535. */
+const CHUNK = 60_000;
+
+/** How the file is sealed: NIP-44 to the node's own key (`selfCipher`), or a test double. */
+export interface FileCipher {
+  encrypt(plaintext: string): Promise<string>;
+  decrypt(ciphertext: string): Promise<string>;
+}
+
+/** NIP-44 encryption to `pubkey` itself through the signer — the key never leaves it. */
+export function selfCipher(
+  signer: Pick<Signer, 'nip44Encrypt' | 'nip44Decrypt'>,
+  pubkey: NostrPubkey,
+): FileCipher {
+  return {
+    encrypt: (plaintext) => signer.nip44Encrypt(pubkey, plaintext),
+    decrypt: (ciphertext) => signer.nip44Decrypt(pubkey, ciphertext),
+  };
+}
+
+/** JSON with every non-ASCII character escaped (valid JSON; one byte per character). */
+function toAscii(json: string): string {
+  return json.replace(
+    /[\u0080-\uffff]/g,
+    (c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, '0')}`,
+  );
+}
+
+async function seal(cipher: FileCipher, doc: WalletFile): Promise<string> {
+  const text = toAscii(JSON.stringify(doc));
+  const n = Math.max(1, Math.ceil(text.length / CHUNK));
+  const chunks: string[] = [];
+  for (let i = 0; i < n; i++)
+    chunks.push(
+      await cipher.encrypt(`${String(i)}/${String(n)}\n${text.slice(i * CHUNK, (i + 1) * CHUNK)}`),
+    );
+  return JSON.stringify({ format: FORMAT, v: ENCRYPTED_VERSION, enc: ENC, chunks });
+}
+
+/** The wallet document inside an encrypted envelope, or `null` when it does not open cleanly. */
+async function unseal(cipher: FileCipher, raw: Record<string, unknown>): Promise<string | null> {
+  const chunks = raw['chunks'];
+  if (raw['enc'] !== ENC || !Array.isArray(chunks) || chunks.length === 0) return null;
+  const n = chunks.length;
+  let text = '';
+  for (let i = 0; i < n; i++) {
+    const c: unknown = chunks[i];
+    if (typeof c !== 'string') return null;
+    let pt: string;
+    try {
+      pt = await cipher.decrypt(c);
+    } catch {
+      return null;
+    }
+    const head = `${String(i)}/${String(n)}\n`;
+    if (!pt.startsWith(head)) return null;
+    text += pt.slice(head.length);
+  }
+  return text;
+}
+/**
+ * History lines kept (newest first when read); the proofs themselves are never dropped. Small on
+ * purpose: every commit reseals the whole file, and under the unit's `--jitless` NIP-44 costs
+ * ~3.3 ms per KB on the event loop (measured: 200 ms per 60 KB chunk, Node 22). Flushes and payouts
+ * are in the journal anyway.
+ */
+export const HISTORY_LIMIT = 100;
 
 interface WalletFile {
   readonly format: typeof FORMAT;
@@ -101,30 +172,54 @@ export class FileProofStore implements ProofStore {
   /** Commits run one at a time, in call order: each rewrites the whole file. */
   private chain: Promise<unknown> = Promise.resolve();
 
+  /** True when `open()` found an unencrypted (version 1) file and rewrote it sealed. */
+  migrated = false;
+
   private constructor(
     readonly path: string,
+    private readonly cipher: FileCipher,
     private readonly now: () => UnixSeconds,
   ) {}
 
-  /** Open (or start) the wallet file. Throws `RuntimeSetupError` on a file it cannot trust. */
+  /**
+   * Open (or start) the wallet file. Throws `RuntimeSetupError` on a file it cannot trust: one
+   * that does not parse, does not decrypt with this node's key, or whose chunks do not line up.
+   * An unencrypted version-1 file (written before encryption at rest) is read and resealed at once.
+   */
   static async open(
     path: string,
+    cipher: FileCipher,
     now: () => UnixSeconds = () => Math.floor(Date.now() / 1000) as UnixSeconds,
   ): Promise<FileProofStore> {
-    const store = new FileProofStore(path, now);
+    const store = new FileProofStore(path, cipher, now);
     await assertPrivate(path, 'the wallet file');
     const text = await readTextIfExists(path);
     if (text === null) return store;
-    const file = parse(text);
+    let raw: unknown = null;
+    try {
+      raw = JSON.parse(text);
+    } catch {
+      // handled below
+    }
+    const envelope =
+      typeof raw === 'object' && raw !== null ? (raw as Record<string, unknown>) : null;
+    let inner: string | null = text;
+    const sealed = envelope?.['format'] === FORMAT && envelope['v'] === ENCRYPTED_VERSION;
+    if (sealed) inner = await unseal(cipher, envelope);
+    const file = inner === null ? null : parse(inner);
     if (file === null)
       throw new RuntimeSetupError(
-        `the wallet file ${path} is unreadable — refusing to start rather than overwrite it; ` +
-          'recover its proofs before moving it aside',
+        `the wallet file ${path} is unreadable${sealed ? ' or not sealed to this node’s key' : ''} — ` +
+          'refusing to start rather than overwrite it; recover its proofs before moving it aside',
       );
     store.seq = file.seq;
     store.hist = file.history;
     for (const [mint, proofs] of Object.entries(file.mints))
       store.byMint.set(mint as MintUrl, new Map(proofs.map((p) => [p.secret, p])));
+    if (!sealed) {
+      await writeFileAtomic(path, await seal(cipher, file));
+      store.migrated = true;
+    }
     return store;
   }
 
@@ -185,7 +280,7 @@ export class FileProofStore implements ProofStore {
       mints: Object.fromEntries([...next].map(([mint, ps]) => [mint, [...ps.values()]])),
       history: hist,
     };
-    await writeFileAtomic(this.path, JSON.stringify(file));
+    await writeFileAtomic(this.path, await seal(this.cipher, file));
     this.byMint = next;
     this.hist = hist;
     this.seq = seq;

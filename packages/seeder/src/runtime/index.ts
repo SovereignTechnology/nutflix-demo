@@ -3,13 +3,15 @@
  * seeder (execution plan §4, build-plan Phase 3; decisions in ADR 0011).
  *
  *   identity   `LocalSigner` from the encrypted key file, passphrase from a systemd credential
- *   wallet     `CashuWallet` over `FileProofStore` (<dataDir>/wallet/proofs.json, 0600), redeeming
+ *   wallet     `CashuWallet` over `FileProofStore` (<dataDir>/wallet/proofs.json, 0600, NIP-44
+ *              encrypted to the node's own key), redeeming
  *              with the key file's wallet key (`signSecret`: the key stays in the signer)
  *   engine     `RealPaymentEngine` with every hook wired: rate-limited keysets, redeem, NUT-07
  *              `checkSpent` / `spentByUs`, the durable pending queue and seen set, nutzaps
  *   mints      `node:http(s)` via `mint-http.ts`, never the global `fetch` (a crash under --jitless)
  *   nostr      NIP-61 nutzaps and the kind 10019 over a `ws`-backed relay pool
  *   pay/1      a `PayChannel` + HELLO on every admitted session (`pay-wiring.ts`)
+ *   payout     above a threshold, the balance goes to the owner's wallet as a nutzap (`payout.ts`)
  *
  * Node only: reachable from `cli/providers.ts`, never from `portable.ts` (entry-hygiene.test.ts).
  */
@@ -37,7 +39,8 @@ import { guardedKeyset } from './keysets.js';
 import { nodeMintRequest } from './mint-http.js';
 import { announceNutzapInfo, createRelayPool, nutzapPublisher } from './nostr-publish.js';
 import { wirePay } from './pay-wiring.js';
-import { FileProofStore } from './proof-file.js';
+import { Payout } from './payout.js';
+import { FileProofStore, selfCipher } from './proof-file.js';
 
 /** Secrets the seen set keeps in memory (~300 B each, ~75 MB): older replays are caught at the mint. */
 export const SEEN_CAPACITY = 250_000;
@@ -61,6 +64,8 @@ export interface SeederRuntime {
   readonly wallet: walletMod.CashuWallet;
   readonly pubkey: NostrPubkey;
   readonly p2pk: CashuP2pkPubkey;
+  /** `null` when `payout` is not configured (earnings stay in the wallet file). */
+  readonly payout: Payout | null;
   /** Before `seeder.start()`: pay/1 on every session, then the kind 10019 (best effort). */
   attach(seeder: Seeder): void;
   /** After `seeder.close()` (its final flush has run): relays closed, key locked, lock freed. */
@@ -156,7 +161,11 @@ export async function createSeederRuntime(
   }
 
   try {
-    const store = await FileProofStore.open(join(walletDir, 'proofs.json'));
+    const store = await FileProofStore.open(
+      join(walletDir, 'proofs.json'),
+      selfCipher(identity.signer, identity.pubkey),
+    );
+    if (store.migrated) log.warn('wallet file was unencrypted — resealed to this node’s key');
     const httpRequest = nodeMintRequest();
     const mints = new walletMod.CashuMintConnections({
       request: o.mintRequest ?? (() => httpRequest),
@@ -210,23 +219,63 @@ export async function createSeederRuntime(
         videoEventFor: (core) => config.videoEvents.get(core),
       }),
     });
+    const po = config.payout;
+    if (po !== null && (po.pubkey === identity.pubkey || po.p2pk === identity.p2pk))
+      throw new RuntimeSetupError(
+        'payout names this node’s own key: set payout.pubkey / payout.p2pk to the owner’s wallet',
+      );
+    const payout =
+      po === null
+        ? null
+        : new Payout({
+            wallet,
+            signer: identity.signer,
+            pool,
+            owner: { pubkey: po.pubkey, p2pk: po.p2pk },
+            relays: po.relays,
+            thresholdSats: po.thresholdSats,
+            logPath: join(walletDir, 'payouts.jsonl'),
+            logger: o.logger,
+          });
+    const runPayout = (): void => {
+      payout?.run().catch((err: unknown) => {
+        log.error('payout run failed', { error: err });
+      });
+    };
+
     engine.restorePending(pending);
     if (pending.length > 0) log.info('restored accepted PAYs', { pending: engine.pendingCount() });
 
-    let unwire: (() => void) | null = null;
+    const unsubs: (() => void)[] = [];
     let closed = false;
     return {
       engine,
       wallet,
       pubkey: identity.pubkey,
       p2pk: identity.p2pk,
+      payout,
       attach(seeder) {
-        unwire = wirePay(seeder, {
-          signer: identity.signer,
-          p2pk: identity.p2pk,
-          windowBlocks,
-          logger: o.logger,
-        });
+        unsubs.push(
+          wirePay(seeder, {
+            signer: identity.signer,
+            p2pk: identity.p2pk,
+            windowBlocks,
+            logger: o.logger,
+          }),
+        );
+        if (payout === null)
+          log.warn(
+            'no payout configured: earnings stay in the wallet file (see payout in the config)',
+          );
+        else {
+          // Whatever was earned before a restart, then after every flush that swapped sats in.
+          runPayout();
+          unsubs.push(
+            seeder.on((e) => {
+              if (e.type === 'flush' && e.result.swapped > 0) runPayout();
+            }),
+          );
+        }
         // Load every accepted mint now: the first PAY then verifies against keysets already in
         // memory, and an unreachable mint shows up at start, not at the first payment.
         for (const m of policy.mints)
@@ -259,7 +308,8 @@ export async function createSeederRuntime(
       async close() {
         if (closed) return;
         closed = true;
-        unwire?.();
+        for (const off of unsubs) off();
+        await payout?.idle();
         pool.close();
         await identity.signer.lock();
         release();

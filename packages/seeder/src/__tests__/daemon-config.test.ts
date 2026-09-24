@@ -49,6 +49,7 @@ describe('daemon config file: accepted shapes', () => {
         relays: [RELAY],
         creatorPubkey: CREATOR,
         videoEvents: new Map(),
+        payout: null,
         seeder: {
           dataDir: '/var/lib/nutflix-seeder',
           diskCapBytes: 50 * GIB,
@@ -103,6 +104,7 @@ describe('daemon config file: accepted shapes', () => {
         relays: [RELAY, 'wss://relay-b.example/nostr', 'ws://127.0.0.1:7777'],
         creatorPubkey: CREATOR,
         videoEvents: new Map([[core, video]]),
+        payout: null,
         seeder: {
           dataDir: '/srv/seed',
           storageDir: '/srv/seed/store',
