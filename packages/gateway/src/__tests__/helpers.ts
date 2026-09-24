@@ -8,7 +8,15 @@ import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 
-import type { CashuP2pkPubkey, MintUrl, NostrPubkey, PricePolicy, Sats } from '@sovit/core';
+import type {
+  CashuP2pkPubkey,
+  MintUrl,
+  NostrEvent,
+  NostrPubkey,
+  PricePolicy,
+  Sats,
+} from '@sovit/core';
+import { finalizeEvent, getPublicKey } from 'nostr-tools/pure';
 import { mocks } from '@sovit/core';
 import type { LogRecord, Logger, PeerSessionInfo } from '@sovit/seeder';
 import { createLogger } from '@sovit/seeder';
@@ -23,7 +31,16 @@ import { FakePayProtocol } from './fake-pay-protocol.js';
 export const BLOCK = 1024;
 export const MINT_A = 'https://mint.fixture-a.example' as MintUrl;
 export const MINT_B = 'https://mint.fixture-b.example' as MintUrl;
-export const GW_PUBKEY = 'cd'.repeat(32) as NostrPubkey;
+/** The gateway's test Nostr key (public data in tests only). */
+const GW_SECRET = new Uint8Array(32).fill(0x61);
+export const GW_PUBKEY = getPublicKey(GW_SECRET) as NostrPubkey;
+/** Signs as GW_PUBKEY (v5: the HELLO is a connection-bound NIP-01 event). */
+export const GW_IDENTITY: GatewayDeps['identity'] = {
+  signEvent: (t) =>
+    Promise.resolve(
+      finalizeEvent({ ...t, tags: t.tags.map((x) => [...x]) }, GW_SECRET) as unknown as NostrEvent,
+    ),
+};
 export const GW_P2PK = ('02' + 'ab'.repeat(32)) as CashuP2pkPubkey;
 export const CREATOR_P2PK = ('03' + 'cc'.repeat(32)) as CashuP2pkPubkey;
 
@@ -166,7 +183,7 @@ export async function rig(o: RigOptions = {}): Promise<Rig> {
             protocols.push(p);
             return p;
           },
-    identity: { signChallenge: (c) => Promise.resolve(`sig:${c.slice(0, 8)}`) },
+    identity: GW_IDENTITY,
     logger: log.logger,
     ...o.deps,
   });

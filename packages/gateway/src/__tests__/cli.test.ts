@@ -24,6 +24,7 @@ import { FakeBlossomAuth } from './fake-blossom-auth.js';
 import { FakePayProtocol } from './fake-pay-protocol.js';
 import {
   CREATOR_P2PK,
+  GW_IDENTITY,
   GW_P2PK,
   GW_PUBKEY,
   MINT_A,
@@ -78,7 +79,7 @@ function mockDeps(): RuntimeDeps {
     viewerEngine: engine,
     auth: new FakeBlossomAuth(),
     payProtocol: () => new FakePayProtocol(),
-    identity: { signChallenge: () => Promise.resolve('sig') },
+    identity: GW_IDENTITY,
   };
 }
 

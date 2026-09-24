@@ -245,7 +245,10 @@ describe.skipIf(codec === undefined)(`PayProtocolCodec fuzz (${SKIP_REASON})`, (
     const bigPay = fc.record({
       type: fc.constant<'PAY'>('PAY'),
       payload: fc.record({
-        range: fc.constant({ fromBlock: 0, toBlock: 63 }),
+        // v5 (ADR 0010): `core` and `carryIn` are required on every PAY — this fixture was
+        // written against v3, where both were absent; the rest of it is unchanged.
+        range: fc.constant({ core: 'ab'.repeat(32), fromBlock: 0, toBlock: 63 }),
+        carryIn: fc.constant(37),
         seederProofs: fc.record({
           mint: fc.constant('https://mint.example'),
           unit: fc.constant<'sat'>('sat'),

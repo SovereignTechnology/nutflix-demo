@@ -29,6 +29,10 @@ import type {
   PriceMessage,
 } from '@sovit/core';
 import { mocks } from '@sovit/core';
+import type { NostrEvent } from '@sovit/core';
+import { finalizeEvent, generateSecretKey } from 'nostr-tools/pure';
+
+import type { GatewayIdentity } from '../gateway.js';
 
 import type { BlossomAuth, BlossomAuthRequest, BlossomAuthResult } from '../auth/index.js';
 import type { GatewayConfig } from '../config.js';
@@ -128,6 +132,19 @@ export function devMockDeps(config: GatewayConfig): RuntimeDeps {
     viewerEngine: engine,
     auth: new DevAcceptAllAuth(),
     payProtocol: () => new DevPayProtocol(),
-    identity: { signChallenge: () => Promise.resolve('dev-unsigned') },
+    // A throwaway key: the dev HELLO is signed for real but by nobody in particular (the dev
+    // `pay/1` sends nothing anyway — see DevPayProtocol).
+    identity: devIdentity(),
+  };
+}
+
+/** `--dev-mocks` only: a throwaway signing key per run (no real identity is involved). */
+function devIdentity(): GatewayIdentity {
+  const sk = generateSecretKey();
+  return {
+    signEvent: (t) =>
+      Promise.resolve(
+        finalizeEvent({ ...t, tags: t.tags.map((x) => [...x]) }, sk) as unknown as NostrEvent,
+      ),
   };
 }

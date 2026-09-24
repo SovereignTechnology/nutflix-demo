@@ -15,7 +15,7 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import { WebSocket } from 'ws';
 
-import { mocks, payment } from '@sovit/core';
+import { mocks, payProtocol, payment } from '@sovit/core';
 import type { Sats } from '@sovit/core';
 import { Seeder, toHex } from '@sovit/seeder';
 import type { SeederEvent } from '@sovit/seeder';
@@ -396,10 +396,18 @@ describe('WS bridge: one WebSocket = one replication stream + pay/1', () => {
     expect(hello.acceptedMints).toEqual(r.config.acceptedMints);
     expect(hello.split).toEqual({ seeder: 50, creator: 50 });
     expect(hello.version).toBe(1);
-    expect(hello.signature).toBe(`sig:${hello.challenge.slice(0, 8)}`);
-    expect(hello.challenge).toMatch(/^[0-9a-f]{64}$/);
+    // v5 (ADR 0010): the HELLO is bound to THIS connection and verifies from the viewer's end.
+    expect(hello.challenge).toMatch(/^pay\/1:[0-9a-f]{64,128}:[0-9a-f]{64}$/); // Noise hash: 64 bytes
     // Attached to the connection's protomux (what Hypercore parks on the Noise stream).
     expect(p.attachedTo).not.toBeNull();
+    const gw = payProtocol.bindingFromMux(p.attachedTo)!;
+    const fromViewer = {
+      handshakeHash: gw.handshakeHash,
+      localNoiseKey: gw.remoteNoiseKey,
+      remoteNoiseKey: gw.localNoiseKey,
+    };
+    expect(payProtocol.verifyHello({ type: 'HELLO', ...hello }, fromViewer)).toBeNull();
+    expect(payProtocol.verifyHello({ type: 'HELLO', ...hello }, gw)).not.toBeNull(); // not reflectable
     expect(typeof p.attachedTo!.createChannel).toBe('function');
     // The seeder verifies downstream PAYs against the MARKED-UP policy.
     expect(r.gateway.seeder.policy().satsPerBlock).toBe(5);

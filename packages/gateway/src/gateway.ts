@@ -14,7 +14,6 @@
  * or one per side. Stage 1 wires `MockPaymentEngine('honest')`; Stage 2 drops the real
  * engine behind the same interfaces.
  */
-import { randomBytes } from 'node:crypto';
 import { mkdir } from 'node:fs/promises';
 import type { IncomingMessage, Server, ServerResponse } from 'node:http';
 import { createServer } from 'node:http';
@@ -30,8 +29,10 @@ import type {
   PayProtocol,
   PricePolicy,
   Sats,
+  Signer,
+  UnixSeconds,
 } from '@sovit/core';
-import { DEFAULT_WINDOW_BLOCKS, PAY_PROTOCOL_VERSION } from '@sovit/core';
+import { DEFAULT_WINDOW_BLOCKS, payProtocol } from '@sovit/core';
 import type {
   Logger,
   PeerSessionInfo,
@@ -52,12 +53,13 @@ import { UpstreamPayer, helloPolicyResolver } from './upstream/payer.js';
 import type { UpstreamPolicyResolver } from './upstream/payer.js';
 import { WsBridge } from './ws/bridge.js';
 
-type HelloCreatedAt = Parameters<PayProtocol['sendHello']>[0]['createdAt'];
-
-/** The gateway's `pay/1` identity. Signing is NOT this package's — inject a Signer-backed one. */
+/**
+ * The gateway's `pay/1` identity. Signing is NOT this package's — inject the node's `Signer`
+ * (it must sign as `config.identity.pubkey`). v5 (ADR 0010): the HELLO is a NIP-01 event bound
+ * to the connection's Noise handshake (`payProtocol.buildHello`).
+ */
 export interface GatewayIdentity {
-  /** Prove possession of `config.identity.pubkey` over `challenge` (Schnorr, by the Signer). */
-  signChallenge(challenge: string): Promise<string>;
+  readonly signEvent: Signer['signEvent'];
 }
 
 /**
@@ -399,33 +401,46 @@ export class Gateway {
       detachBridge();
       detachPayer();
     });
-    void this.sendHello(session.noiseKeyHex, protocol);
+    void this.sendHello(session.noiseKeyHex, protocol, mux);
   }
 
-  /** HELLO: the gateway's own price (base marked up by %), its mints, split and P2PK target. */
-  private async sendHello(noiseKeyHex: string, protocol: PayProtocol): Promise<void> {
-    const challenge = randomBytes(32).toString('hex');
-    let signature: string;
+  /**
+   * HELLO: the gateway's own price (base marked up by %), its mints, split and P2PK target,
+   * signed as a NIP-01 event bound to THIS connection's Noise handshake (v5).
+   */
+  private async sendHello(noiseKeyHex: string, protocol: PayProtocol, mux: unknown): Promise<void> {
+    const binding = payProtocol.bindingFromMux(mux);
+    if (binding === null) {
+      this.log.error('no Noise handshake on this session — cannot bind a HELLO', {
+        noiseKey: noiseKeyHex,
+      });
+      return;
+    }
+    const policy = gatewayPolicy(this.config);
+    let hello: Awaited<ReturnType<typeof payProtocol.buildHello>>;
     try {
-      signature = await this.deps.identity.signChallenge(challenge);
+      hello = await payProtocol.buildHello(
+        this.deps.identity,
+        binding,
+        {
+          acceptedMints: this.config.acceptedMints,
+          satsPerBlock: policy.satsPerBlock,
+          split: policy.split,
+          p2pk: this.config.identity.p2pk,
+          windowBlocks: this.deps.seederEngine.config?.windowBlocks ?? DEFAULT_WINDOW_BLOCKS,
+        },
+        () => Math.floor((this.deps.now ?? Date.now)() / 1000) as UnixSeconds,
+      );
     } catch (err) {
       this.log.error('HELLO signing failed', { noiseKey: noiseKeyHex, error: err });
       return;
     }
+    if (hello.pubkey !== this.config.identity.pubkey)
+      this.log.warn('the signer is not config.identity.pubkey — HELLO names the signer', {
+        noiseKey: noiseKeyHex,
+      });
     if (protocol.state === 'closed') return;
-    const policy = gatewayPolicy(this.config);
-    protocol.sendHello({
-      version: PAY_PROTOCOL_VERSION,
-      pubkey: this.config.identity.pubkey,
-      challenge,
-      createdAt: Math.floor((this.deps.now ?? Date.now)() / 1000) as HelloCreatedAt,
-      signature,
-      acceptedMints: this.config.acceptedMints,
-      satsPerBlock: policy.satsPerBlock,
-      split: policy.split,
-      p2pk: this.config.identity.p2pk,
-      windowBlocks: this.deps.seederEngine.config?.windowBlocks ?? DEFAULT_WINDOW_BLOCKS,
-    });
+    protocol.sendHello(hello);
     this.log.debug('HELLO sent', { noiseKey: noiseKeyHex, satsPerBlock: policy.satsPerBlock });
   }
 

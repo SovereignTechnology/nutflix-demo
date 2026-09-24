@@ -56,3 +56,28 @@ declare module 'sodium-universal' {
   const sodium: SodiumUniversal;
   export default sodium;
 }
+
+declare module 'compact-encoding' {
+  interface State {
+    start: number;
+    end: number;
+    buffer: Uint8Array | null;
+  }
+  interface Encoding<T> {
+    preencode(state: State, value: T): void;
+    encode(state: State, value: T): void;
+    decode(state: State): T;
+  }
+  const c: {
+    state(start?: number, end?: number, buffer?: Uint8Array | null): State;
+    readonly uint: Encoding<number>;
+    readonly uint8: Encoding<number>;
+    readonly string: Encoding<string>;
+    readonly fixed32: Encoding<Uint8Array>;
+    readonly raw: Encoding<Uint8Array>;
+    encode<T>(enc: Encoding<T>, value: T): Uint8Array;
+    decode<T>(enc: Encoding<T>, buffer: Uint8Array): T;
+  };
+  export type { Encoding, State };
+  export default c;
+}

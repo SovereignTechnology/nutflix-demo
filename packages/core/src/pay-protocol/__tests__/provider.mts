@@ -13,9 +13,11 @@
  * `.mts` so vitest's `__tests__/**\/*.ts` include glob does not collect it as a test file.
  */
 import type { PayProtocolCodec } from '../../contracts/index.js';
+import { payCodec } from '../codec.js';
 
+/** Stage 2: the compact-encoding codec (`pay-protocol/codec.ts`). */
 export function getCodec(): PayProtocolCodec | undefined {
-  return undefined;
+  return payCodec;
 }
 
 /** Human-readable reason printed in the describe title while the suite is skipped. */
