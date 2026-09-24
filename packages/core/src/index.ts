@@ -11,3 +11,4 @@ export * as nostr from './nostr/index.js';
 export * as manifest from './manifest/index.js';
 export * as media from './media/index.js';
 export * as payment from './payment/index.js';
+export * as signer from './signer/index.js';
