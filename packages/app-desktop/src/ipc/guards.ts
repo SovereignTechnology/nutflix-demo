@@ -62,6 +62,7 @@ import {
   IPC_V,
   KEYCHAIN_SLOTS,
   LIMITS,
+  MAX_AUTH_URL,
   MAX_SECRET_BYTES,
 } from './protocol.js';
 
@@ -291,6 +292,10 @@ const IMAGE_RE = new RegExp(
   `^[Hh][Tt][Tt][Pp][Ss]://${HOST}${PORT}(?:[/?#][^\\s\\u0000-\\u001f\\u007f]*)?$`,
 );
 const NF_IMG_RE = /^nf-media:\/\/img\/[A-Za-z0-9_-]{1,128}$/;
+/** ADR 0013 NIP-46 approval links: like `IMAGE_RE`, and no C1 controls or bidi overrides either. */
+const AUTH_URL_RE = new RegExp(
+  `^[Hh][Tt][Tt][Pp][Ss]://${HOST}${PORT}(?:[/?#][^\\s\\u0000-\\u001f\\u007f-\\u009f\\u2028\\u2029\\u202a-\\u202e\\u2066-\\u2069]*)?$`,
+);
 
 export const isRelayUrl = safe(branded<RelayUrl>(matches(RELAY_RE, LIMITS.maxServerUrl)));
 export const isMintUrl = safe(branded<MintUrl>(matches(HTTPS_SERVER_RE, LIMITS.maxServerUrl)));
@@ -567,13 +572,23 @@ const isUploadFile = obj({ path: isAbsolutePath, name: text(1, 1024), size: isCo
 const isSecretBytes: Guard<Uint8Array> = (x): x is Uint8Array =>
   bytes(MAX_SECRET_BYTES)(x) && x.byteLength > 0;
 
+/**
+ * ADR 0013: a NIP-46 `auth_url` main may open in the user's browser — `https:` only, an ASCII
+ * (IDNA-encoded) host, no user-info, no whitespace / control / bidi characters, bounded. A regex,
+ * not `URL`: this module runs under Bare too.
+ */
+export const isAuthUrl: Guard<string> = safe(matches(AUTH_URL_RE, MAX_AUTH_URL));
+
 /** ADR 0013: a question for main's prompt window (data only; the page holds the words). */
 export const isPromptForm: Guard<PromptForm> = safe(
   union(
     obj({ kind: literal('local-setup'), hasKey: bool, keychain: bool }),
     obj({ kind: literal('unlock-passphrase'), retry: bool }),
-    obj({ kind: oneOf(['new-passphrase', 'import-nsec', 'create-wallet'] as const) }),
+    obj({
+      kind: oneOf(['new-passphrase', 'import-nsec', 'create-wallet', 'remove-key'] as const),
+    }),
     obj({ kind: literal('bunker'), keychain: bool }),
+    obj({ kind: literal('bunker-auth'), url: isAuthUrl }),
   ),
 );
 
@@ -583,11 +598,13 @@ export const isPromptAnswer: Guard<PromptAnswer> = safe(
     obj({
       kind: literal('local-setup'),
       method: oneOf(['passphrase', 'keychain'] as const),
-      flow: oneOf(['unlock', 'import', 'generate'] as const),
+      flow: oneOf(['unlock', 'import', 'generate', 'remove'] as const),
     }),
     obj({ kind: literal('secret'), value: isSecretBytes }),
     obj({ kind: literal('bunker'), uri: isSecretBytes, remember: bool }),
     obj({ kind: literal('create-wallet'), create: bool }),
+    obj({ kind: literal('remove-key'), confirm: bool }),
+    obj({ kind: literal('bunker-auth'), open: bool }),
   ),
 );
 
@@ -604,7 +621,9 @@ export function promptAnswerFits(form: PromptForm, a: PromptAnswer): boolean {
       return (
         a.kind === 'local-setup' &&
         (a.method === 'passphrase' || form.keychain) &&
-        (form.hasKey ? a.flow === 'unlock' : a.flow !== 'unlock')
+        (form.hasKey
+          ? a.flow === 'unlock' || a.flow === 'remove'
+          : a.flow === 'import' || a.flow === 'generate')
       );
     case 'unlock-passphrase':
     case 'new-passphrase':
@@ -614,6 +633,10 @@ export function promptAnswerFits(form: PromptForm, a: PromptAnswer): boolean {
       return a.kind === 'bunker' && (!a.remember || form.keychain);
     case 'create-wallet':
       return a.kind === 'create-wallet';
+    case 'remove-key':
+      return a.kind === 'remove-key';
+    case 'bunker-auth':
+      return a.kind === 'bunker-auth';
   }
 }
 

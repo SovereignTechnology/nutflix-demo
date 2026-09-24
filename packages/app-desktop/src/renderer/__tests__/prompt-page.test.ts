@@ -140,4 +140,45 @@ describe('prompt page', () => {
     document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape' }));
     expect(sent).toEqual([null]);
   });
+
+  it('an existing key offers "Forgot the passphrase? Remove this key…"', () => {
+    const { sent } = show({ kind: 'local-setup', hasKey: true, keychain: false });
+    const link = [...root.querySelectorAll('button')].find((b) =>
+      b.textContent.includes('Remove this key'),
+    );
+    expect(link).toBeDefined();
+    link?.click();
+    expect(sent).toEqual([{ kind: 'local-setup', method: 'passphrase', flow: 'remove' }]);
+    root.remove();
+    show({ kind: 'local-setup', hasKey: false, keychain: false });
+    expect(root.textContent).not.toMatch(/Remove this key/);
+  });
+
+  it('remove key: "Keep it" is the default and the answer to Escape; Delete is destructive', () => {
+    const a = show({ kind: 'remove-key' });
+    expect(document.activeElement?.textContent).toBe('Keep it');
+    expect(root.textContent).toMatch(/no undo/);
+    expect(find('button.danger').textContent).toBe('Delete key');
+    document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape' }));
+    expect(a.sent).toEqual([{ kind: 'remove-key', confirm: false }]);
+    root.remove();
+    const b = show({ kind: 'remove-key' });
+    submit();
+    expect(b.sent).toEqual([{ kind: 'remove-key', confirm: true }]);
+  });
+
+  it('approval link: shows the real host (punycode for a lookalike), defaults to Not now', () => {
+    const a = show({
+      kind: 'bunker-auth',
+      url: 'https://auth.bunker.example:8443/approve?t=SECRET',
+    });
+    expect(find('.host code').textContent).toBe('auth.bunker.example:8443');
+    expect(root.textContent).not.toMatch(/SECRET/);
+    expect(document.activeElement?.textContent).toBe('Not now');
+    (document.activeElement as HTMLButtonElement).click();
+    expect(a.sent).toEqual([{ kind: 'bunker-auth', open: false }]);
+    root.remove();
+    show({ kind: 'bunker-auth', url: 'https://аuth.example/' }); // a Cyrillic "а"
+    expect(find('.host code').textContent).toMatch(/^xn--/);
+  });
 });

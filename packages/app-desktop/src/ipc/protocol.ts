@@ -252,14 +252,25 @@ export interface SignerConnectWire {
  * holds every word it shows, so neither the host nor anything upstream supplies prose.
  */
 export type PromptForm =
-  /** Choose how to unlock; with no key yet, also create or import. */
+  /**
+   * Choose how to unlock; with no key yet, also create or import; with one, unlock it — or
+   * remove it (a forgotten passphrase).
+   */
   | { readonly kind: 'local-setup'; readonly hasKey: boolean; readonly keychain: boolean }
   | { readonly kind: 'unlock-passphrase'; readonly retry: boolean }
   | { readonly kind: 'new-passphrase' }
   | { readonly kind: 'import-nsec' }
   | { readonly kind: 'bunker'; readonly keychain: boolean }
   /** No NIP-60 wallet was found for an existing identity: create one? (default: no) */
-  | { readonly kind: 'create-wallet' };
+  | { readonly kind: 'create-wallet' }
+  /** Delete the encrypted key file from this device? (default: keep it) */
+  | { readonly kind: 'remove-key' }
+  /**
+   * A remote signer asks the user to approve this app on its web page (NIP-46 `auth_url`). The
+   * one piece of upstream data a question carries: an `https:` URL (`isAuthUrl`), whose HOST the
+   * page shows; main opens it only when the user clicks "Open in browser".
+   */
+  | { readonly kind: 'bunker-auth'; readonly url: string };
 export type PromptKind = PromptForm['kind'];
 
 /** The window's answer (main → host); `null` = cancelled. Secrets are UTF-8 bytes. */
@@ -267,11 +278,13 @@ export type PromptAnswer =
   | {
       readonly kind: 'local-setup';
       readonly method: 'passphrase' | 'keychain';
-      readonly flow: 'unlock' | 'import' | 'generate';
+      readonly flow: 'unlock' | 'import' | 'generate' | 'remove';
     }
   | { readonly kind: 'secret'; readonly value: Uint8Array }
   | { readonly kind: 'bunker'; readonly uri: Uint8Array; readonly remember: boolean }
-  | { readonly kind: 'create-wallet'; readonly create: boolean };
+  | { readonly kind: 'create-wallet'; readonly create: boolean }
+  | { readonly kind: 'remove-key'; readonly confirm: boolean }
+  | { readonly kind: 'bunker-auth'; readonly open: boolean };
 
 /** What main's keychain holds, one sealed file each. */
 export type KeychainSlot = 'passphrase' | 'nip46';
@@ -279,6 +292,8 @@ export const KEYCHAIN_SLOTS = ['passphrase', 'nip46'] as const satisfies readonl
 
 /** Longest secret that crosses main ⇄ host (a bunker URI with a few relays). */
 export const MAX_SECRET_BYTES = 2048;
+/** Longest NIP-46 `auth_url` a question may carry. */
+export const MAX_AUTH_URL = 2048;
 
 // ---- the method table -------------------------------------------------------------------
 

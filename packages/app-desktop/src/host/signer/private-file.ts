@@ -10,7 +10,7 @@
  */
 import { randomBytes } from 'node:crypto';
 import { constants } from 'node:fs';
-import { chmod, lstat, mkdir, open, rename, rm } from 'node:fs/promises';
+import { chmod, lstat, mkdir, open, rename, rm, unlink } from 'node:fs/promises';
 import { basename, dirname, join } from 'node:path';
 
 import { hostError } from '../errors.js';
@@ -87,5 +87,28 @@ export async function writePrivateFile(path: string, data: Uint8Array): Promise<
     }
   } catch {
     // Directory fsync is not supported everywhere (Windows); the rename already landed.
+  }
+}
+
+/**
+ * Delete `path` (a symlink is removed itself, never followed); a missing file is fine. The
+ * directory is synced so the removal survives a crash.
+ */
+export async function removePrivateFile(path: string): Promise<void> {
+  try {
+    await unlink(path);
+  } catch (e) {
+    if ((e as { code?: unknown }).code === 'ENOENT') return;
+    throw e;
+  }
+  try {
+    const dh = await open(dirname(path), 'r');
+    try {
+      await dh.sync();
+    } finally {
+      await dh.close();
+    }
+  } catch {
+    // Directory fsync is not supported everywhere (Windows); the unlink already landed.
   }
 }

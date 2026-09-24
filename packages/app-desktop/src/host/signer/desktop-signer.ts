@@ -31,6 +31,7 @@ import { signer as signerMod } from '@sovit/core';
 import type { DesktopSignerInfo, SignerConnectWire, UnlockMethod } from '../../ipc/protocol.js';
 import { UNLOCK_METHODS } from '../../ipc/protocol.js';
 import { IpcError } from '../../ipc/errors.js';
+import { isAuthUrl } from '../../ipc/guards.js';
 import { fail, hostError } from '../errors.js';
 import type { IdentityProvider } from '../identity.js';
 import type { Logger } from '../log.js';
@@ -38,7 +39,12 @@ import type { MoneyPlane } from '../money.js';
 import { JsonFile } from '../settings/json-file.js';
 import type { MainBridge } from './main-bridge.js';
 import { wipeAnswer } from './main-bridge.js';
-import { ensurePrivateDir, readPrivateFile, writePrivateFile } from './private-file.js';
+import {
+  ensurePrivateDir,
+  readPrivateFile,
+  removePrivateFile,
+  writePrivateFile,
+} from './private-file.js';
 
 /** A NEW passphrase must be at least this long (bytes; the prompt window enforces it first). */
 export const MIN_NEW_PASSPHRASE_BYTES = 12;
@@ -52,6 +58,12 @@ export const UNLOCK_ATTEMPTS = 3;
 export const CANCEL_LIMIT = 3;
 export const CANCEL_WINDOW_MS = 60_000;
 export const CANCEL_COOLDOWN_MS = 60_000;
+/**
+ * NIP-46 approval links (`auth_url`): at most this many prompts per `AUTH_WINDOW_MS`, one at a
+ * time — a misbehaving bunker cannot flood the user with approval windows.
+ */
+export const AUTH_LIMIT = 5;
+export const AUTH_WINDOW_MS = 10 * 60_000;
 const KEY_FILE = 'local.key';
 const METHOD_FILE = 'method.json';
 const MAX_KEY_FILE_BYTES = 64 * 1024;
@@ -71,6 +83,10 @@ export class FileKeyStore implements signerMod.KeyStore {
   async write(file: Uint8Array): Promise<void> {
     await ensurePrivateDir(dirname(this.path));
     await writePrivateFile(this.path, file);
+  }
+  /** Delete the key file from this device (ADR 0013 addendum: a forgotten passphrase). */
+  async remove(): Promise<void> {
+    await removePrivateFile(this.path);
   }
   /** True when a key file is there — also when it is not private (unlocking then says why). */
   async exists(): Promise<boolean> {
@@ -168,6 +184,9 @@ export class DesktopSigner implements IdentityProvider {
   /** When the user dismissed recent prompts (the throttle). */
   private cancels: number[] = [];
   private coolUntil = 0;
+  /** NIP-46 approval prompts: one open at a time, and when recent ones were shown. */
+  private authOpen = false;
+  private authTimes: number[] = [];
   private readonly listeners = new Set<(s: SignerStatus) => void>();
 
   // One flow's scratch state (flows are exclusive).
@@ -342,10 +361,15 @@ export class DesktopSigner implements IdentityProvider {
       wipeAnswer(setup);
       fail('cancelled', 'the prompt was dismissed');
     }
+    if (setup.flow === 'remove') {
+      await this.removeLocalKey();
+      return;
+    }
+    const flow = setup.flow;
     const useKeychain = setup.method === 'keychain' && this.o.keychain;
     this.capturing = useKeychain;
     try {
-      await this.localConnectLoop(setup.flow);
+      await this.localConnectLoop(flow);
       await this.readLockedPubkey();
       await this.forgetKeychain('nip46');
       this.rememberedValue = false;
@@ -353,7 +377,25 @@ export class DesktopSigner implements IdentityProvider {
     } finally {
       this.endFlow();
     }
-    await this.changed(true, setup.flow === 'generate');
+    await this.changed(true, flow === 'generate');
+  }
+
+  /**
+   * Delete the key file (a forgotten passphrase is otherwise a dead end), after the user confirms
+   * in the prompt window ("Keep it" is the default). A local signer is signed out, its keychain
+   * copy forgotten; a connected remote signer is left alone.
+   */
+  private async removeLocalKey(): Promise<void> {
+    const a = await this.o.bridge.ask({ kind: 'remove-key' });
+    if (a?.kind !== 'remove-key' || !a.confirm) fail('cancelled', 'the key was kept');
+    if (this.manager.current()?.kind === 'local') await this.manager.disconnect();
+    await this.keyStore.remove();
+    this.lockedPubkey = null;
+    await this.forgetKeychain('passphrase');
+    if (this.methodValue === 'passphrase' || this.methodValue === 'keychain')
+      await this.setMethod(null);
+    this.log.info('the local key was removed from this device');
+    await this.changed(false, false);
   }
 
   private async unlockLocal(interactive: boolean): Promise<void> {
@@ -520,17 +562,50 @@ export class DesktopSigner implements IdentityProvider {
       this.resumeIn = null;
       if (blob === null) throw new Error('invalid-argument: no remembered session');
       try {
-        return await this.nip46.resume(blob);
+        return await this.nip46.resume(blob, {
+          onauth: (u) => {
+            this.onAuthUrl(u);
+          },
+        });
       } finally {
         signerMod.wipe(blob);
       }
     }
-    const s = await this.nip46.connect(uri, { remember: this.remember });
+    const s = await this.nip46.connect(uri, {
+      remember: this.remember,
+      onauth: (u) => {
+        this.onAuthUrl(u);
+      },
+    });
     if (s.resume !== undefined) {
       signerMod.wipe(this.resumeOut);
       this.resumeOut = s.resume;
     }
     return { bunker: s.bunker, relays: s.relays };
+  }
+
+  /**
+   * A NIP-46 `auth_url`: ask the user, in the prompt window, whether to open it (main opens it on
+   * "Open in browser"). Only `https:` links; one prompt at a time, `AUTH_LIMIT` per window. It can
+   * come at any time — during setup, or when the bunker wants approval to sign later.
+   */
+  private onAuthUrl(url: string): void {
+    if (!isAuthUrl(url)) {
+      this.log.warn('ignored a remote signer approval link that is not a plain https: URL');
+      return;
+    }
+    const now = (this.o.now ?? Date.now)();
+    this.authTimes = this.authTimes.filter((t) => now - t < AUTH_WINDOW_MS);
+    if (this.authOpen || this.authTimes.length >= AUTH_LIMIT || this.closed) {
+      this.log.info('ignored a remote signer approval link (one is open, or too many)');
+      return;
+    }
+    this.authTimes.push(now);
+    this.authOpen = true;
+    void this.o.bridge.ask({ kind: 'bunker-auth', url }).then((a) => {
+      this.authOpen = false;
+      wipeAnswer(a);
+    });
   }
 
   // ---- helpers -------------------------------------------------------------------------------

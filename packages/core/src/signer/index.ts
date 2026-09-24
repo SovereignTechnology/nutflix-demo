@@ -35,6 +35,7 @@ export {
   type Nip07Provider,
 } from './remote.js';
 export {
+  BUNKER_AUTH_WAIT_MS,
   BUNKER_SETUP_TIMEOUT_MS,
   connectBunker,
   parseBunkerUri,

@@ -13,12 +13,14 @@
  *     app webContents), so the page can reach nothing but its own question.
  *   - The answer is shape-checked and must fit the question (`promptAnswerFits`); text becomes
  *     UTF-8 bytes for the host and main's copy is wiped once posted (structured clone).
+ *   - A NIP-46 `auth_url` (the one piece of upstream data a question carries, `https:` only) is
+ *     opened by main — never the page — and only when the user clicks "Open in browser".
  *   - Closing the window is a cancel. The host's own deadline closes it (`prompt-cancel`); a host
  *     that went away closes everything (`cancelAll`).
  *
  * Electron-free: `main.ts` passes a window factory; the tests pass fakes.
  */
-import { promptAnswerFits } from '../ipc/guards.js';
+import { isAuthUrl, promptAnswerFits } from '../ipc/guards.js';
 import type { PromptAnswer, PromptForm } from '../ipc/protocol.js';
 import { MAX_SECRET_BYTES } from '../ipc/protocol.js';
 import type { LogEvent } from './log.js';
@@ -28,7 +30,13 @@ export { PROMPT_CHANNEL } from '../ipc/protocol.js';
 
 /** What the page sends: text, not bytes (`null` = cancel). */
 export type PageAnswer =
-  | Extract<PromptAnswer, { kind: 'local-setup' } | { kind: 'create-wallet' }>
+  | Extract<
+      PromptAnswer,
+      | { kind: 'local-setup' }
+      | { kind: 'create-wallet' }
+      | { kind: 'remove-key' }
+      | { kind: 'bunker-auth' }
+    >
   | { readonly kind: 'secret'; readonly value: string }
   | { readonly kind: 'bunker'; readonly uri: string; readonly remember: boolean }
   | null;
@@ -54,6 +62,11 @@ export interface PromptServiceDeps {
   openWindow(): PromptWindowLike;
   /** Deliver an answer to the host (`HostIn` `prompt-answer`). */
   answer(req: number, answer: PromptAnswer | null): void;
+  /**
+   * Open a NIP-46 approval page in the user's browser (`shell.openExternal`). Called only for a
+   * `bunker-auth` question the user answered "Open in browser", with its URL re-checked.
+   */
+  openExternal?(url: string): void;
   readonly log?: (level: 'info' | 'warn', event: Extract<LogEvent, `prompt.${string}`>) => void;
 }
 
@@ -85,12 +98,23 @@ export function toPromptAnswer(raw: unknown): PromptAnswer | null | undefined {
       case 'local-setup':
         if (keys !== 'flow,kind,method') return undefined;
         if (o['method'] !== 'passphrase' && o['method'] !== 'keychain') return undefined;
-        if (o['flow'] !== 'unlock' && o['flow'] !== 'import' && o['flow'] !== 'generate')
+        if (
+          o['flow'] !== 'unlock' &&
+          o['flow'] !== 'import' &&
+          o['flow'] !== 'generate' &&
+          o['flow'] !== 'remove'
+        )
           return undefined;
         return { kind: 'local-setup', method: o['method'], flow: o['flow'] };
       case 'create-wallet':
         if (keys !== 'create,kind' || typeof o['create'] !== 'boolean') return undefined;
         return { kind: 'create-wallet', create: o['create'] };
+      case 'remove-key':
+        if (keys !== 'confirm,kind' || typeof o['confirm'] !== 'boolean') return undefined;
+        return { kind: 'remove-key', confirm: o['confirm'] };
+      case 'bunker-auth':
+        if (keys !== 'kind,open' || typeof o['open'] !== 'boolean') return undefined;
+        return { kind: 'bunker-auth', open: o['open'] };
       case 'secret': {
         if (keys !== 'kind,value' || !isOwnText(o['value'], MAX_SECRET_BYTES)) return undefined;
         const value = enc(o['value']);
@@ -199,6 +223,19 @@ export class PromptService {
       this.d.log?.('warn', 'prompt.bad-answer');
       this.d.answer(c.req, null);
     } else {
+      // The approval page opens from HERE, on the user's click, with main's own copy of the URL.
+      if (
+        a?.kind === 'bunker-auth' &&
+        a.open &&
+        c.form.kind === 'bunker-auth' &&
+        isAuthUrl(c.form.url)
+      ) {
+        try {
+          this.d.openExternal?.(c.form.url);
+        } catch {
+          this.d.log?.('warn', 'prompt.open-failed');
+        }
+      }
       this.d.answer(c.req, a);
       // `answer` posts a structured clone to the host: main's copy is no longer needed.
       wipe(a);

@@ -117,3 +117,26 @@ button:disabled {
   opacity: 0.6;
   cursor: default;
 }
+button.danger {
+  background: var(--error);
+  border-color: var(--error);
+  color: #111;
+  font-weight: 600;
+}
+button.link {
+  background: none;
+  border: none;
+  color: var(--muted);
+  text-decoration: underline;
+  padding: 8px 4px;
+  margin-right: auto;
+}
+.host code {
+  display: inline-block;
+  font-size: 15px;
+  padding: 4px 8px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel);
+  word-break: break-all;
+}

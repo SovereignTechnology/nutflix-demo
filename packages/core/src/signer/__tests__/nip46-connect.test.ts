@@ -86,6 +86,8 @@ class FakeBunker {
   readonly seen: string[] = [];
   /** Answer the first get_public_key with an `auth_url` challenge first (NIP-46 auth flow). */
   authUrl: string | undefined;
+  /** …and the real answer only after this long (the user approving on the web page). */
+  approveAfterMs = 0;
   constructor(
     private readonly pool: MemoryPool,
     private readonly secret: string,
@@ -137,6 +139,21 @@ class FakeBunker {
         );
         this.authUrl = undefined;
         void this.pool.publish([RELAY], challenge);
+        if (this.approveAfterMs > 0) {
+          const later = finalizeEvent(
+            {
+              kind: NOSTR_CONNECT,
+              created_at: Math.floor(Date.now() / 1000),
+              tags: [['p', e.pubkey]],
+              content: nip44.encrypt(JSON.stringify({ id: req.id, result: this.pk }), ck),
+            },
+            this.sk,
+          );
+          setTimeout(() => {
+            void this.pool.publish([RELAY], later);
+          }, this.approveAfterMs);
+          return;
+        }
       }
       result = this.pk;
     } else if (req.method === 'sign_event') {
@@ -254,6 +271,22 @@ describe('connectBunker / resumeBunker (ADR 0013)', () => {
     } finally {
       warn.mockRestore();
     }
+  });
+
+  it('an auth_url challenge pushes the setup deadline out while the user approves', async () => {
+    const pool = new MemoryPool();
+    const b = new FakeBunker(pool, 's');
+    b.authUrl = 'https://auth.bunker.example/approve';
+    b.approveAfterMs = 300;
+    const urls: string[] = [];
+    const s = await connectBunker(b.uri(), {
+      pool: pool.asPool(),
+      timeoutMs: 100,
+      onauth: (u) => urls.push(u),
+    });
+    expect(urls).toEqual(['https://auth.bunker.example/approve']);
+    expect(await s.bunker.getPublicKey()).toBe(b.pk);
+    await s.bunker.close();
   });
 
   it('a pool the connector made itself is closed with the bunker, and when setup fails', async () => {

@@ -23,11 +23,13 @@ type Answer =
   | {
       kind: 'local-setup';
       method: 'passphrase' | 'keychain';
-      flow: 'unlock' | 'import' | 'generate';
+      flow: 'unlock' | 'import' | 'generate' | 'remove';
     }
   | { kind: 'secret'; value: string }
   | { kind: 'bunker'; uri: string; remember: boolean }
   | { kind: 'create-wallet'; create: boolean }
+  | { kind: 'remove-key'; confirm: boolean }
+  | { kind: 'bunker-auth'; open: boolean }
   | null;
 
 // ---- tiny DOM helpers --------------------------------------------------------------------
@@ -107,6 +109,15 @@ interface View {
   /** Focus this first (default: the first input, then the submit button). */
   readonly focus?: HTMLElement;
   readonly secrets?: HTMLInputElement[];
+  /**
+   * An outward or destructive question: focus starts on Cancel, and Cancel / Escape send this
+   * answer ("no") instead of a bare cancel.
+   */
+  readonly safeNo?: Answer;
+  /** The confirm button is destructive (styled as such). */
+  readonly danger?: boolean;
+  /** A secondary action beside the buttons (e.g. "Forgot the passphrase?"). */
+  readonly alt?: { readonly label: string; readonly answer: Answer };
 }
 
 function view(q: PromptForm): View {
@@ -151,6 +162,14 @@ function view(q: PromptForm): View {
         title: 'Local key',
         body,
         submitLabel: 'Continue',
+        ...(q.hasKey
+          ? {
+              alt: {
+                label: 'Forgot the passphrase? Remove this key…',
+                answer: { kind: 'local-setup', method: 'passphrase', flow: 'remove' },
+              },
+            }
+          : {}),
         collect: (f) => {
           const method =
             checked(f, 'method') === 'keychain' && q.keychain ? 'keychain' : 'passphrase';
@@ -279,6 +298,47 @@ function view(q: PromptForm): View {
         },
       };
     }
+    case 'remove-key':
+      return {
+        title: 'Remove your key from this device?',
+        body: [
+          el(
+            'p',
+            {},
+            'This deletes the encrypted key file. Your identity lives only in that key: unless its secret key (nsec) is saved somewhere else, you lose this identity and any sats its wallet holds.',
+          ),
+          el('p', { class: 'warning' }, 'There is no undo.'),
+        ],
+        submitLabel: 'Delete key',
+        cancelLabel: 'Keep it',
+        danger: true,
+        safeNo: { kind: 'remove-key', confirm: false },
+        collect: () => ({ kind: 'remove-key', confirm: true }),
+      };
+    case 'bunker-auth': {
+      let host: string;
+      try {
+        host = new URL(q.url).host;
+      } catch {
+        host = '(invalid address)';
+      }
+      return {
+        title: 'Approve in your remote signer',
+        body: [
+          el('p', {}, 'Your remote signer asks you to approve Nutflix on its web page at:'),
+          el('p', { class: 'host' }, el('code', {}, host)),
+          el(
+            'p',
+            { class: 'hint' },
+            'Continue only if you recognise this address. Nutflix opens it in your browser; approve there, then come back.',
+          ),
+        ],
+        submitLabel: 'Open in browser',
+        cancelLabel: 'Not now',
+        safeNo: { kind: 'bunker-auth', open: false },
+        collect: () => ({ kind: 'bunker-auth', open: true }),
+      };
+    }
     case 'create-wallet': {
       return {
         title: 'No wallet found',
@@ -292,6 +352,7 @@ function view(q: PromptForm): View {
         ],
         submitLabel: 'Create wallet',
         cancelLabel: 'Not now',
+        safeNo: { kind: 'create-wallet', create: false },
         collect: () => ({ kind: 'create-wallet', create: true }),
       };
     }
@@ -307,7 +368,9 @@ function isForm(x: unknown): x is PromptForm {
     k === 'new-passphrase' ||
     k === 'import-nsec' ||
     k === 'bunker' ||
-    k === 'create-wallet'
+    k === 'create-wallet' ||
+    k === 'remove-key' ||
+    k === 'bunker-auth'
   );
 }
 
@@ -315,15 +378,21 @@ export function mount(root: HTMLElement, api: PromptApi, q: PromptForm): void {
   const v = view(q);
   let sent = false;
   const error = el('p', { class: 'error', role: 'alert', hidden: true });
-  const submit = el('button', { type: 'submit', class: 'primary' }, v.submitLabel);
+  const submit = el(
+    'button',
+    { type: 'submit', class: v.danger === true ? 'danger' : 'primary' },
+    v.submitLabel,
+  );
   const cancel = el('button', { type: 'button' }, v.cancelLabel ?? 'Cancel');
+  const alt =
+    v.alt === undefined ? null : el('button', { type: 'button', class: 'link' }, v.alt.label);
   const form = el(
     'form',
     { autocomplete: 'off', novalidate: true },
     el('h1', {}, v.title),
     ...v.body,
     error,
-    el('div', { class: 'actions' }, cancel, submit),
+    el('div', { class: 'actions' }, ...(alt === null ? [] : [alt]), cancel, submit),
   );
   const clear = (): void => {
     for (const s of v.secrets ?? []) s.value = '';
@@ -334,9 +403,7 @@ export function mount(root: HTMLElement, api: PromptApi, q: PromptForm): void {
     for (const c of form.querySelectorAll<HTMLInputElement | HTMLButtonElement>('input, button'))
       c.disabled = true;
     clear();
-    void api.answer(
-      q.kind === 'create-wallet' && a === null ? { kind: 'create-wallet', create: false } : a,
-    );
+    void api.answer(a === null && v.safeNo !== undefined ? v.safeNo : a);
   };
   form.addEventListener('submit', (e) => {
     e.preventDefault();
@@ -351,12 +418,18 @@ export function mount(root: HTMLElement, api: PromptApi, q: PromptForm): void {
   cancel.addEventListener('click', () => {
     send(null);
   });
+  if (alt !== null && v.alt !== undefined) {
+    const answer = v.alt.answer;
+    alt.addEventListener('click', () => {
+      send(answer);
+    });
+  }
   document.addEventListener('keydown', (e) => {
     if (e.key === 'Escape') send(null);
   });
   root.replaceChildren(form);
-  // A money-shaped question defaults to its safe answer.
-  (q.kind === 'create-wallet' ? cancel : (v.focus ?? submit)).focus();
+  // A money-shaped, destructive or outward question defaults to its safe answer.
+  (v.safeNo !== undefined ? cancel : (v.focus ?? submit)).focus();
 }
 
 async function start(): Promise<void> {

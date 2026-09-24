@@ -26,6 +26,7 @@ import {
   protocol,
   safeStorage,
   session,
+  shell,
   utilityProcess,
   webContents as allWebContents,
   type MessageBoxOptions,
@@ -121,6 +122,11 @@ const prompts = new PromptService({
       },
     };
   },
+  openExternal: (url) => {
+    void shell.openExternal(url).catch(() => {
+      log('warn', 'prompt.open-failed');
+    });
+  },
   answer: (req, answer) => {
     if (e2ePrompts.has(req)) {
       // --e2e-hooks: a synthetic question (below) — only the answer's shape is kept.
@@ -147,6 +153,8 @@ function summarizeAnswer(a: PromptAnswer | null): { kind: string; bytes: number 
   if (a.kind === 'secret') return { kind: a.kind, bytes: a.value.byteLength };
   if (a.kind === 'bunker') return { kind: a.kind, bytes: a.uri.byteLength };
   if (a.kind === 'create-wallet') return { kind: `create-wallet:${String(a.create)}`, bytes: 0 };
+  if (a.kind === 'remove-key') return { kind: `remove-key:${String(a.confirm)}`, bytes: 0 };
+  if (a.kind === 'bunker-auth') return { kind: `bunker-auth:${String(a.open)}`, bytes: 0 };
   return { kind: `local-setup:${a.method}:${a.flow}`, bytes: 0 };
 }
 

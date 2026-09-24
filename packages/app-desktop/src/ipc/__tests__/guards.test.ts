@@ -282,6 +282,41 @@ describe('message envelopes', () => {
       null,
     ])
       expect(isHostOut({ kind: 'prompt', req: 1, form }), JSON.stringify(form)).toBe(false);
+    // ADR 0013 addendum: removing the key; a NIP-46 approval link (https only).
+    expect(isHostOut({ kind: 'prompt', req: 1, form: { kind: 'remove-key' } })).toBe(true);
+    expect(
+      isHostOut({
+        kind: 'prompt',
+        req: 1,
+        form: { kind: 'bunker-auth', url: 'https://auth.example/approve?t=1' },
+      }),
+    ).toBe(true);
+    for (const url of [
+      'http://auth.example/x',
+      'javascript:alert(1)',
+      'file:///etc/passwd',
+      'https://user:pw@auth.example/',
+      'https://auth.example/a b',
+      'https://auth.example/\u202eevil',
+      'https://auth.example/\nx',
+      'https://auth.example/' + 'a'.repeat(2048),
+      'nf-media://x',
+      'https://аuth.example/', // a raw (Cyrillic) IDN host: bunkers must send punycode
+      'https://auth.example/\u0085x',
+      '',
+      42,
+    ])
+      expect(
+        isHostOut({ kind: 'prompt', req: 1, form: { kind: 'bunker-auth', url } }),
+        String(url).slice(0, 40),
+      ).toBe(false);
+    expect(
+      isHostOut({
+        kind: 'prompt',
+        req: 1,
+        form: { kind: 'bunker-auth', url: 'https://xn--uth-8cd.example:8443/a?b=c#d' },
+      }),
+    ).toBe(true);
     expect(isHostOut({ kind: 'prompt-cancel', req: 1 })).toBe(true);
     expect(isHostOut({ kind: 'keychain', req: 1, op: 'get', slot: 'passphrase' })).toBe(true);
     expect(isHostOut({ kind: 'keychain', req: 1, op: 'forget', slot: 'nip46' })).toBe(true);
@@ -335,6 +370,12 @@ describe('message envelopes', () => {
       expect(isHostIn({ kind: 'prompt-answer', req: 1, answer }), JSON.stringify(answer)).toBe(
         false,
       );
+    expect(
+      isHostIn({ kind: 'prompt-answer', req: 1, answer: { kind: 'remove-key', confirm: true } }),
+    ).toBe(true);
+    expect(
+      isHostIn({ kind: 'prompt-answer', req: 1, answer: { kind: 'bunker-auth', open: false } }),
+    ).toBe(true);
     expect(isHostIn({ kind: 'keychain-result', req: 1, ok: true, value: null })).toBe(true);
     expect(isHostIn({ kind: 'keychain-result', req: 1, ok: true, value: b('pw') })).toBe(true);
     expect(isHostIn({ kind: 'keychain-result', req: 1, ok: 'yes', value: null })).toBe(false);
@@ -342,8 +383,10 @@ describe('message envelopes', () => {
 
   it('ADR 0013: an answer fits only the question it answers, with only what was offered', () => {
     const secret = { kind: 'secret', value: new Uint8Array([1]) } as const;
-    const setup = (method: 'passphrase' | 'keychain', flow: 'unlock' | 'import' | 'generate') =>
-      ({ kind: 'local-setup', method, flow }) as const;
+    const setup = (
+      method: 'passphrase' | 'keychain',
+      flow: 'unlock' | 'import' | 'generate' | 'remove',
+    ) => ({ kind: 'local-setup', method, flow }) as const;
     const noKey = { kind: 'local-setup', hasKey: false, keychain: false } as const;
     const hasKey = { kind: 'local-setup', hasKey: true, keychain: true } as const;
     expect(promptAnswerFits(noKey, setup('passphrase', 'generate'))).toBe(true);
@@ -352,6 +395,20 @@ describe('message envelopes', () => {
     expect(promptAnswerFits(noKey, setup('keychain', 'generate'))).toBe(false);
     expect(promptAnswerFits(hasKey, setup('keychain', 'unlock'))).toBe(true);
     expect(promptAnswerFits(hasKey, setup('passphrase', 'generate'))).toBe(false);
+    expect(promptAnswerFits(hasKey, setup('passphrase', 'remove'))).toBe(true);
+    expect(promptAnswerFits(noKey, setup('passphrase', 'remove'))).toBe(false);
+    expect(promptAnswerFits({ kind: 'remove-key' }, { kind: 'remove-key', confirm: true })).toBe(
+      true,
+    );
+    expect(promptAnswerFits({ kind: 'remove-key' }, { kind: 'create-wallet', create: true })).toBe(
+      false,
+    );
+    expect(
+      promptAnswerFits(
+        { kind: 'bunker-auth', url: 'https://a.example/' },
+        { kind: 'bunker-auth', open: true },
+      ),
+    ).toBe(true);
     expect(promptAnswerFits({ kind: 'import-nsec' }, secret)).toBe(true);
     expect(promptAnswerFits({ kind: 'create-wallet' }, secret)).toBe(false);
     const bunker = { kind: 'bunker', uri: new Uint8Array([1]), remember: true } as const;

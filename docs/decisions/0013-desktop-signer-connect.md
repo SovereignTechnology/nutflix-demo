@@ -125,15 +125,41 @@ header ("Unlock" while locked, "Lock", "Sign out").
 - `--e2e-hooks` gains `openPrompt` / `promptAnswer` (kind + byte length only), so the Electron
   suite can drive the real window under `--dev-mocks`.
 
+## 7. Addendum (same day): removing the key, NIP-46 approval links
+
+Cameron: "do the still missing".
+
+- **Removing the key.** With a key on the device, the prompt window's "Local key" question offers
+  "Forgot the passphrase? Remove this key…" (`flow: 'remove'`, fits only when a key exists).
+  - The prompt window then asks `remove-key`, with the warning that without an nsec saved
+    elsewhere the identity and its wallet's sats are lost, and that there is no undo. "Keep it" is
+    the default and the answer to Escape, and "Delete key" is styled destructive.
+  - Confirmed, the host signs a local signer out, unlinks the key file (a symlink is removed
+    itself, never followed; the directory is synced), forgets the keychain copy and clears the
+    method. A connected remote signer is left alone.
+  - The renderer has no way to start this: it is an answer in the trusted window only.
+- **NIP-46 approval links.** A bunker that answers with `auth_url` now gets one:
+  - the host checks the link (`isAuthUrl`: `https:`, an ASCII — punycode — host, no credentials,
+    no control, whitespace or bidi characters, ≤ 2048), then asks `bunker-auth {url}`;
+  - the prompt window shows the link's HOST (the real one: punycode for a lookalike), never the
+    path or query (it may carry a token), and defaults to "Not now";
+  - **main** opens its own copy of the URL with `shell.openExternal`, re-checked, and only when
+    the user clicks "Open in browser" (F25's "show the real host" for this path);
+  - one approval prompt at a time, at most five per ten minutes;
+  - during setup a challenge pushes the deadline from 60 s to 5 minutes
+    (`BUNKER_AUTH_WAIT_MS`) while the user approves; later challenges (a bunker asking approval to
+    sign) are asked the same way.
+- The keychain trade-off stays by design: with the keychain method, any process of the same OS
+  user can have the passphrase unsealed. `safeStorage` offers no per-access user-presence check,
+  so closing that would mean a different method (a hardware or OS-biometric unlock), not a fix to
+  this one. The prompt says so where the method is chosen.
+
 ## Consequences
 
 - The desktop signs, pays and is paid with a signer the user connected, unlocked the way they
   chose. F24 is closed for the desktop.
 - `--dev-mocks` keeps its fixed read-only identity; the flow is refused there.
 - Residual:
-  - no "remove the key from this device" flow (a forgotten passphrase is a dead end without
-    deleting the file; UI lane);
-  - NIP-46 `auth_url` flows are not supported (ignored);
   - the locked identity shown before unlock is the key file header's pubkey, unauthenticated
     until unlock;
   - JS strings for `safeStorage` and the bunker URI.

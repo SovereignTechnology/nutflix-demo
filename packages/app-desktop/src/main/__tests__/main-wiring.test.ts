@@ -38,6 +38,8 @@ const fx = vi.hoisted(() => {
     /** ADR 0013: `safeStorage` — off (a Linux box with no keyring) unless a test turns it on. */
     keychain: false,
     keychainBackend: 'gnome_libsecret',
+    /** ADR 0013 addendum: what main asked the OS to open in the browser. */
+    opened: [] as string[],
   };
   return state;
 });
@@ -123,6 +125,12 @@ vi.mock('electron', () => {
         }),
     },
     BrowserWindow,
+    shell: {
+      openExternal: (url: string) => {
+        fx.opened.push(url);
+        return Promise.resolve();
+      },
+    },
     safeStorage: {
       isEncryptionAvailable: () => fx.keychain,
       getSelectedStorageBackend: () => fx.keychainBackend,
@@ -212,6 +220,7 @@ beforeEach(() => {
   fx.dialogAnswer = 0;
   fx.keychain = false;
   fx.keychainBackend = 'gnome_libsecret';
+  fx.opened.length = 0;
   fx.appListeners.clear();
   fx.protocols.clear();
   fx.ipc.clear();
@@ -596,5 +605,32 @@ describe('main.ts wiring (fake electron)', () => {
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
+  });
+
+  it("ADR 0013 addendum: a NIP-46 approval link opens in the browser only on the prompt window's click", async () => {
+    await boot();
+    const child = fx.children[0];
+    const deliver = (m: unknown): void => {
+      for (const l of child?.listeners.get('message') ?? []) l(m);
+    };
+    const url = 'https://auth.bunker.example/approve?s=1';
+    deliver({ kind: 'prompt', req: 9, form: { kind: 'bunker-auth', url } });
+    const answer = fx.ipc.get('nf-prompt:answer');
+    const ev = (id: number, frameUrl: string): unknown => ({
+      sender: { id },
+      senderFrame: { url: frameUrl, parent: null },
+    });
+    // The app window cannot answer (or open) it.
+    expect(
+      await answer?.(ev(1, 'app://nutflix/index.html'), { kind: 'bunker-auth', open: true }),
+    ).toBe(false);
+    expect(fx.opened).toEqual([]);
+    expect(
+      await answer?.(ev(2, 'app://prompt/prompt.html'), { kind: 'bunker-auth', open: true }),
+    ).toBe(true);
+    expect(fx.opened).toEqual([url]);
+    // A host message with a non-https link never even reaches the window (isHostOut).
+    deliver({ kind: 'prompt', req: 10, form: { kind: 'bunker-auth', url: 'http://x.example/' } });
+    expect(fx.windows).toHaveLength(2);
   });
 });

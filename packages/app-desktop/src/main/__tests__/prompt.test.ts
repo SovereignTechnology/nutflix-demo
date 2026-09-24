@@ -181,6 +181,43 @@ describe('PromptService', () => {
   });
 });
 
+describe('NIP-46 approval links (ADR 0013 addendum)', () => {
+  function withOpener(): { s: PromptService; windows: FakeWindow[]; opened: string[] } {
+    const windows: FakeWindow[] = [];
+    const opened: string[] = [];
+    const s = new PromptService({
+      openWindow: () => {
+        const w = new FakeWindow(200 + windows.length);
+        windows.push(w);
+        return w;
+      },
+      answer: () => undefined,
+      openExternal: (u) => opened.push(u),
+    });
+    return { s, windows, opened };
+  }
+  const URL_ = 'https://auth.bunker.example/approve?session=1';
+
+  it('main opens the link — its own copy — only on "Open in browser"', () => {
+    const { s, windows, opened } = withOpener();
+    s.ask(1, { kind: 'bunker-auth', url: URL_ });
+    expect(s.submit(from(windows[0]), { kind: 'bunker-auth', open: false })).toBe(true);
+    expect(opened).toEqual([]);
+    s.ask(2, { kind: 'bunker-auth', url: URL_ });
+    s.submit(from(windows[1]), { kind: 'bunker-auth', open: true });
+    expect(opened).toEqual([URL_]);
+  });
+
+  it('never opens anything for another question, or a link that is not https', () => {
+    const { s, windows, opened } = withOpener();
+    s.ask(1, { kind: 'create-wallet' });
+    s.submit(from(windows[0]), { kind: 'bunker-auth', open: true }); // a misfit: a cancel
+    s.ask(2, { kind: 'bunker-auth', url: 'http://auth.example/' } as never); // bypassed the guard
+    s.submit(from(windows[1]), { kind: 'bunker-auth', open: true });
+    expect(opened).toEqual([]);
+  });
+});
+
 describe('toPromptAnswer (the page → the host)', () => {
   it('converts text to UTF-8 bytes and keeps only the known keys', () => {
     const a = toPromptAnswer({ kind: 'secret', value: 'pässword' });
@@ -210,6 +247,9 @@ describe('toPromptAnswer (the page → the host)', () => {
     [{ kind: 'local-setup', method: 'plaintext', flow: 'generate' }],
     [{ kind: 'local-setup', method: 'passphrase', flow: 'export' }],
     [{ kind: 'create-wallet', create: 1 }],
+    [{ kind: 'remove-key' }],
+    [{ kind: 'remove-key', confirm: 'yes' }],
+    [{ kind: 'bunker-auth', open: true, url: 'https://evil.example' }],
     [{ kind: 'nip07' }],
   ])('refuses %j', (raw) => {
     expect(toPromptAnswer(raw)).toBeUndefined();

@@ -101,9 +101,6 @@ LOW:
 
 ## Residual
 
-- No "remove the key from this device" flow: a forgotten passphrase needs the file deleted by hand
-  (UI lane, with a native confirm).
-- NIP-46 `auth_url` flows are ignored, not supported.
 - The locked identity shown before unlock is the key file header's pubkey (unauthenticated until
   the unlock verifies it; informational only).
 - JS strings: `safeStorage` takes and returns strings; a bunker URI is a string for nostr-tools.
@@ -144,3 +141,37 @@ LOW:
   native-module inventory and the Electron security lint OK (the lint's pinned window count moved
   from 1 to 2 in `packages/app-desktop/src`, with this review as its justification).
 - `npm run test:e2e` (real Electron): 15 passed (fidelity 5, signer 2, Stage 1 8).
+
+## Addendum — removing the key, NIP-46 approval links (ADR 0013 §7)
+
+Same method; diff on top of `e4c4510`.
+
+- **Removing the key (HIGH: destructive).**
+  - Reachable only as an answer in the trusted window: `flow: 'remove'` fits only a question
+    that says a key exists, then a separate `remove-key` confirmation whose default and Escape
+    answer is "Keep it".
+  - A compromised renderer can open the "Local key" question (throttled) but cannot answer it.
+  - Unlink never follows a symlink; the directory is synced.
+  - Tested: keep, delete (file, keychain copy, method, identity gone; the next connect offers
+    create / import again), and "remove" refused without a key.
+  - The mutation that ignores the confirmation fails the test.
+- **Approval links (HIGH: an upstream URL, opened outside the app).**
+  - The URL is the only upstream data a question may carry. It is guarded three times
+    (`isAuthUrl` in the host before asking, in `isHostOut`, and again by main before opening):
+    `https:` only, no credentials, no control / whitespace / bidi characters, bounded (tested
+    with `http:`, `javascript:`, `file:`, credentials, a space, U+202E, a newline, oversize).
+  - The page shows only the host (punycode for an IDN lookalike, tested with a Cyrillic "а").
+    The path and query, which may carry a token, are never shown.
+  - Main opens its OWN copy of the URL, only for a `bunker-auth` question answered "Open"
+    (tested: not on "Not now", not for another question's misfit answer, not for a non-https
+    URL that bypassed the guard). The app window cannot answer the question.
+  - A misbehaving bunker gets one prompt at a time and five per ten minutes (tested).
+  - The setup deadline moves to 5 minutes only after a challenge (tested; the mutation that drops
+    the extension fails the test).
+- No new finding. F25 is satisfied for this path (the host is shown before anything opens).
+- Tests: desktop-signer 24 (+3), nip46-connect 9 (+1), prompt service (+2), guards (+ approval
+  URLs, the remove answers), prompt page (+3), main-wiring (+1: `shell.openExternal` only on the
+  prompt window's click), e2e signer 3 (+1: remove-key and approval-link defaults).
+- `npm run ci` green: 160 files passed, 2 skipped; 2580 tests passed, 7 skipped; all gates OK.
+  `npm run test:e2e`: 16 passed. (The first CI run caught `new URL` in `src/ipc`, which must run
+  under Bare: `isAuthUrl` is a regex built from the existing URL guards' pieces.)

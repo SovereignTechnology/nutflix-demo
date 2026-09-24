@@ -61,6 +61,8 @@ export function parseBunkerUri(uri: string): BunkerPointer {
 
 /** How long setup waits for the bunker to answer (`connect`, then `get_public_key`). */
 export const BUNKER_SETUP_TIMEOUT_MS = 60_000;
+/** After an `auth_url` challenge, setup waits this long (the user approves on a web page). */
+export const BUNKER_AUTH_WAIT_MS = 5 * 60_000;
 
 export interface BunkerOptions {
   readonly pool?: AbstractSimplePool;
@@ -72,9 +74,10 @@ export interface BunkerOptions {
    */
   readonly remember?: boolean;
   /**
-   * A bunker's `auth_url` challenge (a URL for the user to open). Default: ignored. Never left to
-   * nostr-tools, which would `console.warn` the URL — often carrying a session token — past the
-   * host's redacting logger.
+   * A bunker's `auth_url` challenge (a URL for the user to open; untrusted — check it before
+   * showing or opening it). Default: ignored. Never left to nostr-tools, which would
+   * `console.warn` the URL — often carrying a session token — past the host's redacting logger.
+   * During setup a challenge also pushes the deadline out to `BUNKER_AUTH_WAIT_MS`.
    */
   readonly onauth?: (url: string) => void;
 }
@@ -100,20 +103,42 @@ export interface BunkerSession {
   readonly resume?: Uint8Array;
 }
 
-/** Rejects with `remote-signer` when `p` has not settled within `ms`, after `onTimeout`. */
-async function within<T>(p: Promise<T>, ms: number, onTimeout: () => void): Promise<T> {
+/**
+ * The setup deadline. An `auth_url` challenge pushes it out to `BUNKER_AUTH_WAIT_MS`: the user is
+ * off approving this client on the bunker's web page.
+ */
+interface Deadline {
+  race<T>(p: Promise<T>): Promise<T>;
+  extend(ms: number): void;
+  clear(): void;
+}
+
+function deadline(ms: number, onTimeout: () => void): Deadline {
   let timer: ReturnType<typeof setTimeout> | undefined;
+  let rejectLate: (e: Error) => void = () => undefined;
   const late = new Promise<never>((_resolve, reject) => {
-    timer = setTimeout(() => {
-      onTimeout();
-      reject(new Error('remote-signer: the bunker did not answer in time'));
-    }, ms);
+    rejectLate = reject;
   });
-  try {
-    return await Promise.race([p, late]);
-  } finally {
+  late.catch(() => undefined); // settled only by a race that is already over
+  let done = false;
+  const arm = (t: number): void => {
+    if (done) return;
     clearTimeout(timer);
-  }
+    timer = setTimeout(() => {
+      done = true;
+      onTimeout();
+      rejectLate(new Error('remote-signer: the bunker did not answer in time'));
+    }, t);
+  };
+  arm(ms);
+  return {
+    race: <T>(p: Promise<T>): Promise<T> => Promise.race([p, late]),
+    extend: arm,
+    clear: () => {
+      done = true;
+      clearTimeout(timer);
+    },
+  };
 }
 
 interface Opened {
@@ -125,19 +150,25 @@ interface Opened {
 
 /**
  * A `BunkerSigner` on `opts.pool`, or on a pool of its own that is closed with it: left alone,
- * nostr-tools makes a pool per signer and `close()` leaves its relay sockets open.
+ * nostr-tools makes a pool per signer and `close()` leaves its relay sockets open. `onSetupAuth`
+ * hears an `auth_url` too (the setup deadline is pushed out).
  */
 function open(
   clientKey: Uint8Array,
   bp: BunkerPointer,
   opts: Omit<BunkerOptions, 'remember'>,
+  onSetupAuth: () => void,
 ): Opened {
   const own = opts.pool === undefined ? new SimplePool() : undefined;
   const pool = opts.pool ?? own;
+  const onauth = (url: string): void => {
+    onSetupAuth();
+    opts.onauth?.(url);
+  };
   const signer = BunkerSigner.fromBunker(
     clientKey,
     bp,
-    bunkerParams(pool === undefined ? opts : { ...opts, pool }),
+    bunkerParams(pool === undefined ? { ...opts, onauth } : { ...opts, pool, onauth }),
   );
   const dispose = async (): Promise<void> => {
     await signer.close().catch(() => undefined);
@@ -157,14 +188,11 @@ function open(
 }
 
 /** Ask for the user's pubkey now (bounded), so `Nip46Signer.adopt` finds it cached. */
-async function warmUp(o: Opened, ms: number): Promise<void> {
-  const closeQuietly = (): void => {
-    void o.dispose();
-  };
+async function warmUp(o: Opened, d: Deadline): Promise<void> {
   try {
-    await within(o.signer.getPublicKey(), ms, closeQuietly);
+    await d.race(o.signer.getPublicKey());
   } catch (e) {
-    closeQuietly();
+    await o.dispose();
     if (e instanceof Error && e.message.startsWith('remote-signer:')) throw e;
     throw new Error('remote-signer: the bunker did not return a pubkey', { cause: e });
   }
@@ -183,17 +211,25 @@ function encodeResume(clientKey: Uint8Array, bp: BunkerPointer): Uint8Array {
 /** Open and `connect()` a NIP-46 session. Rejects if the bunker does not answer in time. */
 export async function connectBunker(uri: string, opts: BunkerOptions = {}): Promise<BunkerSession> {
   const bp = parseBunkerUri(uri);
-  const ms = opts.timeoutMs ?? BUNKER_SETUP_TIMEOUT_MS;
   // BunkerSigner keeps THIS array as its channel key (no copy): it must not be wiped here.
   const clientKey = generateSecretKey();
-  const o = open(clientKey, bp, opts);
+  const late: { d?: Deadline } = {};
+  const o = open(clientKey, bp, opts, () => {
+    late.d?.extend(BUNKER_AUTH_WAIT_MS);
+  });
+  const d = deadline(opts.timeoutMs ?? BUNKER_SETUP_TIMEOUT_MS, () => undefined);
+  late.d = d;
   try {
-    await within(o.signer.connect(), ms, () => undefined);
-  } catch {
-    await o.dispose();
-    throw new Error('remote-signer: the bunker did not answer connect');
+    try {
+      await d.race(o.signer.connect());
+    } catch {
+      await o.dispose();
+      throw new Error('remote-signer: the bunker did not answer connect');
+    }
+    await warmUp(o, d);
+  } finally {
+    d.clear();
   }
-  await warmUp(o, ms);
   const relays = bp.relays;
   return opts.remember === true
     ? { bunker: o.bunker, relays, resume: encodeResume(clientKey, { ...bp, secret: null }) }
@@ -231,7 +267,16 @@ export async function resumeBunker(
     throw new Error('invalid-argument: not a remembered NIP-46 session');
   const bp: BunkerPointer = { pubkey: o.pubkey, relays: [...o.relays], secret: null };
   // Held by BunkerSigner from here on (no copy), like connectBunker's.
-  const opened = open(hexToBytes(o.key), bp, opts);
-  await warmUp(opened, opts.timeoutMs ?? BUNKER_SETUP_TIMEOUT_MS);
+  const late: { d?: Deadline } = {};
+  const opened = open(hexToBytes(o.key), bp, opts, () => {
+    late.d?.extend(BUNKER_AUTH_WAIT_MS);
+  });
+  const d = deadline(opts.timeoutMs ?? BUNKER_SETUP_TIMEOUT_MS, () => undefined);
+  late.d = d;
+  try {
+    await warmUp(opened, d);
+  } finally {
+    d.clear();
+  }
   return { bunker: opened.bunker, relays: bp.relays };
 }

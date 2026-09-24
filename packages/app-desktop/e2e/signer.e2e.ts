@@ -201,5 +201,23 @@ void describe(
       });
       assert.equal((await answerOf(app, c.req)).value, null);
     });
+
+    void it("removing the key and a remote signer's approval link default to the safe answer", async () => {
+      const r = await openPrompt(app, { kind: 'remove-key' });
+      assert.equal(await r.page.evaluate(() => document.activeElement?.textContent), 'Keep it');
+      assert.equal(await r.page.locator('button.danger').textContent(), 'Delete key');
+      await r.page.keyboard.press('Escape').catch(() => undefined);
+      assert.deepEqual((await answerOf(app, r.req)).value, { kind: 'remove-key:false', bytes: 0 });
+
+      // Never "Open in browser" here: it would launch the system browser.
+      const a = await openPrompt(app, {
+        kind: 'bunker-auth',
+        url: 'https://auth.bunker.example/approve?t=e2e',
+      });
+      assert.equal(await a.page.locator('.host code').textContent(), 'auth.bunker.example');
+      assert.equal(await a.page.evaluate(() => document.activeElement?.textContent), 'Not now');
+      await a.page.keyboard.press('Enter').catch(() => undefined);
+      assert.deepEqual((await answerOf(app, a.req)).value, { kind: 'bunker-auth:false', bytes: 0 });
+    });
   },
 );

@@ -159,6 +159,8 @@ function localScript(
         return { kind: 'secret', value: enc(nsec ?? '') };
       case 'bunker':
       case 'create-wallet':
+      case 'remove-key':
+      case 'bunker-auth':
         return null;
     }
   };
@@ -353,6 +355,59 @@ describe('DesktopSigner — local key', () => {
   });
 });
 
+describe('DesktopSigner — removing the key (a forgotten passphrase)', () => {
+  it('asks first ("Keep it" keeps it), then deletes the file, the keychain copy and the identity', async () => {
+    const s = setup({ keychain: true });
+    s.main.script = localScript('keychain', 'generate');
+    await s.signer.connect({ kind: 'local' });
+    expect(s.main.keychain.has('passphrase')).toBe(true);
+    const keyPath = join(userData, 'signer', 'local.key');
+
+    s.main.asked.length = 0;
+    s.main.script = (f) =>
+      f.kind === 'local-setup'
+        ? { kind: 'local-setup', method: 'passphrase', flow: 'remove' }
+        : f.kind === 'remove-key'
+          ? { kind: 'remove-key', confirm: false }
+          : null;
+    expect(await code(s.signer.connect({ kind: 'local' }))).toBe('cancelled');
+    expect(s.main.asked).toEqual([
+      { kind: 'local-setup', hasKey: true, keychain: true },
+      { kind: 'remove-key' },
+    ]);
+    expect((await stat(keyPath)).isFile()).toBe(true);
+    expect(s.signer.signer()).toBeDefined();
+
+    s.main.script = (f) =>
+      f.kind === 'local-setup'
+        ? { kind: 'local-setup', method: 'passphrase', flow: 'remove' }
+        : f.kind === 'remove-key'
+          ? { kind: 'remove-key', confirm: true }
+          : null;
+    const st = await s.signer.connect({ kind: 'local' });
+    expect(st).toMatchObject({ pubkey: null, locked: true });
+    await expect(stat(keyPath)).rejects.toThrow();
+    expect(s.main.keychain.has('passphrase')).toBe(false);
+    expect(await s.signer.info()).toMatchObject({ method: null, hasLocalKey: false });
+    expect(s.signer.money()).toBeUndefined();
+    // With no key, the next connect offers create / import again.
+    s.main.asked.length = 0;
+    s.main.script = () => null;
+    await code(s.signer.connect({ kind: 'local' }));
+    expect(s.main.asked[0]).toEqual({ kind: 'local-setup', hasKey: false, keychain: true });
+  });
+
+  it('"remove" is not an answer when there is no key', async () => {
+    const s = setup({});
+    s.main.script = (f) =>
+      f.kind === 'local-setup'
+        ? { kind: 'local-setup', method: 'passphrase', flow: 'remove' }
+        : null;
+    expect(await code(s.signer.connect({ kind: 'local' }))).toBe('cancelled');
+    expect(s.main.asked.map((f) => f.kind)).toEqual(['local-setup']);
+  });
+});
+
 describe('DesktopSigner — lock, sign out, exclusivity', () => {
   it('lock closes the money plane; unlock asks again', async () => {
     const s = setup({});
@@ -538,6 +593,51 @@ describe('DesktopSigner — remote signer (NIP-46)', () => {
     expect(again.resumed).toEqual(['{"session":"blob"}']);
     expect(main.asked).toEqual([]);
     expect(next.signer.signer()?.kind).toBe('nip46');
+  });
+
+  it('an approval link (auth_url) is asked in the prompt window: https only, one at a time, bounded', async () => {
+    let t = 5_000_000;
+    const nip46 = fakeNip46();
+    const links: string[] = [];
+    const connector: Nip46Connector = {
+      connect: async (uri, opts) => {
+        for (const l of links) opts?.onauth?.(l);
+        return nip46.connect(uri, opts);
+      },
+      resume: nip46.resume,
+    };
+    const s = setup({ nip46: connector, now: () => t });
+    s.main.hold = true; // approval prompts stay open until released
+    s.main.script = (f) =>
+      f.kind === 'bunker'
+        ? { kind: 'bunker', uri: enc(URI), remember: false }
+        : f.kind === 'bunker-auth'
+          ? { kind: 'bunker-auth', open: true }
+          : null;
+    links.push(
+      'http://auth.example/plain-http',
+      'https://user:pw@auth.example/creds',
+      'https://auth.example/approve?x=1',
+      'https://auth.example/second-while-open',
+    );
+    const done = s.signer.connect({ kind: 'nip46' });
+    await Promise.resolve();
+    s.main.release();
+    await done;
+    const auth = s.main.asked.filter((f) => f.kind === 'bunker-auth');
+    expect(auth).toEqual([{ kind: 'bunker-auth', url: 'https://auth.example/approve?x=1' }]);
+    // Bounded: five approval prompts per ten minutes, then ignored until the window passes.
+    links.length = 0;
+    links.push('https://auth.example/again');
+    for (let i = 0; i < 6; i++) {
+      await s.signer.connect({ kind: 'nip46' });
+      await new Promise((r) => setTimeout(r, 0));
+    }
+    expect(s.main.asked.filter((f) => f.kind === 'bunker-auth')).toHaveLength(5);
+    t += 10 * 60_000 + 1;
+    await s.signer.connect({ kind: 'nip46' });
+    await new Promise((r) => setTimeout(r, 0));
+    expect(s.main.asked.filter((f) => f.kind === 'bunker-auth')).toHaveLength(6);
   });
 
   it('"remember" where there is no keychain does not fit the question: cancelled', async () => {
