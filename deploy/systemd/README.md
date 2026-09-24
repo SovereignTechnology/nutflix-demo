@@ -23,9 +23,43 @@ The application tree is expected at `/opt/nutflix` (a `git checkout` + `npm ci -
 
 ## Assumptions the owning lanes must confirm
 
-- **`ExecStart`**: `node --jitless <package main> --config /etc/nutflix/<svc>.json`. Keep `--jitless` (see below).
+- **`ExecStart`**: `node --jitless <package main> --config /etc/nutflix/<svc>.json`. Keep `--jitless` (see below). On Node 22, `--jitless` also needs `--no-experimental-websocket` (seeder unit, `MDWE-RESULTS.md` §6).
   - **Gateway: confirmed by L3** (`docs/lanes/L3.md` "systemd entry-point confirmation"). `packages/gateway/dist/index.js` self-runs only as the main module, takes `--config`, exits 78 (`EX_CONFIG`) on a bad config so `Restart=on-failure` + `StartLimitBurst` fail fast, and `STATE_DIRECTORY` fills a missing `dataDir`. `Type=simple` is right (`sdNotify` is a no-op without `NOTIFY_SOCKET`).
-  - **Seeder: NOT yet runnable from this unit.** `@sovit/seeder` deliberately ships no self-executing `main()` and no `bin/` (`docs/lanes/L2.md`): the shell that owns the `PaymentEngineSeeder` (L6's worker, or a Stage 2 service entry) calls `runDaemon()`. Until that entry exists, `nutflix-seeder.service`'s `ExecStart` points at a module that does nothing when executed. The seeder's own `renderSystemdUnit()` and duplicate unit file were **removed in the L2-v3 re-issue**; this directory is the only source of the units.
+  - **Seeder: runnable, confirmed by lane Seeder-entry** (`docs/lanes/Seeder-entry.md`). `packages/seeder/dist/index.js` self-runs only when it is the process's main module (`isMainModule`, symlinks resolved; importing `@sovit/seeder`, as the gateway does, runs nothing), takes `--config <path>` (fallback `NUTFLIX_SEEDER_CONFIG`) and `--check`, and exits **0** clean, **1** on a runtime failure, **78** (`EX_CONFIG`) on bad arguments, a missing/unreadable/invalid config, or missing runtime providers. `STATE_DIRECTORY` fills a missing `dataDir`, so `StateDirectory=nutflix-seeder` works unchanged; `Type=simple` fits (`sdNotify` is a no-op without `NOTIFY_SOCKET`); SIGTERM/SIGINT/SIGHUP → one graceful `Seeder.close()` (hard exit 1 after 25 s, under `TimeoutStopSec=30s`).
+    - **Until Stage 2 it refuses to start, on purpose:** the real `PaymentEngineSeeder`, `PayProtocol` and HELLO signer are in the locked dirs, so `packages/seeder/src/cli/providers.ts` returns nothing and every start logs `refusing to start` + the reason and exits 78. With `Restart=on-failure` + `StartLimitBurst=5` the unit gives up after 5 tries in 5 minutes rather than looping. Enable it only once Stage 2 has landed; until then use `--check`.
+    - **`--check` works today**: `sudo -u nutflix-seeder node --jitless --no-experimental-websocket /opt/nutflix/packages/seeder/dist/index.js --check --config /etc/nutflix/seeder.json` validates the file (and the env overrides) and exits 0/78 without touching state. `sudo` does not set `STATE_DIRECTORY`: if the file relies on it for `dataDir`, prefix the command with `STATE_DIRECTORY=/var/lib/nutflix-seeder` (via `sudo -u nutflix-seeder env …`). Errors name JSON paths (`$.policy.creatorP2pk: …`), never values, so the output is safe to paste.
+    - **The one unit change** (2026-09-23): `ExecStart` gained `--no-experimental-websocket`. Without it the real entry dies one tick after start on Node 22 (`ReferenceError: WebAssembly is not defined`, from Node's own `undici`, which `--jitless` cannot run) — see `MDWE-RESULTS.md` §6. The flag is accepted and harmless on Node 24.
+    - The seeder's own `renderSystemdUnit()` and duplicate unit file were **removed in the L2-v3 re-issue**; this directory is the only source of the units.
+  - **Gateway under Node 22 + `--jitless`: crashes at startup (open, lane L3).** Same `undici` crash, triggered both by the global `WebSocket` and by the gateway's ESM `import … from 'node:http'`, which no flag fixes (`MDWE-RESULTS.md` §6). Works on Node 24. Until the gateway loads `http` via `createRequire` (or the host runs Node ≥ 24), `nutflix-gateway.service` as written does not stay up on Node 22.
+
+### Seeder configuration (`/etc/nutflix/seeder.json`)
+
+Every key is checked (`packages/seeder/src/cli/config-file.ts`); an unknown key at any level is an error, so a typo cannot silently fall back to a default. ★ = required. The file is strict JSON: the comments below are for this README only.
+
+```jsonc
+{
+  "dataDir": "/var/lib/nutflix-seeder",   // ★ unless NUTFLIX_SEEDER_DATA_DIR or STATE_DIRECTORY (the unit's StateDirectory=) supplies it
+  "storageDir": "/var/lib/nutflix-seeder/corestore", // default <dataDir>/corestore
+  "blockSize": 65536,                     // integer in [1024, 16 MiB]; default 65536
+  "diskCapBytes": 53687091200,            // payload-byte cap; default 50 GiB
+  "rateLimits": { "maxStreams": 64, "maxStreamsPerKey": 2, "connectsPerWindow": 10, "windowMs": 60000 }, // any subset
+  "swarm": { "maxPeers": 64, "server": true, "client": false },
+                                          // default {} = ON; null = OFF (no peers at all). "bootstrap": [{ "host", "port" }]
+                                          // only for a private DHT (omit it for hyperdht's public nodes).
+                                          // keyPair / seed are REFUSED: key material never goes in this file
+  "policy": {                             // ★ the price every PAY is verified against (one per seeder)
+    "satsPerBlock": 1,                    // ★ integer ≥ 0
+    "mints": ["https://mint.example"],    // ★ ≥ 1, normalised (lower-case host, no trailing slash), no duplicates
+    "split": { "seeder": 50, "creator": 50 }, // default 50/50; must sum to 100
+    "creatorP2pk": "02…64 hex…",          // ★ creator's Cashu P2PK pubkey (02/03 + 64 lower-case hex)
+    "blockSize": 65536                    // optional; must equal the top-level blockSize
+  },
+  "flushEveryBlocks": 64, "flushEveryMs": 60000, // default: the engine's config, else 64 / 60 s
+  "logLevel": "info"                      // debug | info | warn | error
+}
+```
+
+Precedence, per value: **`NUTFLIX_SEEDER_*` env > file > `STATE_DIRECTORY` (fills `dataDir` only) > default**; config path: **`--config` > `NUTFLIX_SEEDER_CONFIG`**. Env overrides: `NUTFLIX_SEEDER_DATA_DIR`, `NUTFLIX_SEEDER_DISK_CAP_BYTES`, `NUTFLIX_SEEDER_MAX_STREAMS` (→ `rateLimits.maxStreams`), `NUTFLIX_SEEDER_LOG_LEVEL`. An empty assignment (`Environment=NAME=`) counts as unset; numbers must be plain decimal digits. None of these is secret, so `Environment=` is acceptable for them — nothing secret belongs in this file or the environment. The file is not secret either (the policy is published in every video manifest); `0640 root:nutflix-seeder` as in the install block keeps it read-only to the daemon.
 
 ### Gateway configuration the unit does NOT set (operator must)
 
@@ -72,7 +106,7 @@ Both units share the same block; the gateway differs only in resource caps.
 | `SystemCallFilter=@system-service` then `~@privileged @resources @obsolete @mount @reboot @swap @cpu-emulation @debug @module @raw-io` | Allowlist of what a normal service needs, minus groups a Node daemon never uses. **Verified** (test-hardening.sh) that Node 22 `--jitless` + `sodium-native` (`mlock`, `mprotect`), `udx-native`, `rocksdb-native`, `hyperdht`, `http`, `worker_threads` all run under it. `@resources` removal is safe: `mlock` lives in `@memlock`, which `@system-service` includes. |
 | `SystemCallErrorNumber=EPERM` | A filtered syscall returns `EPERM` instead of `SIGSYS`-killing the process, so a stray call in a dependency surfaces as a logged error rather than a silent crash loop. |
 | `RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK` | §7 says the first three. **`AF_NETLINK` is added and required**: `getifaddrs(3)` (libuv `uv_interface_addresses`, called by `udx-native` → `dht-rpc` → `hyperdht` at construction) opens a `NETLINK_ROUTE` socket; without it the swarm throws `EAFNOSUPPORT` before binding. Verified both ways in `MDWE-RESULTS.md` §3. Netlink here is read-only enumeration; with an empty capability set no `NET_ADMIN` operation is possible over it. |
-| `MemoryDenyWriteExecute=yes` + `ExecStart=… --jitless …` | §7 "test against the JS engine's JIT" — tested, see `MDWE-RESULTS.md`. Node 22's default JIT **aborts at startup** under MDWE; with `--jitless` V8 never creates executable memory and everything works, at a measured ~1.7× cost on the secp256k1 (DLEQ) JS path and no cost to native hashing. The pair must be changed **together**. |
+| `MemoryDenyWriteExecute=yes` + `ExecStart=… --jitless …` | §7 "test against the JS engine's JIT" — tested, see `MDWE-RESULTS.md`. Node 22's default JIT **aborts at startup** under MDWE; with `--jitless` V8 never creates executable memory and everything works, at a measured ~1.7× cost on the secp256k1 (DLEQ) JS path and no cost to native hashing. The pair must be changed **together**. **`--jitless` also removes WebAssembly, which Node 22's built-in `undici` needs**: the seeder unit therefore adds `--no-experimental-websocket` (MDWE-RESULTS.md §6); the gateway is still open there. |
 
 ### Environment (T12 supply chain at runtime)
 

@@ -63,6 +63,11 @@ resolves to `sodium-native` under Node, `@cashu/cashu-ts` → `@noble/*` pure JS
 dependency needs wasm on the server, the choice is between dropping MDWE and dropping that
 dependency — record it here.
 
+**Correction (2026-09-23, lane Seeder-entry): Node 22 itself needs it.** Node's built-in
+`undici` (behind the global `WebSocket`/`fetch` and `http.WebSocket`) compiles its HTTP parser
+to WebAssembly the moment it is loaded, so under `--jitless` loading it kills the process.
+The real package entries hit that at startup; the `-e` rows above never did. See §6.
+
 ## 3. `RestrictAddressFamilies` — the plan's literal set breaks the swarm
 
 Tested alongside, because it is the other §7 directive that can silently kill the daemon:
@@ -78,7 +83,8 @@ Tested alongside, because it is the other §7 directive that can silently kill t
 
 ```
 MemoryDenyWriteExecute=yes
-ExecStart=/usr/bin/node --jitless …
+ExecStart=/usr/bin/node --jitless --no-experimental-websocket …   # seeder, since 2026-09-23 (§6)
+ExecStart=/usr/bin/node --jitless …                               # gateway: BROKEN on Node 22, §6
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
 ```
 
@@ -108,3 +114,41 @@ PASS | FULL portable set + MDWE + unit RAF, --jitless: dht + sodium + http + wor
 PASS | FULL portable set, default JIT (what the unit would do WITHOUT --jitless) | rc=1 | # Check failed: 12 == (*__errno_location ()).
 hardening test: 13 passed, 0 failed
 ```
+
+## 6. `--jitless` vs Node 22's lazy `undici` — the real entries crash at startup (2026-09-23)
+
+Found by lane Seeder-entry when the seeder got a real entry point, by running the built
+`dist/index.js` with the unit's own flags (the §5 rows only ever ran `-e` scripts that
+`require()` modules, never the package entries). Node v22.22.0; reproducers need no systemd:
+
+| Command (Node 22.22.0) | Result |
+|---|---|
+| `node --jitless --input-type=module -e "try{WebSocket}catch{}; setTimeout(()=>{},50)"` | **dies**: `ReferenceError: WebAssembly is not defined` at `lazyllhttp` (undici) |
+| same, `--jitless --no-experimental-websocket` | ok (the global `WebSocket` does not exist) |
+| `node --jitless --input-type=module -e "import 'node:http'; setTimeout(()=>{},50)"` | **dies**, same error, **with or without** `--no-experimental-websocket` |
+| `node --jitless --input-type=module -e "import {createRequire} from 'node:module'; createRequire(import.meta.url)('node:http')"` | ok |
+| every row above on Node v24.18.0 | ok (and v24 still accepts `--no-experimental-websocket`) |
+
+Mechanism: touching the lazy global `WebSocket` loads Node's bundled `undici`, whose HTTP/1
+client calls `WebAssembly.compile(llhttp)` at load; under `--jitless` `WebAssembly` is
+undefined, the promise rejects unhandled, and Node exits 1 one tick later — after the entry
+has already started, so a quick `--help` still "works". An ESM `import … from 'node:http'`
+does the same through a different door: the ESM facade of a builtin reads **every** export,
+including Node 22's lazy `http.WebSocket` getter. A CJS `require('http')` builds no facade,
+which is why §5's `http` row passed.
+
+Who triggers it:
+- **seeder** (`packages/seeder/dist/index.js`): `nostr-tools/lib/esm/pool.js` reads the global
+  `WebSocket` at import (`try { _WebSocket = WebSocket } catch {}`), pulled in through
+  `@sovit/core`'s barrel. **Fixed in the unit**: `--no-experimental-websocket`. Guarded by
+  `packages/seeder/src/__tests__/entry.test.ts`, which spawns the built entry with the node
+  flags READ FROM `nutflix-seeder.service` (fails with this exact `ReferenceError` if the flag
+  is dropped).
+- **gateway** (`packages/gateway/dist/index.js`): the same `nostr-tools` access, **plus** its
+  ESM `import … from 'node:http'`, which no flag fixes. `node --jitless
+  --no-experimental-websocket packages/gateway/dist/index.js --check --config <valid>` still
+  dies on Node 22. **Open, not fixed here** (gateway code is lane L3's; its `cli.test.ts` pins
+  the current ExecStart): load `http` via `createRequire` in the gateway, or require Node ≥ 24
+  on the host, or drop the MDWE + `--jitless` pair for the gateway (§4 escape hatch). The
+  gateway unit also needs `--no-experimental-websocket` in any Node 22 fix.
+
