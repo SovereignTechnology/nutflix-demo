@@ -19,6 +19,8 @@ import {
 const tick = (): Promise<void> => new Promise((r) => setTimeout(r, 0));
 const CORE_A = mocks.asCoreKey('A');
 const CORE_B = mocks.asCoreKey('B');
+/** The default core of these tests (v5: every range and upload names a real core key). */
+const CORE_C = mocks.asCoreKey('c');
 
 describe('pay bridge (PayProtocol ⇄ PeerSession ⇄ PaymentEngine.verify)', () => {
   let dir: string;
@@ -33,10 +35,7 @@ describe('pay bridge (PayProtocol ⇄ PeerSession ⇄ PaymentEngine.verify)', ()
   async function rig(
     windowBlocks = 4,
     mode: mocks.MockPaymentMode = 'honest',
-    v3: {
-      readonly corePolicies?: ReadonlyMap<CoreKeyHex, PricePolicy>;
-      readonly replicatedCores?: () => number;
-    } = {},
+    v3: { readonly corePolicies?: ReadonlyMap<CoreKeyHex, PricePolicy> } = {},
   ) {
     const engine = honestEngine(windowBlocks);
     const viewer = new mocks.MockPaymentEngine({ mode });
@@ -66,8 +65,7 @@ describe('pay bridge (PayProtocol ⇄ PeerSession ⇄ PaymentEngine.verify)', ()
     const detach = attachPayBridge({
       session,
       protocol,
-      policy: (core) => (core === undefined ? undefined : v3.corePolicies?.get(core)) ?? policy,
-      ...(v3.replicatedCores ? { replicatedCores: v3.replicatedCores } : {}),
+      policy: (core) => v3.corePolicies?.get(core) ?? policy,
       scheduler,
       logger: log.logger,
     });
@@ -97,21 +95,27 @@ describe('pay bridge (PayProtocol ⇄ PeerSession ⇄ PaymentEngine.verify)', ()
     r.protocol.remoteHello(hello(pk));
     expect(r.session.pubkey).toBe(pk);
 
-    for (let i = 0; i < 4; i++) r.session.onUpload('c', i, 1024);
+    for (let i = 0; i < 4; i++) r.session.onUpload(CORE_C, i, 1024);
     expect(r.engine.window(pk)?.outstanding).toBe(4);
 
-    const msg = await r.viewer.pay({ fromBlock: 0, toBlock: 3 }, r.seederRef, r.policy);
+    const msg = await r.viewer.pay(
+      { core: CORE_C, fromBlock: 0, toBlock: 3 },
+      r.seederRef,
+      r.policy,
+    );
     r.protocol.remotePay(msg);
     await tick();
-    expect(r.protocol.acks).toEqual([{ type: 'ACK', fromBlock: 0, toBlock: 3, ok: true }]);
+    expect(r.protocol.acks).toEqual([
+      { type: 'ACK', core: CORE_C, fromBlock: 0, toBlock: 3, ok: true },
+    ]);
     expect(r.engine.window(pk)?.outstanding).toBe(0);
     expect(r.scheduler.pendingBlocks).toBe(4);
     expect(r.engine.pendingCount()).toBe(1);
 
     // Window is free again: 4 more blocks flow without a cut.
-    for (let i = 4; i < 8; i++) r.session.onUpload('c', i, 1024);
+    for (let i = 4; i < 8; i++) r.session.onUpload(CORE_C, i, 1024);
     expect(r.stream.destroyed).toBe(false);
-    r.session.onUpload('c', 8, 1024);
+    r.session.onUpload(CORE_C, 8, 1024);
     expect(r.stream.destroyed).toBe(true);
     expect(r.session.cutReason).toBe('window-exceeded');
     await r.scheduler.stop({ flush: false });
@@ -123,8 +127,12 @@ describe('pay bridge (PayProtocol ⇄ PeerSession ⇄ PaymentEngine.verify)', ()
     const r = await rig(4, 'stiff-creator');
     const pk = pubkey('cheat');
     r.protocol.remoteHello(hello(pk));
-    for (let i = 0; i < 3; i++) r.session.onUpload('c', i, 1024);
-    const msg = await r.viewer.pay({ fromBlock: 0, toBlock: 2 }, r.seederRef, r.policy);
+    for (let i = 0; i < 3; i++) r.session.onUpload(CORE_C, i, 1024);
+    const msg = await r.viewer.pay(
+      { core: CORE_C, fromBlock: 0, toBlock: 2 },
+      r.seederRef,
+      r.policy,
+    );
     r.protocol.remotePay(msg);
     await tick();
     expect(r.protocol.acks[0]).toMatchObject({ ok: false, reason: 'wrong-p2pk-target' });
@@ -154,79 +162,64 @@ describe('pay bridge (PayProtocol ⇄ PeerSession ⇄ PaymentEngine.verify)', ()
     await r.scheduler.stop({ flush: false });
   });
 
-  it('double-spend detected at flush bans via the engine (seeder-level wiring is tested in seeder.test)', async () => {
+  it('a double-spend (reused proofs) is refused at verify (v5), banned by the engine and cut by the bridge (seeder-level wiring is tested in seeder.test)', async () => {
     const r = await rig(8, 'double-spend');
     const pk = pubkey('ds');
     r.protocol.remoteHello(hello(pk));
-    for (let i = 0; i < 8; i++) r.session.onUpload('c', i, 1024);
-    const m1 = await r.viewer.pay({ fromBlock: 0, toBlock: 3 }, r.seederRef, r.policy);
-    const m2 = await r.viewer.pay({ fromBlock: 4, toBlock: 7 }, r.seederRef, r.policy); // replays m1's proofs
+    for (let i = 0; i < 8; i++) r.session.onUpload(CORE_C, i, 1024);
+    const m1 = await r.viewer.pay(
+      { core: CORE_C, fromBlock: 0, toBlock: 3 },
+      r.seederRef,
+      r.policy,
+    );
+    const m2 = await r.viewer.pay(
+      { core: CORE_C, fromBlock: 4, toBlock: 7 },
+      r.seederRef,
+      r.policy,
+    ); // replays m1's proofs
     r.protocol.remotePay(m1);
     await tick();
     r.protocol.remotePay(m2);
     await tick();
-    expect(r.protocol.acks.map((a) => a.ok)).toEqual([true, true]); // offline checks pass
-    const res = await r.scheduler.flush();
-    expect(res.failed).toBe(1);
+    expect(r.protocol.acks.map((a) => [a.ok, a.reason])).toEqual([
+      [true, undefined],
+      [false, 'double-spend'],
+    ]);
     expect(r.engine.isBanned(pk)).toBe(true);
+    expect(r.session.cutReason).toBe('banned');
+    expect((await r.scheduler.flush()).failed).toBe(0);
     await r.scheduler.stop({ flush: false });
   });
 
   // ---------------------------------------------------------------- contracts v3 (ADR 0004)
 
-  it('v3 (a): a core-less PAY on a stream replicating 2 cores is refused as malformed before the engine sees it', async () => {
+  it('v5 (ADR 0010): a core-less PAY is refused as `malformed` by the engine on any stream, with nothing credited and no cut; the same PAY with a core is accepted', async () => {
     const r = await rig(8);
     const pk = pubkey('v2-client');
     r.protocol.remoteHello(hello(pk));
     for (let i = 0; i < 2; i++) r.session.onUpload(CORE_A, i, 1024);
-    for (let i = 0; i < 2; i++) r.session.onUpload(CORE_B, i, 1024);
-    expect(r.session.uploadedCores.size).toBe(2);
 
-    const v2pay = await r.viewer.pay({ fromBlock: 0, toBlock: 1 }, r.seederRef, r.policy);
-    r.protocol.remotePay(v2pay);
-    await tick();
-    expect(r.protocol.acks).toEqual([
-      { type: 'ACK', fromBlock: 0, toBlock: 1, ok: false, reason: 'malformed' },
-    ]);
-    // nothing was credited, nothing queued, the session is NOT cut (a refusal, not a ban)
-    expect(r.engine.window(pk)).toMatchObject({ uploaded: 4, paid: 0, outstanding: 4 });
-    expect(r.engine.pendingCount()).toBe(0);
-    expect(r.scheduler.pendingBlocks).toBe(0);
-    expect(r.stream.destroyed).toBe(false);
-    expect(
-      r.log.records.some((x) => x.msg === 'PAY rejected' && x.fields['reason'] === 'malformed'),
-    ).toBe(true);
-
-    // The same PAY WITH a core is fine.
-    const v3pay = await r.viewer.pay(
+    const named = await r.viewer.pay(
       { core: CORE_A, fromBlock: 0, toBlock: 1 },
       r.seederRef,
       r.policy,
     );
-    r.protocol.remotePay(v3pay);
+    const { core: _core, ...coreless } = named.range;
+    r.protocol.remotePay({ ...named, range: coreless } as unknown as typeof named);
     await tick();
-    expect(r.protocol.acks[1]).toMatchObject({ ok: true });
-    expect(r.engine.window(pk)).toMatchObject({ paid: 2, outstanding: 2 });
+    expect(r.protocol.acks[0]).toMatchObject({ ok: false, reason: 'malformed' });
+    // nothing was credited, nothing queued, the session is NOT cut (a refusal, not a ban)
+    expect(r.engine.window(pk)).toMatchObject({ uploaded: 2, paid: 0, outstanding: 2 });
+    expect(r.engine.pendingCount()).toBe(0);
+    expect(r.scheduler.pendingBlocks).toBe(0);
+    expect(r.stream.destroyed).toBe(false);
+
+    r.protocol.remotePay(named);
+    await tick();
+    expect(r.protocol.acks[1]).toMatchObject({ core: CORE_A, ok: true });
+    expect(r.engine.window(pk)).toMatchObject({ paid: 2, outstanding: 0 });
     await r.scheduler.stop({ flush: false });
     r.detach();
-  });
-
-  it('v3 (a): the seeder-supplied replicatedCores view counts too, even before a block was uploaded from the 2nd core', async () => {
-    let cores = 1;
-    const r = await rig(8, 'honest', { replicatedCores: () => cores });
-    const pk = pubkey('v2-client-2');
-    r.protocol.remoteHello(hello(pk));
-    for (let i = 0; i < 2; i++) r.session.onUpload(CORE_A, i, 1024);
-    // one core on the stream: v2 aggregate semantics still apply
-    r.protocol.remotePay(await r.viewer.pay({ fromBlock: 0, toBlock: 0 }, r.seederRef, r.policy));
-    await tick();
-    expect(r.protocol.acks[0]).toMatchObject({ ok: true });
-    // the peer attached a second core (no upload from it yet): core-less PAY now malformed
-    cores = 2;
-    r.protocol.remotePay(await r.viewer.pay({ fromBlock: 1, toBlock: 1 }, r.seederRef, r.policy));
-    await tick();
-    expect(r.protocol.acks[1]).toMatchObject({ ok: false, reason: 'malformed' });
-    await r.scheduler.stop({ flush: false });
   });
 
   it("v3 (c): the policy is resolved per range.core — a PAY for core B is verified against B's policy, not the default", async () => {

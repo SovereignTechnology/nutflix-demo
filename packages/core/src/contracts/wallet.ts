@@ -32,10 +32,20 @@ export interface Wallet {
    * NUT-11 P2PK send. Produces proofs locked to `p2pk`, with DLEQ included, and updates
    * NIP-60 state (7375 with `del`, 7376 history) BEFORE returning. The caller (payment
    * engine) then puts the set on the wire. Fails if balance at `mint` is insufficient.
+   *
+   * v5 (ADR 0010): `tags` are extra NUT-10 tags committed into every proof's P2PK secret —
+   * the engine binds a creator set to its seeder with `[['pay1', <seeder P2PK>]]`. The lock
+   * is always a plain one: `data` = `p2pk`, no `locktime`, `refund` or `pubkeys` (a proof a
+   * payer could still reclaim is not a payment). `memo` goes into the 7376 history entry.
    */
   send(
     amount: Sats,
-    opts: { readonly p2pk: CashuP2pkPubkey; readonly mint: MintUrl },
+    opts: {
+      readonly p2pk: CashuP2pkPubkey;
+      readonly mint: MintUrl;
+      readonly tags?: readonly (readonly string[])[];
+      readonly memo?: string;
+    },
   ): Promise<LockedProofSet>;
 
   /** Receive proofs (NUT-03 swap into fresh, unlocked proofs) and record 7375/7376. */

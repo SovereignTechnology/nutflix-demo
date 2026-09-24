@@ -39,6 +39,34 @@ export interface Signer {
   isLocked(): boolean;
 }
 
+/**
+ * v5 (ADR 0010, L5-Settings request 1): how a shell asks for a signer. No key material
+ * crosses this type in either direction — a local passphrase or nsec is collected by the
+ * core side's own prompt (`SecretPrompt`), a NIP-46 URI's secret stays with the connector.
+ */
+export type SignerConnectRequest =
+  | { readonly kind: 'nip07' }
+  | { readonly kind: 'nip46'; readonly uri: string }
+  | { readonly kind: 'local'; readonly flow: 'unlock' | 'import' | 'generate' };
+
+/**
+ * v5: the connect / lock / sign-out surface a host exposes (implemented in
+ * `core/src/signer/`). Bridging it into `NetworkAdapter` (IPC table, Settings screen) is
+ * Stage 3 integration; until then Settings keeps its `onChangeSigner` prop. `status()` with
+ * no signer reports `{ kind: 'local', pubkey: null, locked: true, … }` (the convention the
+ * Settings screen already reads as "signer not detected").
+ */
+export interface SignerControl {
+  current(): Signer | null;
+  status(): SignerStatus;
+  connect(req: SignerConnectRequest): Promise<SignerStatus>;
+  /** "Lock now": zeroises a local key; a remote signer is kept but marked locked. */
+  lock(): Promise<void>;
+  /** Sign out: lock, then forget the signer (a NIP-46 session is closed). */
+  disconnect(): Promise<void>;
+  onStatus(cb: (s: SignerStatus) => void): () => void;
+}
+
 /** Capability report for the settings/wallet screens. Never exposes key material. */
 export interface SignerStatus {
   readonly kind: Signer['kind'];

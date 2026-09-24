@@ -9,10 +9,11 @@
  *     `127.0.0.1` bootstrap or the worker's own in-process fixture testnet — and the DHT node
  *     is bound to `127.0.0.1` (`PeerNode.loopbackOnly`): mock payments never meet the public
  *     DHT (the worker-guards refuse a non-loopback bootstrap too; this is the second check);
- *   - `MockPaymentEngine('honest')` for both roles (through `DevEngine`, which fixes the one
- *     rule the mock gets wrong for non-prefix downloads): it "pays" with mock proofs worth
- *     nothing and accepts the same; `pay/1` is the in-process `LoopbackPayHub`; HELLO
- *     signatures are the literal `dev-unsigned`.
+ *   - `MockPaymentEngine('honest')` for both roles (contracts v5 fixed the two mock bugs the
+ *     Stage 1 `DevEngine` wrapper worked around — block index read as a count, colliding
+ *     secrets — so the plain mock is used): it "pays" with mock proofs worth nothing and
+ *     accepts the same; `pay/1` is the in-process `LoopbackPayHub`; HELLO signatures are the
+ *     literal `dev-unsigned`.
  */
 import type {
   CashuP2pkPubkey,
@@ -27,7 +28,6 @@ import { DEFAULT_WINDOW_BLOCKS, mocks } from '@sovit/core';
 import { utf8 } from '../../ipc/codec.js';
 import type { WorkerInit } from '../../ipc/worker-protocol.js';
 import { sha256Hex } from '../crypto.js';
-import { DevEngine } from './dev-engine.js';
 import type { WorkerProviders } from '../providers.js';
 import type { LoopbackPayHub } from './loopback-pay.js';
 
@@ -59,24 +59,26 @@ export function devHello(
     version: 1,
     pubkey: engine.config.ownPubkey,
     challenge: 'dev',
+    createdAt: 0 as HelloMessage['createdAt'],
     signature: 'dev-unsigned',
     acceptedMints: engine.config.acceptedMints,
     satsPerBlock: terms.satsPerBlock,
     split: terms.split,
     p2pk: engine.config.ownP2pk,
+    windowBlocks: engine.config.windowBlocks,
   };
 }
 
-/** A fresh `MockPaymentEngine('honest')` under a dev identity, wrapped by `DevEngine`. */
+/** The dev engine: the plain v5 `MockPaymentEngine`. */
+export type DevEngine = mocks.MockPaymentEngine;
+
+/** A fresh `MockPaymentEngine('honest')` under a dev identity. */
 export function devEngine(label: string): DevEngine {
   const id = devIdentity(label);
-  return new DevEngine(
-    new mocks.MockPaymentEngine({
-      mode: 'honest',
-      config: { ownPubkey: id.pubkey, ownP2pk: id.p2pk },
-    }),
-    id.pubkey.slice(0, 12),
-  );
+  return new mocks.MockPaymentEngine({
+    mode: 'honest',
+    config: { ownPubkey: id.pubkey, ownP2pk: id.p2pk },
+  });
 }
 
 /**

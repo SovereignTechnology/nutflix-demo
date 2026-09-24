@@ -2,7 +2,7 @@
  * Maps Noise key → PeerSession, applies admission control (ban list, rate limits, stream
  * cap) and attaches the `upload` gate to every seeded core.
  */
-import type { NostrPubkey, PaymentEngineSeeder } from '@sovit/core';
+import type { CoreKeyHex, NostrPubkey, PaymentEngineSeeder } from '@sovit/core';
 import type Hypercore from 'hypercore';
 import type { ReplicationPeer, ReplicationStream } from 'hypercore';
 import type { PeerInfo } from 'hyperswarm';
@@ -10,7 +10,7 @@ import type { PeerInfo } from 'hyperswarm';
 import type { Logger } from '../log/logger.js';
 import type { BanList } from '../store/ban-list.js';
 import { toHex } from '../util/hex.js';
-import { PeerSession } from './peer-session.js';
+import { PeerSession, type UploadPricing } from './peer-session.js';
 import type { RateLimiter } from './rate-limit.js';
 
 export type SessionEvent =
@@ -28,6 +28,11 @@ export interface SessionRegistryOptions {
   readonly rateLimiter: RateLimiter;
   readonly logger: Logger;
   readonly now?: () => number;
+  /**
+   * v5: the price of a core, for the engine's effective window (`recordUpload`). Default:
+   * unpriced (`{ satsPerBlock: 0 }` → the configured window).
+   */
+  readonly pricing?: (core: CoreKeyHex) => UploadPricing;
 }
 
 export class SessionRegistry {
@@ -38,6 +43,7 @@ export class SessionRegistry {
   private readonly rateLimiter: RateLimiter;
   private readonly log: Logger;
   private readonly now: (() => number) | undefined;
+  private readonly pricing: ((core: CoreKeyHex) => UploadPricing) | undefined;
 
   constructor(opts: SessionRegistryOptions) {
     this.engine = opts.engine;
@@ -45,6 +51,7 @@ export class SessionRegistry {
     this.rateLimiter = opts.rateLimiter;
     this.log = opts.logger;
     this.now = opts.now;
+    this.pricing = opts.pricing;
   }
 
   on(cb: (e: SessionEvent) => void): () => void {
@@ -106,6 +113,7 @@ export class SessionRegistry {
       stream,
       peerInfo,
       ...(this.now ? { now: this.now } : {}),
+      ...(this.pricing ? { pricing: this.pricing } : {}),
       onClose: (s) => {
         admitted.release();
         if (this.byNoise.get(hex) === s) this.byNoise.delete(hex);

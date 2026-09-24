@@ -9,9 +9,10 @@
  * What this adds around `UpstreamPayer`:
  *
  *   - **settlement for the `CreditPool`**: every block downloaded from a peer is owed until
- *     that peer ACKs the `PAY` covering it. `pay/1`'s ACK carries no core, so the payer keeps a
- *     FIFO of the PAYs it put on the wire per peer (by decorating the peer's `sendPay`) and
- *     matches ACKs by `(fromBlock, toBlock)`. A block from a peer without `pay/1`, of a core we
+ *     that peer ACKs the `PAY` covering it. The payer keeps a FIFO of the PAYs it put on the
+ *     wire per peer (by decorating the peer's `sendPay`) and matches ACKs by
+ *     `(core, fromBlock, toBlock)` — v5 `ACK` names its core (L6-C request 3), so two cores
+ *     with coinciding ranges can no longer be confused. A block from a peer without `pay/1`, of a core we
  *     have no policy for, or owed to a peer that disconnected, settles at once (nothing more
  *     will ever be paid for it; the seeder decides what that means for us).
  *   - **spend events**: one `onPaid` per PAY (amount = both proof sets, mint, blocks), which
@@ -96,7 +97,7 @@ export class ViewerPayer {
       pay: async (range, seeder, policy) => {
         const msg = await o.pay(range, seeder, policy);
         const amount = proofSum(msg);
-        if (range.core !== undefined && amount > 0)
+        if (amount > 0)
           o.onPaid?.({
             core: range.core,
             seeder: seeder.pubkey,
@@ -238,7 +239,10 @@ export class ViewerPayer {
 
   private onAck(link: Link, ack: AckMessage): void {
     const i = link.sent.findIndex(
-      (m) => m.range.fromBlock === ack.fromBlock && m.range.toBlock === ack.toBlock,
+      (m) =>
+        m.range.core === ack.core &&
+        m.range.fromBlock === ack.fromBlock &&
+        m.range.toBlock === ack.toBlock,
     );
     if (i === -1) {
       this.unmatchedAcks++;
@@ -250,8 +254,8 @@ export class ViewerPayer {
       this.acksRejected++;
       this.log.warn('seeder rejected our PAY', { reason: ack.reason ?? 'unknown' });
     }
-    const core = msg?.range.core;
-    if (msg === undefined || core === undefined) return;
+    if (msg === undefined) return;
+    const core = msg.range.core;
     const owed = link.owed.get(core);
     for (let b = msg.range.fromBlock; b <= msg.range.toBlock; b++) {
       owed?.delete(b);

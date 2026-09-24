@@ -19,27 +19,38 @@ import {
   SEEDER_INFO,
   VIEWER,
   WIDE_WINDOW,
+  expectedSequence,
   expectedShares,
   getPair,
   policyWith,
+  range,
   sats,
   sumProofs,
+  upload,
   type CheatingMode,
 } from './provider.mjs';
 
 /**
  * Mode → the SECURITY.md row it exercises → the reason offline `verify` must return.
- * `double-spend` is the one cheat that offline verification cannot see (that is the point of
- * T5); it is caught by the swap batch instead, so its offline reason is `null`.
+ * `double-spend` replays the PREVIOUS PAY's proofs, so its first PAY is honest and only the
+ * second is the cheat (`replay: true`). Before v5 offline verification accepted the replay and
+ * the swap batch caught it; since v5 `verify` sees the reused secrets itself (ADR 0010).
  */
-const EXPECTED: Record<CheatingMode, { row: string; offline: RejectReason | null }> = {
+const EXPECTED: Record<CheatingMode, { row: string; offline: RejectReason; replay?: true }> = {
   'stiff-creator': { row: 'T4', offline: 'wrong-p2pk-target' },
   'stiff-seeder': { row: 'T3', offline: 'missing-seeder-set' },
-  'double-spend': { row: 'T5 / INV6', offline: null },
+  'double-spend': { row: 'T5 / INV6', offline: 'double-spend', replay: true },
   forge: { row: 'T7', offline: 'bad-dleq' },
   overpay: { row: 'INV2', offline: 'overpay' },
   underpay: { row: 'INV2', offline: 'wrong-amount' },
 };
+
+function shareTotals(s: { readonly seeder: number; readonly creator: number }): {
+  readonly swapped: number;
+  readonly nutzapped: number;
+} {
+  return { swapped: s.seeder, nutzapped: s.creator };
+}
 
 describe('MockPaymentEngine cheating modes (each mode, each reason)', () => {
   it('enumerates every mode the mock exposes', () => {
@@ -60,8 +71,8 @@ describe('MockPaymentEngine cheating modes (each mode, each reason)', () => {
 
   it('honest (control): accepted and credited exactly', async () => {
     const { viewer, seeder } = getPair('honest');
-    seeder.recordUpload(VIEWER, 4);
-    const msg = await viewer.pay({ fromBlock: 0, toBlock: 3 }, SEEDER_INFO, POLICY);
+    upload(seeder, VIEWER, 4);
+    const msg = await viewer.pay(range(0, 3), SEEDER_INFO, POLICY);
     const shares = expectedShares(4, POLICY);
     expect(await seeder.verify(VIEWER, msg, POLICY)).toEqual({
       ok: true,
@@ -82,12 +93,12 @@ describe('MockPaymentEngine cheating modes (each mode, each reason)', () => {
   });
 
   for (const mode of CHEATING_MODES) {
-    const { row, offline } = EXPECTED[mode];
-    if (offline !== null) {
+    const { row, offline, replay } = EXPECTED[mode];
+    if (replay !== true) {
       it(`${row}: mode=${mode} → offline verify rejects with '${offline}' and credits nothing`, async () => {
         const { viewer, seeder } = getPair(mode);
-        seeder.recordUpload(VIEWER, 4);
-        const msg = await viewer.pay({ fromBlock: 0, toBlock: 3 }, SEEDER_INFO, POLICY);
+        upload(seeder, VIEWER, 4);
+        const msg = await viewer.pay(range(0, 3), SEEDER_INFO, POLICY);
         const res = await seeder.verify(VIEWER, msg, POLICY);
         expect(res).toMatchObject({ ok: false, reason: offline });
         expect(seeder.window(VIEWER)).toMatchObject({ uploaded: 4, paid: 0, outstanding: 4 });
@@ -98,22 +109,26 @@ describe('MockPaymentEngine cheating modes (each mode, each reason)', () => {
         // nothing is ever credited.
       });
     } else {
-      it(`${row}: mode=${mode} → offline verify accepts, swap batch reports the spent proof, peer banned`, async () => {
+      it(`${row}: mode=${mode} → the first PAY is honest; the replay is refused at verify with '${offline}', the peer is banned, and only the first PAY is swapped`, async () => {
         const { viewer, seeder } = getPair(mode, WIDE_WINDOW);
-        seeder.recordUpload(VIEWER, 8);
-        const first = await viewer.pay({ fromBlock: 0, toBlock: 3 }, SEEDER_INFO, POLICY);
-        const second = await viewer.pay({ fromBlock: 4, toBlock: 7 }, SEEDER_INFO, POLICY);
+        upload(seeder, VIEWER, 8);
+        const first = await viewer.pay(range(0, 3), SEEDER_INFO, POLICY);
         expect(await seeder.verify(VIEWER, first, POLICY)).toMatchObject({ ok: true });
-        expect(await seeder.verify(VIEWER, second, POLICY)).toMatchObject({ ok: true });
-        const r = await seeder.flush();
-        expect(r.failed).toBe(1);
+        const second = await viewer.pay(range(4, 7), SEEDER_INFO, POLICY);
+        expect(await seeder.verify(VIEWER, second, POLICY)).toMatchObject({
+          ok: false,
+          reason: offline,
+        });
         expect(seeder.isBanned(VIEWER)).toBe(true);
         expect(seeder.bans().map((b) => b.pubkey)).toEqual([VIEWER]);
+        expect(seeder.window(VIEWER)).toMatchObject({ paid: 4 });
+        const r = await seeder.flush();
+        expect(r).toEqual({ ...shareTotals(expectedShares(4, POLICY)), failed: 0 });
       });
     }
   }
 
-  it('every cheating mode is rejected (offline or at flush) across arbitrary prices, splits and ranges; honest is always accepted', async () => {
+  it('every cheating mode is rejected across arbitrary prices, splits and ranges; honest is always accepted and the creator carry chains across its PAYs', async () => {
     const scenario = fc
       .record({
         blocks: fc.integer({ min: 1, max: 10 }),
@@ -129,10 +144,12 @@ describe('MockPaymentEngine cheating modes (each mode, each reason)', () => {
         }),
       }))
       .filter(({ blocks, policy }) => {
-        const sh = expectedShares(blocks, policy);
         // Both honest shares must be ≥ 2 sat so `underpay` (−1 on the creator side) and
-        // `stiff-*` remain distinguishable from an empty set. See docs/lanes/L10.md §edge.
-        return sh.seeder >= 2 && sh.creator >= 2;
+        // `stiff-*` remain distinguishable from an empty set, for the first PAY and for the
+        // second, whose split the carry can move by one sat. See docs/lanes/L10.md §edge.
+        const one = expectedShares(blocks, policy);
+        const two = expectedShares(blocks, policy, one.carryOut);
+        return Math.min(one.seeder, one.creator, two.seeder, two.creator) >= 2;
       });
 
     await fc.assert(
@@ -141,35 +158,42 @@ describe('MockPaymentEngine cheating modes (each mode, each reason)', () => {
         fc.constantFrom(...ALL_MODES),
         async ({ blocks, from, policy }, mode) => {
           const { viewer, seeder } = getPair(mode, WIDE_WINDOW);
-          seeder.recordUpload(VIEWER, from + 2 * blocks);
-          const r1 = { fromBlock: from, toBlock: from + blocks - 1 };
-          const r2 = { fromBlock: from + blocks, toBlock: from + 2 * blocks - 1 };
+          upload(seeder, VIEWER, from + 2 * blocks);
+          const r1 = range(from, from + blocks - 1);
+          const r2 = range(from + blocks, from + 2 * blocks - 1);
           const m1 = await viewer.pay(r1, SEEDER_INFO, policy);
-          const m2 = await viewer.pay(r2, SEEDER_INFO, policy);
           const v1 = await seeder.verify(VIEWER, m1, policy);
+          // The payer's side of the carry rule: the second PAY is split with the carry the
+          // seeder holds, i.e. advanced only if the first PAY was accepted (ADR 0010 §viewer).
+          const carry = v1.ok ? expectedShares(blocks, policy).carryOut : 0;
+          const m2 = await viewer.pay(r2, SEEDER_INFO, policy, { carryIn: carry });
           const v2 = await seeder.verify(VIEWER, m2, policy);
           const flush = await seeder.flush();
-          const shares = expectedShares(blocks, policy);
+          const one = expectedShares(blocks, policy);
+          const both = expectedSequence([blocks, blocks], policy);
 
           if (mode === 'honest') {
-            expect(v1).toEqual({ ok: true, credited: shares.total, blocks });
-            expect(v2).toEqual({ ok: true, credited: shares.total, blocks });
-            expect(flush).toEqual({
-              swapped: 2 * shares.seeder,
-              nutzapped: 2 * shares.creator,
-              failed: 0,
-            });
+            expect(v1).toEqual({ ok: true, credited: one.total, blocks });
+            expect(v2).toEqual({ ok: true, credited: one.total, blocks });
+            expect(flush).toEqual({ swapped: both.seeder, nutzapped: both.creator, failed: 0 });
             expect(seeder.isBanned(VIEWER)).toBe(false);
             return;
           }
           const expected = EXPECTED[mode];
-          if (expected.offline === null) {
-            // double-spend: first PAY honest, second replays → caught at flush.
+          if (expected.replay === true) {
+            // double-spend: first PAY honest, second replays its proofs → refused at verify.
+            // When the carry moved the split by a sat, the replayed amounts no longer match
+            // either, and the amount check (which runs first) is what refuses it.
             expect(v1).toMatchObject({ ok: true });
-            expect(v2).toMatchObject({ ok: true });
-            expect(flush.failed).toBe(1);
-            expect(flush.swapped + flush.nutzapped).toBe(shares.total);
-            expect(seeder.isBanned(VIEWER)).toBe(true);
+            const sameSplit = expectedShares(blocks, policy, carry).creator === one.creator;
+            if (sameSplit) {
+              expect(v2).toMatchObject({ ok: false, reason: 'double-spend' });
+              expect(seeder.isBanned(VIEWER)).toBe(true);
+            } else {
+              expect(v2.ok).toBe(false);
+              if (!v2.ok) expect(['wrong-amount', 'overpay']).toContain(v2.reason);
+            }
+            expect(flush).toEqual({ swapped: one.seeder, nutzapped: one.creator, failed: 0 });
           } else {
             expect(v1).toMatchObject({ ok: false, reason: expected.offline });
             expect(v2).toMatchObject({ ok: false, reason: expected.offline });
@@ -177,8 +201,8 @@ describe('MockPaymentEngine cheating modes (each mode, each reason)', () => {
             expect(seeder.window(VIEWER)?.paid).toBe(0);
           }
           // Whatever the cheat, the seeder never credits more than the honest amount.
-          expect(flush.swapped).toBeLessThanOrEqual(2 * shares.seeder);
-          expect(flush.nutzapped).toBeLessThanOrEqual(2 * shares.creator);
+          expect(flush.swapped).toBeLessThanOrEqual(both.seeder);
+          expect(flush.nutzapped).toBeLessThanOrEqual(both.creator);
         },
       ),
       { numRuns: 120 },
@@ -188,15 +212,11 @@ describe('MockPaymentEngine cheating modes (each mode, each reason)', () => {
   it('the cheating PAYs really are cheats on the wire (the mock produces the attack it claims)', async () => {
     // Guards against a mode silently becoming honest, which would make the rejections above
     // vacuous. Each mode's message must differ from the honest one in the documented way.
-    const honestMsg = await getPair('honest').viewer.pay(
-      { fromBlock: 0, toBlock: 3 },
-      SEEDER_INFO,
-      POLICY,
-    );
+    const honestMsg = await getPair('honest').viewer.pay(range(0, 3), SEEDER_INFO, POLICY);
     const shares = expectedShares(4, POLICY);
     for (const mode of CHEATING_MODES) {
       const { viewer } = getPair(mode);
-      const a = await viewer.pay({ fromBlock: 0, toBlock: 3 }, SEEDER_INFO, POLICY);
+      const a = await viewer.pay(range(0, 3), SEEDER_INFO, POLICY);
       switch (mode) {
         case 'stiff-creator':
           expect(a.creatorProofs.lockedTo).toBe(SEEDER_INFO.p2pk);
@@ -216,7 +236,7 @@ describe('MockPaymentEngine cheating modes (each mode, each reason)', () => {
           expect(sumProofs(a.creatorProofs.proofs)).toBe(shares.creator - 1);
           break;
         case 'double-spend': {
-          const b = await viewer.pay({ fromBlock: 4, toBlock: 7 }, SEEDER_INFO, POLICY);
+          const b = await viewer.pay(range(4, 7), SEEDER_INFO, POLICY);
           expect(b.seederProofs.proofs.map((p) => p.secret)).toEqual(
             a.seederProofs.proofs.map((p) => p.secret),
           );
@@ -230,10 +250,10 @@ describe('MockPaymentEngine cheating modes (each mode, each reason)', () => {
   it('v3 (ADR 0004 c): naming a core is not a bypass — every cheating mode is rejected with the same reason when the PAY carries `range.core`; honest with a core is accepted; `pay()` passes `core` through unchanged in every mode', async () => {
     for (const mode of ALL_MODES) {
       const { viewer, seeder } = getPair(mode, WIDE_WINDOW);
-      seeder.recordUpload(VIEWER, 4, CORE_A);
-      seeder.recordUpload(VIEWER, 4, CORE_B);
-      const rangeA = { core: CORE_A, fromBlock: 0, toBlock: 3 };
-      const rangeB = { core: CORE_B, fromBlock: 0, toBlock: 3 };
+      upload(seeder, VIEWER, 4, { core: CORE_A });
+      upload(seeder, VIEWER, 4, { core: CORE_B });
+      const rangeA = range(0, 3, CORE_A);
+      const rangeB = range(0, 3, CORE_B);
       const a = await viewer.pay(rangeA, SEEDER_INFO, POLICY);
       const b = await viewer.pay(rangeB, SEEDER_INFO, POLICY);
       // The wire carries exactly the core the viewer was handed — for cheats too.
@@ -256,13 +276,13 @@ describe('MockPaymentEngine cheating modes (each mode, each reason)', () => {
         expect(seeder.window(VIEWER), mode).toMatchObject({ uploaded: 8, paid: 8 });
         continue;
       }
-      const { offline } = EXPECTED[mode];
-      if (offline === null) {
+      const { offline, replay } = EXPECTED[mode];
+      if (replay === true) {
         // double-spend: the second PAY (core B) replays the first's proofs — a different
-        // core is not a different proof.
+        // core is not a different proof, and `verify` refuses it (v5).
         expect(va, mode).toMatchObject({ ok: true });
-        expect(vb, mode).toMatchObject({ ok: true });
-        expect(flush.failed, mode).toBe(1);
+        expect(vb, mode).toMatchObject({ ok: false, reason: offline });
+        expect(flush.failed, mode).toBe(0);
         expect(flush.swapped + flush.nutzapped, mode).toBe(shares.total);
         expect(seeder.isBanned(VIEWER), mode).toBe(true);
       } else {

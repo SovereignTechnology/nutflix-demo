@@ -41,6 +41,13 @@ export const DEFAULT_BLOCK_SIZE = 65_536 as const;
 /** Default unpaid window in blocks (assumption A4 — refined by spike S-A; threat T3). */
 export const DEFAULT_WINDOW_BLOCKS = 4 as const;
 
+/**
+ * v5 (ADR 0007, amended by ADR 0010): the PAY size viewers batch to when a policy does not
+ * set `minPaySats`. Each PAY is a P2PK proof set and a mint round-trip, and mints charge per
+ * input, so a 1–4 sat PAY can cost more in fees and round-trips than it carries.
+ */
+export const DEFAULT_MIN_PAY_SATS = 10 as const;
+
 export interface Rendition {
   /** Label shown in the player, e.g. "1080p". */
   readonly label: string;
@@ -87,12 +94,23 @@ export interface PricePolicy {
   /** Creator-chosen mint(s). Open question 2: one or several. */
   readonly mints: readonly MintUrl[];
   /**
-   * Percentages, must sum to 100. Default 50/50 if the `split` tag is absent.
-   * Per-PAY split (ADR 0005 Q1, amended by ADR 0007 — implemented in Stage 2): the creator's
-   * fractional share is carried across PAYs on the same stream, and PAYs have a minimum size.
-   * Until then the v3 rule stands: `seederSats = ceil(amount × seeder / 100)`.
+   * Percentages, integers, must sum to 100. Default 50/50 if the `split` tag is absent.
+   * Per-PAY split (ADR 0005 Q1, amended by ADR 0007, specified by ADR 0010 — contracts v5):
+   * the creator's fractional share is carried across PAYs on the same channel × core, see
+   * `PayMessage`. With `carryIn = 0` it is ADR 0005's rule, `seederSats = ceil(amount ×
+   * seeder / 100)`.
    */
   readonly split: { readonly seeder: number; readonly creator: number };
+  /**
+   * v5 (ADR 0007 as amended by ADR 0010 §minimum): the PAY size in sats a viewer SHOULD batch
+   * to; absent = `DEFAULT_MIN_PAY_SATS` (10). The unpaid window must fit one such PAY, so the
+   * effective window for this video is `max(windowBlocks, ceil(minPaySats / satsPerBlock))`
+   * (`effectiveWindowBlocks`). A seeder does NOT refuse a smaller PAY: a viewer streaming
+   * from several seeders under one credit budget cannot always reach it (ADR 0010). A creator
+   * raises it with the NIP-71 `minpay` tag (parsing it is owed to the manifest layer — until
+   * then the default applies to every video).
+   */
+  readonly minPaySats?: Sats;
   /** Creator's Cashu P2PK pubkey from their kind 10019. */
   readonly creatorP2pk: CashuP2pkPubkey;
 }
@@ -124,6 +142,8 @@ export interface Nip71TagSchema {
   readonly imeta: ['imeta', ...string[]]; // space-separated key/value pairs per NIP-92
   readonly mint: ['mint', string];
   readonly price: ['price', string, 'sat'];
+  /** v5 (ADR 0010): optional; absent = `DEFAULT_MIN_PAY_SATS`. */
+  readonly minpay?: ['minpay', string, 'sat'];
   readonly split: ['split', `seeder:${number}`, `creator:${number}`];
   readonly p2pk: ['p2pk', string];
   readonly t: ['t', string];

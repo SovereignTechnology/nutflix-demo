@@ -1917,7 +1917,7 @@ export function Watch({
               <span className="nf-watch__desc-stat">
                 {formatRelativeTime(video.publishedAt, nowSec)}
               </span>
-              {stats !== undefined ? (
+              {stats?.seedersOnline !== undefined ? (
                 <span className="nf-watch__desc-stat">
                   {formatInteger(stats.seedersOnline)}{' '}
                   {stats.seedersOnline === 1 ? 'seeder' : 'seeders'} online

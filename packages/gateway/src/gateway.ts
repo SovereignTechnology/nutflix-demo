@@ -31,7 +31,7 @@ import type {
   PricePolicy,
   Sats,
 } from '@sovit/core';
-import { PAY_PROTOCOL_VERSION } from '@sovit/core';
+import { DEFAULT_WINDOW_BLOCKS, PAY_PROTOCOL_VERSION } from '@sovit/core';
 import type {
   Logger,
   PeerSessionInfo,
@@ -52,6 +52,8 @@ import { UpstreamPayer, helloPolicyResolver } from './upstream/payer.js';
 import type { UpstreamPolicyResolver } from './upstream/payer.js';
 import { WsBridge } from './ws/bridge.js';
 
+type HelloCreatedAt = Parameters<PayProtocol['sendHello']>[0]['createdAt'];
+
 /** The gateway's `pay/1` identity. Signing is NOT this package's — inject a Signer-backed one. */
 export interface GatewayIdentity {
   /** Prove possession of `config.identity.pubkey` over `challenge` (Schnorr, by the Signer). */
@@ -66,7 +68,12 @@ export type PayProtocolFactory = (session: PeerSessionInfo) => PayProtocol;
 
 export interface GatewayDeps {
   readonly seederEngine: PaymentEngineSeeder & {
-    readonly config?: { readonly flushEveryBlocks: number; readonly flushEveryMs: number };
+    readonly config?: {
+      readonly flushEveryBlocks: number;
+      readonly flushEveryMs: number;
+      /** v5: advertised in HELLO (`DEFAULT_WINDOW_BLOCKS` when absent). */
+      readonly windowBlocks?: number;
+    };
   };
   readonly viewerEngine: PaymentEngineViewer;
   /** `null` = no provider yet (Stage 1 runtime): authenticated Blossom verbs answer 503. */
@@ -411,11 +418,13 @@ export class Gateway {
       version: PAY_PROTOCOL_VERSION,
       pubkey: this.config.identity.pubkey,
       challenge,
+      createdAt: Math.floor((this.deps.now ?? Date.now)() / 1000) as HelloCreatedAt,
       signature,
       acceptedMints: this.config.acceptedMints,
       satsPerBlock: policy.satsPerBlock,
       split: policy.split,
       p2pk: this.config.identity.p2pk,
+      windowBlocks: this.deps.seederEngine.config?.windowBlocks ?? DEFAULT_WINDOW_BLOCKS,
     });
     this.log.debug('HELLO sent', { noiseKey: noiseKeyHex, satsPerBlock: policy.satsPerBlock });
   }

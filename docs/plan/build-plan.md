@@ -35,8 +35,8 @@ Changes from v1: transport/storage is now Hyperblobs + Hypercore replication (pe
 | Malicious seeder | Serves wrong bytes | Hypercore Merkle proof per block, before `download` fires | 0 |
 | Malicious seeder | Stalls | Hypercore already multi-sources; per-peer timeout, drop | Time |
 | Malicious viewer | Downloads, never pays | Window (4 blocks), then stream destroy + ban | ~4 blocks of sats |
-| Malicious viewer | Pays seeder, stiffs creator | Seeder requires both proof sets | 0 |
-| Malicious viewer | Double-spends | DLEQ offline check; async swap at mint; ban on failure | ≤ window |
+| Malicious viewer | Pays seeder, stiffs creator | Seeder requires both proof sets; creator set bound to the seeder (`pay1` tag, ADR 0010) | 0 |
+| Malicious viewer | Double-spends | DLEQ offline check; seen-secret check at verify (ADR 0010); async swap at mint; ban on failure | ≤ window |
 | MITM | Steals proofs in flight | Noise secret-stream + P2PK lock to recipient | 0 |
 | Any peer | Forged proofs | NUT-12 DLEQ against cached mint keyset | 0 |
 | Mint | Rug / compromise | Small balances, creator-chosen mint, one-click melt-out, mint shown in UI | Balance at that mint |

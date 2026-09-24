@@ -41,6 +41,7 @@ export const REJECT_REASONS = [
   'missing-dleq',
   'malformed',
   'peer-banned',
+  'double-spend',
 ] as const satisfies readonly RejectReason[];
 type _ReasonsExhaustive =
   Exclude<RejectReason, (typeof REJECT_REASONS)[number]> extends never ? true : never;
@@ -111,18 +112,25 @@ export const splitArb = fc.integer({ min: 0, max: 100 }).map((seeder) => ({
 /** Contracts v3 (ADR 0004 (c)): `BlockRange.core`, a 64-char lower-case hex core key. */
 export const coreKeyArb: fc.Arbitrary<CoreKeyHex> = hex32Arb.map((h) => h as CoreKeyHex);
 
-/**
- * `core` is optional at v3 and required at the Stage 2 bump; generate both shapes so the
- * codec round-trip covers the field (the Stage 2 codec encodes it as a fixed 32-byte field).
- * When absent it is ABSENT, not `undefined` (`exactOptionalPropertyTypes`).
- */
+/** v5 (ADR 0010): `core` is REQUIRED; the codec encodes it as a fixed 32-byte field. */
 export const rangeArb: fc.Arbitrary<PayMessage['range']> = fc
-  .tuple(blockIndexArb, fc.integer({ min: 0, max: 4096 }), fc.option(coreKeyArb, { freq: 3 }))
+  .tuple(blockIndexArb, fc.integer({ min: 0, max: 4096 }), coreKeyArb)
   .map(([from, len, core]) => ({
-    ...(core === null ? {} : { core }),
+    core,
     fromBlock: from,
     toBlock: Math.min(from + len, MAX_BLOCK),
   }));
+
+/** v5: `PayMessage.carryIn`, an integer in [0, 99]. */
+export const carryArb = fc.integer({ min: 0, max: 99 });
+
+/** v5: `HELLO.challenge` = `pay/1:<handshake hash hex>:<sender Noise key hex>`. */
+export const challengeArb = fc
+  .tuple(hex32Arb, hex32Arb)
+  .map(([hash, key]) => `pay/1:${hash}:${key}`);
+
+/** Unix seconds that fit the codec's uint (any time before 2106). */
+export const unixArb = fc.integer({ min: 0, max: 2 ** 32 - 1 });
 
 // ---------------------------------------------------------------------------------------
 // Cashu shapes
@@ -176,6 +184,7 @@ export const lockedSetArb: fc.Arbitrary<LockedProofSet> = fc.record({
 export const payMessageArb: fc.Arbitrary<PayMessage> = fc
   .record({
     range: rangeArb,
+    carryIn: carryArb,
     seederProofs: lockedSetArb,
     creatorProofs: lockedSetArb,
   })
@@ -190,12 +199,14 @@ export const helloArb: fc.Arbitrary<HelloMessage> = fc
     type: fc.constant<'HELLO'>('HELLO'),
     version: fc.integer({ min: 0, max: 0xffff }),
     pubkey: nostrPubkeyArb,
-    challenge: hex32Arb,
+    challenge: challengeArb,
+    createdAt: unixArb.map((n) => n as HelloMessage['createdAt']),
     signature: hex64Arb,
     acceptedMints: fc.array(mintUrlArb, { maxLength: 6 }),
     satsPerBlock: satsArb,
     split: splitArb,
     p2pk: p2pkArb,
+    windowBlocks: fc.integer({ min: 0, max: 0xffff }),
   })
   .map(plain);
 
@@ -208,13 +219,14 @@ export const payWireArb: fc.Arbitrary<PayWireMessage> = fc
 
 export const ackArb: fc.Arbitrary<AckMessage> = fc
   .record({
+    core: coreKeyArb,
     fromBlock: blockIndexArb,
     toBlock: blockIndexArb,
     ok: fc.boolean(),
     reason: fc.option(fc.constantFrom(...REJECT_REASONS)),
   })
-  .map(({ fromBlock, toBlock, ok, reason }) => {
-    const base: AckMessage = { type: 'ACK', fromBlock, toBlock, ok };
+  .map(({ core, fromBlock, toBlock, ok, reason }) => {
+    const base: AckMessage = { type: 'ACK', core, fromBlock, toBlock, ok };
     return reason === null ? base : { ...base, reason };
   })
   .map(plain);
@@ -222,6 +234,7 @@ export const ackArb: fc.Arbitrary<AckMessage> = fc
 export const priceArb: fc.Arbitrary<PriceMessage> = fc
   .record({
     type: fc.constant<'PRICE'>('PRICE'),
+    core: coreKeyArb,
     satsPerBlock: satsArb,
     effectiveFromBlock: blockIndexArb,
   })
@@ -276,18 +289,15 @@ function isLockedSet(x: unknown): x is LockedProofSet {
 const isCoreKey = (x: unknown): x is CoreKeyHex => isStr(x) && /^[0-9a-f]{64}$/.test(x);
 
 function isRange(x: unknown): x is PayMessage['range'] {
-  return (
-    isObj(x) &&
-    isUint(x['fromBlock']) &&
-    isUint(x['toBlock']) &&
-    (x['core'] === undefined ? !('core' in x) : isCoreKey(x['core']))
-  );
+  return isObj(x) && isUint(x['fromBlock']) && isUint(x['toBlock']) && isCoreKey(x['core']);
 }
 
 export function isPayMessageShape(x: unknown): x is PayMessage {
   return (
     isObj(x) &&
     isRange(x['range']) &&
+    isUint(x['carryIn']) &&
+    x['carryIn'] < 100 &&
     isLockedSet(x['seederProofs']) &&
     isLockedSet(x['creatorProofs'])
   );
@@ -301,6 +311,7 @@ export function isPayProtocolMessage(x: unknown): x is PayProtocolMessage {
         isUint(x['version']) &&
         isStr(x['pubkey']) &&
         isStr(x['challenge']) &&
+        isUint(x['createdAt']) &&
         isStr(x['signature']) &&
         Array.isArray(x['acceptedMints']) &&
         x['acceptedMints'].every(isStr) &&
@@ -308,12 +319,14 @@ export function isPayProtocolMessage(x: unknown): x is PayProtocolMessage {
         isObj(x['split']) &&
         isUint(x['split']['seeder']) &&
         isUint(x['split']['creator']) &&
-        isStr(x['p2pk'])
+        isStr(x['p2pk']) &&
+        isUint(x['windowBlocks'])
       );
     case 'PAY':
       return isPayMessageShape(x['payload']);
     case 'ACK':
       return (
+        isCoreKey(x['core']) &&
         isUint(x['fromBlock']) &&
         isUint(x['toBlock']) &&
         typeof x['ok'] === 'boolean' &&
@@ -322,7 +335,7 @@ export function isPayProtocolMessage(x: unknown): x is PayProtocolMessage {
           : (REJECT_REASONS as readonly string[]).includes(x['reason'] as string))
       );
     case 'PRICE':
-      return isUint(x['satsPerBlock']) && isUint(x['effectiveFromBlock']);
+      return isCoreKey(x['core']) && isUint(x['satsPerBlock']) && isUint(x['effectiveFromBlock']);
     default:
       return false;
   }

@@ -144,7 +144,7 @@ describe('Seeder façade', () => {
     expect(s.seeder.sessions.admit(new FakeStream(noiseKey(9)))).not.toBeNull();
   });
 
-  it('double-spend reported at flush bans the peer on both keys and cuts its session', async () => {
+  it('a double-spend (v5: refused at verify) bans the peer on both keys and cuts its session', async () => {
     const s = await make({ windowBlocks: 8 });
     const viewer = new mocks.MockPaymentEngine({ mode: 'double-spend' });
     const policy: PricePolicy = {
@@ -161,23 +161,26 @@ describe('Seeder façade', () => {
     s.seeder.attachPayProtocol(session, protocol);
     const pk = pubkey('ds');
     protocol.remoteHello(hello(pk));
-    for (let i = 0; i < 8; i++) session.onUpload('c', i, BLOCK);
+    const core = mocks.asCoreKey('c');
+    for (let i = 0; i < 8; i++) session.onUpload(core, i, BLOCK);
     const ref = {
       pubkey: s.engine.config.ownPubkey,
       p2pk: s.engine.config.ownP2pk,
       mint: policy.mints[0]!,
     };
-    protocol.remotePay(await viewer.pay({ fromBlock: 0, toBlock: 3 }, ref, policy));
+    protocol.remotePay(await viewer.pay({ core, fromBlock: 0, toBlock: 3 }, ref, policy));
     await new Promise((r) => setTimeout(r, 0));
-    protocol.remotePay(await viewer.pay({ fromBlock: 4, toBlock: 7 }, ref, policy));
+    protocol.remotePay(await viewer.pay({ core, fromBlock: 4, toBlock: 7 }, ref, policy));
     await new Promise((r) => setTimeout(r, 0));
-    expect(protocol.acks.map((a) => a.ok)).toEqual([true, true]);
-    expect(s.seeder.stats().pendingPaidBlocks).toBe(8);
-
-    const res = await s.seeder.flushNow();
-    expect(res).toMatchObject({ failed: 1, swapped: 2, nutzapped: 2 }); // 4 blocks × 1 sat, split 50/50
+    // v5: the replay is refused at verify, the engine bans and fires `onDoubleSpend`, and the
+    // seeder cuts the session before the bridge can ACK it (a cut session gets no ACK).
+    expect(protocol.acks.map((a) => (a.ok ? 'ok' : a.reason))).toEqual(['ok']);
     expect(st.destroyed).toBe(true);
     expect(session.cutReason).toBe('banned');
+    expect(s.seeder.stats().pendingPaidBlocks).toBe(4);
+
+    const res = await s.seeder.flushNow();
+    expect(res).toMatchObject({ failed: 0, swapped: 2, nutzapped: 2 }); // 4 blocks × 1 sat, split 50/50
     expect(s.seeder.banList.isPubkeyBanned(pk)).toBe(true);
     expect(s.seeder.banList.isNoiseBanned(noiseKey(5))).toBe(true);
     const ds = s.events.find((e) => e.type === 'double-spend');
@@ -188,7 +191,7 @@ describe('Seeder façade', () => {
     expect(all).toContain('double-spend');
   });
 
-  it('setPolicy announces PRICE to live pay/1 peers with the old price honoured for uploaded blocks', async () => {
+  it('setPolicy announces PRICE to live pay/1 peers — one per core on the default policy (v5: PRICE names its core) — with the old price honoured for uploaded blocks', async () => {
     const s = await make();
     const st = new FakeStream(noiseKey(6));
     const session = s.seeder.sessions.admit(st)!;
@@ -205,7 +208,9 @@ describe('Seeder façade', () => {
     s.seeder.setPolicy(base);
     s.seeder.setPolicy(base); // unchanged price: no announcement
     s.seeder.setPolicy({ ...base, satsPerBlock: 2 as never });
-    expect(protocol.prices).toEqual([{ type: 'PRICE', satsPerBlock: 2, effectiveFromBlock: 3 }]);
+    expect(protocol.prices).toEqual([
+      { type: 'PRICE', core: 'c', satsPerBlock: 2, effectiveFromBlock: 3 },
+    ]);
     expect(s.seeder.policy().satsPerBlock).toBe(2);
   });
 
@@ -252,8 +257,12 @@ describe('Seeder façade', () => {
     await new Promise((r) => setTimeout(r, 0));
     protocol.remotePay(await viewer.pay({ core: coreA, fromBlock: 0, toBlock: 1 }, ref, base));
     await new Promise((r) => setTimeout(r, 0));
-    // and a core-less PAY on this two-core session is malformed (a)
-    protocol.remotePay(await viewer.pay({ fromBlock: 0, toBlock: 1 }, ref, base));
+    // and a core-less PAY is malformed (v5: on any session)
+    const named = await viewer.pay({ core: coreA, fromBlock: 0, toBlock: 1 }, ref, base, {
+      carryIn: 0,
+    });
+    const { core: _core, ...coreless } = named.range;
+    protocol.remotePay({ ...named, range: coreless } as unknown as typeof named);
     await new Promise((r) => setTimeout(r, 0));
     expect(protocol.acks.map((a) => (a.ok ? 'ok' : a.reason))).toEqual([
       'wrong-p2pk-target',

@@ -11,9 +11,10 @@
  * non-payer.
  *
  * The cut (spike S-A, ADR 0003): `onUpload()` is called synchronously from Hypercore's
- * `upload` event, calls `recordUpload(id, 1, core)` (synchronous by contract), and if the
- * returned window has `outstanding > windowBlocks` bans (ban list + engine + hyperswarm
- * `PeerInfo`) and destroys the stream IN THE SAME TICK. No `await` anywhere on that path.
+ * `upload` event, calls `recordUpload(id, {core, index..index}, pricing)` (synchronous by
+ * contract; v5 records the block INDEX, ADR 0010), and if the returned window has
+ * `outstanding > windowBlocks` bans (ban list + engine + hyperswarm `PeerInfo`) and destroys
+ * the stream IN THE SAME TICK. No `await` anywhere on that path.
  */
 import type {
   CoreKeyHex,
@@ -26,6 +27,11 @@ import type {
   PricePolicy,
   VerifyResult,
 } from '@sovit/core';
+
+/** v5: what `recordUpload` needs of a core's policy (its effective window). */
+export type UploadPricing = Pick<PricePolicy, 'satsPerBlock' | 'minPaySats'>;
+
+const UNPRICED: UploadPricing = { satsPerBlock: 0 as PricePolicy['satsPerBlock'] };
 import type { ReplicationStream } from 'hypercore';
 import type { PeerInfo } from 'hyperswarm';
 
@@ -55,6 +61,8 @@ export interface PeerSessionOptions {
   /** hyperswarm PeerInfo when the connection came through the swarm; `ban(true)` target. */
   readonly peerInfo?: PeerInfo | null;
   readonly now?: () => number;
+  /** v5: the price of a core, for the engine's effective window. Default: unpriced. */
+  readonly pricing?: (core: CoreKeyHex) => UploadPricing;
   /** Called exactly once when the underlying stream closes (after any cut). */
   readonly onClose?: (session: PeerSession) => void;
 }
@@ -70,6 +78,9 @@ export class PeerSession {
   private uploaded = 0;
   private uploadedBytesTotal = 0;
   private readonly coresUploaded = new Set<string>();
+  /** core → one past the highest block index sent (the `effectiveFromBlock` of a PRICE). */
+  private readonly nextIndex = new Map<string, number>();
+  private readonly pricing: (core: CoreKeyHex) => UploadPricing;
   private cutWith: CutReason | null = null;
   private isClosed = false;
   private readonly engine: PaymentEngineSeeder;
@@ -84,6 +95,7 @@ export class PeerSession {
     this.engine = opts.engine;
     this.banList = opts.banList;
     this.peerInfo = opts.peerInfo ?? null;
+    this.pricing = opts.pricing ?? ((): UploadPricing => UNPRICED);
     this.openedAt = (opts.now ?? Date.now)();
     this.log = opts.logger.child({ noiseKey: this.noiseKeyHex });
     this.stream.once('close', () => {
@@ -111,6 +123,11 @@ export class PeerSession {
   /** Distinct cores this session has uploaded at least one block from (hex keys). */
   get uploadedCores(): ReadonlySet<string> {
     return this.coresUploaded;
+  }
+
+  /** One past the highest block index of `core` sent on this session (0 if none). */
+  nextIndexFor(core: string): number {
+    return this.nextIndex.get(core) ?? 0;
   }
 
   /**
@@ -150,10 +167,17 @@ export class PeerSession {
     this.uploaded++;
     this.uploadedBytesTotal += byteLength;
     this.coresUploaded.add(coreKeyHex);
+    this.nextIndex.set(coreKeyHex, Math.max(this.nextIndexFor(coreKeyHex), index + 1));
     if (this.pubkeyBound === null) this.provisionalUploads++;
-    // v3: the core travels with the count so the engine can answer `range-not-uploaded`
-    // per core (ADR 0004 (c)); the window itself stays per peer, summed over cores.
-    const w = this.engine.recordUpload(this.accountId(), 1, coreKeyHex as CoreKeyHex);
+    // v5 (ADR 0010): the block INDEX travels, so `range-not-uploaded` is exact per block
+    // (seeks, several seeders); the core's price sets the effective window. The window
+    // itself stays per peer, summed over cores.
+    const core = coreKeyHex as CoreKeyHex;
+    const w = this.engine.recordUpload(
+      this.accountId(),
+      { core, fromBlock: index, toBlock: index },
+      this.pricing(core),
+    );
     if (w.outstanding > w.windowBlocks) {
       this.log.warn('window exceeded — cutting', {
         core: coreKeyHex,

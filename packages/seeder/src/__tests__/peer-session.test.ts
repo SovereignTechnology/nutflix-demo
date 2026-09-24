@@ -166,7 +166,14 @@ describe('PeerSession', () => {
   it('v3: a rebind whose merged outstanding crosses the window cuts synchronously (engine listener or session check)', async () => {
     const { engine, stream, session } = await make(4);
     const pk = pubkey('two-sessions');
-    engine.recordUpload(pk, 3, CORE_A); // an earlier session of the same pubkey, unpaid
+    // An earlier session of the same pubkey, unpaid: 3 blocks the new session never sends again
+    // (v5 counts DISTINCT blocks, so the merge is a union — ADR 0010).
+    for (let i = 10; i < 13; i++)
+      engine.recordUpload(
+        pk,
+        { core: CORE_A, fromBlock: i, toBlock: i },
+        { satsPerBlock: 0 as never },
+      );
     session.onUpload(CORE_A, 0, 1);
     session.onUpload(CORE_A, 1, 1);
     expect(stream.destroyed).toBe(false);
@@ -223,7 +230,7 @@ describe('PeerSession', () => {
     const viewer = honestEngine();
     const pk = pubkey('v');
     session.bindPubkey(pk);
-    for (let i = 0; i < 4; i++) session.onUpload('c', i, 1);
+    for (let i = 0; i < 4; i++) session.onUpload(CORE_A, i, 1);
     const policy = {
       satsPerBlock: 2 as never,
       blockSize: 1,
@@ -232,7 +239,7 @@ describe('PeerSession', () => {
       creatorP2pk: ('02' + '11'.repeat(32)) as never,
     };
     const msg = await viewer.pay(
-      { fromBlock: 0, toBlock: 3 },
+      { core: CORE_A, fromBlock: 0, toBlock: 3 },
       {
         pubkey: engine.config.ownPubkey,
         p2pk: engine.config.ownP2pk,

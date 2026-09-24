@@ -64,20 +64,22 @@ class FakeProto implements PayProtocol {
       version: 1,
       pubkey: mocks.asPubkey('seeder'),
       challenge: 'c',
+      createdAt: 0 as HelloMessage['createdAt'],
       signature: 's',
       acceptedMints: [mocks.MINTS.a],
       satsPerBlock: mocks.sats(2),
       split: { seeder: 50, creator: 50 },
       p2pk: mocks.asP2pk('seeder'),
+      windowBlocks: 4,
       ...h,
     };
     this.peer = m;
     for (const cb of this.l.open) cb(m);
   }
-  ack(from: number, to: number, ok = true): void {
+  ack(from: number, to: number, ok = true, core: CoreKeyHex = CORE_1): void {
     const a: AckMessage = ok
-      ? { type: 'ACK', fromBlock: from, toBlock: to, ok }
-      : { type: 'ACK', fromBlock: from, toBlock: to, ok, reason: 'wrong-amount' };
+      ? { type: 'ACK', core, fromBlock: from, toBlock: to, ok }
+      : { type: 'ACK', core, fromBlock: from, toBlock: to, ok, reason: 'wrong-amount' };
     for (const cb of this.l.ack) cb(a);
   }
   close(): void {
@@ -86,6 +88,8 @@ class FakeProto implements PayProtocol {
 }
 
 const NOISE = 'aa'.repeat(32);
+/** The key of `fakeCore(1)` (the rig's core). */
+const CORE_1 = '01'.repeat(32) as CoreKeyHex;
 const peerKey = Uint8Array.from(Buffer.from(NOISE, 'hex'));
 
 function fakeCore(fill: number): Hypercore & EventEmitter {
@@ -149,7 +153,7 @@ describe('ViewerPayer', () => {
     ]);
   });
 
-  it('an ACK settles exactly the blocks of the PAY it answers (matched FIFO without a core)', async () => {
+  it('an ACK settles exactly the blocks of the PAY it answers — matched by core and range (v5 ACK names its core)', async () => {
     const r = rig();
     r.proto.hello();
     r.download(0);
@@ -160,11 +164,15 @@ describe('ViewerPayer', () => {
       [0, 0],
       [1, 1],
     ]);
+    // Same range, another core: answers nothing we sent on this core.
+    r.proto.ack(1, 1, true, 'ee'.repeat(32) as CoreKeyHex);
+    expect(r.credit.holds(r.key, 1)).toBe(true);
+    expect(r.payer.stats().unmatchedAcks).toBe(1);
     r.proto.ack(1, 1);
     expect(r.credit.holds(r.key, 1)).toBe(false);
     expect(r.credit.holds(r.key, 0)).toBe(true);
     r.proto.ack(7, 7); // answers nothing we sent
-    expect(r.payer.stats().unmatchedAcks).toBe(1);
+    expect(r.payer.stats().unmatchedAcks).toBe(2);
     r.proto.ack(0, 0, false); // refused: still settled (the seeder decides what that means)
     expect(r.credit.size).toBe(0);
     expect(r.payer.stats()).toMatchObject({ acksRejected: 1, owed: 0 });

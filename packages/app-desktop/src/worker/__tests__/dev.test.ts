@@ -1,6 +1,6 @@
 /**
  * The `--dev-mocks` pieces: the fence (D1: never mock payments on a public DHT), the loopback
- * `pay/1` hub, and `DevEngine` (the mock with the non-prefix rule re-expressed).
+ * `pay/1` hub, and the dev engine — since contracts v5 the plain `MockPaymentEngine`.
  */
 import { EventEmitter } from 'node:events';
 
@@ -11,7 +11,6 @@ import { describe, expect, it } from 'vitest';
 
 import type { WorkerInit } from '../../ipc/worker-protocol.js';
 import { DEV_PRICE, checkDevFence, devEngine, devHello, devIdentity } from '../dev/dev-mocks.js';
-import { DevEngine } from '../dev/dev-engine.js';
 import { LoopbackPayHub } from '../dev/loopback-pay.js';
 
 const tick = async (): Promise<void> => {
@@ -91,8 +90,9 @@ describe('LoopbackPayHub (D1)', () => {
     const got: string[] = [];
     b.on('open', (h) => got.push(`hello:${h.pubkey.slice(0, 4)}`));
     b.on('ack', (x) => got.push(`ack:${String(x.fromBlock)}`));
-    a.sendAck({ fromBlock: 1, toBlock: 1, ok: true });
-    a.sendAck({ fromBlock: 2, toBlock: 2, ok: true });
+    const core = mocks.asCoreKey('c');
+    a.sendAck({ core, fromBlock: 1, toBlock: 1, ok: true });
+    a.sendAck({ core, fromBlock: 2, toBlock: 2, ok: true });
     await tick();
     expect(got).toEqual([`hello:${hello.pubkey.slice(0, 4)}`, 'ack:1', 'ack:2']);
     expect(b.peer).not.toBe(hello); // structured clone, not a shared object
@@ -131,16 +131,13 @@ describe('LoopbackPayHub (D1)', () => {
   });
 });
 
-describe('DevEngine (MockPaymentEngine with the count rule for non-prefix downloads)', () => {
+describe('the dev engine is the plain v5 MockPaymentEngine (the Stage 1 DevEngine workarounds are no longer needed)', () => {
   const core = mocks.asCoreKey('c');
   const id = devIdentity('seeder');
   // A wide window so the setup can record 16 unpaid uploads without the peer being cut.
-  const seeder = new DevEngine(
-    new mocks.MockPaymentEngine({
-      config: { windowBlocks: 64, ownPubkey: id.pubkey, ownP2pk: id.p2pk },
-    }),
-    'seeder',
-  );
+  const seeder = new mocks.MockPaymentEngine({
+    config: { windowBlocks: 64, ownPubkey: id.pubkey, ownP2pk: id.p2pk },
+  });
   const policy: PricePolicy = {
     satsPerBlock: mocks.sats(2),
     blockSize: 65_536,
@@ -149,44 +146,47 @@ describe('DevEngine (MockPaymentEngine with the count rule for non-prefix downlo
     creatorP2pk: devIdentity('creator').p2pk,
   };
   const to = { pubkey: seeder.config.ownPubkey, p2pk: seeder.config.ownP2pk, mint: mocks.MINTS.a };
+  const sent = (
+    s: mocks.MockPaymentEngine,
+    peer: typeof id.pubkey,
+    from: number,
+    to_: number,
+  ): void => {
+    for (let i = from; i <= to_; i++)
+      s.recordUpload(peer, { core, fromBlock: i, toBlock: i }, policy);
+  };
 
-  it('pays a peer for blocks [16, 32) it received (the plain mock refuses: 16 >= 16)', async () => {
-    const plain = new mocks.MockPaymentEngine({
-      config: { windowBlocks: 64, ownP2pk: seeder.config.ownP2pk },
-    });
+  it('pays a peer for blocks [16, 32) it received (the v4 mock refused: 16 >= 16) — per block, never more than was sent', async () => {
     const viewer = devEngine('viewer');
     const v = viewer.config.ownPubkey;
-    for (let i = 0; i < 16; i++) {
-      seeder.recordUpload(v, 1, core);
-      plain.recordUpload(v, 1, core);
-    }
+    sent(seeder, v, 16, 31);
     const msg = await viewer.pay({ core, fromBlock: 16, toBlock: 17 }, to, policy);
-    expect(await plain.verify(v, msg, policy)).toMatchObject({
-      ok: false,
-      reason: 'range-not-uploaded',
-    });
     expect(await seeder.verify(v, msg, policy)).toMatchObject({ ok: true, blocks: 2, credited: 4 });
-    // Replay on the REAL indexes.
-    const again = await viewer.pay({ core, fromBlock: 17, toBlock: 17 }, to, policy);
+    // Replay on the real indexes.
+    const again = await viewer.pay({ core, fromBlock: 17, toBlock: 17 }, to, policy, {
+      carryIn: 0,
+    });
     expect(await seeder.verify(v, again, policy)).toMatchObject({
       ok: false,
       reason: 'range-already-paid',
     });
-    // Never more blocks than were sent and not yet paid (16 sent, 2 paid).
-    const tooMany = await viewer.pay({ core, fromBlock: 18, toBlock: 32 }, to, policy);
+    // Block 32 was never sent.
+    const tooMany = await viewer.pay({ core, fromBlock: 18, toBlock: 32 }, to, policy, {
+      carryIn: 0,
+    });
     expect(await seeder.verify(v, tooMany, policy)).toMatchObject({
       ok: false,
       reason: 'range-not-uploaded',
     });
-    const rest = await viewer.pay({ core, fromBlock: 18, toBlock: 31 }, to, policy);
+    const rest = await viewer.pay({ core, fromBlock: 18, toBlock: 31 }, to, policy, { carryIn: 0 });
     expect(await seeder.verify(v, rest, policy)).toMatchObject({ ok: true, blocks: 14 });
     expect(seeder.window(v)).toMatchObject({ uploaded: 16, paid: 16, outstanding: 0 });
   });
 
-  it('keeps the mock’s money rules (amount, targets) and moves state on rebind', async () => {
+  it('keeps the money rules (amount, targets) and moves state on rebind', async () => {
     const viewer = devEngine('viewer-2');
     const noise = mocks.asPubkey('noise');
-    seeder.recordUpload(noise, 2, core);
+    sent(seeder, noise, 0, 1);
     const under = { ...(await viewer.pay({ core, fromBlock: 0, toBlock: 1 }, to, policy)) };
     expect(
       await seeder.verify(noise, under, { ...policy, satsPerBlock: mocks.sats(4) }),
@@ -202,13 +202,13 @@ describe('DevEngine (MockPaymentEngine with the count rule for non-prefix downlo
     });
   });
 
-  it('two wallets never mint colliding secrets (no false double-spend); a real replay is still caught', async () => {
+  it('two wallets never mint colliding secrets (no false double-spend); a real replay is caught at verify', async () => {
     const s = devEngine('seeder-3');
     const dest = { pubkey: s.config.ownPubkey, p2pk: s.config.ownP2pk, mint: mocks.MINTS.a };
     const w1 = devEngine('w1');
     const w2 = devEngine('w2');
     for (const w of [w1, w2]) {
-      s.recordUpload(w.config.ownPubkey, 1, core);
+      sent(s, w.config.ownPubkey, 0, 0);
       expect(
         await s.verify(
           w.config.ownPubkey,
@@ -219,12 +219,13 @@ describe('DevEngine (MockPaymentEngine with the count rule for non-prefix downlo
     }
     expect((await s.flush()).failed).toBe(0);
     const cheat = devEngine('cheat');
-    cheat.mock.mode = 'double-spend';
+    cheat.mode = 'double-spend';
     const c = cheat.config.ownPubkey;
-    s.recordUpload(c, 2, core);
+    sent(s, c, 0, 1);
     await s.verify(c, await cheat.pay({ core, fromBlock: 0, toBlock: 0 }, dest, policy), policy);
-    await s.verify(c, await cheat.pay({ core, fromBlock: 1, toBlock: 1 }, dest, policy), policy);
-    expect((await s.flush()).failed).toBe(1);
+    expect(
+      await s.verify(c, await cheat.pay({ core, fromBlock: 1, toBlock: 1 }, dest, policy), policy),
+    ).toMatchObject({ ok: false, reason: 'double-spend' });
     expect(s.isBanned(c)).toBe(true);
   });
 });

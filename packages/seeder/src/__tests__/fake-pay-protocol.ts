@@ -76,10 +76,12 @@ export function hello(pubkey: HelloMessage['pubkey']): HelloMessage {
     version: 1,
     pubkey,
     challenge: 'c',
+    createdAt: 0 as never,
     signature: 's',
     acceptedMints: [],
     satsPerBlock: 1 as never,
     split: { seeder: 50, creator: 50 },
     p2pk: ('02' + '00'.repeat(32)) as never,
+    windowBlocks: 4,
   };
 }

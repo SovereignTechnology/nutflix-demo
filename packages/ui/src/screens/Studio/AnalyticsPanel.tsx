@@ -228,7 +228,11 @@ export function AnalyticsPanel({
             <li className="nf-studio__tile" data-warn={stats?.seedersOnline === 0 || undefined}>
               <span className="nf-studio__tile-label">Seeders online</span>
               {stats ? (
-                <span className="nf-studio__tile-value">{formatInteger(stats.seedersOnline)}</span>
+                <span className="nf-studio__tile-value">
+                  {stats.seedersOnline === undefined
+                    ? 'Unknown'
+                    : formatInteger(stats.seedersOnline)}
+                </span>
               ) : (
                 <Skeleton variant="text" width="40%" />
               )}

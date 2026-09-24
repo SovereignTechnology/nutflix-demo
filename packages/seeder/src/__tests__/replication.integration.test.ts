@@ -280,7 +280,7 @@ describe('replication over a direct stream pair (offline)', () => {
 
     // Viewer pays for what Hypercore emitted `download` for (invariant 1) → ACK ok.
     const pay = await viewerEngine.pay(
-      { fromBlock: 0, toBlock: 3 },
+      { core: entry.coreKey, fromBlock: 0, toBlock: 3 },
       {
         pubkey: seeder.engine.config.ownPubkey,
         p2pk: seeder.engine.config.ownP2pk,
@@ -290,7 +290,9 @@ describe('replication over a direct stream pair (offline)', () => {
     );
     protocol.remotePay(pay);
     await settle(20);
-    expect(protocol.acks).toEqual([{ type: 'ACK', fromBlock: 0, toBlock: 3, ok: true }]);
+    expect(protocol.acks).toEqual([
+      { type: 'ACK', core: entry.coreKey, fromBlock: 0, toBlock: 3, ok: true },
+    ]);
     expect(seeder.engine.window(viewerPubkey)).toMatchObject({
       uploaded: 4,
       paid: 4,
@@ -313,7 +315,7 @@ describe('replication over a direct stream pair (offline)', () => {
 
     // Second PAY → 8 paid blocks = flushEveryBlocks → the scheduler flushed the batch.
     const pay2 = await viewerEngine.pay(
-      { fromBlock: 4, toBlock: 7 },
+      { core: entry.coreKey, fromBlock: 4, toBlock: 7 },
       {
         pubkey: seeder.engine.config.ownPubkey,
         p2pk: seeder.engine.config.ownP2pk,
@@ -401,10 +403,17 @@ describe('replication over a direct stream pair (offline)', () => {
       p2pk: seeder.engine.config.ownP2pk,
       mint: policyA.mints[0]!,
     };
-    // (a) a v2 core-less PAY → malformed: nothing has been uploaded from B yet, so only the
-    // Corestore view (both cores have a replication peer on this stream) can know it is a
-    // two-core stream — that is `Seeder.replicatedCores()`.
-    protocol.remotePay(await viewerEngine.pay({ fromBlock: 0, toBlock: 1 }, ref, policyA));
+    // (a) a core-less PAY → malformed. v3 needed the Corestore view to know this was a
+    // two-core stream before B had sent a block; v5 (ADR 0010) makes `core` required, so the
+    // engine refuses it whatever the stream carries.
+    const named = await viewerEngine.pay(
+      { core: a.entry.coreKey, fromBlock: 0, toBlock: 1 },
+      ref,
+      policyA,
+      { carryIn: 0 },
+    );
+    const { core: _core, ...coreless } = named.range;
+    protocol.remotePay({ ...named, range: coreless } as unknown as typeof named);
     await settle(20);
     expect(protocol.acks[0]).toMatchObject({ ok: false, reason: 'malformed' });
     expect(session.cutReason).toBeNull();

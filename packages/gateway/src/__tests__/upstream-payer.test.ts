@@ -115,14 +115,14 @@ describe('UpstreamPayer (unit)', () => {
     payer.onDownload(CORE_B, 0, NOISE);
     await payer.flush();
     const ranges = protocol.sentPays.map(
-      (p) => `${p.range.core?.slice(0, 2) ?? '?'}:${p.range.fromBlock}-${p.range.toBlock}`,
+      (p) => `${p.range.core.slice(0, 2)}:${p.range.fromBlock}-${p.range.toBlock}`,
     );
     expect(ranges.sort()).toEqual(['aa:0-1', 'aa:3-3', 'bb:0-0']);
     payer.onDownload(CORE_A, 1, NOISE);
     await payer.flush();
     expect(protocol.sentPays).toHaveLength(3);
-    // Every PAY carries a core (v3 requirement for the multi-core gateway).
-    expect(protocol.sentPays.every((p) => p.range.core !== undefined)).toBe(true);
+    // Every PAY carries a well-formed core (required since v5).
+    expect(protocol.sentPays.every((p) => /^[0-9a-f]{64}$/.test(p.range.core))).toBe(true);
   });
 
   it('blocks from a peer that has not sent HELLO are counted and paid the moment it does', async () => {
@@ -135,17 +135,27 @@ describe('UpstreamPayer (unit)', () => {
     expect(protocol.sentPays.map((p) => [p.range.fromBlock, p.range.toBlock])).toEqual([[0, 3]]);
   });
 
-  it('PRICE splits a run at effectiveFromBlock: old price below, new price from it', async () => {
+  it('PRICE splits a run at effectiveFromBlock: old price below, new price from it — for the core it names only (v5)', async () => {
     const { engine, payer, protocol } = unit(10);
     protocol.remoteHello(hello());
     for (let i = 0; i < 6; i++) payer.onDownload(CORE_A, i, NOISE);
-    protocol.remotePrice({ type: 'PRICE', satsPerBlock: 5 as Sats, effectiveFromBlock: 4 });
+    for (let i = 0; i < 6; i++) payer.onDownload(CORE_B, i, NOISE);
+    protocol.remotePrice({
+      type: 'PRICE',
+      core: CORE_A,
+      satsPerBlock: 5 as Sats,
+      effectiveFromBlock: 4,
+    });
     await payer.flush();
-    expect(protocol.sentPays.map((p) => [p.range.fromBlock, p.range.toBlock])).toEqual([
+    const a = protocol.sentPays.filter((p) => p.range.core === CORE_A);
+    const b = protocol.sentPays.filter((p) => p.range.core === CORE_B);
+    expect(a.map((p) => [p.range.fromBlock, p.range.toBlock])).toEqual([
       [0, 3],
       [4, 5],
     ]);
-    expect(engine.spent().perPeer.get(UP_PUBKEY)).toBe(4 * 3 + 2 * 5);
+    expect(b.map((p) => [p.range.fromBlock, p.range.toBlock])).toEqual([[0, 5]]);
+    // A at 3 sat below the boundary and 5 from it; B untouched at 3.
+    expect(engine.spent().perPeer.get(UP_PUBKEY)).toBe(4 * 3 + 2 * 5 + 6 * 3);
   });
 
   it('no policy / no common mint → nothing is paid and it is counted; ACKs are tallied; detach stops paying', async () => {
@@ -172,9 +182,10 @@ describe('UpstreamPayer (unit)', () => {
     u.protocol.remoteHello(hello());
     u.payer.onDownload(CORE_A, 0, NOISE);
     await u.payer.flush();
-    u.protocol.remoteAck({ type: 'ACK', fromBlock: 0, toBlock: 0, ok: true });
+    u.protocol.remoteAck({ type: 'ACK', core: CORE_A, fromBlock: 0, toBlock: 0, ok: true });
     u.protocol.remoteAck({
       type: 'ACK',
+      core: CORE_A,
       fromBlock: 0,
       toBlock: 0,
       ok: false,

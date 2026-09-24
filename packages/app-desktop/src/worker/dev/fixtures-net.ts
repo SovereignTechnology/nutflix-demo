@@ -39,8 +39,7 @@ import type { BootstrapNode } from '../net/peer-node.js';
 import { PeerNode } from '../net/peer-node.js';
 import { ViewerPayer } from '../pay/viewer-payer.js';
 import { CreditPool } from '../playback/credit.js';
-import type { DevEngine } from './dev-engine.js';
-import { DEV_PRICE, devEngine, devHello, devIdentity } from './dev-mocks.js';
+import { DEV_PRICE, devEngine, devHello, devIdentity, type DevEngine } from './dev-mocks.js';
 import type { LoopbackPayHub } from './loopback-pay.js';
 
 export interface DevTestnet {

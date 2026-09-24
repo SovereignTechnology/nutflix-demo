@@ -42,9 +42,11 @@ import {
   policyByCore,
   policyWith,
   proofMaterial,
+  range,
   sats,
+  spendAtMint,
   sumProofs,
-  usingMock,
+  upload,
   withCreatorSet,
   withSeederSet,
 } from './provider.mjs';
@@ -104,12 +106,12 @@ describe('SECURITY.md money-path invariants', () => {
         fc.nat(6), // range length − 1
         async (uploaded, from, len) => {
           const { viewer, seeder } = getPair('honest', WIDE_WINDOW);
-          if (uploaded > 0) seeder.recordUpload(VIEWER, uploaded);
-          const range = { fromBlock: from, toBlock: from + len };
-          const msg = await viewer.pay(range, SEEDER_INFO, POLICY);
-          expect(msg.range).toEqual(range);
+          if (uploaded > 0) upload(seeder, VIEWER, uploaded);
+          const r = range(from, from + len);
+          const msg = await viewer.pay(r, SEEDER_INFO, POLICY);
+          expect(msg.range).toEqual(r);
           const res = await seeder.verify(VIEWER, msg, POLICY);
-          if (range.toBlock < uploaded) {
+          if (r.toBlock < uploaded) {
             expect(res).toMatchObject({ ok: true, blocks: len + 1 });
             expect(seeder.window(VIEWER)).toMatchObject({ uploaded, paid: len + 1 });
           } else {
@@ -124,12 +126,12 @@ describe('SECURITY.md money-path invariants', () => {
 
   it('INV1 per core (v3, ADR 0004 c): `range-not-uploaded` and `range-already-paid` are per core — [0,3] on core A then [0,3] on core B is not a replay, [0,3] on core A twice is, and a core’s own upload count governs even when the aggregate would cover the range', async () => {
     const { viewer, seeder } = getPair('honest', WIDE_WINDOW);
-    seeder.recordUpload(VIEWER, 4, CORE_A);
-    seeder.recordUpload(VIEWER, 4, CORE_B);
+    upload(seeder, VIEWER, 4, { core: CORE_A });
+    upload(seeder, VIEWER, 4, { core: CORE_B });
 
     // Same indexes, two cores: two distinct ranges, both payable.
-    const a = await viewer.pay({ core: CORE_A, fromBlock: 0, toBlock: 3 }, SEEDER_INFO, POLICY);
-    const b = await viewer.pay({ core: CORE_B, fromBlock: 0, toBlock: 3 }, SEEDER_INFO, POLICY);
+    const a = await viewer.pay(range(0, 3, CORE_A), SEEDER_INFO, POLICY);
+    const b = await viewer.pay(range(0, 3, CORE_B), SEEDER_INFO, POLICY);
     expect(await seeder.verify(VIEWER, a, POLICY)).toMatchObject({ ok: true, blocks: 4 });
     expect(await seeder.verify(VIEWER, b, POLICY)).toMatchObject({ ok: true, blocks: 4 });
     expect(seeder.window(VIEWER)).toMatchObject({ uploaded: 8, paid: 8, outstanding: 0 });
@@ -140,20 +142,12 @@ describe('SECURITY.md money-path invariants', () => {
       ok: false,
       reason: 'range-already-paid',
     });
-    const aAgain = await viewer.pay(
-      { core: CORE_A, fromBlock: 0, toBlock: 3 },
-      SEEDER_INFO,
-      POLICY,
-    );
+    const aAgain = await viewer.pay(range(0, 3, CORE_A), SEEDER_INFO, POLICY);
     expect(await seeder.verify(VIEWER, aAgain, POLICY)).toMatchObject({
       ok: false,
       reason: 'range-already-paid',
     });
-    const aOverlap = await viewer.pay(
-      { core: CORE_A, fromBlock: 3, toBlock: 3 },
-      SEEDER_INFO,
-      POLICY,
-    );
+    const aOverlap = await viewer.pay(range(3, 3, CORE_A), SEEDER_INFO, POLICY);
     expect(await seeder.verify(VIEWER, aOverlap, POLICY)).toMatchObject({
       ok: false,
       reason: 'range-already-paid',
@@ -163,16 +157,16 @@ describe('SECURITY.md money-path invariants', () => {
     // Per-core `range-not-uploaded`: 3 blocks on A + 1 on B = 4 in total, but B[0..2] was
     // never sent — the aggregate count would say yes, the per-core count says no.
     const fresh = getSeederEngine(WIDE_WINDOW);
-    fresh.recordUpload(VIEWER, 3, CORE_A);
-    fresh.recordUpload(VIEWER, 1, CORE_B);
-    const lieB = await viewer.pay({ core: CORE_B, fromBlock: 0, toBlock: 2 }, SEEDER_INFO, POLICY);
+    upload(fresh, VIEWER, 3, { core: CORE_A });
+    upload(fresh, VIEWER, 1, { core: CORE_B });
+    const lieB = await viewer.pay(range(0, 2, CORE_B), SEEDER_INFO, POLICY);
     expect(await fresh.verify(VIEWER, lieB, POLICY)).toMatchObject({
       ok: false,
       reason: 'range-not-uploaded',
     });
-    const okB = await viewer.pay({ core: CORE_B, fromBlock: 0, toBlock: 0 }, SEEDER_INFO, POLICY);
+    const okB = await viewer.pay(range(0, 0, CORE_B), SEEDER_INFO, POLICY);
     expect(await fresh.verify(VIEWER, okB, POLICY)).toMatchObject({ ok: true, blocks: 1 });
-    const okA = await viewer.pay({ core: CORE_A, fromBlock: 0, toBlock: 2 }, SEEDER_INFO, POLICY);
+    const okA = await viewer.pay(range(0, 2, CORE_A), SEEDER_INFO, POLICY);
     expect(await fresh.verify(VIEWER, okA, POLICY)).toMatchObject({ ok: true, blocks: 3 });
     expect(fresh.window(VIEWER)).toMatchObject({ uploaded: 4, paid: 4, outstanding: 0 });
 
@@ -186,8 +180,8 @@ describe('SECURITY.md money-path invariants', () => {
         fc.constantFrom(CORE_A, CORE_B),
         async (nA, nB, toBlock, core) => {
           const s = getSeederEngine(WIDE_WINDOW);
-          if (nA > 0) s.recordUpload(VIEWER, nA, CORE_A);
-          if (nB > 0) s.recordUpload(VIEWER, nB, CORE_B);
+          if (nA > 0) upload(s, VIEWER, nA, { core: CORE_A });
+          if (nB > 0) upload(s, VIEWER, nB, { core: CORE_B });
           const own = core === CORE_A ? nA : nB;
           const msg = await viewer.pay({ core, fromBlock: 0, toBlock }, SEEDER_INFO, POLICY);
           const res = await s.verify(VIEWER, msg, POLICY);
@@ -203,38 +197,26 @@ describe('SECURITY.md money-path invariants', () => {
     );
   });
 
-  it.skipIf(usingMock())(
-    'INV1 per core (v3): a PAY naming a core with NO recorded uploads is `range-not-uploaded` even when other cores have uploads (Stage 2 packages/core/src/payment/ unskips this)',
-    async () => {
-      // Interim behaviour the reference model pins (ADR 0004 (c)): the per-core check applies
-      // "whenever the PAY names a core for which uploads were recorded"; for a core with no
-      // record it falls back to the aggregate and ACCEPTS. Once `core` is required at the
-      // Stage 2 bump every upload is per core, so "no record" means "never sent".
-      const { viewer, seeder } = getPair('honest', WIDE_WINDOW);
-      seeder.recordUpload(VIEWER, 4, CORE_A);
-      const never = await viewer.pay(
-        { core: CORE_NONE, fromBlock: 0, toBlock: 0 },
-        SEEDER_INFO,
-        POLICY,
-      );
-      expect(await seeder.verify(VIEWER, never, POLICY)).toMatchObject({
-        ok: false,
-        reason: 'range-not-uploaded',
-      });
-      expect(seeder.window(VIEWER)?.paid).toBe(0);
-    },
-  );
+  it('INV1 per core (v3): a PAY naming a core with NO recorded uploads is `range-not-uploaded` even when other cores have uploads', async () => {
+    // The v3 reference model fell back to the aggregate count for a core with no record
+    // and ACCEPTED (so this ran only against a real engine). v5 records every upload per
+    // core, so "no record" means "never sent" — in the mock too.
+    const { viewer, seeder } = getPair('honest', WIDE_WINDOW);
+    upload(seeder, VIEWER, 4, { core: CORE_A });
+    const never = await viewer.pay(range(0, 0, CORE_NONE), SEEDER_INFO, POLICY);
+    expect(await seeder.verify(VIEWER, never, POLICY)).toMatchObject({
+      ok: false,
+      reason: 'range-not-uploaded',
+    });
+    expect(seeder.window(VIEWER)?.paid).toBe(0);
+  });
 
   it('INV1 rebind (v3, ADR 0004 d): per-core upload counts and paid ranges survive the move — a PAY from `to` for a core uploaded under `from` verifies, replaying it is range-already-paid, and a range already paid under `from` cannot be paid again by `to`', async () => {
     const { viewer, seeder } = getPair('honest', WIDE_WINDOW);
     // Pre-HELLO: 4 blocks of A and 2 of B served under the provisional id; A[0,1] paid there.
-    seeder.recordUpload(NOISE_ID, 4, CORE_A);
-    seeder.recordUpload(NOISE_ID, 2, CORE_B);
-    const paidEarly = await viewer.pay(
-      { core: CORE_A, fromBlock: 0, toBlock: 1 },
-      SEEDER_INFO,
-      POLICY,
-    );
+    upload(seeder, NOISE_ID, 4, { core: CORE_A });
+    upload(seeder, NOISE_ID, 2, { core: CORE_B });
+    const paidEarly = await viewer.pay(range(0, 1, CORE_A), SEEDER_INFO, POLICY);
     expect(await seeder.verify(NOISE_ID, paidEarly, POLICY)).toMatchObject({ ok: true });
     expect(seeder.window(NOISE_ID)).toMatchObject({ uploaded: 6, paid: 2, outstanding: 4 });
 
@@ -243,16 +225,12 @@ describe('SECURITY.md money-path invariants', () => {
     expect(seeder.window(NOISE_ID)).toBeUndefined();
 
     // (v) per-core counts travelled: the rest of A and all of B are payable by `to`…
-    const restA = await viewer.pay({ core: CORE_A, fromBlock: 2, toBlock: 3 }, SEEDER_INFO, POLICY);
+    const restA = await viewer.pay(range(2, 3, CORE_A), SEEDER_INFO, POLICY);
     expect(await seeder.verify(VIEWER, restA, POLICY)).toMatchObject({ ok: true, blocks: 2 });
-    const allB = await viewer.pay({ core: CORE_B, fromBlock: 0, toBlock: 1 }, SEEDER_INFO, POLICY);
+    const allB = await viewer.pay(range(0, 1, CORE_B), SEEDER_INFO, POLICY);
     expect(await seeder.verify(VIEWER, allB, POLICY)).toMatchObject({ ok: true, blocks: 2 });
     // …but not more than was sent on each core.
-    const tooMuchB = await viewer.pay(
-      { core: CORE_B, fromBlock: 2, toBlock: 2 },
-      SEEDER_INFO,
-      POLICY,
-    );
+    const tooMuchB = await viewer.pay(range(2, 2, CORE_B), SEEDER_INFO, POLICY);
     expect(await seeder.verify(VIEWER, tooMuchB, POLICY)).toMatchObject({
       ok: false,
       reason: 'range-not-uploaded',
@@ -266,11 +244,7 @@ describe('SECURITY.md money-path invariants', () => {
       ok: false,
       reason: 'range-already-paid',
     });
-    const earlyAgain = await viewer.pay(
-      { core: CORE_A, fromBlock: 0, toBlock: 1 },
-      SEEDER_INFO,
-      POLICY,
-    );
+    const earlyAgain = await viewer.pay(range(0, 1, CORE_A), SEEDER_INFO, POLICY);
     expect(await seeder.verify(VIEWER, earlyAgain, POLICY)).toMatchObject({
       ok: false,
       reason: 'range-already-paid',
@@ -291,9 +265,8 @@ describe('SECURITY.md money-path invariants', () => {
         fc.constantFrom<'+1' | '-1' | 'drop-one'>('+1', '-1', 'drop-one'),
         async ({ blocks, policy }, which, delta) => {
           const { viewer, seeder } = getPair('honest', WIDE_WINDOW);
-          seeder.recordUpload(VIEWER, blocks);
-          const range = { fromBlock: 0, toBlock: blocks - 1 };
-          const honest = await viewer.pay(range, SEEDER_INFO, policy);
+          upload(seeder, VIEWER, blocks);
+          const honest = await viewer.pay(range(0, blocks - 1), SEEDER_INFO, policy);
           const shares = expectedShares(blocks, policy);
 
           // The honest PAY carries exactly the split…
@@ -307,7 +280,7 @@ describe('SECURITY.md money-path invariants', () => {
 
           // Any deviation in either set is rejected, whichever direction.
           const fresh = getSeederEngine(WIDE_WINDOW);
-          fresh.recordUpload(VIEWER, blocks);
+          upload(fresh, VIEWER, blocks);
           const set = honest[which];
           const extra: CashuProof = { ...set.proofs[0]!, amount: 1, secret: `mock:extra:${which}` };
           let mutated: PayMessage;
@@ -339,8 +312,8 @@ describe('SECURITY.md money-path invariants', () => {
 
     // Total-preserving but split-violating: right sum, wrong distribution → still rejected.
     const { viewer, seeder } = getPair('honest');
-    seeder.recordUpload(VIEWER, 4);
-    const honest = await viewer.pay({ fromBlock: 0, toBlock: 3 }, SEEDER_INFO, POLICY);
+    upload(seeder, VIEWER, 4);
+    const honest = await viewer.pay(range(0, 3), SEEDER_INFO, POLICY);
     const oneSat: CashuProof = {
       ...honest.creatorProofs.proofs[0]!,
       amount: 1,
@@ -369,11 +342,11 @@ describe('SECURITY.md money-path invariants', () => {
       ]),
     );
     const { viewer, seeder } = getPair('honest', WIDE_WINDOW);
-    seeder.recordUpload(VIEWER, 4, CORE_A);
-    seeder.recordUpload(VIEWER, 4, CORE_B);
+    upload(seeder, VIEWER, 4, { core: CORE_A });
+    upload(seeder, VIEWER, 4, { core: CORE_B });
 
     // The attack: B's blocks (8 sat each) paid at A's price (2 sat each) → 8 sat for 32 owed.
-    const rangeB = { core: CORE_B, fromBlock: 0, toBlock: 3 };
+    const rangeB = range(0, 3, CORE_B);
     const underB = await viewer.pay(rangeB, SEEDER_INFO, cheap);
     expect(sumProofs(underB.seederProofs.proofs) + sumProofs(underB.creatorProofs.proofs)).toBe(
       expectedShares(4, cheap).total,
@@ -386,7 +359,7 @@ describe('SECURITY.md money-path invariants', () => {
 
     // The mirror (an honest-but-confused viewer): A's blocks at B's price → strictly more
     // than owed, which INV2 rejects as `overpay` rather than pocketing the difference.
-    const rangeA = { core: CORE_A, fromBlock: 0, toBlock: 3 };
+    const rangeA = range(0, 3, CORE_A);
     const overA = await viewer.pay(rangeA, SEEDER_INFO, expensive);
     expect(await seeder.verify(VIEWER, overA, resolve(overA.range))).toMatchObject({
       ok: false,
@@ -412,8 +385,8 @@ describe('SECURITY.md money-path invariants', () => {
     // Control — the v2 degradation: a seeder verifying every core at the cheapest price
     // accepts the underpayment ("cheapest price wins", ADR 0004 (c)).
     const v2 = getSeederEngine(WIDE_WINDOW);
-    v2.recordUpload(VIEWER, 4, CORE_A);
-    v2.recordUpload(VIEWER, 4, CORE_B);
+    upload(v2, VIEWER, 4, { core: CORE_A });
+    upload(v2, VIEWER, 4, { core: CORE_B });
     expect(await v2.verify(VIEWER, underB, cheap)).toMatchObject({ ok: true });
 
     // Property: for any two distinct prices, paying core X's blocks at core Y's price is
@@ -429,20 +402,24 @@ describe('SECURITY.md money-path invariants', () => {
           const pA = policyWith({ satsPerBlock: sats(priceA) });
           const pB = policyWith({ satsPerBlock: sats(priceB) });
           // Both honest shares must be ≥ 1 sat or the PAY is an INV3 case, not an amount one
-          // (docs/lanes/L10.md §observations 3).
-          fc.pre(expectedShares(blocks, pA).seeder >= 1 && expectedShares(blocks, pB).seeder >= 1);
+          // (docs/lanes/L10.md §observations 3). v5 rounds the CREATOR share down (ADR 0005/
+          // 0007), so it is the creator share that can be 0 now; check both, as stated.
+          const [a, b] = [expectedShares(blocks, pA), expectedShares(blocks, pB)];
+          fc.pre(a.seeder >= 1 && a.creator >= 1 && b.seeder >= 1 && b.creator >= 1);
           const s = getSeederEngine(WIDE_WINDOW);
-          s.recordUpload(VIEWER, blocks, CORE_A);
-          s.recordUpload(VIEWER, blocks, CORE_B);
-          const range = { core: CORE_B, fromBlock: 0, toBlock: blocks - 1 };
-          const wrong = await viewer.pay(range, SEEDER_INFO, pA);
+          upload(s, VIEWER, blocks, { core: CORE_A });
+          upload(s, VIEWER, blocks, { core: CORE_B });
+          // `viewer` is shared across runs; each run is a fresh channel to a fresh seeder, so
+          // the carry is 0 (v5) — passed explicitly rather than read from the running carry.
+          const r = range(0, blocks - 1, CORE_B);
+          const wrong = await viewer.pay(r, SEEDER_INFO, pA, { carryIn: 0 });
           const res = await s.verify(VIEWER, wrong, pB);
           expect(res).toMatchObject({
             ok: false,
             reason: priceA < priceB ? 'wrong-amount' : 'overpay',
           });
           expect(s.window(VIEWER)?.paid).toBe(0);
-          const right = await viewer.pay(range, SEEDER_INFO, pB);
+          const right = await viewer.pay(r, SEEDER_INFO, pB, { carryIn: 0 });
           expect(await s.verify(VIEWER, right, pB)).toEqual({
             ok: true,
             credited: expectedShares(blocks, pB).total,
@@ -458,7 +435,7 @@ describe('SECURITY.md money-path invariants', () => {
     await fc.assert(
       fc.asyncProperty(pricedScenarioArb, async ({ blocks, policy }) => {
         const { viewer } = getPair('honest');
-        const msg = await viewer.pay({ fromBlock: 0, toBlock: blocks - 1 }, SEEDER_INFO, policy);
+        const msg = await viewer.pay(range(0, blocks - 1), SEEDER_INFO, policy);
         for (const [set, target] of [
           [msg.seederProofs, SEEDER_INFO.p2pk],
           [msg.creatorProofs, policy.creatorP2pk],
@@ -480,8 +457,8 @@ describe('SECURITY.md money-path invariants', () => {
 
     // The seeder enforces the same shape: missing set / missing DLEQ / wrong lock → refused.
     const { viewer, seeder } = getPair('honest');
-    seeder.recordUpload(VIEWER, 4);
-    const honest = await viewer.pay({ fromBlock: 0, toBlock: 3 }, SEEDER_INFO, POLICY);
+    upload(seeder, VIEWER, 4);
+    const honest = await viewer.pay(range(0, 3), SEEDER_INFO, POLICY);
     const cases: { msg: PayMessage; reason: string }[] = [
       { msg: withSeederSet(honest, { proofs: [] }), reason: 'missing-seeder-set' },
       { msg: withCreatorSet(honest, { proofs: [] }), reason: 'missing-creator-set' },
@@ -516,8 +493,8 @@ describe('SECURITY.md money-path invariants', () => {
     // (a) Acceptance is decided by `verify` alone: the window is credited before any
     //     `flush()` (the swap batch) has run, and `flush()` then only swaps what was accepted.
     const { viewer, seeder } = getPair('honest');
-    seeder.recordUpload(VIEWER, 4);
-    const msg = await viewer.pay({ fromBlock: 0, toBlock: 3 }, SEEDER_INFO, POLICY);
+    upload(seeder, VIEWER, 4);
+    const msg = await viewer.pay(range(0, 3), SEEDER_INFO, POLICY);
     const res = await seeder.verify(VIEWER, msg, POLICY);
     expect(res).toMatchObject({ ok: true });
     expect(seeder.window(VIEWER)).toMatchObject({ paid: 4, outstanding: 0 });
@@ -533,7 +510,7 @@ describe('SECURITY.md money-path invariants', () => {
     await fc.assert(
       fc.asyncProperty(fc.anything(), async (junk) => {
         const s = getSeederEngine();
-        s.recordUpload(VIEWER, 4);
+        upload(s, VIEWER, 4);
         let out: VerifyResult | undefined;
         let threw = false;
         try {
@@ -583,12 +560,8 @@ describe('SECURITY.md money-path invariants', () => {
     await fc.assert(
       fc.asyncProperty(corruption, async (corrupt) => {
         const s = getSeederEngine();
-        s.recordUpload(VIEWER, 4);
-        const good = await getPair('honest').viewer.pay(
-          { fromBlock: 0, toBlock: 3 },
-          SEEDER_INFO,
-          POLICY,
-        );
+        upload(s, VIEWER, 4);
+        const good = await getPair('honest').viewer.pay(range(0, 3), SEEDER_INFO, POLICY);
         let out: VerifyResult | undefined;
         let threw = false;
         try {
@@ -624,7 +597,7 @@ describe('SECURITY.md money-path invariants', () => {
           let banned = false;
           for (const op of ops) {
             if (op.kind === 'upload') {
-              const w = seeder.recordUpload(VIEWER, op.blocks);
+              const w = upload(seeder, VIEWER, op.blocks);
               uploaded += op.blocks;
               expect(w.uploaded).toBe(uploaded);
               expect(w.outstanding).toBe(w.uploaded - w.paid);
@@ -638,13 +611,13 @@ describe('SECURITY.md money-path invariants', () => {
               // Pay for the next `blocks` blocks, but only ones actually uploaded.
               const to = Math.min(nextUnpaid + op.blocks, uploaded) - 1;
               if (to < nextUnpaid) continue; // nothing payable yet
-              const range = { fromBlock: nextUnpaid, toBlock: to };
-              const msg = await viewer.pay(range, SEEDER_INFO, POLICY);
+              const r = range(nextUnpaid, to);
+              const msg = await viewer.pay(r, SEEDER_INFO, POLICY);
               const res = await seeder.verify(VIEWER, msg, POLICY);
               if (banned) {
                 expect(res).toMatchObject({ ok: false, reason: 'peer-banned' });
               } else {
-                expect(res).toMatchObject({ ok: true, blocks: blocksIn(range) });
+                expect(res).toMatchObject({ ok: true, blocks: blocksIn(r) });
                 nextUnpaid = to + 1;
               }
             }
@@ -671,12 +644,14 @@ describe('SECURITY.md money-path invariants', () => {
   });
 
   it('INV5 rebind (v3, ADR 0004 d): sum-merge — after `rebind(from, to)` the window for `to` shows n + m uploaded and `from` is gone from windows(); when n + m > window the ban and `onWindowExceeded` fire synchronously inside `rebind` and the returned window reflects it; an unknown `from` is a no-op', async () => {
+    // v5: `uploaded` counts DISTINCT blocks, so the merge is a union — the two sessions
+    // below send different blocks (`from:`), which is what "n + m" always meant here.
     // (i) Sum-merge below the window: nothing fires, `to` has both sessions' blocks.
     const a = getPair('honest'); // default window (4)
     const firedA: PeerWindow[] = [];
     a.seeder.onWindowExceeded((w) => firedA.push(w));
-    a.seeder.recordUpload(VIEWER, 2); // m = 2 from an earlier session of the same pubkey
-    a.seeder.recordUpload(NOISE_ID, 1); // n = 1 pre-HELLO on the new session
+    upload(a.seeder, VIEWER, 2); // m = 2 from an earlier session of the same pubkey: [0,1]
+    upload(a.seeder, NOISE_ID, 1, { from: 2 }); // n = 1 pre-HELLO on the new session: [2]
     const merged = a.seeder.rebind(NOISE_ID, VIEWER);
     expect(merged).toMatchObject({
       peer: VIEWER,
@@ -691,8 +666,8 @@ describe('SECURITY.md money-path invariants', () => {
     expect(firedA).toEqual([]);
     expect(a.seeder.isBanned(VIEWER)).toBe(false);
     // The merged window is live: one more block is tolerated, the next crosses.
-    expect(a.seeder.recordUpload(VIEWER, 1).banned).toBe(false);
-    expect(a.seeder.recordUpload(VIEWER, 1).banned).toBe(true);
+    expect(upload(a.seeder, VIEWER, 1, { from: 3 }).banned).toBe(false);
+    expect(upload(a.seeder, VIEWER, 1, { from: 4 }).banned).toBe(true);
     expect(firedA).toHaveLength(1);
 
     // (iii) Sum-merge across the window: the crossing is detected inside `rebind`, the
@@ -708,8 +683,8 @@ describe('SECURITY.md money-path invariants', () => {
         bannedAtCallback: b.seeder.isBanned(w.peer) && !rebindReturned,
       }),
     );
-    b.seeder.recordUpload(VIEWER, 3); // m = 3 ≤ window
-    b.seeder.recordUpload(NOISE_ID, 2); // n = 2 ≤ window
+    upload(b.seeder, VIEWER, 3); // m = 3 ≤ window: [0,2]
+    upload(b.seeder, NOISE_ID, 2, { from: 3 }); // n = 2 ≤ window: [3,4]
     expect(firedB).toEqual([]);
     const crossed = b.seeder.rebind(NOISE_ID, VIEWER);
     rebindReturned = true;
@@ -719,7 +694,7 @@ describe('SECURITY.md money-path invariants', () => {
     expect(b.seeder.isBanned(NOISE_ID)).toBe(false);
     expect(b.seeder.window(NOISE_ID)).toBeUndefined();
     expect(b.seeder.bans().some((e) => e.pubkey === VIEWER)).toBe(true);
-    const late = await b.viewer.pay({ fromBlock: 0, toBlock: 3 }, SEEDER_INFO, POLICY);
+    const late = await b.viewer.pay(range(0, 3), SEEDER_INFO, POLICY);
     expect(await b.seeder.verify(VIEWER, late, POLICY)).toMatchObject({
       ok: false,
       reason: 'peer-banned',
@@ -729,7 +704,7 @@ describe('SECURITY.md money-path invariants', () => {
     const c = getPair('honest');
     const firedC: PeerWindow[] = [];
     c.seeder.onWindowExceeded((w) => firedC.push(w));
-    c.seeder.recordUpload(VIEWER, 2);
+    upload(c.seeder, VIEWER, 2);
     const before = c.seeder.window(VIEWER);
     const beforeAll = c.seeder.windows();
     expect(c.seeder.rebind(UNKNOWN_ID, VIEWER)).toEqual(before);
@@ -744,63 +719,57 @@ describe('SECURITY.md money-path invariants', () => {
     // `from` is gone, `to` is banned iff outstanding > window, and the crossing — whether
     // it happened at an upload or at the merge — fired exactly once.
     fc.assert(
-      fc.property(
-        fc.nat(6),
-        fc.nat(6),
-        fc.integer({ min: 1, max: 6 }),
-        fc.boolean(),
-        (n, m, windowBlocks, toExists) => {
-          const s = getSeederEngine({ config: { windowBlocks } });
-          const fired: PeerWindow[] = [];
-          s.onWindowExceeded((w) => fired.push(w));
-          if (toExists || m > 0) s.recordUpload(VIEWER, m);
-          if (n > 0) s.recordUpload(NOISE_ID, n);
-          const firedBefore = fired.length;
-          const w = s.rebind(NOISE_ID, VIEWER);
-          expect(w.peer).toBe(VIEWER);
-          expect(w.uploaded).toBe(n + m);
-          expect(w.paid).toBe(0);
-          expect(w.outstanding).toBe(n + m);
-          expect(w.windowBlocks).toBe(windowBlocks);
-          const shouldBan = n + m > windowBlocks;
-          expect(w.banned).toBe(shouldBan);
-          expect(s.isBanned(VIEWER)).toBe(shouldBan);
-          expect(s.isBanned(NOISE_ID)).toBe(false);
-          expect(s.window(NOISE_ID)).toBeUndefined();
-          expect(s.window(VIEWER)).toEqual(w);
-          expect(s.windows().map((x) => x.peer)).toEqual([VIEWER]);
-          // Each side that crossed on its own already fired at its `recordUpload`; the merge
-          // fires exactly once more iff neither had and the sum crosses. Never twice for one
-          // identity, never zero for a banned one.
-          const preCrossings = (m > windowBlocks ? 1 : 0) + (n > windowBlocks ? 1 : 0);
-          expect(firedBefore).toBe(preCrossings);
-          const crossedAtMerge = preCrossings === 0 && shouldBan;
-          expect(fired.length - firedBefore).toBe(crossedAtMerge ? 1 : 0);
-          if (crossedAtMerge) {
-            expect(fired.at(-1)).toMatchObject({ peer: VIEWER, outstanding: n + m, banned: true });
-          }
-          for (const f of fired) expect(f.banned).toBe(true);
-        },
-      ),
+      fc.property(fc.nat(6), fc.nat(6), fc.integer({ min: 1, max: 6 }), (n, m, windowBlocks) => {
+        const s = getSeederEngine({ config: { windowBlocks } });
+        const fired: PeerWindow[] = [];
+        s.onWindowExceeded((w) => fired.push(w));
+        if (m > 0) upload(s, VIEWER, m); // [0, m)
+        if (n > 0) upload(s, NOISE_ID, n, { from: m }); // [m, m + n)
+        const firedBefore = fired.length;
+        const w = s.rebind(NOISE_ID, VIEWER);
+        expect(w.peer).toBe(VIEWER);
+        expect(w.uploaded).toBe(n + m);
+        expect(w.paid).toBe(0);
+        expect(w.outstanding).toBe(n + m);
+        expect(w.windowBlocks).toBe(windowBlocks);
+        const shouldBan = n + m > windowBlocks;
+        expect(w.banned).toBe(shouldBan);
+        expect(s.isBanned(VIEWER)).toBe(shouldBan);
+        expect(s.isBanned(NOISE_ID)).toBe(false);
+        expect(s.window(NOISE_ID)).toBeUndefined();
+        expect(s.window(VIEWER)).toEqual(w);
+        expect(s.windows().map((x) => x.peer)).toEqual([VIEWER]);
+        // Each side that crossed on its own already fired at its `recordUpload`; the merge
+        // fires exactly once more iff neither had and the sum crosses. Never twice for one
+        // identity, never zero for a banned one.
+        const preCrossings = (m > windowBlocks ? 1 : 0) + (n > windowBlocks ? 1 : 0);
+        expect(firedBefore).toBe(preCrossings);
+        const crossedAtMerge = preCrossings === 0 && shouldBan;
+        expect(fired.length - firedBefore).toBe(crossedAtMerge ? 1 : 0);
+        if (crossedAtMerge) {
+          expect(fired.at(-1)).toMatchObject({ peer: VIEWER, outstanding: n + m, banned: true });
+        }
+        for (const f of fired) expect(f.banned).toBe(true);
+      }),
       { numRuns: 150 },
     );
   });
 
-  it('INV6 ban on double-spend → an already-spent proof reported by the swap bans the paying pubkey and the ban is listed durably', async () => {
+  it('INV6 ban on double-spend → a double-spend — a reused proof at verify (v5) or an already-spent proof reported by the swap — bans the paying pubkey and the ban is listed durably', async () => {
     // Persistence to disk (across process restarts) is owned by L2; the engine must expose
     // the ban list the seeder persists, with pubkey, reason and timestamp.
     const { viewer, seeder, clock } = getPair('double-spend');
-    seeder.recordUpload(VIEWER, 2);
-    const a = await viewer.pay({ fromBlock: 0, toBlock: 1 }, SEEDER_INFO, POLICY);
+    upload(seeder, VIEWER, 2);
+    const a = await viewer.pay(range(0, 1), SEEDER_INFO, POLICY);
     expect(await seeder.verify(VIEWER, a, POLICY)).toMatchObject({ ok: true });
-    seeder.recordUpload(VIEWER, 2);
-    const b = await viewer.pay({ fromBlock: 2, toBlock: 3 }, SEEDER_INFO, POLICY); // replays a's proofs
-    expect(await seeder.verify(VIEWER, b, POLICY)).toMatchObject({ ok: true });
-    expect(seeder.isBanned(VIEWER)).toBe(false);
     expect(seeder.bans()).toHaveLength(0);
-
+    upload(seeder, VIEWER, 2);
+    const b = await viewer.pay(range(2, 3), SEEDER_INFO, POLICY); // replays a's proofs
     const before = clock.current();
-    expect((await seeder.flush()).failed).toBe(1);
+    expect(await seeder.verify(VIEWER, b, POLICY)).toMatchObject({
+      ok: false,
+      reason: 'double-spend',
+    });
 
     expect(seeder.isBanned(VIEWER)).toBe(true);
     const entry = seeder.bans().find((e) => e.pubkey === VIEWER);
@@ -810,10 +779,10 @@ describe('SECURITY.md money-path invariants', () => {
     expect(seeder.window(VIEWER)?.banned).toBe(true);
 
     // The ban outlives the batch and gates every later interaction from that pubkey.
-    await seeder.flush();
+    expect((await seeder.flush()).failed).toBe(0);
     expect(seeder.bans().find((e) => e.pubkey === VIEWER)).toEqual(entry);
-    seeder.recordUpload(VIEWER, 1);
-    const c = await getPair('honest').viewer.pay({ fromBlock: 4, toBlock: 4 }, SEEDER_INFO, POLICY);
+    upload(seeder, VIEWER, 1);
+    const c = await getPair('honest').viewer.pay(range(4, 4), SEEDER_INFO, POLICY);
     expect(await seeder.verify(VIEWER, c, POLICY)).toMatchObject({
       ok: false,
       reason: 'peer-banned',
@@ -822,30 +791,41 @@ describe('SECURITY.md money-path invariants', () => {
     seeder.unban(VIEWER);
     expect(seeder.isBanned(VIEWER)).toBe(false);
     expect(seeder.bans()).toHaveLength(0);
+
+    // The swap half: a proof the mint already saw spent passes offline verification, and
+    // the batch that swaps it bans the payer with the same durable entry.
+    const s = getPair('honest');
+    upload(s.seeder, VIEWER, 2);
+    const spent = await s.viewer.pay(range(0, 1), SEEDER_INFO, POLICY);
+    await spendAtMint(s.seeder, spent.creatorProofs.proofs);
+    expect(await s.seeder.verify(VIEWER, spent, POLICY)).toMatchObject({ ok: true });
+    expect(s.seeder.bans()).toHaveLength(0);
+    const beforeFlush = s.clock.current();
+    expect((await s.seeder.flush()).failed).toBe(1);
+    const e2 = s.seeder.bans().find((e) => e.pubkey === VIEWER);
+    expect(e2).toBeDefined();
+    expect(e2!.at).toBeGreaterThanOrEqual(beforeFlush);
+    expect(s.seeder.window(VIEWER)?.banned).toBe(true);
   });
 
   it('INV6 rebind (v3, ADR 0004 d): pending proofs move with the accounting — a double-spend accepted under the provisional id and caught at flush after `rebind` bans the bound pubkey, not the dead provisional id', async () => {
-    const { viewer, seeder } = getPair('double-spend', WIDE_WINDOW);
+    const { viewer, seeder } = getPair('honest', WIDE_WINDOW);
     const doubles: NostrPubkey[] = [];
     seeder.onDoubleSpend((p) => doubles.push(p));
 
     // Earlier session, already bound: an honest PAY, swapped.
-    seeder.recordUpload(VIEWER, 4, CORE_A);
-    const first = await viewer.pay({ core: CORE_A, fromBlock: 0, toBlock: 3 }, SEEDER_INFO, POLICY);
+    upload(seeder, VIEWER, 4, { core: CORE_A });
+    const first = await viewer.pay(range(0, 3, CORE_A), SEEDER_INFO, POLICY);
     expect(await seeder.verify(VIEWER, first, POLICY)).toMatchObject({ ok: true });
     expect(await seeder.flush()).toMatchObject({ failed: 0 });
 
-    // New session, pre-HELLO: the same proofs again, for blocks served under the Noise id.
-    // Offline verification cannot see the double-spend, so it is queued under `from`.
-    seeder.recordUpload(NOISE_ID, 4, CORE_B);
-    const replay = await viewer.pay(
-      { core: CORE_B, fromBlock: 0, toBlock: 3 },
-      SEEDER_INFO,
-      POLICY,
-    );
-    expect(replay.seederProofs.proofs.map((p) => p.secret)).toEqual(
-      first.seederProofs.proofs.map((p) => p.secret),
-    );
+    // New session, pre-HELLO: a PAY whose proofs the mint already saw spent elsewhere
+    // (v5: proofs THIS seeder accepted are refused at verify, so the flush path is the
+    // one where attribution after `rebind` matters). It passes offline verification and is
+    // queued under `from`.
+    upload(seeder, NOISE_ID, 4, { core: CORE_B });
+    const replay = await viewer.pay(range(0, 3, CORE_B), SEEDER_INFO, POLICY);
+    await spendAtMint(seeder, replay.seederProofs.proofs);
     expect(await seeder.verify(NOISE_ID, replay, POLICY)).toMatchObject({ ok: true });
 
     // HELLO verifies → rebind. The swap batch then reports the spent proof: the ban must
@@ -861,6 +841,21 @@ describe('SECURITY.md money-path invariants', () => {
     expect(seeder.window(VIEWER)?.banned).toBe(true);
     // Nothing new was swapped or nutzapped for the replay.
     expect(r.swapped + r.nutzapped).toBe(0);
+
+    // And a reused proof re-presented under a provisional id is refused at verify: the ban
+    // lands on the provisional id and `rebind` carries it onto the pubkey (T3 ban-sticks).
+    const d = getPair('double-spend', WIDE_WINDOW);
+    upload(d.seeder, VIEWER, 4, { core: CORE_A });
+    const one = await d.viewer.pay(range(0, 3, CORE_A), SEEDER_INFO, POLICY);
+    expect(await d.seeder.verify(VIEWER, one, POLICY)).toMatchObject({ ok: true });
+    upload(d.seeder, NOISE_ID, 4, { core: CORE_B });
+    const two = await d.viewer.pay(range(0, 3, CORE_B), SEEDER_INFO, POLICY);
+    expect(await d.seeder.verify(NOISE_ID, two, POLICY)).toMatchObject({
+      ok: false,
+      reason: 'double-spend',
+    });
+    expect(d.seeder.rebind(NOISE_ID, VIEWER)).toMatchObject({ peer: VIEWER, banned: true });
+    expect(d.seeder.isBanned(NOISE_ID)).toBe(false);
   });
 
   it('INV7 no key or proof in a log, ever → for every mode, every observable output of the seeder (results incl. `detail`, callbacks, state) is free of proof material', async () => {
@@ -876,17 +871,14 @@ describe('SECURITY.md money-path invariants', () => {
       seeder.onDoubleSpend((p, d) => doubleSpendEvents.push([p, d]));
       const results: VerifyResult[] = [];
       const messages: PayMessage[] = [];
-      seeder.recordUpload(VIEWER, 4);
-      for (const range of [
-        { fromBlock: 0, toBlock: 3 },
-        { fromBlock: 4, toBlock: 7 },
-      ]) {
-        const msg = await viewer.pay(range, SEEDER_INFO, POLICY);
+      upload(seeder, VIEWER, 4);
+      for (const r of [range(0, 3), range(4, 7)]) {
+        const msg = await viewer.pay(r, SEEDER_INFO, POLICY);
         messages.push(msg);
         results.push(await seeder.verify(VIEWER, msg, POLICY));
-        seeder.recordUpload(VIEWER, 4);
+        upload(seeder, VIEWER, 4);
       }
-      seeder.recordUpload(VIEWER, 2); // cross the window at least once
+      upload(seeder, VIEWER, 2); // cross the window at least once
       const flushResult = await seeder.flush();
       const observed =
         observableState(seeder, VIEWER, { windowEvents, doubleSpendEvents, flushResult }) +
@@ -903,7 +895,7 @@ describe('SECURITY.md money-path invariants', () => {
     }
     // The viewer-side accounting is amounts only.
     const { viewer } = getPair('honest');
-    const msg = await viewer.pay({ fromBlock: 0, toBlock: 3 }, SEEDER_INFO, POLICY);
+    const msg = await viewer.pay(range(0, 3), SEEDER_INFO, POLICY);
     const spent = JSON.stringify({ ...viewer.spent(), perPeer: [...viewer.spent().perPeer] });
     for (const s of proofMaterial(msg)) expect(spent).not.toContain(s);
     expect(viewer.spent().perPeer.get(SEEDER_INFO.pubkey)).toBe(

@@ -41,6 +41,8 @@ export interface NostrFilter {
 export const NostrKind = {
   Profile: 0,
   Follows: 3,
+  /** v5 (L6-B request 4): NIP-09 deletion request — `unreact` withdraws kind-7 reactions with it. */
+  Deletion: 5,
   Reaction: 7,
   Video: 21, // NIP-71 normal
   ShortVideo: 22, // NIP-71 short
@@ -53,6 +55,11 @@ export const NostrKind = {
   NutzapInfo: 10019, // NIP-61
   BlossomServerList: 10063, // BUD-03
   WalletInfo: 17375, // NIP-60
+  /**
+   * v5 (ADR 0010): the event a `pay/1` HELLO signature is made over (ephemeral, never sent to
+   * a relay) — see `PAY_HELLO_KIND` in `pay-protocol.ts`.
+   */
+  PayHello: 21071,
   BlossomAuth: 24242, // BUD-01
   ChannelSet: 30000, // NIP-51 follow set used as "subscriptions"
   VideoSet: 30005, // NIP-51 playlist

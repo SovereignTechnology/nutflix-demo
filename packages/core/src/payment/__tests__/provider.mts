@@ -15,6 +15,7 @@
  */
 import type {
   BanEntry,
+  BlockIndex,
   BlockRange,
   CashuP2pkPubkey,
   CashuProof,
@@ -34,6 +35,7 @@ import type {
 } from '../../contracts/index.js';
 import { DEFAULT_BLOCK_SIZE, DEFAULT_WINDOW_BLOCKS } from '../../contracts/index.js';
 import { MockPaymentEngine, type MockPaymentMode } from '../../mocks/mock-payment-engine.js';
+import { splitPay, splitSequence } from '../split.js';
 
 // ---------------------------------------------------------------------------------------
 // Modes — enumerated from the mock's `MockPaymentMode` type, checked exhaustive at compile
@@ -83,12 +85,19 @@ export const OTHER_VIEWER = 'fe'.repeat(32) as NostrPubkey;
 export const sats = (n: number): Sats => n as Sats;
 export const unix = (n: number): UnixSeconds => n as UnixSeconds;
 
+/**
+ * The generic policy. `minPaySats: 1` keeps the v5 effective window equal to the configured
+ * one (`max(windowBlocks, ceil(minPaySats / satsPerBlock))`), so every window test written
+ * before v5 keeps the meaning it was written with; the effective-window rule has its own
+ * tests with the default (`DEFAULT_MIN_PAY_SATS`) in `split.test.ts` and the mock's tests.
+ */
 export const POLICY: PricePolicy = {
   satsPerBlock: sats(2),
   blockSize: DEFAULT_BLOCK_SIZE,
   mints: [MINT_A],
   split: { seeder: 50, creator: 50 },
   creatorP2pk: CREATOR_P2PK,
+  minPaySats: sats(1),
 };
 
 export function policyWith(overrides: Partial<PricePolicy>): PricePolicy {
@@ -102,7 +111,7 @@ export const SEEDER_INFO = { pubkey: SEEDER, p2pk: SEEDER_P2PK, mint: MINT_A } a
 // provisional (pre-HELLO) identity the transport accounts under before `rebind`.
 // ---------------------------------------------------------------------------------------
 
-/** Video A's core (creator A = `CREATOR_P2PK`, priced by `POLICY`). */
+/** Video A's core (creator A = `CREATOR_P2PK`, priced by `POLICY`). The default core. */
 export const CORE_A = 'a1'.repeat(32) as CoreKeyHex;
 /** Video B's core (creator B = `CREATOR_B_P2PK`; price per test). */
 export const CORE_B = 'b2'.repeat(32) as CoreKeyHex;
@@ -127,11 +136,53 @@ export function policyByCore(
   policies: ReadonlyMap<CoreKeyHex, PricePolicy>,
 ): (range: BlockRange) => PricePolicy {
   return (range) => {
-    if (range.core === undefined) throw new Error('policyByCore: PAY carries no core');
     const p = policies.get(range.core);
     if (!p) throw new Error(`policyByCore: no policy for core ${range.core}`);
     return p;
   };
+}
+
+// ---------------------------------------------------------------------------------------
+// Contracts v5 (ADR 0010): every range names a core, and uploads are recorded per block.
+// ---------------------------------------------------------------------------------------
+
+/** `[fromBlock, toBlock]` on `core` (default `CORE_A`). */
+export function range(fromBlock: BlockIndex, toBlock: BlockIndex, core = CORE_A): BlockRange {
+  return { core, fromBlock, toBlock };
+}
+
+/** Next block index the helpers below will send, per engine × peer × core. */
+const nextBlock = new WeakMap<object, Map<string, number>>();
+
+/**
+ * Send `n` blocks of `core` to `peer`, one `recordUpload` per block the way the seeder's
+ * `upload` handler does, and return the window after the last one. By default the blocks
+ * continue where the previous `upload()` to the same peer and core stopped (a peer
+ * streaming a core front to back); `opts.from` sends `[from, from + n)` instead (a seek, a
+ * second seeder's half, or a different session sending different blocks). `n` must be ≥ 1.
+ */
+export function upload(
+  seeder: Pick<PaymentEngine, 'recordUpload'>,
+  peer: NostrPubkey,
+  n: number,
+  opts: { readonly core?: CoreKeyHex; readonly from?: number; readonly policy?: PricePolicy } = {},
+): PeerWindow {
+  if (!Number.isInteger(n) || n < 1) throw new RangeError('upload(): n must be a positive integer');
+  const core = opts.core ?? CORE_A;
+  let perEngine = nextBlock.get(seeder);
+  if (!perEngine) {
+    perEngine = new Map();
+    nextBlock.set(seeder, perEngine);
+  }
+  const key = `${peer}|${core}`;
+  let at = opts.from ?? perEngine.get(key) ?? 0;
+  let w = seeder.recordUpload(peer, range(at, at, core), opts.policy ?? POLICY);
+  for (let i = 1; i < n; i++) {
+    at++;
+    w = seeder.recordUpload(peer, range(at, at, core), opts.policy ?? POLICY);
+  }
+  perEngine.set(key, Math.max(at + 1, perEngine.get(key) ?? 0));
+  return w;
 }
 
 /**
@@ -195,6 +246,18 @@ export function usingMock(): boolean {
   return getSeederEngine() instanceof MockPaymentEngine;
 }
 
+/**
+ * Make the mint behind `seeder` report `proofs` as already spent, as if they had been
+ * redeemed by a route this engine never saw. Drives the async-swap (flush) half of T5.
+ */
+export function spendAtMint(seeder: PaymentEngine, proofs: readonly CashuProof[]): Promise<void> {
+  if (seeder instanceof MockPaymentEngine) {
+    seeder.markSpentAtMint(proofs.map((p) => p.secret));
+    return Promise.resolve();
+  }
+  return Promise.reject(new Error('spendAtMint: no test mint wired for this engine'));
+}
+
 export interface AdversaryPair {
   readonly viewer: PaymentEngineViewer;
   readonly seeder: PaymentEngine;
@@ -224,14 +287,39 @@ export function sumProofs(proofs: readonly CashuProof[]): number {
   return proofs.reduce((a, p) => a + p.amount, 0);
 }
 
-/** The split rule the reference model uses: floor to the seeder, remainder to the creator. */
+/**
+ * The v5 split (ADR 0007/0010, `splitPay`): creator share floored with the carry, the seeder
+ * takes the rest. With `carryIn = 0` this is ADR 0005's `seederSats = ceil(amount × s / 100)`.
+ * (Before v5 the reference model floored the SEEDER share — the opposite of ADR 0005.)
+ */
 export function expectedShares(
   blocks: number,
   policy: PricePolicy,
-): { readonly total: number; readonly seeder: number; readonly creator: number } {
+  carryIn = 0,
+): {
+  readonly total: number;
+  readonly seeder: number;
+  readonly creator: number;
+  readonly carryOut: number;
+} {
   const total = blocks * policy.satsPerBlock;
-  const seeder = Math.floor((total * policy.split.seeder) / 100);
-  return { total, seeder, creator: total - seeder };
+  const s = splitPay(total, policy.split, carryIn);
+  return { total, seeder: s.seederSats, creator: s.creatorSats, carryOut: s.carryOut };
+}
+
+/** Totals of a sequence of accepted PAYs of `blocks[i]` blocks each on one channel × core. */
+export function expectedSequence(
+  blocks: readonly number[],
+  policy: PricePolicy,
+  carryIn = 0,
+): { readonly total: number; readonly seeder: number; readonly creator: number } {
+  const amounts = blocks.map((b) => b * policy.satsPerBlock);
+  const { splits } = splitSequence(amounts, policy.split, carryIn);
+  return {
+    total: amounts.reduce((a, b) => a + b, 0),
+    seeder: splits.reduce((a, x) => a + x.seederSats, 0),
+    creator: splits.reduce((a, x) => a + x.creatorSats, 0),
+  };
 }
 
 export function withSeederSet(msg: PayMessage, set: Partial<LockedProofSet>): PayMessage {

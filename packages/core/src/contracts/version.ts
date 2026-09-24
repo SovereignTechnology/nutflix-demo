@@ -25,5 +25,19 @@
  *       .unreact(videoId)` — NIP-09 deletion; un-like must never be sent as a `-` dislike.
  *       (c) `PricePolicy.split` doc points at ADR 0007 (min PAY size + creator carry,
  *       implemented in Stage 2). The Stage 2 bump planned as "v4" in docs/status.md is v5.
+ *   5 — 2026-09-23 Stage 2 (ADR 0010). BREAKING for the money path, additive elsewhere.
+ *       (a) `BlockRange.core` REQUIRED; `recordUpload(peer, blocks: BlockRange, policy)`
+ *       records block INDEXES (distinct per core) and takes the core's policy (effective
+ *       window). (b) Per-PAY split (ADR 0007): `PayMessage.carryIn`, carry + minimum PAY
+ *       (`PricePolicy.minPaySats`, `DEFAULT_MIN_PAY_SATS` 10), `PeerWindow.windowBlocks` is the
+ *       effective window; `pay(…, opts?.carryIn)`. The minimum is a batching target, not a
+ *       seeder-side rejection (ADR 0010 §minimum). (c) `RejectReason` + `double-spend` (local
+ *       seen-secret check). (d) pay/1: `HELLO.createdAt` + connection-
+ *       bound `challenge` + `windowBlocks`, `ACK.core`, `PRICE.core`, `PAY_HELLO_KIND` /
+ *       `NostrKind.PayHello` 21071. (e) Creator set bound to its seeder (`['pay1', p2pk]`
+ *       NUT-10 tag); `Wallet.send` takes `tags`/`memo`. (f) `NostrKind.Deletion` 5;
+ *       `VideoStats.seedersOnline?` (absent = unknown); `UploadInput.file` = file token on
+ *       desktop; `Settings.autoTopUp` semantics normative; `SignerConnectRequest` /
+ *       `SignerControl` (core side only; the NetworkAdapter bridge is Stage 3).
  */
-export const CONTRACTS_VERSION = 4 as const;
+export const CONTRACTS_VERSION = 5 as const;

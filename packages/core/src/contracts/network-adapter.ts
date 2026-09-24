@@ -65,8 +65,12 @@ export interface VideoStats {
   /** v4: the signed-in viewer's current reaction, when it is a like or a dislike. */
   readonly myReaction?: 'like' | 'dislike';
   readonly comments: number;
-  /** Seeders currently announcing this core (from swarm / 10019). */
-  readonly seedersOnline: number;
+  /**
+   * Seeders currently announcing this core (from swarm / 10019). v5 (L6-B request 5):
+   * ABSENT = unknown — the adapter has no way to count them yet. Screens gate playback only
+   * on a KNOWN 0; `play()` reports the truth either way.
+   */
+  readonly seedersOnline?: number;
 }
 
 /**
@@ -126,7 +130,12 @@ export interface PeerSpend {
 }
 
 export interface UploadInput {
-  /** Desktop: absolute path. Web: a File (gateway transcodes after BUD-02 upload). */
+  /**
+   * v5 (SE-1, L6-0): Desktop — the renderer passes an opaque FILE TOKEN minted by the main
+   * process for a file the user picked, never a path; the host resolves it to a path before
+   * the pipeline runs (an unknown token is `file-token-invalid`). Web: a File (the gateway
+   * transcodes after the BUD-02 upload, Stage 3).
+   */
   readonly file: string | FileLike;
   readonly title: string;
   readonly description: string;
@@ -175,6 +184,12 @@ export interface Settings {
   readonly prefetchSeconds: number;
   readonly hoverPreview: boolean;
   readonly theme: 'dark' | 'light' | 'system';
+  /**
+   * v5 (L5-Settings/Wallet, L6-B, SE-4) — normative: `belowSats <= 0` means DISABLED (a patch
+   * cannot remove the key, so "off" is written as 0). `belowSats` is compared with the balance
+   * at the mint a payment is about to draw from, and the top-up is funded from `fromMint`
+   * (melt there, mint at the target); it never fires for `fromMint` itself.
+   */
   readonly autoTopUp?: { readonly belowSats: Sats; readonly fromMint: MintUrl };
 }
 

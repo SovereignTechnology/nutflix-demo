@@ -42,8 +42,8 @@ verbatim from `docs/plan/build-plan.md` §1; change it there first.
 | T1 | Malicious seeder | Serves wrong bytes | Hypercore Merkle proof per block, before `download` fires | 0 |
 | T2 | Malicious seeder | Stalls | Hypercore already multi-sources; per-peer timeout, drop | Time |
 | T3 | Malicious viewer | Downloads, never pays | Window (4 blocks), then stream destroy + ban | ~4 blocks of sats |
-| T4 | Malicious viewer | Pays seeder, stiffs creator | Seeder requires both proof sets | 0 |
-| T5 | Malicious viewer | Double-spends | DLEQ offline check; async swap at mint; ban on failure | ≤ window |
+| T4 | Malicious viewer | Pays seeder, stiffs creator | Seeder requires both proof sets; creator set bound to the seeder (`pay1` tag, ADR 0010) | 0 |
+| T5 | Malicious viewer | Double-spends | DLEQ offline check; seen-secret check at verify (ADR 0010); async swap at mint; ban on failure | ≤ window |
 | T6 | MITM | Steals proofs in flight | Noise secret-stream + P2PK lock to recipient | 0 |
 | T7 | Any peer | Forged proofs | NUT-12 DLEQ against cached mint keyset | 0 |
 | T8 | Mint | Rug / compromise | Small balances, creator-chosen mint, one-click melt-out, mint shown in UI | Balance at that mint |
@@ -64,15 +64,18 @@ Specified in `docs/plan/build-plan.md` §1–§3 and enforced by the adversary t
    for from that specific peer. Hypercore does not emit `download` for a block that failed
    its Merkle proof.
 2. **Exact amounts.** A `PAY` must cover exactly `blocks × price` split per the video's
-   `split` tag. Underpayment and overpayment are both rejected.
+   `split` tag, with the creator's fractional share carried across PAYs on the channel
+   (`payment/split.ts`, ADR 0007/0010). Underpayment and overpayment are both rejected.
 3. **Two locked sets.** Every `PAY` carries a seeder proof set and a creator proof set,
-   each P2PK-locked (NUT-11) to its recipient, each carrying DLEQ (NUT-12).
+   each P2PK-locked (NUT-11) to its recipient, each carrying DLEQ (NUT-12); the creator set
+   is bound to the seeder it pays through. A set is empty only when its share is 0 sats.
 4. **Offline verification before `ACK`.** DLEQ against the cached mint keyset, P2PK target
    check, amount check, mint allowlist — all before the seeder acknowledges.
 5. **Window then cut.** `uploaded − paid` per peer may not exceed the window (default 4
    blocks). Past it the seeder destroys the stream and bans the pubkey.
-6. **Ban on double-spend.** An async swap at the mint that reports an already-spent proof
-   bans the paying pubkey; the ban list is persisted.
+6. **Ban on double-spend.** A PAY re-presenting a proof the seeder already accepted is
+   refused at `verify`, and an async swap at the mint that reports an already-spent proof
+   bans the paying pubkey; either way the ban list is persisted.
 7. **No key or proof in a log, ever.** A redaction layer sits in front of every logger.
 8. **No browser persistence of proofs or keys.** The web shell holds NIP-60 state in memory
    only.

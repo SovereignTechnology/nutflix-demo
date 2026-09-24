@@ -17,8 +17,8 @@
  * counted and paid the moment its HELLO arrives.
  *
  * `PRICE` (seeder → viewer): `effectiveFromBlock` is honoured by splitting a run at the
- * boundary; blocks below it are paid at the old price. The message carries no core (v2
- * shape), so the new price applies to every core on that peer — see docs/lanes/L3.md.
+ * boundary; blocks below it are paid at the old price. v5 (ADR 0010): the message names its
+ * core, and the new price applies to that core only.
  */
 import type {
   BlockRange,
@@ -59,7 +59,8 @@ interface PeerState {
   readonly noiseHex: string;
   readonly protocol: PayProtocol;
   hello: HelloMessage | null;
-  price: PriceOverride | null;
+  /** core → the latest `PRICE` for it (v5: prices are per core). */
+  readonly price: Map<CoreKeyHex, PriceOverride>;
   /** core → sorted set of downloaded-but-unpaid block indexes. */
   readonly pending: Map<CoreKeyHex, Set<number>>;
   /** core → indexes already paid (replay guard). */
@@ -131,7 +132,7 @@ export class UpstreamPayer {
       noiseHex,
       protocol,
       hello: protocol.peer,
-      price: null,
+      price: new Map(),
       pending: new Map(),
       paid: new Map(),
       chain: Promise.resolve(),
@@ -151,9 +152,13 @@ export class UpstreamPayer {
         this.schedule(state, false);
       }),
       protocol.on('price', (p) => {
-        state.price = { satsPerBlock: p.satsPerBlock, effectiveFromBlock: p.effectiveFromBlock };
+        state.price.set(p.core, {
+          satsPerBlock: p.satsPerBlock,
+          effectiveFromBlock: p.effectiveFromBlock,
+        });
         this.log.info('upstream PRICE', {
           peer: noiseHex,
+          core: p.core,
           satsPerBlock: p.satsPerBlock,
           effectiveFromBlock: p.effectiveFromBlock,
         });
@@ -285,9 +290,9 @@ export class UpstreamPayer {
     }
   }
 
-  private splitAtPrice(state: PeerState, r: Required<BlockRange>): Required<BlockRange>[] {
-    const p = state.price;
-    if (p === null || p.effectiveFromBlock <= r.fromBlock || p.effectiveFromBlock > r.toBlock)
+  private splitAtPrice(state: PeerState, r: BlockRange): BlockRange[] {
+    const p = state.price.get(r.core);
+    if (p === undefined || p.effectiveFromBlock <= r.fromBlock || p.effectiveFromBlock > r.toBlock)
       return [r];
     return [
       { core: r.core, fromBlock: r.fromBlock, toBlock: p.effectiveFromBlock - 1 },
@@ -299,15 +304,15 @@ export class UpstreamPayer {
     state: PeerState,
     core: CoreKeyHex,
     hello: HelloMessage,
-    range: Required<BlockRange>,
+    range: BlockRange,
   ): PricePolicy | null {
     const base = this.policyFor(core, hello, state.noiseHex);
     if (base === null) {
       this.log.warn('no policy for upstream core — not paying', { peer: state.noiseHex, core });
       return null;
     }
-    const p = state.price;
-    if (p !== null && range.fromBlock >= p.effectiveFromBlock)
+    const p = state.price.get(core);
+    if (p !== undefined && range.fromBlock >= p.effectiveFromBlock)
       return { ...base, satsPerBlock: p.satsPerBlock };
     return base;
   }

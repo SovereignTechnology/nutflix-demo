@@ -45,7 +45,6 @@ import type { PersistedBan } from './store/ban-list.js';
 import { CasIndex } from './store/cas-index.js';
 import type { CasEntry } from './store/cas-index.js';
 import { DiskCap } from './store/disk-cap.js';
-import { toHex } from './util/hex.js';
 
 export interface SeederDeps {
   readonly engine: PaymentEngineSeeder & { readonly config?: EngineConfigLike };
@@ -127,6 +126,9 @@ export class Seeder {
       rateLimiter: this.rateLimiter,
       logger: this.log,
       ...(deps.now ? { now: deps.now } : {}),
+      // v5: the engine's effective window needs the core's price. A core with no policy
+      // (no default either) is served unpriced — its PAYs cannot be verified anyway.
+      pricing: (core) => this.pricingFor(core),
     });
     this.blobs = new BlobStore({
       storageDir: config.storageDir,
@@ -317,7 +319,6 @@ export class Seeder {
       session,
       protocol,
       policy: (core) => this.policyFor(core),
-      replicatedCores: () => this.replicatedCores(session),
       scheduler: this.scheduler,
       logger: this.log,
     });
@@ -351,11 +352,18 @@ export class Seeder {
     return this.policy();
   }
 
+  /** v5: `policyFor` for the effective window, never throwing (unpriced when none). */
+  private pricingFor(core: CoreKeyHex): Pick<PricePolicy, 'satsPerBlock' | 'minPaySats'> {
+    const p = this.corePolicies.get(core) ?? this.policyOverride;
+    return p ?? { satsPerBlock: 0 as PricePolicy['satsPerBlock'] };
+  }
+
   /**
-   * Set (or with `null` clear) the policy for one core. No `PRICE` is announced: the v2
-   * `PRICE` message carries no core, so it cannot express a per-core change (a PRICE from
-   * `setPolicy()` applies to every core on a connection). Peers learn the price for a core
-   * from the manifest / `HELLO` and their `PAY` is verified against this policy from now on.
+   * Set (or with `null` clear) the policy for one core. No `PRICE` is announced (v5 `PRICE`
+   * names its core, so a per-core announcement is now expressible — owed to Stage 3 with the
+   * old-price honouring in `verify`, see docs/security-review.md). Peers learn the price for
+   * a core from the manifest / `HELLO` and their `PAY` is verified against this policy from
+   * now on.
    */
   setCorePolicy(core: CoreKeyHex, policy: PricePolicy | null): void {
     if (policy === null) this.corePolicies.delete(core);
@@ -369,7 +377,9 @@ export class Seeder {
 
   /**
    * Change the DEFAULT price policy. With `announce` (default) every live `pay/1` peer gets a
-   * `PRICE` message; blocks already uploaded stay at the old price (`effectiveFromBlock`).
+   * `PRICE` message per core it has downloaded under the default policy (v5: `PRICE` names
+   * its core); blocks already uploaded stay at the old price (`effectiveFromBlock` = one past
+   * the highest index of that core sent on the session).
    */
   setPolicy(policy: PricePolicy, opts: { readonly announce?: boolean } = {}): void {
     const prev = this.policyOverride;
@@ -378,10 +388,14 @@ export class Seeder {
     if (!(opts.announce ?? true) || !changed) return;
     for (const [session, protocol] of this.protocols) {
       if (session.closed) continue;
-      protocol.sendPrice({
-        satsPerBlock: policy.satsPerBlock,
-        effectiveFromBlock: session.uploadedBlocks,
-      });
+      for (const core of session.uploadedCores) {
+        if (this.corePolicies.has(core as CoreKeyHex)) continue;
+        protocol.sendPrice({
+          core: core as CoreKeyHex,
+          satsPerBlock: policy.satsPerBlock,
+          effectiveFromBlock: session.nextIndexFor(core),
+        });
+      }
     }
   }
 
@@ -445,27 +459,6 @@ export class Seeder {
   private afterPut(r: PutResult): PutResult {
     if (r.ok) this.emit({ type: 'blob-added', entry: r.entry, deduplicated: r.deduplicated });
     return r;
-  }
-
-  /**
-   * Cores this session's stream replicates, as Corestore sees it: every open core with a
-   * replication peer whose Noise key is the session's. Hypercore attaches a core to a
-   * stream when both sides announce its discovery key, so this counts cores the peer has
-   * opened even before it pulls a block. The bridge takes the max of this and the cores
-   * the session has actually uploaded from.
-   */
-  private replicatedCores(session: PeerSession): number {
-    let n = 0;
-    for (const sc of this.blobs.openCores()) {
-      if (sc.core.closed) continue;
-      for (const peer of sc.core.peers) {
-        if (peer.stream === session.stream || toHex(peer.remotePublicKey) === session.noiseKeyHex) {
-          n++;
-          break;
-        }
-      }
-    }
-    return n;
   }
 
   private onCoreOpened(sc: SeedCore): void {

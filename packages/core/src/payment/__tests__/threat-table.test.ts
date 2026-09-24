@@ -50,6 +50,9 @@ import {
   policyByCore,
   policyWith,
   proofMaterial,
+  range,
+  spendAtMint,
+  upload,
   usingMock,
   withCreatorSet,
   withSeederSet,
@@ -77,9 +80,7 @@ async function listTs(dirUrl: URL): Promise<URL[]> {
   return out;
 }
 
-const rangeArb = fc
-  .tuple(fc.nat(64), fc.nat(15))
-  .map(([from, len]) => ({ fromBlock: from, toBlock: from + len }));
+const rangeArb = fc.tuple(fc.nat(64), fc.nat(15)).map(([from, len]) => range(from, from + len));
 
 describe('SECURITY.md threat table', () => {
   it('T1 malicious seeder serves wrong bytes → the money path only ever pays for the exact range the viewer verified; malformed ranges are refused', async () => {
@@ -99,13 +100,13 @@ describe('SECURITY.md threat table', () => {
     );
 
     const { viewer, seeder } = getPair('honest');
-    seeder.recordUpload(VIEWER, 4);
-    const good = await viewer.pay({ fromBlock: 0, toBlock: 3 }, SEEDER_INFO, POLICY);
+    upload(seeder, VIEWER, 4);
+    const good = await viewer.pay(range(0, 3), SEEDER_INFO, POLICY);
     for (const bad of [
-      { fromBlock: 3, toBlock: 0 }, // inverted
-      { fromBlock: -1, toBlock: 0 }, // negative
-      { fromBlock: 0.5, toBlock: 3 }, // non-integer
-      { fromBlock: 0, toBlock: Number.NaN },
+      range(3, 0), // inverted
+      range(-1, 0), // negative
+      range(0.5, 3), // non-integer
+      range(0, Number.NaN),
     ]) {
       const res = await seeder.verify(VIEWER, { ...good, range: bad }, POLICY);
       expect(res).toMatchObject({ ok: false, reason: 'malformed' });
@@ -118,10 +119,10 @@ describe('SECURITY.md threat table', () => {
     // At the interface the engine must expose the signal a timeout needs.
     const { viewer, seeder, clock } = getPair('honest');
     const t0 = clock.current();
-    const w1 = seeder.recordUpload(VIEWER, 4);
+    const w1 = upload(seeder, VIEWER, 4);
     expect(w1.lastActivity).toBeGreaterThanOrEqual(t0);
     const afterUpload = w1.lastActivity;
-    const msg = await viewer.pay({ fromBlock: 0, toBlock: 3 }, SEEDER_INFO, POLICY);
+    const msg = await viewer.pay(range(0, 3), SEEDER_INFO, POLICY);
     expect(await seeder.verify(VIEWER, msg, POLICY)).toMatchObject({ ok: true });
     const w2 = seeder.window(VIEWER);
     expect(w2).toBeDefined();
@@ -139,13 +140,13 @@ describe('SECURITY.md threat table', () => {
 
     // Exactly `windowBlocks` unpaid blocks are tolerated…
     for (let i = 0; i < seeder.config.windowBlocks; i++) {
-      const w = seeder.recordUpload(VIEWER, 1);
+      const w = upload(seeder, VIEWER, 1);
       expect(w.banned).toBe(false);
       expect(events).toHaveLength(0);
     }
     // …the block that crosses the window triggers the cut synchronously, before
     // `recordUpload` returns (spike S-A: `upload` fires before the block hits the wire).
-    const crossed = seeder.recordUpload(VIEWER, 1);
+    const crossed = upload(seeder, VIEWER, 1);
     expect(events).toEqual([
       { outstanding: seeder.config.windowBlocks + 1, bannedAtCallback: true },
     ]);
@@ -157,7 +158,7 @@ describe('SECURITY.md threat table', () => {
     expect(crossed.outstanding).toBeLessThanOrEqual(seeder.config.windowBlocks + 1);
 
     // A late PAY from the banned peer is refused, not credited.
-    const late = await viewer.pay({ fromBlock: 0, toBlock: 3 }, SEEDER_INFO, POLICY);
+    const late = await viewer.pay(range(0, 3), SEEDER_INFO, POLICY);
     expect(await seeder.verify(VIEWER, late, POLICY)).toMatchObject({
       ok: false,
       reason: 'peer-banned',
@@ -166,8 +167,8 @@ describe('SECURITY.md threat table', () => {
 
     // The seeder-side of the same row via the mock: a PAY with no seeder set is refused.
     const stiff = getPair('stiff-seeder');
-    stiff.seeder.recordUpload(VIEWER, 4);
-    const m = await stiff.viewer.pay({ fromBlock: 0, toBlock: 3 }, SEEDER_INFO, POLICY);
+    upload(stiff.seeder, VIEWER, 4);
+    const m = await stiff.viewer.pay(range(0, 3), SEEDER_INFO, POLICY);
     expect(await stiff.seeder.verify(VIEWER, m, POLICY)).toMatchObject({
       ok: false,
       reason: 'missing-seeder-set',
@@ -180,7 +181,7 @@ describe('SECURITY.md threat table', () => {
     const a = getPair('honest');
     const fired: PeerWindow[] = [];
     a.seeder.onWindowExceeded((w) => fired.push(w));
-    a.seeder.recordUpload(NOISE_ID, a.seeder.config.windowBlocks + 1);
+    upload(a.seeder, NOISE_ID, a.seeder.config.windowBlocks + 1);
     expect(a.seeder.isBanned(NOISE_ID)).toBe(true);
     expect(fired).toHaveLength(1);
 
@@ -194,7 +195,7 @@ describe('SECURITY.md threat table', () => {
     // second crossing.
     expect(fired).toHaveLength(1);
     // The numbers alone would let this PAY through (5 uploaded, [0,3] paid) — the ban wins.
-    const late = await a.viewer.pay({ fromBlock: 0, toBlock: 3 }, SEEDER_INFO, POLICY);
+    const late = await a.viewer.pay(range(0, 3), SEEDER_INFO, POLICY);
     expect(await a.seeder.verify(VIEWER, late, POLICY)).toMatchObject({
       ok: false,
       reason: 'peer-banned',
@@ -205,13 +206,13 @@ describe('SECURITY.md threat table', () => {
     //     onto it does not lift the ban.
     const b = getPair('honest');
     b.seeder.ban(VIEWER, 'double-spend', new Uint8Array(32).fill(9));
-    b.seeder.recordUpload(NOISE_ID, 2);
+    upload(b.seeder, NOISE_ID, 2);
     expect(b.seeder.isBanned(NOISE_ID)).toBe(false);
     const w2 = b.seeder.rebind(NOISE_ID, VIEWER);
     expect(w2).toMatchObject({ peer: VIEWER, uploaded: 2, paid: 0, banned: true });
     expect(b.seeder.isBanned(VIEWER)).toBe(true);
     expect(b.seeder.window(NOISE_ID)).toBeUndefined();
-    const paid = await b.viewer.pay({ fromBlock: 0, toBlock: 1 }, SEEDER_INFO, POLICY);
+    const paid = await b.viewer.pay(range(0, 1), SEEDER_INFO, POLICY);
     expect(await b.seeder.verify(VIEWER, paid, POLICY)).toMatchObject({
       ok: false,
       reason: 'peer-banned',
@@ -231,8 +232,8 @@ describe('SECURITY.md threat table', () => {
   it('T4 malicious viewer pays the seeder and stiffs the creator → both proof sets required, creator set must be locked to the creator', async () => {
     // Mode: creator share re-locked to the seeder's own key.
     const stiff = getPair('stiff-creator');
-    stiff.seeder.recordUpload(VIEWER, 4);
-    const msg = await stiff.viewer.pay({ fromBlock: 0, toBlock: 3 }, SEEDER_INFO, POLICY);
+    upload(stiff.seeder, VIEWER, 4);
+    const msg = await stiff.viewer.pay(range(0, 3), SEEDER_INFO, POLICY);
     expect(msg.creatorProofs.lockedTo).toBe(SEEDER_P2PK); // the attack, as sent
     expect(await stiff.seeder.verify(VIEWER, msg, POLICY)).toMatchObject({
       ok: false,
@@ -242,8 +243,8 @@ describe('SECURITY.md threat table', () => {
 
     // Hand-built variants of the same attack against an honest PAY.
     const { viewer, seeder } = getPair('honest');
-    seeder.recordUpload(VIEWER, 4);
-    const honest = await viewer.pay({ fromBlock: 0, toBlock: 3 }, SEEDER_INFO, POLICY);
+    upload(seeder, VIEWER, 4);
+    const honest = await viewer.pay(range(0, 3), SEEDER_INFO, POLICY);
 
     const noCreator = withCreatorSet(honest, { proofs: [] });
     expect(await seeder.verify(VIEWER, noCreator, POLICY)).toMatchObject({
@@ -282,12 +283,12 @@ describe('SECURITY.md threat table', () => {
     const resolve = policyByCore(policies);
 
     const { viewer, seeder } = getPair('honest', WIDE_WINDOW);
-    seeder.recordUpload(VIEWER, 4, CORE_A);
-    seeder.recordUpload(VIEWER, 4, CORE_B);
+    upload(seeder, VIEWER, 4, { core: CORE_A });
+    upload(seeder, VIEWER, 4, { core: CORE_B });
 
     // The attack: the viewer downloaded B's blocks (range.core = B) but built the PAY under
     // A's policy, so the creator share is locked to creator A.
-    const rangeB = { core: CORE_B, fromBlock: 0, toBlock: 3 };
+    const rangeB = range(0, 3, CORE_B);
     const stiffB = await viewer.pay(rangeB, SEEDER_INFO, policyA);
     expect(stiffB.range.core).toBe(CORE_B);
     expect(stiffB.creatorProofs.lockedTo).toBe(CREATOR_P2PK); // the attack, as sent
@@ -312,7 +313,7 @@ describe('SECURITY.md threat table', () => {
       ok: true,
       blocks: 4,
     });
-    const rangeA = { core: CORE_A, fromBlock: 0, toBlock: 3 };
+    const rangeA = range(0, 3, CORE_A);
     const okA = await viewer.pay(rangeA, SEEDER_INFO, policyA);
     expect(okA.creatorProofs.lockedTo).toBe(CREATOR_P2PK);
     expect(await seeder.verify(VIEWER, okA, resolve(okA.range))).toMatchObject({
@@ -326,111 +327,118 @@ describe('SECURITY.md threat table', () => {
     // stiffing PAY. The engine is policy-agnostic; `core` is what lets the caller pick the
     // right one, which is why ADR 0004 put it on the wire.
     const v2 = getSeederEngine(WIDE_WINDOW);
-    v2.recordUpload(VIEWER, 4, CORE_A);
-    v2.recordUpload(VIEWER, 4, CORE_B);
+    upload(v2, VIEWER, 4, { core: CORE_A });
+    upload(v2, VIEWER, 4, { core: CORE_B });
     expect(await v2.verify(VIEWER, stiffB, policyA)).toMatchObject({ ok: true });
   });
 
-  it('T4 core-less PAY (v3, ADR 0004 c): the contract requires a PAY without `core` on a multi-core stream to be `malformed` — pinned as text today (the reference model cannot express "stream replicates > 1 core"); a `core` that is not a 64-hex key IS `malformed` today', async () => {
-    // What the contract says (the normative text the Stage 2 test below enforces).
+  it('T4 core-less PAY (v3, ADR 0004 c): the contract required a PAY without `core` on a multi-core stream to be `malformed`; v5 (ADR 0010) makes `core` REQUIRED, so a PAY without a well-formed 64-hex `core` is `malformed` on every stream', async () => {
+    // What the contract says (the normative text the engine enforces).
     const payment = await readRepoFile('packages/core/src/contracts/payment.ts');
     expect(payment).toMatch(
-      /the seeder MUST treat a `PAY` without[\s*]+`core` as `malformed` when the stream replicates more than one core/,
+      /\*\*v5 makes it required\*\* \(ADR 0010\): a `PAY` without a[\s*]+well-formed `core` is `malformed`, whatever the stream carries/,
     );
-    expect(payment).toMatch(/readonly core\?: CoreKeyHex;/);
+    expect(payment).toMatch(/readonly core: CoreKeyHex;/);
     const adr = await readRepoFile('docs/decisions/0004-contracts-v3.md');
     expect(adr).toMatch(
       /a seeder that replicates more than one\s+core on a stream MUST reject a `PAY` without `core` as `malformed`/,
     );
 
-    // What is checkable at the engine boundary today: a PAY whose `core` is not a 64-char
-    // lower-case hex core key is refused as `malformed` before anything is credited.
-    const { viewer, seeder } = getPair('honest', WIDE_WINDOW);
-    seeder.recordUpload(VIEWER, 4, CORE_A);
-    const good = await viewer.pay({ core: CORE_A, fromBlock: 0, toBlock: 3 }, SEEDER_INFO, POLICY);
-    for (const badCore of [
-      'nothex',
-      'A1'.repeat(32), // upper-case: ADR 0004 (b) fixes the grammar as lower-case hex
-      'a1'.repeat(31),
-      'a1'.repeat(33),
-      42,
-      null,
-      new Uint8Array(32),
-    ]) {
-      const msg = { ...good, range: { ...good.range, core: badCore } } as unknown as PayMessage;
-      expect(await seeder.verify(VIEWER, msg, POLICY), String(badCore)).toMatchObject({
-        ok: false,
-        reason: 'malformed',
-      });
+    // At the engine boundary: a PAY whose `core` is missing or not a 64-char lower-case hex
+    // core key is refused as `malformed` before anything is credited — with uploads recorded
+    // on ONE core (the v3 single-core case that used to fall back to an aggregate count) and
+    // on TWO.
+    for (const cores of [[CORE_A], [CORE_A, CORE_B]] as const) {
+      const { viewer, seeder } = getPair('honest', WIDE_WINDOW);
+      for (const core of cores) upload(seeder, VIEWER, 4, { core });
+      const good = await viewer.pay(range(0, 3, CORE_A), SEEDER_INFO, POLICY);
+      const { core: _core, ...coreless } = good.range;
+      const variants: unknown[] = [
+        { ...good, range: coreless },
+        ...[
+          'nothex',
+          'A1'.repeat(32), // upper-case: ADR 0004 (b) fixes the grammar as lower-case hex
+          'a1'.repeat(31),
+          'a1'.repeat(33),
+          42,
+          null,
+          new Uint8Array(32),
+        ].map((badCore) => ({ ...good, range: { ...good.range, core: badCore } })),
+      ];
+      for (const msg of variants) {
+        expect(
+          await seeder.verify(VIEWER, msg as PayMessage, POLICY),
+          JSON.stringify(msg),
+        ).toMatchObject({
+          ok: false,
+          reason: 'malformed',
+        });
+      }
+      expect(seeder.window(VIEWER)?.paid).toBe(0);
+      expect(await seeder.verify(VIEWER, good, POLICY)).toMatchObject({ ok: true, blocks: 4 });
     }
-    expect(seeder.window(VIEWER)?.paid).toBe(0);
-    expect(await seeder.verify(VIEWER, good, POLICY)).toMatchObject({ ok: true, blocks: 4 });
   });
 
-  it.skipIf(usingMock())(
-    'T4 core-less PAY on a multi-core stream is `malformed` (Stage 2 packages/core/src/payment/ unskips this; if the check lands in the pay-protocol seeder instead, move it there)',
-    async () => {
-      // The reference model has no notion of "how many cores this stream replicates": with
-      // `range.core` absent it falls back to the v2 aggregate count and ACCEPTS (pinned in
-      // mocks/__tests__ as interim behaviour). The strongest engine-observable signal is
-      // uploads recorded on ≥ 2 distinct cores for the peer — after that, a PAY that does
-      // not say which core it pays for cannot be verified against any policy.
-      const { viewer, seeder } = getPair('honest', WIDE_WINDOW);
-      seeder.recordUpload(VIEWER, 4, CORE_A);
-      seeder.recordUpload(VIEWER, 4, CORE_B);
-      const coreless = await viewer.pay({ fromBlock: 0, toBlock: 3 }, SEEDER_INFO, POLICY);
-      expect(coreless.range.core).toBeUndefined();
-      expect(await seeder.verify(VIEWER, coreless, POLICY)).toMatchObject({
-        ok: false,
-        reason: 'malformed',
-      });
-      expect(seeder.window(VIEWER)?.paid).toBe(0);
-      const named = await viewer.pay(
-        { core: CORE_A, fromBlock: 0, toBlock: 3 },
-        SEEDER_INFO,
-        POLICY,
-      );
-      expect(await seeder.verify(VIEWER, named, POLICY)).toMatchObject({ ok: true, blocks: 4 });
-    },
-  );
-
-  it('T5 malicious viewer double-spends → passes offline check, caught by the async swap, peer banned, loss ≤ window', async () => {
+  it('T5 malicious viewer double-spends → a reused proof is refused at verify (v5 local seen-secret check) and the peer banned at once; a proof spent where this seeder cannot see is caught by the async swap; loss ≤ window', async () => {
+    // (a) Re-presenting proofs this seeder already accepted. Before v5 the second PAY was
+    //     CREDITED and only the next swap batch (every 64 blocks / 60 s) caught it, so a
+    //     replayer could stream up to a whole batch for free — more than the window.
     const { viewer, seeder } = getPair('double-spend');
     const doubles: { peer: NostrPubkey; mint: string; amount: number }[] = [];
     seeder.onDoubleSpend((peer, d) => doubles.push({ peer, mint: d.mint, amount: d.amount }));
 
-    seeder.recordUpload(VIEWER, 4);
-    const first = await viewer.pay({ fromBlock: 0, toBlock: 3 }, SEEDER_INFO, POLICY);
+    upload(seeder, VIEWER, 4);
+    const first = await viewer.pay(range(0, 3), SEEDER_INFO, POLICY);
     expect(await seeder.verify(VIEWER, first, POLICY)).toMatchObject({ ok: true });
 
-    seeder.recordUpload(VIEWER, 4);
-    const second = await viewer.pay({ fromBlock: 4, toBlock: 7 }, SEEDER_INFO, POLICY);
-    // Same proofs, new range: offline verification cannot know they were spent.
+    upload(seeder, VIEWER, 4);
+    const second = await viewer.pay(range(4, 7), SEEDER_INFO, POLICY);
+    // Same proofs, new range.
     expect(second.seederProofs.proofs.map((p) => p.secret)).toEqual(
       first.seederProofs.proofs.map((p) => p.secret),
     );
-    expect(await seeder.verify(VIEWER, second, POLICY)).toMatchObject({ ok: true });
-
-    const r = await seeder.flush();
-    expect(r.failed).toBe(1);
+    expect(await seeder.verify(VIEWER, second, POLICY)).toMatchObject({
+      ok: false,
+      reason: 'double-spend',
+    });
     expect(seeder.isBanned(VIEWER)).toBe(true);
     expect(doubles).toHaveLength(1);
     expect(doubles[0]).toMatchObject({ peer: VIEWER, mint: MINT_A });
+    expect(seeder.window(VIEWER)).toMatchObject({ paid: 4, outstanding: 4 });
 
-    // Bounded: only the genuinely-new value was ever swapped/nutzapped — one window's worth.
+    // Bounded: only the genuinely-new value is ever swapped/nutzapped — one window's worth.
+    const r = await seeder.flush();
     const { total } = expectedShares(4, POLICY);
+    expect(r).toMatchObject({ failed: 0 });
     expect(r.swapped + r.nutzapped).toBe(total);
     expect(total).toBe(seeder.config.windowBlocks * POLICY.satsPerBlock);
 
     // Ban is durable across further batches and blocks further PAYs.
     expect(await seeder.flush()).toMatchObject({ failed: 0 });
     expect(seeder.isBanned(VIEWER)).toBe(true);
-    seeder.recordUpload(VIEWER, 1);
-    const third = await viewer.pay({ fromBlock: 8, toBlock: 8 }, SEEDER_INFO, POLICY);
+    upload(seeder, VIEWER, 1);
+    const third = await viewer.pay(range(8, 8), SEEDER_INFO, POLICY);
     expect(await seeder.verify(VIEWER, third, POLICY)).toMatchObject({
       ok: false,
       reason: 'peer-banned',
     });
+
+    // (b) A proof already spent at the mint by a route this seeder never saw (another
+    //     instance with the same key, a restart that lost its seen set): offline verification
+    //     accepts it, the swap batch reports it, the payer is banned, nothing is swapped.
+    const b = getPair('honest');
+    const bDoubles: NostrPubkey[] = [];
+    b.seeder.onDoubleSpend((p) => bDoubles.push(p));
+    upload(b.seeder, VIEWER, 4);
+    const spentElsewhere = await b.viewer.pay(range(0, 3), SEEDER_INFO, POLICY);
+    await spendAtMint(b.seeder, spentElsewhere.seederProofs.proofs);
+    expect(await b.seeder.verify(VIEWER, spentElsewhere, POLICY)).toMatchObject({ ok: true });
+    expect(b.seeder.isBanned(VIEWER)).toBe(false);
+    const rb = await b.seeder.flush();
+    expect(rb).toMatchObject({ failed: 1, swapped: 0 });
+    expect(b.seeder.isBanned(VIEWER)).toBe(true);
+    expect(bDoubles).toEqual([VIEWER]);
+    expect(rb.swapped + rb.nutzapped).toBeLessThanOrEqual(total);
   });
 
   it('T6 MITM steals proofs in flight → every set is P2PK-locked to its recipient, so a stolen PAY is worthless to anyone else', async () => {
@@ -438,13 +446,13 @@ describe('SECURITY.md threat table', () => {
     // At the interface: (a) the viewer locks each set to the intended recipient, (b) a
     // different seeder re-presenting the captured PAY as its own is refused.
     const { viewer, seeder } = getPair('honest');
-    seeder.recordUpload(VIEWER, 4);
-    const msg = await viewer.pay({ fromBlock: 0, toBlock: 3 }, SEEDER_INFO, POLICY);
+    upload(seeder, VIEWER, 4);
+    const msg = await viewer.pay(range(0, 3), SEEDER_INFO, POLICY);
     expect(msg.seederProofs.lockedTo).toBe(SEEDER_INFO.p2pk);
     expect(msg.creatorProofs.lockedTo).toBe(POLICY.creatorP2pk);
 
     const mitm = getSeederEngine({ config: { ownP2pk: OTHER_SEEDER_P2PK } });
-    mitm.recordUpload(VIEWER, 4);
+    upload(mitm, VIEWER, 4);
     expect(await mitm.verify(VIEWER, msg, POLICY)).toMatchObject({
       ok: false,
       reason: 'wrong-p2pk-target',
@@ -453,35 +461,32 @@ describe('SECURITY.md threat table', () => {
     expect(await seeder.verify(VIEWER, msg, POLICY)).toMatchObject({ ok: true });
   });
 
-  it.skipIf(usingMock())(
-    'T6 a captured PAY re-labelled to the thief’s key is still refused: the NUT-11 lock is in the proof secret, not the envelope (Stage 2 packages/core/src/payment/ unskips this)',
-    async () => {
-      // The reference model checks only the `lockedTo` envelope field, so under the mock a
-      // re-labelled set is accepted (documented in docs/lanes/L10.md as a mock/spec gap).
-      // The real engine must parse the NUT-11 secret (`["P2PK", { data: <pubkey> … }]`) and
-      // compare THAT to its own key; the envelope is untrusted input.
-      const { viewer } = getPair('honest');
-      const thief = getSeederEngine({ config: { ownP2pk: OTHER_SEEDER_P2PK } });
-      thief.recordUpload(VIEWER, 4);
-      const captured = await viewer.pay({ fromBlock: 0, toBlock: 3 }, SEEDER_INFO, POLICY);
-      for (const relabelled of [
-        withSeederSet(captured, { lockedTo: OTHER_SEEDER_P2PK }),
-        withCreatorSet(withSeederSet(captured, { lockedTo: OTHER_SEEDER_P2PK }), {
-          lockedTo: POLICY.creatorP2pk,
-        }),
-      ]) {
-        const res = await thief.verify(VIEWER, relabelled, POLICY);
-        expect(res.ok).toBe(false);
-        if (!res.ok) expect(['wrong-p2pk-target', 'bad-dleq']).toContain(res.reason);
-      }
-      expect(thief.window(VIEWER)?.paid).toBe(0);
-    },
-  );
+  it('T6 a captured PAY re-labelled to the thief’s key is still refused: the NUT-11 lock is in the proof secret, not the envelope', async () => {
+    // Before v5 the reference model checked only the `lockedTo` envelope, so this ran only
+    // against a real engine. The mock now models the lock inside the secret too. The real
+    // engine parses the NUT-11 secret (`["P2PK", { data: <pubkey> … }]`) and compares THAT
+    // to its own key; the envelope is untrusted input.
+    const { viewer } = getPair('honest');
+    const thief = getSeederEngine({ config: { ownP2pk: OTHER_SEEDER_P2PK } });
+    upload(thief, VIEWER, 4);
+    const captured = await viewer.pay(range(0, 3), SEEDER_INFO, POLICY);
+    for (const relabelled of [
+      withSeederSet(captured, { lockedTo: OTHER_SEEDER_P2PK }),
+      withCreatorSet(withSeederSet(captured, { lockedTo: OTHER_SEEDER_P2PK }), {
+        lockedTo: POLICY.creatorP2pk,
+      }),
+    ]) {
+      const res = await thief.verify(VIEWER, relabelled, POLICY);
+      expect(res.ok).toBe(false);
+      if (!res.ok) expect(['wrong-p2pk-target', 'bad-dleq']).toContain(res.reason);
+    }
+    expect(thief.window(VIEWER)?.paid).toBe(0);
+  });
 
   it('T7 forged proofs → NUT-12 DLEQ against the cached keyset; forged, missing or tampered DLEQ is refused', async () => {
     const forge = getPair('forge');
-    forge.seeder.recordUpload(VIEWER, 4);
-    const forged = await forge.viewer.pay({ fromBlock: 0, toBlock: 3 }, SEEDER_INFO, POLICY);
+    upload(forge.seeder, VIEWER, 4);
+    const forged = await forge.viewer.pay(range(0, 3), SEEDER_INFO, POLICY);
     expect(await forge.seeder.verify(VIEWER, forged, POLICY)).toMatchObject({
       ok: false,
       reason: 'bad-dleq',
@@ -496,8 +501,8 @@ describe('SECURITY.md threat table', () => {
         fc.constantFrom<'forge' | 'strip' | 'tamper-secret'>('forge', 'strip', 'tamper-secret'),
         async (which, idx, how) => {
           const { viewer, seeder } = getPair('honest');
-          seeder.recordUpload(VIEWER, 4);
-          const honest = await viewer.pay({ fromBlock: 0, toBlock: 3 }, SEEDER_INFO, POLICY);
+          upload(seeder, VIEWER, 4);
+          const honest = await viewer.pay(range(0, 3), SEEDER_INFO, POLICY);
           const set = honest[which];
           const i = idx % set.proofs.length;
           const mutated = mapProofs(set, (p: CashuProof, j: number): CashuProof => {
@@ -529,8 +534,8 @@ describe('SECURITY.md threat table', () => {
       // this is skipped under the mock and documented in docs/lanes/L10.md. NUT-12: the DLEQ
       // proves C = k·B' for the keyset's k; any change to C, secret or amount breaks it.
       const { viewer, seeder } = getPair('honest');
-      seeder.recordUpload(VIEWER, 4);
-      const honest = await viewer.pay({ fromBlock: 0, toBlock: 3 }, SEEDER_INFO, POLICY);
+      upload(seeder, VIEWER, 4);
+      const honest = await viewer.pay(range(0, 3), SEEDER_INFO, POLICY);
       const tamperedC: PayMessage = {
         ...honest,
         seederProofs: mapProofs(honest.seederProofs, (p, i) =>
@@ -564,9 +569,9 @@ describe('SECURITY.md threat table', () => {
       });
       const { viewer } = getPair('honest');
       const policy = policyWith({ mints: c.policyMints as PayMessage['seederProofs']['mint'][] });
-      seeder.recordUpload(VIEWER, 4);
+      upload(seeder, VIEWER, 4);
       const msg = await viewer.pay(
-        { fromBlock: 0, toBlock: 3 },
+        range(0, 3),
         { ...SEEDER_INFO, mint: c.pay as PayMessage['seederProofs']['mint'] },
         policy,
       );
@@ -578,8 +583,8 @@ describe('SECURITY.md threat table', () => {
     }
     // A mixed PAY (seeder set at an accepted mint, creator set at a rogue one) is refused too.
     const { viewer, seeder } = getPair('honest');
-    seeder.recordUpload(VIEWER, 4);
-    const honest = await viewer.pay({ fromBlock: 0, toBlock: 3 }, SEEDER_INFO, POLICY);
+    upload(seeder, VIEWER, 4);
+    const honest = await viewer.pay(range(0, 3), SEEDER_INFO, POLICY);
     expect(
       await seeder.verify(VIEWER, withCreatorSet(honest, { mint: MINT_UNKNOWN }), POLICY),
     ).toMatchObject({ ok: false, reason: 'mint-not-accepted' });
@@ -594,8 +599,8 @@ describe('SECURITY.md threat table', () => {
     // policy, which was parsed from the signed event.
     const impostorPolicy = policyWith({ creatorP2pk: ATTACKER_P2PK });
     const { viewer, seeder } = getPair('honest');
-    seeder.recordUpload(VIEWER, 4);
-    const msg = await viewer.pay({ fromBlock: 0, toBlock: 3 }, SEEDER_INFO, impostorPolicy);
+    upload(seeder, VIEWER, 4);
+    const msg = await viewer.pay(range(0, 3), SEEDER_INFO, impostorPolicy);
     expect(msg.creatorProofs.lockedTo).toBe(ATTACKER_P2PK);
     expect(await seeder.verify(VIEWER, msg, POLICY)).toMatchObject({
       ok: false,
@@ -603,7 +608,7 @@ describe('SECURITY.md threat table', () => {
     });
     // The viewer API gives the seeder no field through which to name a creator key:
     // `pay(range, seeder, policy)` takes the creator target only from `policy`.
-    const honest = await viewer.pay({ fromBlock: 0, toBlock: 3 }, SEEDER_INFO, POLICY);
+    const honest = await viewer.pay(range(0, 3), SEEDER_INFO, POLICY);
     expect(honest.creatorProofs.lockedTo).toBe(CREATOR_P2PK);
     // Fixture manifests carry the creator key inside the signed event's `p2pk` tag.
     for (const v of VIDEOS) {
@@ -643,7 +648,7 @@ describe('SECURITY.md threat table', () => {
       { length: 8 },
       (_, i) => String(i).padStart(2, '0').repeat(32) as NostrPubkey,
     );
-    for (const p of peers) seeder.recordUpload(p, 2);
+    for (const p of peers) upload(seeder, p, 2);
     expect(seeder.windows()).toHaveLength(peers.length);
 
     const noise = new Uint8Array(32).fill(7);
@@ -657,12 +662,12 @@ describe('SECURITY.md threat table', () => {
     expect(typeof entry!.at).toBe('number');
 
     // A banned peer's uploads do not disturb the others' windows.
-    seeder.recordUpload(peers[0]!, 100);
+    upload(seeder, peers[0]!, 100);
     for (const p of peers.slice(1))
       expect(seeder.window(p)).toMatchObject({ uploaded: 2, banned: false });
 
     const { viewer } = getPair('honest');
-    const msg = await viewer.pay({ fromBlock: 0, toBlock: 1 }, SEEDER_INFO, POLICY);
+    const msg = await viewer.pay(range(0, 1), SEEDER_INFO, POLICY);
     expect(await seeder.verify(peers[1]!, msg, POLICY)).toMatchObject({ ok: true });
     expect(await seeder.verify(peers[0]!, msg, POLICY)).toMatchObject({
       ok: false,
@@ -731,10 +736,10 @@ describe('SECURITY.md threat table', () => {
       const doubleSpendEvents: unknown[] = [];
       seeder.onWindowExceeded((w) => windowEvents.push(w));
       seeder.onDoubleSpend((p, d) => doubleSpendEvents.push([p, d]));
-      seeder.recordUpload(VIEWER, 4);
-      const msg = await viewer.pay({ fromBlock: 0, toBlock: 3 }, SEEDER_INFO, POLICY);
+      upload(seeder, VIEWER, 4);
+      const msg = await viewer.pay(range(0, 3), SEEDER_INFO, POLICY);
       const result: VerifyResult = await seeder.verify(VIEWER, msg, POLICY);
-      seeder.recordUpload(VIEWER, 5); // force a window-exceeded event too
+      upload(seeder, VIEWER, 5); // force a window-exceeded event too
       const flushResult = await seeder.flush();
       const observed = observableState(seeder, VIEWER, {
         result,

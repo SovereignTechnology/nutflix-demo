@@ -90,10 +90,12 @@ export function helloFrom(
     version: 1,
     pubkey,
     challenge: 'c',
+    createdAt: 0 as HelloMessage['createdAt'],
     signature: 's',
     acceptedMints: o.acceptedMints ?? [],
     satsPerBlock: o.satsPerBlock ?? (1 as HelloMessage['satsPerBlock']),
     split: o.split ?? { seeder: 50, creator: 50 },
     p2pk: o.p2pk ?? (('02' + '00'.repeat(32)) as HelloMessage['p2pk']),
+    windowBlocks: o.windowBlocks ?? 4,
   };
 }

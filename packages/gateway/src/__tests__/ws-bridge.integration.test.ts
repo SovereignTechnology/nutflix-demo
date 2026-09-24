@@ -15,7 +15,7 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import { WebSocket } from 'ws';
 
-import { mocks } from '@sovit/core';
+import { mocks, payment } from '@sovit/core';
 import type { Sats } from '@sovit/core';
 import { Seeder, toHex } from '@sovit/seeder';
 import type { SeederEvent } from '@sovit/seeder';
@@ -279,6 +279,10 @@ describe('WS bridge: one WebSocket = one replication stream + pay/1', () => {
     const WINDOW = 4;
     const BLOCKS = 20;
     const r = await rig({ windowBlocks: WINDOW });
+    // v5 (ADR 0007/0010): the engine's window for a peer is the EFFECTIVE window — large
+    // enough for one minimum PAY at this video's price (2 sat/block, default 10 → 5 blocks).
+    const EFFECTIVE = payment.effectiveWindowBlocks(WINDOW, r.gateway.seeder.policy());
+    expect(EFFECTIVE).toBe(5);
     const { entry } = await putFixture(r, BLOCKS);
     const v = await viewer();
     const vcore = await v.seeder.blobs.openCoreByKey(Buffer.from(entry.coreKey, 'hex'));
@@ -300,13 +304,14 @@ describe('WS bridge: one WebSocket = one replication stream + pay/1', () => {
     expect(fetch.outcome()).toBeNull();
     // Hypercore fired `upload` at least window+1 times (the crossing block was counted, S-A
     // finding + L2's wire-rig note that one more queued request can pop after destroy) …
-    expect(uploadEvents.length).toBeGreaterThanOrEqual(WINDOW + 1);
+    expect(uploadEvents.length).toBeGreaterThanOrEqual(EFFECTIVE + 1);
     // … the engine recorded exactly window+1 and banned the provisional identity …
     const w = r.engine.window(viewerNoise as never)!;
     expect(w).toMatchObject({
-      uploaded: WINDOW + 1,
+      uploaded: EFFECTIVE + 1,
       paid: 0,
-      outstanding: WINDOW + 1,
+      outstanding: EFFECTIVE + 1,
+      windowBlocks: EFFECTIVE,
       banned: true,
     });
     // … the session was cut for that reason and left the registry …
@@ -323,7 +328,7 @@ describe('WS bridge: one WebSocket = one replication stream + pay/1', () => {
     // everything it received has landed.
     const have = await settledBlockCount(v, entry.coreKey);
     expect(have).toBeGreaterThan(0);
-    expect(have).toBeLessThanOrEqual(WINDOW);
+    expect(have).toBeLessThanOrEqual(EFFECTIVE);
     expect(await fetch.cancel()).toBeInstanceOf(Error);
     await until(() => r.gateway.stats().wsConnections === 0, 3000);
   });
