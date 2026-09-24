@@ -86,9 +86,16 @@ export class SwitchingWallet implements Wallet {
   private off: (() => void) | null = null;
   private readonly none = new UnavailableWallet(NO_WALLET_YET);
   private readonly listeners = new Set<(e: WalletChangeEvent) => void>();
+  private gen = 0;
+
+  /** Bumped at every swap: what one wallet handed out (quote handles, F17) dies with it. */
+  generation(): number {
+    return this.gen;
+  }
 
   set(w: Wallet | undefined): void {
     if (w === this.current) return;
+    this.gen++;
     this.off?.();
     this.off = null;
     this.current = w;

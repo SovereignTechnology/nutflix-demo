@@ -29,6 +29,7 @@ import {
   hasValidDleq,
   schnorrVerifyMessage,
   type MeltQuoteBolt11Response,
+  type MintQuoteBolt11Response,
   type P2PKTag,
   type Proof,
   type Wallet as CashuTsWallet,
@@ -60,6 +61,14 @@ export interface WalletKey {
   readonly pubkey: CashuP2pkPubkey;
   /** BIP-340 over SHA-256(secret) — `Signer.signSecret`, or cashu-ts `schnorrSignMessage`. */
   sign(secret: string): Promise<string>;
+  /**
+   * Lend the key, hex-encoded, to ONE cashu-ts call that needs it as a string (NUT-20 locked mint
+   * quotes: cashu-ts signs the domain-separated quote message itself and exports no way to sign it
+   * elsewhere). Only a key held in this process has it; a JS string cannot be wiped, so it is
+   * used for nothing else. A signer-held key (`signSecret`) has none: its wallet takes unlocked
+   * quotes.
+   */
+  withSecretHex?<T>(use: (hex: string) => Promise<T>): Promise<T>;
 }
 
 export interface SpendContext {
@@ -387,13 +396,34 @@ export class Spender {
     });
   }
 
-  /** NUT-04: mint the proofs of a PAID quote into the wallet. Returns the sats minted. */
-  mint(quote: MintQuote): Promise<Sats> {
+  /**
+   * NUT-04: mint the proofs of a PAID quote into the wallet. Returns the sats minted. A NUT-20
+   * locked quote (`locked`: the mint's quote answer, naming its `pubkey`) is signed with this
+   * wallet's key; a quote locked to any other key is refused.
+   */
+  mint(quote: MintQuote, locked?: MintQuoteBolt11Response): Promise<Sats> {
     return this.exclusive(quote.mint, async () => {
       const w = await this.ctx.mints.wallet(quote.mint);
+      // A real mint (Nutshell) answers an UNLOCKED quote with `"pubkey": null`, whatever the
+      // cashu-ts type says: only a non-empty string is a lock.
+      const pk: unknown = locked?.pubkey;
+      const lockedTo = typeof pk === 'string' && pk !== '' ? pk : undefined;
+      const key = this.ctx.key;
+      if (lockedTo !== undefined) {
+        if (key?.withSecretHex === undefined || lockedTo.toLowerCase() !== key.pubkey.toLowerCase())
+          throw new WalletError(
+            'invalid-argument',
+            'the quote is locked to a key this wallet cannot sign with',
+          );
+      }
       let proofs: Proof[];
       try {
-        proofs = await w.mintProofsBolt11(quote.amount, quote.quoteId);
+        proofs =
+          lockedTo !== undefined && key?.withSecretHex !== undefined && locked !== undefined
+            ? await key.withSecretHex((privkey) =>
+                w.mintProofsBolt11(quote.amount, locked, { privkey }),
+              )
+            : await w.mintProofsBolt11(quote.amount, quote.quoteId);
       } catch (e) {
         throw new WalletError('mint-error', `minting failed (${errorName(e)})`);
       }

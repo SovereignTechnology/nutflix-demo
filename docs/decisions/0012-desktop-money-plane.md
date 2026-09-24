@@ -81,6 +81,13 @@ above the manifest, so no block is ever paid at the wrong price.
 - The host logs only an error's code prefix when the wallet cannot open.
 - `WorkerHostOptions.testBootstrap`: a programmatic, test-only local DHT for a worker with real
   payments (never reachable over IPC, never set by `entry.ts`).
+- Addendum 2026-09-24 (security review F17): mint quote ids stay in the host. `wallet.mintQuote`
+  answers the renderer with an opaque handle (`quoteId: "h…"`, 128 random bits), `wallet.change`
+  quote events carry the same handle, and `wallet.pollQuote` resolves it to the quote the host
+  stored — the renderer's copy (mint, amount) is never used. Handles are scoped to the wallet that
+  issued them: a signer change forgets them all, and a quote still being made when it happens is
+  refused. At most 256 are kept. Core locks the quotes themselves with NUT-20 where the mint
+  supports it.
 
 ## Consequences
 

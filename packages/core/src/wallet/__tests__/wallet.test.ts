@@ -31,13 +31,18 @@ function rig(
     readonly fee?: number;
     readonly wrap?: (r: RequestFn) => RequestFn;
     readonly walletKey?: Uint8Array;
+    readonly nut20?: boolean;
+    readonly mint?: TestMint;
   } = {},
 ): { mint: TestMint; store: MemoryProofStore; wallet: CashuWallet } {
-  const mint = new TestMint({
-    url: MINT,
-    seed: new Uint8Array(32).fill(1),
-    inputFeePpk: opts.fee ?? 0,
-  });
+  const mint =
+    opts.mint ??
+    new TestMint({
+      url: MINT,
+      seed: new Uint8Array(32).fill(1),
+      inputFeePpk: opts.fee ?? 0,
+      ...(opts.nut20 === undefined ? {} : { nut20: opts.nut20 }),
+    });
   const store = new MemoryProofStore();
   const request = opts.wrap ? opts.wrap(mint.request) : mint.request;
   const wallet = new CashuWallet({
@@ -56,6 +61,89 @@ async function fund(w: CashuWallet, mint: TestMint, amount: number): Promise<voi
   expect(await w.pollQuote(q)).toEqual({ state: 'ISSUED', minted: amount });
   expect(w.pendingMintQuotes()).toEqual([]);
 }
+
+describe('F17: NUT-20 locked mint quotes', () => {
+  const quoteBody = (mint: TestMint, id: string) =>
+    mint.request<{ pubkey?: string }>({
+      endpoint: `${MINT}/v1/mint/quote/bolt11/${id}`,
+      method: 'GET',
+    });
+
+  it('a quote is locked to the wallet key, and mints with its signature', async () => {
+    const me = keyOf(21);
+    const { mint, wallet } = rig({ walletKey: me.sk });
+    const q = await wallet.mintQuote(MINT, sats(40));
+    expect((await quoteBody(mint, q.quoteId)).pubkey).toBe(me.pub);
+    mint.payQuote(q.quoteId);
+    expect(await wallet.pollQuote(q)).toEqual({ state: 'ISSUED', minted: 40 });
+    expect(await wallet.balance(MINT)).toBe(40);
+  });
+
+  it('knowing the quote id is worth nothing: another wallet, and a raw unsigned mint, are refused', async () => {
+    const { mint, wallet } = rig({ walletKey: keyOf(22).sk });
+    const q = await wallet.mintQuote(MINT, sats(8));
+    mint.payQuote(q.quoteId);
+    // A thief with the id and its own wallet (another key) — refused before the mint is asked.
+    const thief = rig({ walletKey: keyOf(23).sk, mint }).wallet;
+    await expect(thief.pollQuote(q)).rejects.toMatchObject({ code: 'invalid-argument' });
+    const keyless = rig({ mint }).wallet;
+    await expect(keyless.pollQuote(q)).rejects.toMatchObject({ code: 'invalid-argument' });
+    // …and the mint itself refuses an unsigned mint of the locked quote (NUT-20 error 20008).
+    await expect(
+      mint.request({
+        endpoint: `${MINT}/v1/mint/bolt11`,
+        method: 'POST',
+        requestBody: {
+          quote: q.quoteId,
+          outputs: [{ amount: 8, id: mint.keysetId, B_: `02${'11'.repeat(32)}` }],
+        },
+      }),
+    ).rejects.toMatchObject({ code: 20008 });
+    // The owner still mints.
+    expect(await wallet.pollQuote(q)).toEqual({ state: 'ISSUED', minted: 8 });
+  });
+
+  it('unlocked where it cannot be locked: a mint without NUT-20, a wallet without a key, a signer-held key', async () => {
+    const plain = rig({ walletKey: keyOf(24).sk, nut20: false });
+    const q1 = await plain.wallet.mintQuote(MINT, sats(5));
+    expect((await quoteBody(plain.mint, q1.quoteId)).pubkey).toBeUndefined();
+    const nokey = rig();
+    const q2 = await nokey.wallet.mintQuote(MINT, sats(5));
+    expect((await quoteBody(nokey.mint, q2.quoteId)).pubkey).toBeUndefined();
+    const k = memoryWalletKey(keyOf(25).sk);
+    const held = new CashuWallet({
+      mints: new CashuMintConnections({ request: () => nokey.mint.request }),
+      store: new MemoryProofStore(),
+      key: { pubkey: k.pubkey, sign: (m) => k.sign(m) }, // like signerWalletKey: no withSecretHex
+    });
+    const q3 = await held.mintQuote(MINT, sats(5));
+    expect((await quoteBody(nokey.mint, q3.quoteId)).pubkey).toBeUndefined();
+    nokey.mint.payQuote(q3.quoteId);
+    expect(await held.pollQuote(q3)).toEqual({ state: 'ISSUED', minted: 5 });
+  });
+
+  it('a mint that does not lock the quote it was asked to lock is refused', async () => {
+    const { wallet } = rig({
+      walletKey: keyOf(26).sk,
+      wrap:
+        (r): RequestFn =>
+        async <T>(args: Parameters<RequestFn>[0]): Promise<T> => {
+          const out = await r<Record<string, unknown>>(args);
+          if (
+            args.endpoint.endsWith('/v1/mint/quote/bolt11') &&
+            (args.method ?? 'GET') === 'POST'
+          ) {
+            const { pubkey: _dropped, ...rest } = out;
+            return rest as T;
+          }
+          return out as T;
+        },
+    });
+    // cashu-ts refuses an unlocked answer itself; the wallet checks the pubkey too (defense in depth).
+    await expect(wallet.mintQuote(MINT, sats(5))).rejects.toThrow(/unlocked|lock/i);
+    expect(wallet.pendingMintQuotes()).toEqual([]);
+  });
+});
 
 describe('CashuWallet (NUT-04 / NUT-11 / NUT-03 / NUT-05 over a real mint)', () => {
   it('funds through a mint quote; balance and history follow', async () => {

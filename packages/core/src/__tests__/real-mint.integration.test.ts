@@ -30,6 +30,8 @@ import { RealPaymentEngine } from '../payment/engine.js';
 import { SeenSecrets } from '../payment/seen.js';
 import { MemoryProofStore } from '../wallet/store.js';
 import { toCashu } from '../wallet/spend.js';
+import type { RawHttp } from '../wallet/transport.js';
+import { cashuRequestFn } from '../wallet/transport.js';
 import { CashuMintConnections, CashuWallet, memoryWalletKey } from '../wallet/wallet.js';
 
 const MINT_URL = process.env['NUTFLIX_REAL_MINT_URL'] as MintUrl | undefined;
@@ -94,6 +96,53 @@ describe.skipIf(MINT_URL === undefined)(
       };
       for (const nut of ['10', '11', '12'])
         expect(info.nuts[nut]?.supported, `NUT-${nut}`).toBe(true);
+    });
+
+    it('F17: a NUT-20 locked quote mints only with the wallet key — the amended signature, first try', async () => {
+      const info = (await (await fetch(`${mint}/v1/info`)).json()) as {
+        nuts: Record<string, { supported?: boolean }>;
+      };
+      expect(info.nuts['20']?.supported, 'NUT-20').toBe(true);
+      const mintPosts: number[] = [];
+      const http: RawHttp = async (req) => {
+        if (req.method === 'POST' && req.url.endsWith('/v1/mint/bolt11')) mintPosts.push(0);
+        const res = await fetch(req.url, {
+          method: req.method,
+          headers: req.headers,
+          ...(req.body === undefined ? {} : { body: req.body }),
+        });
+        const headers: Record<string, string> = {};
+        res.headers.forEach((v, k) => {
+          headers[k] = v;
+        });
+        return { status: res.status, headers, body: await res.text() };
+      };
+      const me = keyOf(0x41);
+      const w = new CashuWallet({
+        mints: new CashuMintConnections({ request: () => cashuRequestFn(http) }),
+        store: new MemoryProofStore(),
+        key: memoryWalletKey(me.sk),
+      });
+      const q = await w.mintQuote(mint, 16 as Sats);
+      const state = async (): Promise<{ state: string; pubkey?: string }> =>
+        (await (await fetch(`${mint}/v1/mint/quote/bolt11/${q.quoteId}`)).json()) as {
+          state: string;
+          pubkey?: string;
+        };
+      expect((await state()).pubkey).toBe(me.pub);
+      for (let i = 0; i < 50 && (await state()).state !== 'PAID'; i++)
+        await new Promise((r) => setTimeout(r, 100));
+      expect((await state()).state).toBe('PAID');
+      // Someone with only the quote id: an unsigned mint is refused BY THE MINT.
+      const raw = new CashuTsWallet(new Mint(mint), { unit: 'sat' });
+      await raw.loadMint();
+      await expect(raw.mintProofsBolt11(16, q.quoteId)).rejects.toThrow();
+      expect((await state()).state).toBe('PAID');
+      // The owner mints, with one request: the mint took the amended NUT-20 signature (a legacy
+      // fallback would have cost a refused first POST).
+      expect(await w.pollQuote(q)).toEqual({ state: 'ISSUED', minted: 16 });
+      expect(mintPosts).toHaveLength(1);
+      expect(await w.balance(mint)).toBe(16);
     });
 
     it('F6: a pay1-tagged creator set is redeemable by the creator — the mint accepts the NUT-10 tag — and still enforces the lock', async () => {

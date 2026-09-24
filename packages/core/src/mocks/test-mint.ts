@@ -25,6 +25,7 @@ import {
   constructUnblindedSignature,
   hashToCurve,
   pointFromHex,
+  verifyMintQuoteSignature,
   verifyP2PKSpendingConditions,
   verifyUnblindedSignature,
   type Proof,
@@ -65,11 +66,20 @@ export interface TestMintOptions {
   readonly inputFeePpk?: number;
   /** Lightning fee reserve the melt quote asks for, in sats. Default 0. */
   readonly feeReserve?: number;
+  /**
+   * NUT-20 locked mint quotes (default on, like Nutshell and cdk). A locked quote mints only with
+   * a signature by its pubkey. This mint checks the LEGACY message (cashu-ts's own verifier): a
+   * wallet that sends the amended message first is refused with 20008 and must fall back, as
+   * cashu-ts does with older mints — the amended form is exercised against real mints.
+   */
+  readonly nut20?: boolean;
 }
 
 interface Quote {
   readonly amount: number;
   state: 'UNPAID' | 'PAID' | 'ISSUED';
+  /** NUT-20: the key the quote is locked to. */
+  readonly pubkey?: string;
 }
 
 interface MeltQuote {
@@ -85,6 +95,7 @@ export class TestMint {
   private readonly priv: Readonly<Record<string, Uint8Array>>;
   private readonly inputFeePpk: number;
   private readonly feeReserve: number;
+  private readonly nut20: boolean;
   /** hex(Y) of every spent proof. */
   private readonly spent = new Set<string>();
   /** hex(Y) → the witness the proof was spent with (NUT-07 returns it). */
@@ -101,6 +112,7 @@ export class TestMint {
     this.url = o.url;
     this.inputFeePpk = o.inputFeePpk ?? 0;
     this.feeReserve = o.feeReserve ?? 0;
+    this.nut20 = o.nut20 ?? true;
     const pair = createNewMintKeys(16, o.seed, { unit: 'sat', input_fee_ppk: this.inputFeePpk });
     this.keysetId = pair.keysetId;
     this.pub = pair.pubKeys;
@@ -253,6 +265,7 @@ export class TestMint {
         '10': { supported: true },
         '11': { supported: true },
         '12': { supported: true },
+        ...(this.nut20 ? { '20': { supported: true } } : {}),
       },
     };
   }
@@ -384,8 +397,19 @@ export class TestMint {
     const amount = num(body['amount']);
     if (!Number.isSafeInteger(amount) || amount <= 0)
       throw new MintOperationError(11002, 'bad amount');
+    const pubkey = body['pubkey'];
+    if (
+      pubkey !== undefined &&
+      (!this.nut20 || typeof pubkey !== 'string' || !/^0[23][0-9a-f]{64}$/.test(pubkey))
+    )
+      throw new MintOperationError(11002, 'bad or unsupported quote pubkey');
     const quote = `q${String(++this.seq)}`;
-    this.quotes.set(quote, { amount, state: 'UNPAID' });
+    this.quotes.set(
+      quote,
+      typeof pubkey === 'string'
+        ? { amount, state: 'UNPAID', pubkey }
+        : { amount, state: 'UNPAID' },
+    );
     return this.mintQuoteState(quote);
   }
 
@@ -401,6 +425,7 @@ export class TestMint {
       amount: q.amount,
       state: q.state,
       expiry: 4_102_444_800,
+      ...(q.pubkey === undefined ? {} : { pubkey: q.pubkey }),
     };
   }
 
@@ -418,6 +443,17 @@ export class TestMint {
     if (outputs.length === 0) throw new MintOperationError(11002, 'no outputs provided');
     const outTotal = (outputs as SerializedBlindedMessage[]).reduce((a, o) => a + num(o.amount), 0);
     if (outTotal !== q.amount) throw new MintOperationError(11002, 'Transaction is not balanced');
+    if (q.pubkey !== undefined) {
+      const sig = body['signature'];
+      const ok =
+        typeof sig === 'string' &&
+        verifyMintQuoteSignature(q.pubkey, quote, outputs as SerializedBlindedMessage[], sig);
+      if (!ok)
+        throw new MintOperationError(
+          20008,
+          'Mint quote with pubkey but no valid signature provided',
+        );
+    }
     const { signatures } = this.sign(outputs);
     q.state = 'ISSUED';
     return { signatures };

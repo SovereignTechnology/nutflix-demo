@@ -60,7 +60,10 @@ export class TopicRegistry {
         sub.off = a.notifications(emit);
         break;
       case 'wallet.change':
-        sub.off = a.wallet.onChange(emit);
+        // F17: quote events carry handles, never quote ids.
+        sub.off = a.wallet.onChange((e) => {
+          emit(a.quoteHandles.translate(e));
+        });
         break;
       case 'session.peers':
       case 'session.spend': {

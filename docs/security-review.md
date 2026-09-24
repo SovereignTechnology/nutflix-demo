@@ -39,7 +39,7 @@ directories" for this list. Each fix carries a test that fails without it, excep
 | F14 | **Fixed** | `trustProxy` reads the rightmost `X-Forwarded-For` entry |
 | F15 | **Fixed** | Uploads over 8 MiB must send `X-SHA-256` (no unauthenticated spooling of large bodies); default MIME allowlist (F3); a per-pubkey byte quota (`blossom.maxBytesPerPubkey`, default 8 GiB, `null` = none) on upload, mirror and authenticated `HEAD`, checked before a declared body is spooled, with in-flight bytes held (`stage-3/upload-quota`). Open: whether uploads should default to allow-list-only (decision) |
 | F16 | **Fixed** | The gateway loads `node:http` via `createRequire`; the unit gains `--no-experimental-websocket`; a spawn test runs the built entry with the unit's flags (verified on Node 22.22.0) |
-| F17 | **Open** | NUT-20 locked quotes need a signer method for mint requests — Stage 3 |
+| F17 | **Fixed** (`stage-3/nut20-quotes`) | Where the mint advertises NUT-20 and the wallet key is held in the process (the NIP-60 wallet key; the seeder's is signer-held and stays unlocked), `mintQuote` locks the quote to that key and refuses an answer locked to anything else; `pollQuote` signs the mint request (cashu-ts: the amended NUT-20 message, the legacy one as fallback) and refuses a quote locked to a key it cannot sign with. Verified on Nutshell 0.21.0 and cdk-mintd 0.18.1 (one `POST /v1/mint/bolt11`, i.e. the amended signature accepted first try). The desktop hands the renderer an opaque handle (`h…`) in place of every quote id — replies and `wallet.change` events — polls by the stored quote, and forgets every handle when the signer changes |
 | F18 | **Partly fixed** | The distinctive user agent is gone. Open: hash-addressed images only by default (decision) |
 | F19 | **Fixed** | Watch refuses a session whose policy charges more than the quote (play and quality switch) |
 | F20 | **Fixed** | `StoredReport.signatureVerified` is `true` after the auth boundary verified the report |
@@ -562,7 +562,7 @@ hash-addressed images).
   Residual: F24.
 - **Wallet / `spend.ts`.** Per-mint lock; `send` post-checks sum, DLEQ (with `r`) and the lock
   policy of every produced proof; melt commits spent only on PAID, else reconciles via NUT-07.
-  Residual: F17, F23.
+  Residual: F23. (F17 fixed: NUT-20 locked mint quotes.)
 - **Payment engine.** Pay-after-verify, exact amounts, both sets P2PK-checked
   (`checkPayLock`: no locktime/refund/extra keys), DLEQ offline against the cached keyset
   (forged → ban), window accounting on distinct blocks, local double-spend check at verify, ban
@@ -599,7 +599,7 @@ finding's section above plus its row in §0. **Filing waits for Cameron's go-ahe
 | [Done] F10/F11/F12/F31 hooks in the desktop runtime — the worker's seeder engine persists seen secrets and pending PAYs and asks the host for `checkSpent` / `spentByUs` (ADR 0012) |
 | [Medium] F31: NUT-13 deterministic outputs + NUT-09 restore |
 | [Done] F15: per-pubkey upload quota (`blossom.maxBytesPerPubkey`) |
-| [Medium] F17: NUT-20 locked mint quotes; opaque quote handles over IPC |
+| [Done] F17: NUT-20 locked mint quotes; opaque quote handles over IPC. Residual [Low]: a signer-held wallet key (the seeder daemon) takes unlocked quotes — cashu-ts signs NUT-20 itself and needs the key as a string |
 | [Medium] F4: execute auto top-ups with per-top-up and per-day caps |
 | [Low] F21: packaging — compile out dev flags, set Electron fuses |
 | [Done] F24: the desktop's file `KeyStore` (ADR 0013) |
@@ -608,7 +608,7 @@ finding's section above plus its row in §0. **Filing waits for Cameron's go-ahe
 
 ## 7. Not verified
 
-- Real mints (nutshell, cdk): the `pay1` tag (F6), NUT-07/NUT-20 behaviour, fee handling.
+- Real mints (nutshell, cdk): NUT-07 behaviour beyond the real-mint suite, fee handling. (The `pay1` tag, F6, and NUT-20 locked quotes, F17, were verified on Nutshell 0.21.0 and cdk-mintd 0.18.1.)
 - Electron at runtime beyond the Stage 1 e2e (webPreferences, key allowlist, one session):
   this review read the code and its unit tests; it did not attack a running app.
 - The web build's served headers (`scripts/csp-sri.mjs`): out of scope (no web portal).

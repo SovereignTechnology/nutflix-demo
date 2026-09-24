@@ -455,12 +455,13 @@ Wallet QR (pass = decodes to text starting `lnbc5000n1pj9x7`).
 | Upstream credit + batching (F37, F5, ADR 0011 §11) | `stage-3/upstream-credit` (on `stage-3/dleq-batching`) | **done** — the credit pool and ACK settlement moved into the shared `@sovit/gateway/upstream` (`CreditPool` with a pressure signal, `CreditSettler`); `UpstreamPayer` batches to half the pool per seeder, pays everything under pressure and short tails after 2 s; the gateway reads upstream through `readUpstreamBlob` on credit (`upstream.creditBlocks`) — the full-speed swarm test stays inside the window and fails with pacing off. The desktop's `ViewerPayer` runs on the same pieces |
 | Pending-PAY journal + cap (ADR 0011 §12) | `stage-3/pending-journal` (on `stage-3/upstream-credit`) | **done** — accepted PAYs go to an append-only, self-compacting `pending.jsonl` (fsynced before the ACK; torn tail tolerated, other damage refuses; old `pending.json` migrated) instead of a whole-file rewrite per change; at `maxPendingPays` (4096) queued PAYs the daemon and the gateway stop serving (local cut, no ban) until a flush drains the queue |
 | Upload quota (F15) | `stage-3/upload-quota` (on `stage-3/pending-journal`) | **done** — `blossom.maxBytesPerPubkey` (default 8 GiB, `null` = none): the bytes a pubkey owns on the gateway (uploaded, mirrored, or claimed by re-uploading), enforced on `PUT /upload`, `PUT /mirror` and authenticated `HEAD /upload`; a declared body is refused before it is spooled, and concurrent uploads hold their bytes. The default is Cameron's to change (with the pending allow-list-only decision) |
+| NUT-20 quotes (F17) | `stage-3/nut20-quotes` (on `stage-3/upload-quota`) | **done** — mint quotes are locked to the wallet key where the mint advertises NUT-20 and the key is in the process (the NIP-60 wallet), and the mint request is signed (amended message, legacy fallback — both via cashu-ts); an answer locked to another key is refused. Proven on Nutshell 0.21.0 and cdk-mintd 0.18.1. Quote ids no longer reach the desktop renderer: it gets opaque handles, scoped to the wallet that issued them (a signer change forgets them) |
 
 Owed from Stage 2 (ADR 0010 Consequences, `docs/security-review.md` §0 and §6). The F1–F4 and
 F30 blockers were fixed on `stage-2/review-fixes` (2026-09-24); F6 verified on two real mints
 (`stage-3/real-mint`); the seeder daemon's runtime is done (`stage-3/seeder-runtime`, ADR 0011).
 Still owed: "paid views" → sats per video (ADR 0011 §8.4, UI polish);
-executing auto top-ups with caps (F4); NUT-20 quotes (F17); NUT-13 outputs (F31); packaging
+executing auto top-ups with caps (F4); NUT-13 outputs (F31); packaging
 (F21); a contract-level `NetworkAdapter` signer control for the web shell (the desktop uses shell
 methods, ADR 0013) + `SignerStatus` "none"; the deferred
 L5/L6-B/L6-C requests; the NIP-71 `minpay` tag in the manifest parser.

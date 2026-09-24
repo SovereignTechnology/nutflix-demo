@@ -65,6 +65,7 @@ import type { FixtureCatalog } from './catalog/fixture-catalog.js';
 import { fail, hostError } from './errors.js';
 import type { IdentityProvider } from './identity.js';
 import type { DesktopSigner } from './signer/desktop-signer.js';
+import { QuoteHandles } from './quote-handles.js';
 import type { ImageService } from './images/images.js';
 import type { Logger } from './log.js';
 import { redact } from './log.js';
@@ -75,7 +76,7 @@ import { HostPlaySession, SessionRegistry } from './sessions.js';
 import { buildUnreactDeletion, fetchReactionSummary, ownReactionIds } from './social/reactions.js';
 import type { MoneyPlane } from './money.js';
 import type { WalletProvider } from './wallet.js';
-import { DEV_BALANCE_SATS } from './wallet.js';
+import { DEV_BALANCE_SATS, SwitchingWallet } from './wallet.js';
 
 interface HistoryItem {
   readonly video: VideoManifest;
@@ -139,6 +140,8 @@ export class DesktopNetworkAdapter implements NetworkAdapter {
   private readonly random: (n: number) => Uint8Array;
   private readonly now: () => UnixSeconds;
   readonly sessions = new SessionRegistry();
+  /** F17: what the renderer gets in place of mint quote ids. */
+  readonly quoteHandles: QuoteHandles;
   private clientCache: {
     readonly relays: Settings['relays'];
     readonly signer: unknown;
@@ -157,6 +160,11 @@ export class DesktopNetworkAdapter implements NetworkAdapter {
     this.o = opts;
     this.log = opts.log.child('adapter');
     this.random = opts.random ?? ((n) => randomBytes(n));
+    const w = opts.wallet.wallet;
+    this.quoteHandles = new QuoteHandles(
+      this.random,
+      w instanceof SwitchingWallet ? () => w.generation() : undefined,
+    );
     this.now = opts.now ?? nostr.nowSeconds;
     this.wallet = opts.wallet.wallet;
     this.nostrCatalog = new NostrCatalog(() => this.client());

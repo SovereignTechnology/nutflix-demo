@@ -85,6 +85,8 @@ export function memoryWalletKey(secretKey: Uint8Array): WalletKey {
   return {
     pubkey,
     sign: (secret) => Promise.resolve(schnorrSignMessage(secret, secretKey)),
+    // NUT-20: cashu-ts takes the key as a string for a locked mint (see `WalletKey`).
+    withSecretHex: (use) => use(hex(secretKey)),
   };
 }
 
@@ -151,7 +153,16 @@ export class CashuWallet implements Wallet {
     if (!Number.isSafeInteger(amount) || amount < 1)
       throw new WalletError('invalid-argument', 'amount must be a positive integer of sats');
     const w = await this.o.mints.wallet(mint);
-    const q = await w.createMintQuoteBolt11(amount);
+    // Security review F17: a quote is bearer — whoever knows its id once the invoice is paid
+    // mints the ecash. Where the mint supports NUT-20 and our key can sign, lock it to our key.
+    const key = this.o.key;
+    const lock = key?.withSecretHex !== undefined && supportsNut20(w) ? key.pubkey : undefined;
+    const q =
+      lock === undefined
+        ? await w.createMintQuoteBolt11(amount)
+        : await w.createLockedMintQuote(amount, lock);
+    if (lock !== undefined && q.pubkey?.toLowerCase() !== lock.toLowerCase())
+      throw new WalletError('bad-mint-response', 'the mint did not lock the quote to our key');
     const quote: MintQuote = {
       mint,
       quoteId: q.quote,
@@ -175,7 +186,7 @@ export class CashuWallet implements Wallet {
       this.pending.delete(quote.quoteId);
       return { state: 'ISSUED' };
     }
-    const minted = await this.spender.mint(quote);
+    const minted = await this.spender.mint(quote, q.pubkey !== undefined ? q : undefined);
     this.pending.delete(quote.quoteId);
     const issued: MintQuote = { ...quote, state: 'ISSUED' };
     this.emit({ type: 'quote', quote: issued });
@@ -301,5 +312,16 @@ export class CashuWallet implements Wallet {
     this.emit({ type: 'balance', mint, balance: await this.balance(mint) });
     const [latest] = await this.o.store.history({ limit: 1, mint });
     if (latest !== undefined) this.emit({ type: 'history', entry: latest });
+  }
+}
+
+/** NUT-20 in the mint's info (loaded with the mint). Never throws. */
+function supportsNut20(w: {
+  getMintInfo(): { isSupported(n: 20): { supported: boolean } };
+}): boolean {
+  try {
+    return w.getMintInfo().isSupported(20).supported;
+  } catch {
+    return false;
   }
 }

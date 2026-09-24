@@ -66,8 +66,10 @@ export function handlers(a: DesktopNetworkAdapter): HandlerTable {
     'wallet.mints': () => a.wallet.mints(),
     'wallet.balance': (_c, [mint]) => a.wallet.balance(mint),
     'wallet.balances': () => a.wallet.balances(),
-    'wallet.mintQuote': (_c, [mint, amount]) => a.wallet.mintQuote(mint, amount),
-    'wallet.pollQuote': (_c, [quote]) => a.wallet.pollQuote(quote),
+    // F17: the renderer holds an opaque handle, never the (bearer) quote id.
+    'wallet.mintQuote': (_c, [mint, amount]) =>
+      a.quoteHandles.make(() => a.wallet.mintQuote(mint, amount)),
+    'wallet.pollQuote': (_c, [quote]) => a.wallet.pollQuote(a.quoteHandles.resolve(quote)),
     'wallet.meltQuote': (_c, [mint, bolt11]) => a.wallet.meltQuote(mint, bolt11),
     // Stage 2: main's money gate (native confirm) sits in front of this.
     'wallet.melt': (_c, [quote]) => a.wallet.melt(quote),
