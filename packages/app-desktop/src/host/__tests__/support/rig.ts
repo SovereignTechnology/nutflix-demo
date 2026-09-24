@@ -15,6 +15,7 @@ import type { Host } from '../../host.js';
 import { createHost } from '../../host.js';
 import type { IdentityProvider } from '../../identity.js';
 import type { ImageTransport } from '../../images/net.js';
+import type { RestartPolicy } from '../../worker/supervisor.js';
 import { memoryLogger } from '../../log.js';
 import type { FakeWorker, FakeWorkerOptions } from './fake-worker.js';
 import { FakeWorker as FakeWorkerClass, fakeSpawner } from './fake-worker.js';
@@ -43,6 +44,7 @@ export interface RigOptions {
   readonly worker?: FakeWorkerOptions;
   readonly imageTransport?: ImageTransport;
   readonly now?: () => UnixSeconds;
+  readonly restart?: RestartPolicy;
 }
 
 /** Polls `check` every few ms until it returns a value, or fails with `what` after `ms`. */
@@ -78,6 +80,7 @@ export async function rig(o: RigOptions = {}): Promise<Rig> {
     // A strictly increasing clock: replaceable sets never share a second (see L1's rig).
     now: o.now ?? (() => tick++ as UnixSeconds),
     ...(o.identity === undefined ? {} : { identity: o.identity }),
+    ...(o.restart === undefined ? {} : { restart: o.restart }),
     imageTransport: o.imageTransport ?? (() => Promise.reject(new Error('no network in tests'))),
   });
   // Point the relay list at the fake pool's test relays (defaults are public relays).

@@ -238,7 +238,9 @@ export async function createHost(o: HostOptions): Promise<Host> {
   await settings.load();
   const desktop = await loadDesktopConfig(o.userData, log.child('desktop'));
   const storage = join(o.userData, 'worker');
-  const fixtures = flags.devFixtures ? new FixtureCatalog(log) : undefined;
+  const fixtures = flags.devFixtures
+    ? new FixtureCatalog(log, o.timers === undefined ? {} : { timers: o.timers })
+    : undefined;
   // --dev-fixtures runs the relay layer OFFLINE (in-memory), so a dev/e2e run never touches the
   // public network; FakeRelayPool is L1's offline pool.
   const pool =
@@ -281,6 +283,9 @@ export async function createHost(o: HostOptions): Promise<Host> {
     onState: (s: WorkerState) => {
       log.info('media worker state', { state: s });
       if (s === 'down' || s === 'failed' || s === 'stopped') late.adapter?.onWorkerDown();
+      // `down` restarts (and re-announces); `failed`/`stopped` never will: stop the catalogue
+      // waiting for fixtures that are not coming.
+      if (s === 'failed' || s === 'stopped') fixtures?.workerGone();
     },
     handlers: {
       'studio.publish': (draft) => {

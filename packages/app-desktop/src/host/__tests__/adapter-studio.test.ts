@@ -310,8 +310,13 @@ describe('--dev-fixtures (design §5a)', () => {
     // Writes still need a real signer.
     expect(await codeOf(a.react(mocks.VIDEOS[0]!.id, '+'))).toBe('no-signer');
 
-    const trending = await a.feed({ source: 'trending' });
-    expect(trending.items.length).toBeGreaterThan(0);
+    // The boot race (docs/lanes/E2E-fix.md, failure 3): a feed read before the worker's
+    // first dev.fixtures WAITS for it instead of answering with the mock catalogue only.
+    let early: string | undefined;
+    const earlyFeed = a.feed({ source: 'trending' }).then((p) => {
+      early = p.items[0]?.id;
+      return p;
+    });
     const newMint = 'https://mint.dev-fixture.example' as never;
     const live: VideoManifest = {
       ...mocks.VIDEOS[0]!,
@@ -323,11 +328,17 @@ describe('--dev-fixtures (design §5a)', () => {
     a.wallet.onChange((e) => {
       if (e.type === 'balance' && e.mint === newMint && e.balance > 0) credited = true;
     });
+    await new Promise((res) => {
+      setImmediate(res);
+    });
+    expect(early).toBeUndefined();
     r.worker().fixtures([live]);
     await eventually(
       () => r!.log.lines.find((l) => l.msg.startsWith('dev fixtures: live')),
       'live',
     );
+    expect((await earlyFeed).items[0]?.id).toBe(live.id);
+    expect(early).toBe(live.id);
     expect((await a.feed({ source: 'trending' })).items[0]?.id).toBe(live.id);
     expect((await a.stats(live.id)).seedersOnline).toBe(1);
     expect((await a.stats(mocks.VIDEOS[1]!.id)).seedersOnline).toBe(0);
@@ -338,6 +349,37 @@ describe('--dev-fixtures (design §5a)', () => {
     expect(await a.profile(mocks.ME)).toEqual(mocks.MY_PROFILE);
     // Offline: the fake pool (the rig's) was never asked for catalogue data.
     expect(r.pool.queries.filter((q) => q.filter.kinds?.includes(21))).toEqual([]);
+  });
+
+  it('a worker that fails for good releases waiting reads (mock catalogue only)', async () => {
+    r = await rig({
+      flags: { devMocks: true, devFixtures: true },
+      // No restarts: the first death is final (`failed`).
+      restart: { baseMs: 1, maxMs: 1, maxRestarts: 0, windowMs: 60_000 },
+      worker: {
+        handlers: {
+          init: () => {
+            throw new Error('internal: the worker could not start');
+          },
+        },
+      },
+    });
+    const feed = r.host.adapter.feed({ source: 'trending' });
+    await eventually(() => r!.host.worker.state === 'failed', 'worker failed');
+    const page = await feed;
+    expect(page.items.length).toBeGreaterThan(0);
+    expect(page.items.every((v) => mocks.VIDEOS.some((m) => m.id === v.id))).toBe(true);
+    expect(
+      r.log.lines.filter((l) => l.msg.startsWith('dev fixtures: the media worker is gone')),
+    ).toHaveLength(1);
+  });
+
+  it('stopping the host releases waiting reads', async () => {
+    r = await rig({ flags: { devMocks: true, devFixtures: true } });
+    await r.ready();
+    const feed = r.host.adapter.feed({ source: 'trending' });
+    r.host.stop();
+    expect((await feed).items.length).toBeGreaterThan(0);
   });
 
   it('without --dev-fixtures a dev.fixtures event is ignored', async () => {
