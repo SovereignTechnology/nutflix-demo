@@ -55,7 +55,11 @@ export function checkPayLock(
   if (!COMPRESSED.test(want) || data !== want) return { ok: false, reason: 'wrong-target' };
   let binding: string | undefined;
   let bindings = 0;
-  for (const tag of body.tags ?? []) {
+  const tags: unknown = body.tags ?? [];
+  if (!Array.isArray(tags)) return { ok: false, reason: 'malformed' };
+  for (const tag of tags as unknown[]) {
+    if (!Array.isArray(tag) || !tag.every((v): v is string => typeof v === 'string'))
+      return { ok: false, reason: 'malformed' };
     const [key = '', ...values] = tag;
     switch (key) {
       case 'locktime':

@@ -115,6 +115,11 @@ async function signer(): Promise<LocalSigner> {
   ).signer;
 }
 
+/** The refusal reason of a HELLO verdict (`''` for an accepted HELLO, so `toMatch` fails). */
+function reasonOf(v: ReturnType<typeof verifyHello>): string {
+  return v.ok ? '' : v.reason;
+}
+
 describe('pay/1 HELLO (connection-bound, ADR 0010 §7)', () => {
   it('builds a HELLO that verifies on the other end of the SAME connection only', async () => {
     const s = await signer();
@@ -122,18 +127,22 @@ describe('pay/1 HELLO (connection-bound, ADR 0010 §7)', () => {
     const h = await buildHello(s, p.bindA, TERMS);
     const msg: HelloMessage = { type: 'HELLO', ...h };
     expect(msg.challenge).toBe(helloChallenge(p.bindA.handshakeHash, p.bindA.localNoiseKey));
-    expect(verifyHello(msg, p.bindB)).toBeNull();
+    expect(verifyHello(msg, p.bindB)).toEqual({ ok: true });
     // Replayed onto another connection (another handshake hash).
     const other = muxPair(new Uint8Array(32).fill(8));
-    expect(verifyHello(msg, other.bindB)).toMatch(/not bound/);
+    expect(reasonOf(verifyHello(msg, other.bindB))).toMatch(/not bound/);
     // Reflected back to its sender (A receives its own HELLO: the sender key is A, not the remote).
-    expect(verifyHello(msg, p.bindA)).toMatch(/not bound/);
+    expect(reasonOf(verifyHello(msg, p.bindA))).toMatch(/not bound/);
     // Forged signature / another pubkey claiming it.
-    expect(verifyHello({ ...msg, signature: '00'.repeat(64) }, p.bindB)).toMatch(/signature/);
-    expect(verifyHello({ ...msg, pubkey: 'ab'.repeat(32) as never }, p.bindB)).toMatch(/signature/);
-    expect(verifyHello({ ...msg, createdAt: (msg.createdAt + 1) as never }, p.bindB)).toMatch(
+    expect(reasonOf(verifyHello({ ...msg, signature: '00'.repeat(64) }, p.bindB))).toMatch(
       /signature/,
     );
+    expect(reasonOf(verifyHello({ ...msg, pubkey: 'ab'.repeat(32) as never }, p.bindB))).toMatch(
+      /signature/,
+    );
+    expect(
+      reasonOf(verifyHello({ ...msg, createdAt: (msg.createdAt + 1) as never }, p.bindB)),
+    ).toMatch(/signature/);
   });
 
   it('refuses junk terms (version, mints, split, P2PK, window)', async () => {
@@ -149,10 +158,9 @@ describe('pay/1 HELLO (connection-bound, ADR 0010 §7)', () => {
       { windowBlocks: 70_000 },
       { satsPerBlock: -1 },
     ])
-      expect(
-        verifyHello({ ...msg, ...bad } as HelloMessage, p.bindB),
-        JSON.stringify(bad),
-      ).not.toBeNull();
+      expect(verifyHello({ ...msg, ...bad } as HelloMessage, p.bindB).ok, JSON.stringify(bad)).toBe(
+        false,
+      );
     await expect(
       buildHello(s, p.bindA, { ...TERMS, split: { seeder: 1, creator: 1 } }),
     ).rejects.toThrow(/invalid-argument/);
@@ -271,6 +279,30 @@ describe('PayChannel', () => {
     expect(tclose).toBe('protocol-error');
     expect(closes).toContain('close:protocol-error');
     expect(closes.some((c) => c.includes('undecodable'))).toBe(true);
+  });
+
+  // Stage 2 pre-push review (missed before: only a second HELLO under ANOTHER pubkey was tested).
+  // The same pubkey re-HELLOing with a higher price or another P2PK would replace `peer` — the
+  // terms a consumer read at `open` would silently stop being the channel's terms.
+  it('a second HELLO from the same pubkey is ignored if identical and a protocol error if it changes the terms', async () => {
+    const s = await signer();
+    const t = muxPair();
+    const ta = new PayChannel();
+    ta.attach(t.a);
+    let tclose = '';
+    ta.on('close', (x) => (tclose = x));
+    const first = payCodec.encode({ type: 'HELLO', ...(await buildHello(s, t.bindB, TERMS)) });
+    t.inject('a', first);
+    t.inject('a', first); // an identical re-send changes nothing
+    expect(tclose).toBe('');
+    expect(ta.peer?.satsPerBlock).toBe(TERMS.satsPerBlock);
+    const pricier = payCodec.encode({
+      type: 'HELLO',
+      ...(await buildHello(s, t.bindB, { ...TERMS, satsPerBlock: 2000 as Sats })),
+    });
+    t.inject('a', pricier);
+    expect(tclose).toBe('protocol-error');
+    expect(ta.peer?.satsPerBlock).toBe(TERMS.satsPerBlock);
   });
 
   it('cut(): the owner hook runs synchronously, the stream is destroyed, close fires once, later sends are dropped', async () => {

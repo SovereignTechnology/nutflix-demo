@@ -27,7 +27,7 @@ import type {
 import { TestMint } from '../../mocks/test-mint.js';
 import { MemoryProofStore } from '../../wallet/store.js';
 import { CashuMintConnections, CashuWallet, memoryWalletKey } from '../../wallet/wallet.js';
-import { MAX_PROOFS_PER_SET, RealPaymentEngine } from '../engine.js';
+import { MAX_KEYSETS_PER_SET, MAX_PROOFS_PER_SET, RealPaymentEngine } from '../engine.js';
 import { PAY1_TAG } from '../lock.js';
 import { SeenSecrets } from '../seen.js';
 import {
@@ -206,6 +206,36 @@ describe('real engine — keysets (T7)', () => {
     );
     expect(res).toMatchObject({ ok: false, reason: 'malformed' });
     expect(Date.now() - started).toBeLessThan(200);
+  });
+
+  // Stage 2 pre-push review (missed before: every fixture used one keyset). Each keyset id the
+  // seeder has not cached may cost a lookup, and a peer names them freely.
+  it(`a set naming more than ${String(MAX_KEYSETS_PER_SET)} keyset ids is malformed before any keyset lookup`, async () => {
+    const lookups: string[] = [];
+    const seeder = new RealPaymentEngine({
+      config: getSeederEngine(WIDE_WINDOW).config,
+      seen: new SeenSecrets(),
+      keyset: (_mint, id) => {
+        lookups.push(id);
+        return Promise.resolve(undefined);
+      },
+    });
+    const { viewer } = getPair('honest', WIDE_WINDOW);
+    upload(seeder, VIEWER, 4);
+    const honest = await viewer.pay(range(0, 3), SEEDER_INFO, POLICY);
+    const p0 = honest.seederProofs.proofs[0]!;
+    const spread: CashuProof[] = Array.from({ length: MAX_KEYSETS_PER_SET + 1 }, (_, i) => ({
+      ...p0,
+      id: `00${String(i).padStart(14, '0')}`,
+      secret: `k${String(i)}`,
+    }));
+    const res = await seeder.verify(
+      VIEWER,
+      { ...honest, seederProofs: { ...honest.seederProofs, proofs: spread } },
+      POLICY,
+    );
+    expect(res).toMatchObject({ ok: false, reason: 'malformed' });
+    expect(lookups).toEqual([]);
   });
 });
 

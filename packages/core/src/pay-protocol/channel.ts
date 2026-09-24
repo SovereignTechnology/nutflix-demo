@@ -7,8 +7,10 @@
  *
  * - One protomux channel `pay/1`, one message type carrying a codec frame (`codec.ts`).
  * - A remote HELLO must be bound to THIS connection (`hello.ts`) and signed by the pubkey it
- *   names; a second HELLO naming another pubkey is a protocol error. `open` fires once, when
- *   both HELLOs are done.
+ *   names. A second HELLO is ignored if it is byte-identical to the first and is a protocol
+ *   error otherwise — another pubkey, or the same pubkey with other terms (price, P2PK, mints):
+ *   the terms a peer opened with are the ones it keeps. `open` fires once, when both HELLOs
+ *   are done.
  * - PAY, ACK and PRICE are delivered as they arrive, also before HELLO: Hypercore serves blocks
  *   from the first moment and the seeder accounts them under the provisional Noise identity
  *   (ADR 0004 d), so a PAY racing its sender's HELLO must not be dropped.
@@ -65,6 +67,8 @@ export interface PayChannelOptions {
 export class PayChannel implements PayProtocol {
   private st: PayProtocolState = 'idle';
   private remote: HelloMessage | null = null;
+  /** The remote HELLO's encoding, to recognise an identical re-send. */
+  private remoteFrame: Uint8Array | null = null;
   private helloSent = false;
   private openFired = false;
   private channel: ProtomuxChannel | null = null;
@@ -200,16 +204,20 @@ export class PayChannel implements PayProtocol {
           this.protocolError('HELLO on a connection without a binding');
           return;
         }
-        const why = verifyHello(m, b);
-        if (why !== null) {
-          this.protocolError(`HELLO refused: ${why}`);
+        const verdict = verifyHello(m, b);
+        if (!verdict.ok) {
+          this.protocolError(`HELLO refused: ${verdict.reason}`);
           return;
         }
-        if (this.remote !== null && this.remote.pubkey !== m.pubkey) {
-          this.protocolError('a second HELLO names another pubkey');
+        if (this.remote !== null) {
+          if (this.remote.pubkey !== m.pubkey)
+            this.protocolError('a second HELLO names another pubkey');
+          else if (!sameBytes(this.remoteFrame, buf))
+            this.protocolError('a second HELLO changes the terms');
           return;
         }
         this.remote = m;
+        this.remoteFrame = Uint8Array.from(buf);
         this.maybeOpen();
         return;
       }
@@ -262,4 +270,10 @@ export class PayChannel implements PayProtocol {
       }
     }
   }
+}
+
+function sameBytes(a: Uint8Array | null, b: Uint8Array): boolean {
+  if (a?.length !== b.length) return false;
+  for (let i = 0; i < b.length; i++) if (a[i] !== b[i]) return false;
+  return true;
 }

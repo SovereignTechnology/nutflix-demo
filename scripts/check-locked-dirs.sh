@@ -1,13 +1,22 @@
 #!/usr/bin/env bash
 # Enforces SECURITY.md §locked / execution plan §0 rule 3.
 #
-# Until Stage 2, the locked directories may contain ONLY:
-#   - TypeScript files that consist of type/interface declarations and re-exports
-#   - tests (__tests__/ or *.test.ts)
-#   - README.md
-# Anything else (runtime code) fails this check.
+# Until Stage 2 these paths held only interfaces, re-exports and tests. Stage 2 implemented
+# them (2026-09-23); they stay the AUDIT SURFACE, read by the owner on every diff
+# (.gitlab/CODEOWNERS). From Stage 3 on, this check enforces two standing rules on every
+# non-test file there:
 #
-# Usage: scripts/check-locked-dirs.sh [--unlock]   (--unlock is set by Stage 2 via LOCKED_DIRS_UNLOCKED=1)
+#   1. Nothing logs. No `console.*` and no logger calls: SECURITY.md invariant 7 says nothing
+#      in these paths may log a proof, token or key, and the simplest proof is that nothing
+#      logs at all (callers log outcomes, never inputs).
+#   2. No model writes crypto. Imports from outside the package come only from the libraries
+#      the audit surface is a thin wrapper over (cashu-ts, nostr-tools, sodium-universal,
+#      compact-encoding) or from @sovit/core itself. A new dependency here — or a direct
+#      curve/hash library such as @noble/* or node:crypto — is a reviewed change to this list.
+#
+# LOCKED_DIRS_UNLOCKED, which Stage 2 used to skip the old interface-only rule, is ignored.
+#
+# Usage: scripts/check-locked-dirs.sh
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 
@@ -19,10 +28,25 @@ LOCKED=(
   packages/gateway/src/auth
 )
 
-if [[ "${LOCKED_DIRS_UNLOCKED:-0}" == "1" ]]; then
-  echo "check-locked-dirs: LOCKED_DIRS_UNLOCKED=1 — Stage 2 in progress, skipping"
-  exit 0
-fi
+# Module specifiers (exact, or a prefix ending in '/') the audit surface may import.
+ALLOWED_IMPORTS=(
+  @cashu/cashu-ts
+  nostr-tools/
+  sodium-universal
+  compact-encoding
+  @sovit/core
+)
+
+allowed_import() {
+  local spec="$1" a
+  [[ "$spec" == ./* || "$spec" == ../* ]] && return 0
+  for a in "${ALLOWED_IMPORTS[@]}"; do
+    if [[ "$a" == */ ]]; then [[ "$spec" == "$a"* ]] && return 0
+    else [[ "$spec" == "$a" ]] && return 0
+    fi
+  done
+  return 1
+}
 
 fail=0
 for path in "${LOCKED[@]}"; do
@@ -31,16 +55,24 @@ for path in "${LOCKED[@]}"; do
     case "$f" in
       */__tests__/*|*.test.ts|*/README.md) continue ;;
       *.ts) ;;
-      *) echo "LOCKED: non-TypeScript file in locked path: $f"; fail=1; continue ;;
+      *) echo "LOCKED: non-TypeScript file in the audit surface: $f"; fail=1; continue ;;
     esac
-    # Strip comments and blank lines, then every remaining line must be a declaration-only construct.
-    # Allowed line starts: import/export type, export interface/type/enum-less, re-exports, braces, members.
-    if grep -nE '^\s*(export\s+)?(async\s+)?(function|class|const|let|var)\b' "$f" \
-        | grep -vE '^\s*[0-9]+:\s*(export\s+)?(declare\s+)' \
-        | grep -vE "^\s*[0-9]+:\s*//" ; then
-      echo "LOCKED: implementation found in $f (see lines above). Interfaces, types and tests only until Stage 2."
+    # Rule 1: no logging (comment lines excluded).
+    if grep -nE '(^|[^A-Za-z0-9_.])(console\.[a-z]+|log(ger)?\.(trace|debug|info|warn|error|fatal|child))\s*\(' "$f" \
+        | grep -vE '^[0-9]+:\s*(//|\*|/\*)'; then
+      echo "LOCKED: logging in $f (see lines above). The audit surface never logs."
       fail=1
     fi
+    # Rule 2: imports only from the allowlist — `… from 'x'`, a bare `import 'x'`, and
+    # dynamic `import('x')` / `require('x')`.
+    while IFS= read -r spec; do
+      [[ -z "$spec" ]] && continue
+      if ! allowed_import "$spec"; then
+        echo "LOCKED: $f imports '$spec' — not in the audit-surface allowlist (scripts/check-locked-dirs.sh)."
+        fail=1
+      fi
+    done < <(grep -ohE "(^|[[:space:]}])from[[:space:]]+['\"][^'\"]+['\"]|^[[:space:]]*import[[:space:]]+['\"][^'\"]+['\"]|(import|require)\([[:space:]]*['\"][^'\"]+['\"]" "$f" \
+               | sed -E "s/.*['\"]([^'\"]+)['\"].*/\1/")
   done < <(find "$path" -type f -print0 2>/dev/null)
 done
 

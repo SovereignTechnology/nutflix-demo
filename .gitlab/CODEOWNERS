@@ -1,7 +1,7 @@
 # Execution plan §0 rules 1 and 3.
 # Contracts: orchestrator-only writer.
 /packages/core/src/contracts/        @cam
-# Locked audit surface: interface + tests only until Stage 2; Stage 2 diffs are read by the owner.
+# Audit surface (implemented in Stage 2): every diff is read by the owner; scripts/check-locked-dirs.sh enforces no logging + library allowlist.
 /packages/core/src/payment/          @cam
 /packages/core/src/signer/           @cam
 /packages/core/src/pay-protocol/     @cam

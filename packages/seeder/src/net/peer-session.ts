@@ -112,6 +112,15 @@ export class PeerSession {
     return this.isClosed;
   }
 
+  /**
+   * Whether the engine has banned this peer's account — whatever reason code the PAY that did it
+   * carried (`peer-banned`, `double-spend`, or `bad-dleq` for a DLEQ forged against a known
+   * keyset). The pay bridge cuts on it after sending the ACK.
+   */
+  get engineBanned(): boolean {
+    return this.engine.isBanned(this.accountId());
+  }
+
   get cutReason(): CutReason | null {
     return this.cutWith;
   }

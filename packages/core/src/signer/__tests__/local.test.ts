@@ -110,6 +110,18 @@ describe('LocalSigner', () => {
     expect((await fresh()).signSecret).toBeUndefined();
   });
 
+  // Stage 2 pre-push review (missed before: the test above only fed it a valid secret). The
+  // wallet key signs SHA-256 of whatever it is given, so without a format check anything holding
+  // the signer gets a general BIP-340 oracle for the key published in the user's kind 10019 —
+  // e.g. over a NIP-01 serialization, whose SHA-256 is an event id.
+  it('signSecret signs only a NUT-10 P2PK secret: a NIP-01 serialization, plain text or an HTLC secret is refused', async () => {
+    const s = await fresh(new Uint8Array(32).fill(12));
+    const nip01 = JSON.stringify([0, 'ab'.repeat(32), 1_757_000_000, 1, [], 'hello']);
+    const htlc = JSON.stringify(['HTLC', { nonce: 'ab', data: '00'.repeat(32) }]);
+    for (const input of [nip01, 'hello', htlc, '["P2PK"]', '{"P2PK":1}'])
+      await expect(s.signSecret!(input), input.slice(0, 20)).rejects.toThrow(/invalid-argument/);
+  });
+
   it('lock() zeroes the key buffers in place and every operation afterwards is `signer-locked`', async () => {
     const wk = new Uint8Array(32).fill(13);
     const s = await fresh(wk);

@@ -76,4 +76,11 @@ describe('SeenSecrets', () => {
     expect(s.has('a')).toBe(false); // the oldest went
     expect(s.has('d')).toBe(true);
   });
+
+  // Stage 2 pre-push review (sharp edges): capacity 0 evicted each secret as it was added — a
+  // configuration that silently turned the local double-spend check off.
+  it('refuses a capacity that would disable it (0, negative, fractional, NaN)', () => {
+    for (const capacity of [0, -1, 1.5, Number.NaN])
+      expect(() => new SeenSecrets({ capacity }), String(capacity)).toThrow(RangeError);
+  });
 });

@@ -14,7 +14,7 @@ test, to be filed as a `stage-3` issue (§6).
 **Exposure today is nil for the money findings.** No runtime provider is wired: the desktop
 worker, the seeder and the gateway CLIs all refuse to start without `--dev-mocks`
 (`*/providers.ts` return `undefined`), so no real ecash moves until Stage 3 wires the Stage 2
-modules in. That makes F1–F4 **Stage 3 blockers**: each must be fixed before a real wallet is
+modules in. That makes F1–F4 and F30 **Stage 3 blockers**: each must be fixed before a real wallet is
 connected.
 
 ## 1. Summary
@@ -27,12 +27,14 @@ connected.
 | F4 | High | Auto top-up (v5 normative) funds whatever mint a manifest names, automatically | `core/src/contracts/network-adapter.ts:188-193`; `app-desktop/src/host/adapter.ts:818` |
 | F5 | High | DLEQ verification costs 11 ms/proof (20 ms under `--jitless`) on the event loop; per-block PAYs cap a seeder at ~5 HD viewers per core | `core/src/payment/engine.ts:762`; `app-desktop/src/worker/pay/viewer-payer.ts` (`payEveryBlocks: 1`) |
 | F6 | High | The `pay1` creator-set binding (NUT-10 tag) is unverified against a real mint | `core/src/payment/engine.ts:297`, ADR 0010 §6 |
+| F30 | High | The viewer's carry is never scoped per channel or committed on ACK: after a reconnect (or any rejected PAY) an honest viewer's PAYs all fail and it is window-cut and banned | `gateway/src/upstream/payer.ts` (no `carryIn`), contract `PaymentEngineViewer.pay` |
 | F7 | Medium | SE-1 residual: a compromised renderer process can get a token for any path and publish the file | `app-desktop/src/main/file-tokens.ts`, `ipc-gate.ts` |
 | F8 | Medium | The money gate is still a stub (fails closed); settings that move money are not gated at all | `app-desktop/src/main/money-gate.ts:33-35`, `ipc/protocol.ts` (`updateSettings`) |
 | F9 | Medium | The seeder verifies every PAY against its CURRENT policy, so a price change rejects honest PAYs | `seeder/src/payment/pay-bridge.ts`, `core/src/payment/engine.ts:418` |
 | F10 | Medium | The seen-secret set is memory-only with FIFO eviction; a restart re-opens replay until flush | `core/src/payment/seen.ts:11-51` |
 | F11 | Medium | A viewer can double-spend the CREATOR set undetected (the seeder never checks it) | `core/src/payment/engine.ts` flush (~l. 620-660) |
 | F12 | Medium | Accepted-but-unflushed proofs and failed nutzaps live only in memory: a crash loses that income | `core/src/payment/engine.ts:228, 513, 620-666` |
+| F31 | Medium | A redeem whose response is lost is retried, the mint answers "spent", and the engine bans the honest viewer as a double-spender, drops the creator set and the swapped proofs are gone | `core/src/payment/engine.ts:630-641`, `core/src/wallet/spend.ts:300-306` |
 | F13 | Medium | Full peer identifiers (Nostr pubkeys, Noise keys) are logged at info level | `seeder/src/net/peer-session.ts:206,212,232,266`; `seeder/src/seeder.ts:306,472`; `gateway/src/blossom/handler.ts:540-545,718`; `seeder/src/log/redact.ts` (by design) |
 | F14 | Medium | `trustProxy` takes the FIRST `X-Forwarded-For` hop: clients pick their rate-limit bucket behind an appending proxy | `gateway/src/gateway.ts:447-454` |
 | F15 | Medium | Gateway defaults: open uploads (any key, any MIME, 2 GiB, no quota); body spooled before auth without `X-SHA-256` | `gateway/src/config.ts:123-154`; `blossom/handler.ts:462-494` |
@@ -50,6 +52,9 @@ connected.
 | F27 | Low | Two concurrent channels from one pubkey collide on the carry (rebind resets it) | `core/src/payment/engine.ts` (rebind) |
 | F28 | Info | Bans are keyed on free identities; the window, not the ban, bounds loss | `seeder/src/store/ban-list.ts` |
 | F29 | Info | BlossomAuth's `server`-tag rule follows nostr-tools, not BUD-11 text (not vendored) | `gateway/src/auth/blossom-auth.ts`, ADR 0010 §8 |
+| F32 | Info | A DLEQ without `r`, or with non-hex fields, is treated as a forgery and banned — a third-party wallet that strips `r` gets banned | `core/src/payment/engine.ts` `dleqOk` |
+
+F30–F32 were added by the pre-push differential review (`docs/reviews/2026-09-23-pre-push-stage-2.md`); their rows sit at their severity.
 
 ## 2. Findings
 
@@ -181,6 +186,31 @@ the tag buys would vanish silently.
 swap as the creator. If either mint rejects it, move the binding into the secret's `data`
 domain (a per-seeder derived key) and amend ADR 0010 §6.
 
+### F30 — High — the viewer's carry drifts from the seeder's
+
+**What.** The seeder scopes the creator carry per channel × core. Every new session rebinds
+(`peer-session.ts` → `engine.rebind(noiseHex, pubkey)`), and a rebind resets the pubkey's
+carries. The viewer engine keeps its carry per (seeder pubkey, core) across channels and
+advances it when it BUILDS a PAY (`engine.ts` `pay()`), not when the PAY is accepted. The
+contract makes the transport responsible ("a transport that saw a rejected ACK, or opened a
+new channel to the same seeder, passes the carry it reconstructed" — `PaymentEngineViewer.pay`),
+but `UpstreamPayer` never passes `carryIn`.
+
+**Impact.** A viewer reconnects to a seeder, or has one PAY refused (F9's price race, a lost
+frame). From then on every PAY carries a `carryIn` the seeder does not expect, so it is
+`malformed`. The unpaid blocks pass the window, and the seeder window-cuts and **bans** the
+honest viewer, persistently. Not a money loss, but it makes multi-session viewing fail by
+design.
+
+**Fix.** `UpstreamPayer` keeps the carry per channel: 0 at `open`, pass it as `opts.carryIn`,
+advance it to the PAY's carry-out only on the matching `ACK ok`, and hold further PAYs to
+that seeder × core while one is unacknowledged (the carry chains them). Longer term, put the
+seeder's expected carry in a negative `ACK` (v6) so a viewer can resynchronise instead of
+guessing.
+
+**Test.** A viewer pays on channel 1, reconnects (channel 2) and pays again → accepted. A PAY
+refused with `wrong-amount` → the next PAY is accepted.
+
 ### F7 — Medium — SE-1 residual
 
 **What.** SE-1 is implemented (single-use, webContents-bound, 10-minute tokens;
@@ -246,6 +276,19 @@ income, plus every creator share whose nutzap had failed. **Fix:** persist the q
 ACKing (0600, or the NIP-60 store, which is already encrypted to self), and resume flushing at
 start. **Test:** accept a PAY, build a new engine on the same store without flushing, flush →
 redeemed and nutzapped.
+
+### F31 — Medium — a lost redeem response becomes a false double-spend
+
+If the mint executes the seeder's redeem swap but the response is lost (timeout, reset),
+`Spender.receive` reports `mint-error` and the engine keeps the item. At the next flush the
+mint answers `11001 already spent` for proofs *we* spent: the engine bans the honest viewer
+(`double-spend`), skips the creator's nutzap, and the new proofs from the first swap are
+unrecoverable, because outputs are random rather than NUT-13 deterministic. **Fix:** on
+`spent` after an earlier ambiguous failure, NUT-07 `checkstate` the inputs and verify the
+returned witness against our own wallet key. Our own signature means our own swap: no ban,
+nutzap the creator set. Adopt NUT-13 deterministic secrets with NUT-09 restore so the swapped
+outputs can be recovered. **Test:** a transport that drops the first redeem response → no
+ban, the creator is nutzapped, and (with NUT-13) the seeder's balance is restored.
 
 ### F13 — Medium — peer identifiers in logs
 
@@ -344,6 +387,11 @@ hash-addressed images).
 - **F29.** BUD-11 is not vendored. The `server` scoping rule (ADR 0010 §8) mirrors nostr-tools'
   Blossom client and only ever *refuses* tokens that name other servers. Vendor BUD-11 and
   re-check.
+- **F32.** `dleqOk` treats a DLEQ without `r` (or with non-hex fields) as a forgery against
+  a known keyset and bans. Our wallet always sends `r` (its post-check requires it), and L10's
+  forge fixture relies on the ban. But a third-party wallet that forwards proofs with `r`
+  stripped would be banned rather than told `missing-dleq`. Revisit when non-Nutflix payers
+  exist: classify a missing `r` as `missing-dleq` and amend the fixture.
 
 ## 3. Checklist coverage
 
@@ -397,7 +445,7 @@ hash-addressed images).
 - **Payment engine.** Pay-after-verify, exact amounts, both sets P2PK-checked
   (`checkPayLock`: no locktime/refund/extra keys), DLEQ offline against the cached keyset
   (forged → ban), window accounting on distinct blocks, local double-spend check at verify, ban
-  on a mint-reported double-spend. Residual: F5, F6, F9, F10, F11, F12, F27.
+  on a mint-reported double-spend. Residual: F5, F6, F9, F10, F11, F12, F27, F30 (consumer), F31, F32.
 - **pay/1.** Strict codec (exact consumption, caps on every length), and the HELLO is bound to
   the Noise handshake hash and sender key. PAY/ACK/PRICE are delivered as they arrive, even
   before the HELLO, on purpose (ADR 0004 d: a PAY may race its sender's HELLO). The seeder
@@ -405,11 +453,21 @@ hash-addressed images).
   channel. Residual: F1 is in the consumer, not the protocol.
 - **Gateway auth.** ADR 0010 §8. Residual: F29; the handler-side F3, F15 and F20.
 
+**Fixed in the pre-push review** (inside the five directories, or in a consumer adapting to a
+Stage 2 change; details and which ones carry a new test in
+`docs/reviews/2026-09-23-pre-push-stage-2.md`): `signSecret` signs only NUT-10 P2PK secrets (was a
+general signing oracle for the wallet key); a second HELLO that changes the terms is a
+protocol error (was silently adopted as `peer`); a proof set naming more than 3 keyset ids is
+`malformed` before any lookup; `checkPayLock` never throws; `SeenSecrets` refuses a capacity
+that disables it; `verifyHello` returns a verdict object instead of `null`-means-valid; and
+any rejected PAY that leaves the peer engine-banned (the forged-DLEQ `bad-dleq` ban included)
+is ACKed, then cut, with the ban persisted.
+
 ## 6. Stage 3 issues
 
 To be filed on GitLab as one issue per finding, labelled `stage-3` and `security`, severity in
 the title, body = the finding's section above. **Filing waits for Cameron's go-ahead**
-(outward-facing). F1–F4 are blockers for wiring any real wallet.
+(outward-facing). F1–F4 and F30 are blockers for wiring any real wallet.
 
 | Issue title |
 |---|
@@ -419,19 +477,21 @@ the title, body = the finding's section above. **Filing waits for Cameron's go-a
 | [High] F4: auto top-up only into trusted mints, capped, confirmed first time |
 | [High] F5: batch PAYs, cap proofs per set, DLEQ off the event loop |
 | [High] F6: regtest-verify the pay1 NUT-10 tag on nutshell and cdk |
+| [High] F30: UpstreamPayer scopes the carry per channel and commits it on ACK |
 | [Medium] F7: main-owned file choice / confirm before studio.upload |
 | [Medium] F8: native money-gate dialog; gate money-relevant settings |
 | [Medium] F9: price blocks by the policy in force when uploaded |
 | [Medium] F10: persist the seen-secret set |
 | [Medium] F11: NUT-07 checkstate the creator set at flush |
 | [Medium] F12: persist the pending redeem/nutzap queue |
+| [Medium] F31: witness-checked recovery from a lost redeem response; NUT-13 outputs |
 | [Medium] F13: hash peer identifiers in info logs |
 | [Medium] F14: rightmost trusted X-Forwarded-For hop |
 | [Medium] F15: gateway upload defaults, per-pubkey quota, no pre-auth spooling |
 | [Medium] F16: gateway unit on Node 22 (Node ≥ 24 + --no-experimental-websocket) |
 | [Medium] F17: NUT-20 locked mint quotes; opaque quote handles over IPC |
 | [Medium] F18: hash-addressed images by default; drop the distinctive user agent |
-| [Low] F19–F27: one issue each; F28–F29 recorded, no issue |
+| [Low] F19–F27: one issue each; F28, F29, F32 recorded, no issue |
 
 ## 7. Not verified
 

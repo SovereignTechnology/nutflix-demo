@@ -31,5 +31,6 @@ export {
   verifyHello,
   type ConnectionBinding,
   type HelloTerms,
+  type HelloVerdict,
 } from './hello.js';
 export { PayChannel, type PayChannelOptions } from './channel.js';

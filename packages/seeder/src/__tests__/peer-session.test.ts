@@ -225,6 +225,16 @@ describe('PeerSession', () => {
     expect(peerInfo?.banCalls).toEqual([]);
   });
 
+  it('engineBanned reflects an engine ban of the bound account, whatever caused it', async () => {
+    const { engine, session } = await make(8);
+    const pk = pubkey('forger');
+    session.bindPubkey(pk);
+    expect(session.engineBanned).toBe(false);
+    engine.ban(pk, 'forged-proof');
+    expect(session.engineBanned).toBe(true);
+    expect(session.cutReason).toBeNull(); // the bridge decides when to cut (after its ACK)
+  });
+
   it('verifyPay refuses after a cut and otherwise delegates to the engine', async () => {
     const { session, engine } = await make(8);
     const viewer = honestEngine();

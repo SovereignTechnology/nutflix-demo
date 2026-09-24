@@ -21,6 +21,9 @@ export class SeenSecrets {
 
   constructor(opts: SeenSecretsOptions = {}) {
     this.capacity = opts.capacity ?? 1_000_000;
+    // 0 would evict every secret the moment it is added: no local double-spend check at all.
+    if (!Number.isSafeInteger(this.capacity) || this.capacity < 1)
+      throw new RangeError('SeenSecrets: capacity must be a positive integer');
     this.persist = opts.persist;
   }
 

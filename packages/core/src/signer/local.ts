@@ -9,7 +9,7 @@
  * Nothing here logs. Errors carry a code prefix (`signer-locked:`, `invalid-argument:`) and
  * never a key, a passphrase or plaintext.
  */
-import { schnorrSignMessage } from '@cashu/cashu-ts';
+import { parseP2PKSecret, schnorrSignMessage } from '@cashu/cashu-ts';
 import { decode as nip19Decode } from 'nostr-tools/nip19';
 import * as nip44 from 'nostr-tools/nip44';
 import { finalizeEvent, getPublicKey } from 'nostr-tools/pure';
@@ -255,13 +255,24 @@ export class LocalSigner implements Signer {
     }
   }
 
-  /** NUT-11 witness: BIP-340 over SHA-256(secret) with the wallet key (cashu-ts `schnorrSignMessage`). */
+  /**
+   * NUT-11 witness: BIP-340 over SHA-256(secret) with the wallet key (cashu-ts
+   * `schnorrSignMessage`). Only a NUT-10 `P2PK` secret is signed — never an arbitrary string —
+   * so the wallet key cannot be used as a general signing oracle by whatever holds the signer.
+   */
   private signWitness(secret: string): Promise<string> {
     try {
       if (this.walletKey === null || this.sk === null)
         throw new Error('signer-locked: unlock the local key first');
       if (typeof secret !== 'string' || secret.length === 0)
         throw new Error('invalid-argument: secret must be a non-empty string');
+      let kind: unknown;
+      try {
+        [kind] = parseP2PKSecret(secret);
+      } catch {
+        kind = undefined;
+      }
+      if (kind !== 'P2PK') throw new Error('invalid-argument: not a NUT-11 P2PK secret');
       return Promise.resolve(schnorrSignMessage(secret, this.walletKey));
     } catch (e) {
       return Promise.reject(e instanceof Error ? e : new Error('signer: failed'));

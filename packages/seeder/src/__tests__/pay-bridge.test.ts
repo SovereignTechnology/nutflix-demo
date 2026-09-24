@@ -191,6 +191,40 @@ describe('pay bridge (PayProtocol ⇄ PeerSession ⇄ PaymentEngine.verify)', ()
     await r.scheduler.stop({ flush: false });
   });
 
+  // Stage 2 pre-push review: the real engine bans a DLEQ forged against a known keyset but
+  // answers `bad-dleq`; the bridge cut only on `peer-banned` / `double-spend`, so the forger kept
+  // its session for a whole window and the ban never reached the ban list.
+  it('any rejected PAY that left the peer engine-banned is ACKed, then cut, and the ban is persisted; a non-banning rejection is not', async () => {
+    const r = await rig(8);
+    const pk = pubkey('forger');
+    r.protocol.remoteHello(hello(pk));
+    for (let i = 0; i < 8; i++) r.session.onUpload(CORE_C, i, 1024);
+    const msg = await r.viewer.pay(
+      { core: CORE_C, fromBlock: 0, toBlock: 3 },
+      r.seederRef,
+      r.policy,
+    );
+    const realVerify = r.engine.verify.bind(r.engine);
+    r.engine.verify = () => Promise.resolve({ ok: false, reason: 'range-already-paid' });
+    r.protocol.remotePay(msg);
+    await tick();
+    expect(r.session.cutReason).toBeNull();
+    r.engine.verify = (peer) => {
+      r.engine.ban(peer, 'forged-proof');
+      return Promise.resolve({ ok: false, reason: 'bad-dleq' });
+    };
+    r.protocol.remotePay(msg);
+    await tick();
+    r.engine.verify = realVerify;
+    expect(r.protocol.acks.map((a) => [a.ok, a.reason])).toEqual([
+      [false, 'range-already-paid'],
+      [false, 'bad-dleq'],
+    ]);
+    expect(r.session.cutReason).toBe('banned');
+    expect(r.banList.isPubkeyBanned(pk)).toBe(true);
+    await r.scheduler.stop({ flush: false });
+  });
+
   // ---------------------------------------------------------------- contracts v3 (ADR 0004)
 
   it('v5 (ADR 0010): a core-less PAY is refused as `malformed` by the engine on any stream, with nothing credited and no cut; the same PAY with a core is accepted', async () => {

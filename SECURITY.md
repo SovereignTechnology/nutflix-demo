@@ -83,9 +83,11 @@ Specified in `docs/plan/build-plan.md` §1–§3 and enforced by the adversary t
 ## Locked directories {#locked}
 
 These directories are the audit surface. Until Stage 2 of `docs/plan/execution.md` they
-contain **only** interfaces, re-exports and tests (`MockPaymentEngine` lives in
-`packages/core/src/mocks/`, outside the lock). CODEOWNERS plus
-`scripts/check-locked-dirs.sh` fail any change that adds implementation there.
+contained **only** interfaces, re-exports and tests (`MockPaymentEngine` lives in
+`packages/core/src/mocks/`, outside the lock). Stage 2 implemented them (2026-09-23); every
+later diff is read by the owner (CODEOWNERS), and `scripts/check-locked-dirs.sh` fails any
+change that makes them log anything or import from outside the audited libraries
+(`@cashu/cashu-ts`, `nostr-tools`, `sodium-universal`, `compact-encoding`, `@sovit/core`).
 
 ```
 packages/core/src/payment/

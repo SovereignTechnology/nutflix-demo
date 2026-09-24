@@ -131,11 +131,19 @@ function checkHelloTerms(h: HelloMessage): string | null {
   return null;
 }
 
+/** A HELLO check's result. `reason` is short, for the protocol-error log — never key material. */
+export type HelloVerdict = { readonly ok: true } | { readonly ok: false; readonly reason: string };
+
 /**
- * Verify a HELLO received on `binding`. Returns `null` when it is valid, or why not (a short
- * reason for the protocol-error log line — never key material).
+ * Verify a HELLO received on `binding`. The result is a verdict object, not a bare
+ * `string | null`, so that no caller can accept a HELLO by testing the result for truthiness.
  */
-export function verifyHello(hello: HelloMessage, binding: ConnectionBinding): string | null {
+export function verifyHello(hello: HelloMessage, binding: ConnectionBinding): HelloVerdict {
+  const why = helloProblem(hello, binding);
+  return why === null ? { ok: true } : { ok: false, reason: why };
+}
+
+function helloProblem(hello: HelloMessage, binding: ConnectionBinding): string | null {
   const terms = checkHelloTerms(hello);
   if (terms !== null) return terms;
   if (hello.challenge !== helloChallenge(binding.handshakeHash, binding.remoteNoiseKey))

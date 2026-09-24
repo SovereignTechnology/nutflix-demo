@@ -121,6 +121,12 @@ const MAX_BLOCK = 2 ** 40;
  * so an uncapped set is a CPU lever for any peer (T11).
  */
 export const MAX_PROOFS_PER_SET = 64;
+/**
+ * Most distinct keyset ids one set may name. A P2PK send's outputs all come from the mint's
+ * active keyset; a reused orphan set can add an older one. Every id the seeder has not cached
+ * may cost a keyset lookup (the host's policy), so a set naming dozens is refused unread.
+ */
+export const MAX_KEYSETS_PER_SET = 3;
 
 function isProofShape(x: unknown): x is CashuProof {
   if (typeof x !== 'object' || x === null) return false;
@@ -147,7 +153,8 @@ function isSetShape(x: unknown): x is LockedProofSet {
     s['unit'] === 'sat' &&
     Array.isArray(s['proofs']) &&
     s['proofs'].length <= MAX_PROOFS_PER_SET &&
-    s['proofs'].every(isProofShape)
+    s['proofs'].every(isProofShape) &&
+    new Set(s['proofs'].map((p) => p.id)).size <= MAX_KEYSETS_PER_SET
   );
 }
 

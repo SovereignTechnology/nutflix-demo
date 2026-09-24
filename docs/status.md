@@ -3,12 +3,14 @@
 Kept current by the orchestrator after every merge (execution plan §5.1).
 
 **If you are an agent picking this up cold: read an internal session handoff (not published)
-first** — it is the resume point. **Stage 1 is DONE (2026-09-23):** all L5 screens, contracts
-v4, the L6 desktop app (L6-0 IPC, L6-A shell, L6-B host, L6-C worker) and the Stage 1 exit
-lanes (UI-followups, Seeder-entry, E2E-fix) are merged; `npm run ci` **129 files, 2126 passed /
-27 skipped**; the Electron e2e (`NUTFLIX_E2E_APPARMOR_PROFILE=1 npm run -w packages/app-desktop
-test:e2e`) passes **13/13, 3 runs in a row** with the Chromium sandbox on. Next: **Stage 2**
-(`docs/prompts/stage-2-security.md`, contracts v5 — see the v5 list below) — Cameron starts it.
+first** — it is the resume point. **Stage 2 is DONE on branch `stage-2/2026-09-23` (2026-09-23),
+awaiting Cameron's review before anything is pushed or merged:** contracts v5 (ADR 0010), the
+five audit-surface modules implemented over cashu-ts / nostr-tools / sodium, all 27
+Stage-2-gated tests running, and the PART B review (`docs/security-review.md`, 32 findings —
+F1–F4 and F30 block wiring a real wallet in Stage 3). `LOCKED_DIRS_UNLOCKED=1 npm run ci` on the A.5
+commit: **143 files, 2298 passed / 0 skipped**; since the Stage 2 wrap-up commit, plain
+`npm run ci` (the guard is now a standing audit-surface check). Stage 1 (DONE 2026-09-23): all
+L5 screens, the L6 desktop app, e2e 13/13 with the Chromium sandbox on.
 Design: `docs/plan/L6-design.md`; lane reports `docs/lanes/*.md`.
 
 ## Stage 0 — scaffold, contracts, spikes: **DONE 2026-09-04**
@@ -235,10 +237,11 @@ or closed, never leaked (SE-2/SE-3); `autoTopUp.belowSats <= 0` means disabled (
 - **Channel** `seedingVideos?` (from a kind-10019 lookup); **Search** `filters` +
   `onFiltersChange`; **Library** own `ToastStack` (→ `onToast` if the shell owns toasts).
 
-### Open contract-change requests (CONTRACTS_VERSION = 4, FROZEN — ADR 0007)
+### Contract-change requests for v5 — DECIDED (CONTRACTS_VERSION = 5, ADR 0010)
 
-v4 (2026-09-23) was a small additive bump: reactions (`likes`/`dislikes`/`myReaction`,
-`unreact`). Recorded for the Stage 2 bump, **now v5**:
+**Every item below was decided in ADR 0010 §1 (Stage 2 PART 0; item 4 in PART A step 5,
+ADR 0010 §8).** Kept as the record of what was asked. v4 (2026-09-23) was a small additive
+bump: reactions (`likes`/`dislikes`/`myReaction`, `unreact`). The list as recorded for v5:
 
 1. `BlockRange.core` and `recordUpload`'s `core` become **required** (ADR 0004).
 2. **`PRICE` carries no core** — per-core prices need it (L3 observation).
@@ -331,8 +334,9 @@ v4 (2026-09-23) was a small additive bump: reactions (`likes`/`dislikes`/`myReac
    shell's `pushToast` wraps toast actions (dismiss, then run once — this also fixes Settings'
    Retry toast, which never closed). The fixture seam `NUTFLIX_DEV_FIXTURES_JSON` was confirmed
    by L6-C. **Still open:** residual SE-1 risk — a compromised renderer *process* can request a
-   token for any regular file it can name → Stage 2: pick upload files via a main-process
-   `dialog`. **New, from UI-followups (Stage 3 polish):** Watch, Wallet and Shorts still render
+   token for any regular file it can name → pick upload files via a main-process `dialog`
+   (outside the five Stage 2 directories, so filed as `docs/security-review.md` F7 for
+   Stage 3). **New, from UI-followups (Stage 3 polish):** Watch, Wallet and Shorts still render
    their own `ToastStack`, fixed bottom-left like the shell's, so two stacks can overlap — a
    true single stack needs `onToast` on those three; repeated identical Settings failures stack
    instead of replacing (a `replaceKey` on `ToastItem`, `packages/ui/src/components/`); a
@@ -392,7 +396,7 @@ merge between the two histories cannot produce two ADRs with one number. **The n
 
 | Question | Answer |
 |---|---|
-| Creator share at small PAYs (ADR 0005 erratum) | **Minimum PAY size + carry the creator's fractional remainder** across PAYs. Design and proposed parameters (`minPaySats` 10, window ≥ one min PAY) in ADR 0007; implemented in Stage 2 (contracts v5) |
+| Creator share at small PAYs (ADR 0005 erratum) | **Minimum PAY size + carry the creator's fractional remainder** across PAYs. Design and proposed parameters (`minPaySats` 10, window ≥ one min PAY) in ADR 0007; implemented in Stage 2 (contracts v5) — **the minimum is a batching target, not a rejection** (ADR 0010 §3.3 amendment; an enforced minimum deadlocks multi-seeder viewers) |
 | Home card price vs Watch | **Default rendition's price** on every card (no "from") — L4-fixes |
 | Un-like / dislikes | **Always show dislikes.** Contracts v4: `VideoStats.likes/dislikes/myReaction`, `unreact()` (NIP-09) so un-like is never a `-` — L5-fixes |
 | Library privacy copy | **Watch later is encrypted; playlists can be public or private** — L5-fixes |
@@ -408,9 +412,39 @@ merge between the two histories cannot produce two ADRs with one number. **The n
 approved to start now in a fresh session** per `docs/prompts/stage-2-security.md`. Still open:
 one phone scan of the Wallet QR (pass = decodes to text starting `lnbc5000n1pj9x7`). `spec/nfx-suite-m0` (ADR 0006) stays unmerged.
 
-## Stage 2 — audit surface (single session): APPROVED 2026-09-23, starting in a fresh session
+## Stage 2 — audit surface (single session): DONE 2026-09-23, awaiting review
 
-Prompt updated 2026-09-23 (`docs/prompts/stage-2-security.md`: PART 0 = contracts v5 + the
-mock fixes, then the five locked modules, then the seam review). One session, one worktree, no
-subagents. **Model: Opus 5.5 (high), Cameron's choice 2026-09-23** (the plan had named Fable 5.1).
+Prompt: `docs/prompts/stage-2-security.md`. One session (Opus 5.5 high, Cameron's choice), one
+worktree (`.worktrees/stage-2`), no subagents. One branch per deliverable, all stacked on
+`stage-2/2026-09-23` (off `stage-1`); **nothing pushed** — Cameron reviews first.
+
+| Deliverable | Commit | Branch | What |
+|---|---|---|---|
+| PART 0 | `be228a2` | `stage-2/part0-contracts-v5` | Contracts v5 + mock fixes (ADR 0010), consumers adapted |
+| A.1 signer | `0b91d2d` | `stage-2/a1-signer` | Key file (argon2id + XChaCha20-Poly1305), `LocalSigner`, NIP-46/NIP-07 adoption, `SignerManager` |
+| A.2 wallet | `0ece03a` | `stage-2/a2-wallet` | `spend.ts` over cashu-ts (P2PK send with post-checks, receive, melt, mint, NUT-07 reconcile), NIP-60 store, `TestMint` |
+| A.3 payment | `17d636a` | `stage-2/a3-payment` | `RealPaymentEngine`: offline verify, windows, bans, flush, carry-aware viewer; the whole L10 suite over real ecash |
+| A.4 pay/1 | `39cdaeb` | `stage-2/a4-pay-protocol` | Codec, connection-bound HELLO, `PayChannel` on protomux; real replication integration test |
+| A.5 gateway auth | `f398f9f` | `stage-2/a5-gateway-auth` | `BlossomAuthImpl` (kind 24242 + BUD-09 report), ADR 0010 §8 |
+| PART B | `bc12485` | `stage-2/part-b-security-review` | `docs/security-review.md` (F30–F32 and the review fixes added in the wrap-up) |
+| Wrap-up | (this commit) | `stage-2/2026-09-23` | Pre-push differential + sharp-edges review and its fixes, standing audit-surface guard, status, handoff |
+
+Test counts: all 27 Stage-2-gated tests run (13 BlossomAuth, 10 pay/1 codec fuzz, 4
+`skipIf(usingMock())`); adversary cases added after every module, each with why it was missed.
+
+**For Cameron:** (1) ADR 0010 §3.3 amends ADR 0007 — the minimum PAY is a batching target,
+not a rejection (an enforced minimum deadlocks multi-seeder viewers); revisit if you disagree.
+(2) The `pay1` creator-set tag is verified only against the in-process `TestMint` — Stage 3
+must run it against nutshell/cdk (F6). (3) Approve filing the `docs/security-review.md` §6
+issues on GitLab and pushing the branches. (4) Still open from Stage 1: one phone scan of the
+Wallet QR (pass = decodes to text starting `lnbc5000n1pj9x7`).
+
 ## Stage 3 — integration and polish: NOT STARTED
+
+Owed from Stage 2 (ADR 0010 Consequences, `docs/security-review.md`): **F1–F4 and F30 before
+any real wallet is wired**; runtime providers (desktop worker, seeder, gateway `cli/providers.ts`: real
+engines, `BlossomAuthImpl` with `serverHost`, HELLO signer, key-file `KeyStore` at 0600);
+payers batching to `minPaySats` (F5/F26); pricing blocks by the policy in force (F9);
+persisting the seen set and the pending flush queue (F10, F12); the `NetworkAdapter`/IPC
+signer bridge + `SignerStatus` "none"; the deferred L5/L6-B/L6-C requests; the NIP-71 `minpay`
+tag in the manifest parser; the native money-gate dialog (F8).

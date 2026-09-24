@@ -406,8 +406,8 @@ describe('WS bridge: one WebSocket = one replication stream + pay/1', () => {
       localNoiseKey: gw.remoteNoiseKey,
       remoteNoiseKey: gw.localNoiseKey,
     };
-    expect(payProtocol.verifyHello({ type: 'HELLO', ...hello }, fromViewer)).toBeNull();
-    expect(payProtocol.verifyHello({ type: 'HELLO', ...hello }, gw)).not.toBeNull(); // not reflectable
+    expect(payProtocol.verifyHello({ type: 'HELLO', ...hello }, fromViewer)).toEqual({ ok: true });
+    expect(payProtocol.verifyHello({ type: 'HELLO', ...hello }, gw).ok).toBe(false); // not reflectable
     expect(typeof p.attachedTo!.createChannel).toBe('function');
     // The seeder verifies downstream PAYs against the MARKED-UP policy.
     expect(r.gateway.seeder.policy().satsPerBlock).toBe(5);

@@ -53,9 +53,11 @@ export function attachPayBridge(opts: PayBridgeOptions): () => void {
         const at = { core, fromBlock: msg.range.fromBlock, toBlock: msg.range.toBlock };
         protocol.sendAck(r.ok ? { ...at, ok: true } : { ...at, ok: false, reason: r.reason });
         if (r.ok) scheduler.notePaidBlocks(r.blocks);
-        // v5: a reused proof secret bans at verify; cut here too, so a bridge used without the
-        // seeder's `onDoubleSpend` subscription still drops the double-spender.
-        else if (r.reason === 'peer-banned' || r.reason === 'double-spend') session.cut('banned');
+        // v5: a reused proof secret bans at verify, and so does a DLEQ forged against a known
+        // keyset (answered `bad-dleq`). Any engine ban ends the session here, after the ACK, so it
+        // reaches the persisted ban list now rather than at the window cut.
+        else if (r.reason === 'peer-banned' || r.reason === 'double-spend' || session.engineBanned)
+          session.cut('banned');
       })().catch((err: unknown) => {
         log.error('pay handling failed', { error: err });
         session.cut('protocol-error');
