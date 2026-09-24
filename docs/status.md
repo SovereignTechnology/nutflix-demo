@@ -3,13 +3,13 @@
 Kept current by the orchestrator after every merge (execution plan §5.1).
 
 **If you are an agent picking this up cold: read an internal session handoff (not published)
-first** — it is the resume point. Stage 1 is complete in code (2026-09-23): all L5
-screens, contracts v4, and the L6 desktop app (L6-0 IPC, L6-A shell, L6-B host, L6-C worker)
-are merged; `npm run ci` 123 files, 2070 passed / 27 skipped. **The one open Stage 1 exit item
-is the Electron e2e** (`npm run -w packages/app-desktop test:e2e`), which cannot run on
-the dev laptop until Cameron applies the D4 sandbox fix (`docs/plan/L6-design.md` D4). After
-that: Stage 2 (`docs/prompts/stage-2-security.md`, contracts v5 — see the v5 list below). Design:
-`docs/plan/L6-design.md`; lane reports `docs/lanes/L6-*.md`.
+first** — it is the resume point. **Stage 1 is DONE (2026-09-23):** all L5 screens, contracts
+v4, the L6 desktop app (L6-0 IPC, L6-A shell, L6-B host, L6-C worker) and the Stage 1 exit
+lanes (UI-followups, Seeder-entry, E2E-fix) are merged; `npm run ci` **129 files, 2126 passed /
+27 skipped**; the Electron e2e (`NUTFLIX_E2E_APPARMOR_PROFILE=1 npm run -w packages/app-desktop
+test:e2e`) passes **13/13, 3 runs in a row** with the Chromium sandbox on. Next: **Stage 2**
+(`docs/prompts/stage-2-security.md`, contracts v5 — see the v5 list below) — Cameron starts it.
+Design: `docs/plan/L6-design.md`; lane reports `docs/lanes/*.md`.
 
 ## Stage 0 — scaffold, contracts, spikes: **DONE 2026-09-04**
 
@@ -27,10 +27,44 @@ that: Stage 2 (`docs/prompts/stage-2-security.md`, contracts v5 — see the v5 l
 | Prompts | `docs/prompts/{orchestrator,lane,stage-2-security}.md` |
 | Lane briefs | `docs/lanes/BRIEFS.md` |
 
-## Stage 1 — parallel lanes
+## Stage 1 — parallel lanes: **DONE 2026-09-23**
 
-`main` is green: **73 test files, 1039 passed / 27 skipped** (`npm run ci`, 2026-09-23, after
-the L5 screens, contracts v4, UI-fixes and L3-flake). On the dev laptop L8's real-ffmpeg suite ran against the **system**
+**Exit evidence (2026-09-23, the dev laptop, merged tree `3f005f4`):**
+
+- **§5(a) two-seeder integration test** (`packages/app-desktop/src/worker/__tests__/two-seeders.integration.test.ts`)
+  green in `npm test`: blocks `[0,16)` from S1 and `[16,32)` from S2, viewer spend = Σ spend
+  events, each seeder `uploaded == paid`, no bans, downloads ≤ prefetch window, 404 after close.
+- **§5(b) Electron e2e** — `NUTFLIX_E2E_APPARMOR_PROFILE=1 npm run -w packages/app-desktop test:e2e`
+  (fidelity 5 + stage1 8, serial): **13/13 on 3 consecutive runs, 16.1 s / 14.6 s / 15.1 s** at
+  load 3.8–4.6. The app plays a 90 s, 2 Mbit/s fixture served by two in-process seeders on the
+  mock engine: price shown before Play; `currentTime > 1`, `videoWidth > 0`; a seek to 50 s
+  answered 206 through `nf-media:` with a Range starting near the target; the WalletChip shows
+  a sats/min rate; Watch → Home keeps one session playing in the mini-player; Watch → Watch
+  leaves exactly one media link; a Markdown `_blank` link opens nothing; no CSP violation.
+- **Sandbox proven at runtime, not just configured:** no bypass switch in main's command line
+  (`noSandboxSwitch: false`), `webPreferences` literal (`contextIsolation`, `sandbox: true`,
+  `nodeIntegration: false`), and the renderer process has a seccomp-bpf filter and its own PID
+  namespace. D4 is met by Cameron's AppArmor profile `/etc/apparmor.d/nutflix-electron`
+  (grants `userns` to `…/nutflix/{,.worktrees/*/}node_modules/electron/dist/electron` only).
+- **Fidelity findings** (risk 5, all answered — `docs/lanes/L6-A.md` "Fidelity findings (first
+  run, 2026-09-23)"): Maps cross `contextBridge` as real `Map`s; an Error keeps its
+  `"<code>: "` message but loses `.code`; a page `File`/`Blob` arrives as a preload-world
+  instance; `webUtils.getPathForFile` works in the sandboxed preload (`''` for a page-built
+  File); Range seeking through `protocol.handle` + `net.fetch` works; an ESM `utilityProcess`
+  and `bare-sidecar` spawned from it work; the CSP header blocks inline script.
+- **The first e2e run found 3 product bugs and 2 harness bugs** (`docs/lanes/E2E-fix.md`): main
+  and host disagreed on the host's argv (`--user-data` vs `--user-data-dir` + `--worker-entry`),
+  so the host crash-looped — each side's unit tests passed against its own spelling, now a
+  round-trip test; the dev-fixture catalogue answered Home before the worker announced its
+  fixtures; playwright-core's `_electron.launch` silently ADDS `--no-sandbox` on Linux unless
+  `chromiumSandbox: true` (main refused it, correctly); `--ozone-platform=headless` segfaults
+  Electron 44.2.0 at `new BrowserWindow` (X11 via GNOME's Xwayland is the default now); the
+  6 s lavfi fixtures were a single 64 KiB block.
+- Out of scope by decision: the web-portal half (the TS app is Pear/desktop-only, ADR 0006).
+
+`main` is green: **129 test files, 2126 passed / 27 skipped** (`npm run ci`, 2026-09-23, after
+the Stage 1 exit lanes). Earlier: 73 files, 1039 passed / 27 skipped after the L5 screens,
+contracts v4, UI-fixes and L3-flake. On the dev laptop L8's real-ffmpeg suite ran against the **system**
 `/usr/bin/ffmpeg` 6.1.1 (it resolves `NUTFLIX_FFMPEG`, then `/tmp/opencode/ffmpeg/`, then PATH),
 not the pinned dev build. On 2026-09-05 the tree reported 651 passed / 27 skipped with an ffmpeg
 present and 647 / 31 without one — that suite `skipIf`s when no binary is found; both are green.
@@ -84,10 +118,11 @@ present and 647 / 31 without one — that suite `skipIf`s when no binary is foun
 | **L3-flake** | `lane/L3-flake` | **merged 2026-09-23** — real bug, not a flake: late WS frames paused a closing socket (30 s stall); cut sockets left `maxConnections` accounting (F1) and a cut mid-stalled-write never started the close (F2). Fixed + 8 deterministic tests; A/B under load 4/10 → 0/10 failures | see git log |
 | **L6-0 IPC foundation** | `lane/L6-0` | **merged 2026-09-23** (app-desktop 13 → 422 tests; 49-method table exact against v4) | see git log |
 | **L6-B host** | `lane/L6-B` | **merged 2026-09-23** (app-desktop 422 → 674 tests; real `DesktopNetworkAdapter`, SE-4/SE-5, T16 image fetch with DNS-answer checks, 48+12-path conformance vs the mock) | see git log |
-| **L6-A shell** | `lane/L6-A` | **merged 2026-09-23** (app-desktop 674 → 687+ tests; Electron main/preload/renderer, IPC gate, SE-1 tokens, playback coordinator; **Electron e2e + fidelity spike written, never run — pending D4**) | see git log |
+| **L6-A shell** | `lane/L6-A` | **merged 2026-09-23** (app-desktop 674 → 687+ tests; Electron main/preload/renderer, IPC gate, SE-1 tokens, playback coordinator; Electron e2e + fidelity spike written; **first run 2026-09-23 via E2E-fix, green**) | see git log |
 | **L6-C worker** | `lane/L6-C` | **merged 2026-09-23** (Bare data plane; day-1 probe 20/20 under real `bare`; gated playback server; credit-paced payer; **§5(a) two-seeder Stage 1 test green, ~2.2 s, 5/5 + under load**) | see git log | No worktree on the dev laptop and no cached Electron binary here (`node node_modules/electron/install.js`) | — |
 | **UI-followups** | `lane/UI-followups` | **merged 2026-09-23** (Library `onToast` → shell stack, Shorts element-pause stops paying, shell toast actions close their toast; ui 481 tests, app-desktop 1043; repo 2082 passed / 27 skipped) | `a2ea58d` |
 | **Seeder-entry** | `lane/Seeder-entry` | **merged 2026-09-23** (daemon entry behind `nutflix-seeder.service`, strict `seeder.json`, Stage 2 seam; seeder 116 tests; repo 128 files, 2111 passed / 27 skipped) | `c68232e` |
+| **E2E-fix** (Stage 1 exit) | `lane/E2E-fix` | **merged 2026-09-23** — host argv round-trip (main ↔ host), dev-fixture boot wait, sandboxed X11 launch (`chromiumSandbox: true` + runtime seccomp/PID-namespace checks), 90 s CBR fixtures, seeks past the prefetch window; e2e 13/13 × 3; app-desktop 52 files / 1055 tests | `d0cebfa` |
 | L7 web-shell | `lane/L7` | **NOT STARTED** — out of scope if ADR 0006 (unmerged, "Pear-runtime-only v0") is adopted | — |
 
 Lane reports: `docs/lanes/L1.md`, `L2.md` (incl. v3 section), `L3.md` (incl. markup section),
@@ -369,7 +404,13 @@ merge between the two histories cannot produce two ADRs with one number. **The n
 |---|---|
 | First-run relays (the host ships damus, nos.lol, primal; a fresh install contacts them) | **Keep the three defaults** — works out of the box; the privacy cost is accepted for v0 and revisited in Stage 3 (ADR 0009) |
 
-**Nothing is currently blocked on Cameron.** `spec/nfx-suite-m0` (ADR 0006) stays unmerged.
+**Waiting on Cameron (2026-09-23):** approval to tag `stage-1`; the start of Stage 2 and its
+model/session; one phone scan of the Wallet QR (sent to him; pass = decodes to text starting
+`lnbc5000n1pj9x7`). `spec/nfx-suite-m0` (ADR 0006) stays unmerged.
 
-## Stage 2 — audit surface (single Fable 5.1 session): NOT STARTED
+## Stage 2 — audit surface (single Fable 5.1 session): READY, NOT STARTED
+
+Prompt updated 2026-09-23 (`docs/prompts/stage-2-security.md`: PART 0 = contracts v5 + the
+mock fixes, then the five locked modules, then the seam review). **Cameron starts it** and
+confirms the model/session; the plan says one Fable 5.1 (high) session, no subagents.
 ## Stage 3 — integration and polish: NOT STARTED
