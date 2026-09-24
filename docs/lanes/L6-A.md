@@ -173,10 +173,11 @@ Commands (from the repo root; serially, never alongside `npm run ci` — risk 9)
 ```
 NUTFLIX_E2E=1 NUTFLIX_E2E_APPARMOR_PROFILE=1 node --test packages/app-desktop/e2e/fidelity.e2e.ts  # ≈ 5 s
 NUTFLIX_E2E=1 NUTFLIX_E2E_APPARMOR_PROFILE=1 node --test packages/app-desktop/e2e/stage1.e2e.ts    # ≈ 11 s
+NUTFLIX_E2E=1 NUTFLIX_E2E_APPARMOR_PROFILE=1 node --test packages/app-desktop/e2e/signer.e2e.ts    # ≈ 4 s (ADR 0013)
 ```
 
-Both at once, serially, from `packages/app-desktop` (≈ 15 s):
-`NUTFLIX_E2E=1 NUTFLIX_E2E_APPARMOR_PROFILE=1 node --test --test-concurrency=1 e2e/fidelity.e2e.ts e2e/stage1.e2e.ts`. `NUTFLIX_E2E_LOG=<file>` appends the app's own log lines
+All at once, serially, from `packages/app-desktop` (≈ 20 s):
+`NUTFLIX_E2E_APPARMOR_PROFILE=1 npm run test:e2e` (fidelity, stage1, signer). `NUTFLIX_E2E_LOG=<file>` appends the app's own log lines
 (main, host, worker — already redacted) to a file for triage.
 
 What `e2e/support.ts` guarantees on every launch:

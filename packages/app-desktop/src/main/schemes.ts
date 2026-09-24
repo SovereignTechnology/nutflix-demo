@@ -10,6 +10,13 @@ export const APP_SCHEME = 'app';
 export const APP_HOST = 'nutflix';
 export const APP_ORIGIN = 'app://nutflix';
 export const APP_URL = 'app://nutflix/index.html';
+/**
+ * ADR 0013: main's trusted prompt window lives at its OWN origin, so Chromium's site isolation
+ * never puts it in the app renderer's process and `'self'` in its CSP means only its own files.
+ */
+export const PROMPT_HOST = 'prompt';
+export const PROMPT_ORIGIN = 'app://prompt';
+export const PROMPT_URL = 'app://prompt/prompt.html';
 export const MEDIA_SCHEME = 'nf-media';
 
 export function privilegedSchemes(): CustomScheme[] {

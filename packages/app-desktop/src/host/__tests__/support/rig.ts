@@ -7,11 +7,12 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import type { RelayUrl, UnixSeconds } from '@sovit/core';
+import type { signer as signerMod } from '@sovit/core';
 import { nostr } from '@sovit/core';
 
 import type { HostOut } from '../../../ipc/protocol.js';
 import type { HostFlags } from '../../flags.js';
-import type { Host } from '../../host.js';
+import type { Host, HostOptions } from '../../host.js';
 import { createHost } from '../../host.js';
 import type { IdentityProvider } from '../../identity.js';
 import type { ImageTransport } from '../../images/net.js';
@@ -33,8 +34,8 @@ export interface Rig {
   readonly userData: string;
   /** Resolves once the (current) worker is ready. */
   ready(): Promise<void>;
-  /** Waits (bounded) until `pred` holds over `out`. */
-  until<T extends HostOut>(pred: (o: HostOut) => o is T, what: string): Promise<T>;
+  /** Waits (bounded, default 3 s) until `pred` holds over `out`. */
+  until<T extends HostOut>(pred: (o: HostOut) => o is T, what: string, ms?: number): Promise<T>;
   close(): Promise<void>;
 }
 
@@ -45,6 +46,12 @@ export interface RigOptions {
   readonly imageTransport?: ImageTransport;
   readonly now?: () => UnixSeconds;
   readonly restart?: RestartPolicy;
+  /** ADR 0012/0013: the money plane's mint transport, the signer's KDF floor and NIP-46. */
+  readonly mintRequest?: HostOptions['mintRequest'];
+  readonly signerCost?: signerMod.KdfCost;
+  readonly nip46?: HostOptions['nip46'];
+  /** Plays main: sees every HostOut after it is recorded (answer prompts with `host.handle`). */
+  readonly onOut?: (o: HostOut, host: () => Host) => void;
 }
 
 /** Polls `check` every few ms until it returns a value, or fails with `what` after `ms`. */
@@ -69,10 +76,17 @@ export async function rig(o: RigOptions = {}): Promise<Rig> {
   const log = memoryLogger('debug');
   const spawner = fakeSpawner(() => new FakeWorkerClass(o.worker));
   let tick = 1_757_000_000;
+  const late: { host?: Host } = {};
   const host = await createHost({
     userData,
     flags: { devMocks: false, devFixtures: false, ...o.flags },
-    post: (m) => out.push(m),
+    post: (m) => {
+      out.push(m);
+      if (o.onOut !== undefined && late.host !== undefined) {
+        const h = late.host;
+        o.onOut(m, () => h);
+      }
+    },
     log,
     workerEntry: '/nonexistent/worker.js',
     spawn: spawner.spawn,
@@ -81,8 +95,12 @@ export async function rig(o: RigOptions = {}): Promise<Rig> {
     now: o.now ?? (() => tick++ as UnixSeconds),
     ...(o.identity === undefined ? {} : { identity: o.identity }),
     ...(o.restart === undefined ? {} : { restart: o.restart }),
+    ...(o.mintRequest === undefined ? {} : { mintRequest: o.mintRequest }),
+    ...(o.signerCost === undefined ? {} : { signerCost: o.signerCost }),
+    ...(o.nip46 === undefined ? {} : { nip46: o.nip46 }),
     imageTransport: o.imageTransport ?? (() => Promise.reject(new Error('no network in tests'))),
   });
+  late.host = host;
   // Point the relay list at the fake pool's test relays (defaults are public relays).
   await host.adapter.updateSettings({
     relays: [
@@ -101,8 +119,8 @@ export async function rig(o: RigOptions = {}): Promise<Rig> {
     ready: async () => {
       await eventually(() => host.worker.state === 'ready', 'worker ready');
     },
-    until: <T extends HostOut>(pred: (o: HostOut) => o is T, what: string) =>
-      eventually(() => out.find(pred), what),
+    until: <T extends HostOut>(pred: (o: HostOut) => o is T, what: string, ms?: number) =>
+      eventually(() => out.find(pred), what, ms),
     close: async () => {
       host.stop();
       await rm(userData, { recursive: true, force: true });

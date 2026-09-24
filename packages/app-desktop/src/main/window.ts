@@ -44,3 +44,41 @@ export function createMainWindow(
     },
   });
 }
+
+/**
+ * ADR 0013: main's trusted prompt window — where passphrases, an nsec or a bunker URI are typed,
+ * never in the app window. Modal to the app window, small and fixed, at its own origin
+ * (`app://prompt`, see `schemes.ts`), with its own preload (two calls, nothing else). The same
+ * literal posture as the app window, written out for the lint and the reviewer; devtools off.
+ */
+export function createPromptWindow(
+  BrowserWindow: BrowserWindowCtor,
+  preload: string,
+  parent: ElectronBrowserWindow | undefined,
+): ElectronBrowserWindow {
+  return new BrowserWindow({
+    ...(parent === undefined ? {} : { parent, modal: true }),
+    width: 460,
+    height: 480,
+    resizable: false,
+    minimizable: false,
+    maximizable: false,
+    fullscreenable: false,
+    show: false,
+    title: 'Nutflix',
+    backgroundColor: '#0f0f0f',
+    autoHideMenuBar: true,
+    webPreferences: {
+      preload,
+      contextIsolation: true,
+      sandbox: true,
+      nodeIntegration: false,
+      nodeIntegrationInWorker: false,
+      nodeIntegrationInSubFrames: false,
+      spellcheck: false,
+      safeDialogs: true,
+      navigateOnDragDrop: false,
+      devTools: false,
+    },
+  });
+}

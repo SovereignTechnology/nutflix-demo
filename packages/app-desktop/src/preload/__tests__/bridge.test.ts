@@ -7,7 +7,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { mocks } from '@sovit/core';
 import type { ArgsOf, Method, PlaySessionWire, Topic } from '../../ipc/protocol.js';
-import { EXCLUDED_METHODS, METHODS, TOPIC_METHODS } from '../../ipc/index.js';
+import { EXCLUDED_METHODS, METHODS, SHELL_TOPIC_METHODS, TOPIC_METHODS } from '../../ipc/index.js';
 import { fromWireError, wireError } from '../../ipc/errors.js';
 import { createBridge } from '../bridge.js';
 import type { Transport } from '../transport.js';
@@ -20,17 +20,15 @@ const SID = 'a'.repeat(32);
 /** The allowlist, derived from L6-0's constants (the same derivation the renderer test uses). */
 export function expectedKeyTree(): string[] {
   const keys = new Set<string>(['platform']);
+  // Every dotted prefix is an object key too (`desktop`, `desktop.signer`, …).
   const add = (dotted: string): void => {
-    const [head, tail] = dotted.split('.');
-    if (tail === undefined) keys.add(dotted);
-    else {
-      keys.add(head ?? '');
-      keys.add(dotted);
-    }
+    const parts = dotted.split('.');
+    for (let i = 1; i <= parts.length; i++) keys.add(parts.slice(0, i).join('.'));
   };
   for (const m of METHODS) if (!m.startsWith('session.')) add(m);
   for (const m of Object.keys(EXCLUDED_METHODS)) add(m);
   for (const m of Object.keys(TOPIC_METHODS)) add(m);
+  for (const m of Object.keys(SHELL_TOPIC_METHODS)) add(m);
   return [...keys].sort();
 }
 
@@ -136,10 +134,11 @@ async function codeOf(p: Promise<unknown>): Promise<{ code: unknown; message: st
 }
 
 describe('preload surface (key tree allowlist)', () => {
-  it('exposes exactly the NetworkAdapter shape + desktop.ffmpeg', () => {
+  it('exposes exactly the NetworkAdapter shape + desktop.ffmpeg + desktop.signer.*', () => {
     const { b } = bridge();
     expect(keyTree(b)).toEqual(expectedKeyTree());
     expect(keyTree(b)).toContain('desktop.ffmpeg');
+    expect(keyTree(b)).toContain('desktop.signer.connect');
     expect(keyTree(b)).not.toContain('invoke');
     expect(Object.keys(b)).not.toContain('ipcRenderer');
   });

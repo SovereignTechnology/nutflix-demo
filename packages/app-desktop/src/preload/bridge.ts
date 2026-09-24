@@ -1,6 +1,6 @@
 /**
  * `window.nutflix` (design §3 row 2, D3/D5, SE-1). Exactly the `NetworkAdapter` shape plus
- * `desktop.ffmpeg`:
+ * `desktop.ffmpeg` and `desktop.signer.*` (ADR 0013):
  *
  *   - every `MethodTable` method → one numbered call through the IPC gate;
  *   - callback members (`notifications`, `seeder.onStatus`, `wallet.onChange`) → topics;
@@ -273,6 +273,15 @@ export function createBridge(t: Transport, deps: BridgeDeps): NutflixBridge {
     notifications: (cb) => t.subscribe({ t: 'notifications' }, cb),
     desktop: {
       ffmpeg: call('desktop.ffmpeg'),
+      // ADR 0013: names a signer KIND only; secrets are typed in main's prompt window.
+      signer: {
+        info: call('desktop.signer.info'),
+        connect: call('desktop.signer.connect'),
+        unlock: call('desktop.signer.unlock'),
+        lock: call('desktop.signer.lock'),
+        signOut: call('desktop.signer.signOut'),
+        onStatus: (cb) => t.subscribe({ t: 'signer.status' }, cb),
+      },
     },
   };
 }

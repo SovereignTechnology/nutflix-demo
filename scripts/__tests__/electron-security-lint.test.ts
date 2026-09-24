@@ -74,15 +74,18 @@ describe('scripts/electron-security-lint.mjs', () => {
     ).toBe(1);
   });
 
-  // Lane L6-A added the app's one window (src/main/window.ts). Exactly one: a second window or
-  // webPreferences object in src/ must be a deliberate, reviewed change that updates this test.
-  it('packages/app-desktop/src passes: exactly one window, literal posture (lane L6-A)', () => {
+  // Lane L6-A added the app's one window (src/main/window.ts); ADR 0013 (Stage 3, the signer
+  // lane) added the second, main's trusted prompt window (`createPromptWindow`, same file, same
+  // literal posture plus `devTools: false`), reviewed in docs/reviews/2026-09-24-pre-push-desktop-
+  // signer.md. Exactly two: a third window or webPreferences object in src/ must be another
+  // deliberate, reviewed change that updates this test.
+  it('packages/app-desktop/src passes: exactly two windows, literal posture (L6-A, ADR 0013)', () => {
     const r = runNode('electron-security-lint.mjs', [
       join(repoRoot, 'packages', 'app-desktop', 'src'),
     ]);
     expect(r.status, r.stderr).toBe(0);
     expect(r.stderr).toMatch(
-      / 1 window constructor\(s\), 1 webPreferences object\(s\), 0 violations/,
+      / 2 window constructor\(s\), 2 webPreferences object\(s\), 0 violations/,
     );
   });
 

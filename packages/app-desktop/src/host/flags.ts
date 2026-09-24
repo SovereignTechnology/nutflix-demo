@@ -9,6 +9,8 @@ import { isAbsolute } from 'node:path';
 export interface HostFlags {
   readonly devMocks: boolean;
   readonly devFixtures: boolean;
+  /** ADR 0013: main can seal secrets in the OS keychain (never Linux's `basic_text`). */
+  readonly keychain?: boolean;
   readonly devBootstrap?: readonly { readonly host: '127.0.0.1'; readonly port: number }[];
 }
 
@@ -39,6 +41,7 @@ export function parseHostArgs(argv: readonly string[]): HostArgs {
   let workerEntry: string | undefined;
   let devMocks = false;
   let devFixtures = false;
+  let keychain = false;
   let devBootstrap: { host: '127.0.0.1'; port: number }[] | undefined;
   for (const arg of argv) {
     const eq = arg.indexOf('=');
@@ -58,6 +61,10 @@ export function parseHostArgs(argv: readonly string[]): HostArgs {
         if (value !== undefined) throw new HostArgsError(`${key} takes no value`);
         if (key === '--dev-mocks') devMocks = true;
         else devFixtures = true;
+        break;
+      case '--keychain':
+        if (value !== undefined) throw new HostArgsError('--keychain takes no value');
+        keychain = true;
         break;
       case '--dev-bootstrap':
         if (value === undefined) throw new HostArgsError('--dev-bootstrap needs a value');
@@ -79,6 +86,7 @@ export function parseHostArgs(argv: readonly string[]): HostArgs {
     flags: {
       devMocks,
       devFixtures,
+      ...(keychain ? { keychain } : {}),
       ...(devBootstrap === undefined ? {} : { devBootstrap }),
     },
   };

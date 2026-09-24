@@ -2,7 +2,9 @@
  * The shell header (design §4 "Chrome"): back/forward, the brand (→ Home), search (→ the
  * `search` route on submit), the `WalletChip` (total from `wallet.balances` + `onChange`,
  * streaming rate from the playback coordinator; click → Wallet) and the viewer's avatar
- * (→ their channel; signed out → Settings to connect a signer).
+ * (→ their channel; signed out → Settings to connect a signer). ADR 0013: with the desktop
+ * signer flow, "Unlock" while the signer is locked, "Lock" and "Sign out" while it is not (main
+ * asks before signing out; every secret is typed in main's own prompt window).
  */
 import { useEffect, useState, type ReactElement, type SyntheticEvent } from 'react';
 import type { Sats } from '@sovit/core';
@@ -22,6 +24,14 @@ export interface HeaderProps {
   readonly balance: Sats | undefined;
   /** sats/min of the session that is paying now; 0 = none. */
   readonly ratePerMin: number;
+  /** ADR 0013: the signer actions, when the host offers the flow. */
+  readonly signer?:
+    | {
+        readonly unlock: () => Promise<void>;
+        readonly lock: () => Promise<void>;
+        readonly signOut: () => Promise<void>;
+      }
+    | undefined;
 }
 
 export function Header(props: HeaderProps): ReactElement {
@@ -80,6 +90,16 @@ export function Header(props: HeaderProps): ReactElement {
       <div className="nf-shell__header-end">
         {identity.status === 'signed-in' ? (
           <>
+            {props.signer !== undefined && identity.locked === true ? (
+              <Button
+                variant="accent"
+                size="sm"
+                icon="key"
+                onClick={() => void props.signer?.unlock()}
+              >
+                Unlock
+              </Button>
+            ) : null}
             <WalletChip
               balance={props.balance}
               satsPerMin={props.ratePerMin > 0 ? props.ratePerMin : undefined}
@@ -106,6 +126,20 @@ export function Header(props: HeaderProps): ReactElement {
                 size="sm"
               />
             </button>
+            {props.signer !== undefined ? (
+              <>
+                {identity.locked !== true ? (
+                  <IconButton
+                    icon="lock"
+                    label="Lock signer"
+                    onClick={() => void props.signer?.lock()}
+                  />
+                ) : null}
+                <Button variant="ghost" size="sm" onClick={() => void props.signer?.signOut()}>
+                  Sign out
+                </Button>
+              </>
+            ) : null}
           </>
         ) : identity.status === 'signed-out' ? (
           <Button

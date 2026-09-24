@@ -427,4 +427,103 @@ describe('WorkerSupervisor', () => {
     expect(events).toEqual([]);
     sup.stop();
   });
+
+  it('ADR 0013: restart(between) stops the worker, runs `between` with none alive, then starts a fresh one', async () => {
+    const { sup, spawner, states, ready } = setup({
+      worker: { handlers: { 'play.pause': () => new Promise(() => undefined) } },
+    });
+    sup.start();
+    await ready();
+    const hanging = sup.request('play.pause', { sid: SID });
+    await eventually(() => spawner.last().calls('play.pause').length === 1, 'the call to land');
+    let during: { state: string; alive: boolean } | undefined;
+    await sup.restart(() => {
+      during = { state: sup.state, alive: !spawner.spawned[0]!.destroyed };
+      return Promise.resolve();
+    });
+    expect(during).toEqual({ state: 'down', alive: false });
+    expect(await codeOf(hanging)).toBe('backend-down');
+    expect(spawner.spawned).toHaveLength(2);
+    await ready();
+    expect(spawner.last().received[0]?.m).toBe('init');
+    expect(states).toEqual(['starting', 'ready', 'down', 'starting', 'ready']);
+    sup.stop();
+  });
+
+  it('ADR 0013: deliberate restarts never exhaust the crash budget, and revive a failed worker', async () => {
+    const { sup, spawner, clock } = setup({ worker: { silent: true } });
+    sup.start();
+    for (let i = 0; i < 6; i++) await sup.restart(() => Promise.resolve());
+    expect(sup.state).toBe('starting');
+    expect(spawner.spawned).toHaveLength(7);
+    // Now crash it into `failed`…
+    for (let i = 0; i < 4; i++) {
+      spawner.last().crash(1);
+      await eventually(() => sup.state === 'down' || sup.state === 'failed', `down #${String(i)}`);
+      clock.advance(10_000);
+    }
+    await eventually(() => sup.state === 'failed', 'failed');
+    // …and a new signer is a reason to try again.
+    await sup.restart(() => Promise.resolve());
+    expect(sup.state).toBe('starting');
+    sup.stop();
+  });
+
+  it('ADR 0013: restart on a stopped (or never started) supervisor only runs `between`', async () => {
+    const { sup, spawner } = setup();
+    let ran = 0;
+    await sup.restart(() => {
+      ran++;
+      return Promise.resolve();
+    });
+    expect(spawner.spawned).toHaveLength(0);
+    sup.start();
+    sup.stop();
+    await sup.restart(() => {
+      ran++;
+      return Promise.resolve();
+    });
+    expect(ran).toBe(2);
+    expect(spawner.spawned).toHaveLength(1);
+    expect(sup.state).toBe('stopped');
+  });
+
+  it('ADR 0013: a failing `between` still restarts the worker, then rethrows', async () => {
+    const { sup, spawner, ready } = setup();
+    sup.start();
+    await ready();
+    await expect(sup.restart(() => Promise.reject(new Error('boom')))).rejects.toThrow('boom');
+    expect(spawner.spawned).toHaveLength(2);
+    await ready();
+    sup.stop();
+  });
+
+  it('ADR 0013: handlers given as a function are read per request', async () => {
+    let table: 'a' | 'b' = 'a';
+    const clock = new ManualClock();
+    const spawner = fakeSpawner(() => new FakeWorker());
+    const sup = new WorkerSupervisor({
+      spawn: spawner.spawn,
+      entry: '/w.js',
+      init: () => INIT,
+      log: memoryLogger('debug'),
+      onEvent: () => undefined,
+      handlers: () => ({
+        'studio.publish': () =>
+          Promise.reject(new Error(table === 'a' ? 'no-signer: a' : 'relay-down: b')),
+      }),
+      timers: clock,
+      now: () => clock.now,
+    });
+    sup.start();
+    await eventually(() => sup.state === 'ready', 'ready');
+    await expect(spawner.last().request('studio.publish', DRAFT)).rejects.toMatchObject({
+      code: 'no-signer',
+    });
+    table = 'b';
+    await expect(spawner.last().request('studio.publish', DRAFT)).rejects.toMatchObject({
+      code: 'relay-down',
+    });
+    sup.stop();
+  });
 });

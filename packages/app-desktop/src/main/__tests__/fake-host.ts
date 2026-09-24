@@ -213,6 +213,10 @@ export class FakeHost {
         });
         return;
       }
+      case 'prompt-answer':
+      case 'keychain-result':
+        // ADR 0013: main's prompt window / keychain answering the host; this fake asks nothing.
+        return;
     }
   }
 
@@ -261,6 +265,9 @@ export class FakeHost {
           );
         };
       }
+      case 'signer.status':
+        // ADR 0013: the fake adapter's signer never changes.
+        return () => undefined;
     }
   }
 

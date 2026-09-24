@@ -23,50 +23,133 @@ import { mocks } from '@sovit/core';
 import { hostError } from './errors.js';
 
 const UNAVAILABLE = 'no wallet in Stage 1 (run with --dev-mocks for fake sats)';
-
-function unavailable<T>(): Promise<T> {
-  return Promise.reject(hostError('payments-unavailable', UNAVAILABLE));
-}
+/** Stage 3 (ADR 0013): what a signed-out, locked or wallet-less desktop says. */
+export const NO_WALLET_YET =
+  'no wallet: connect and unlock a signer (Settings › Account), and create a wallet';
 
 export class UnavailableWallet implements Wallet {
+  private readonly why: string;
+  constructor(why: string = UNAVAILABLE) {
+    this.why = why;
+  }
+  private unavailable<T>(): Promise<T> {
+    return Promise.reject(hostError('payments-unavailable', this.why));
+  }
   mints(): Promise<readonly MintUrl[]> {
-    return unavailable();
+    return this.unavailable();
   }
   balance(_mint: MintUrl): Promise<Sats> {
-    return unavailable();
+    return this.unavailable();
   }
   balances(): Promise<ReadonlyMap<MintUrl, Sats>> {
-    return unavailable();
+    return this.unavailable();
   }
   p2pkPubkey(): Promise<CashuP2pkPubkey> {
-    return unavailable();
+    return this.unavailable();
   }
   mintQuote(_mint: MintUrl, _amount: Sats): Promise<MintQuote> {
-    return unavailable();
+    return this.unavailable();
   }
   pollQuote(_quote: MintQuote): Promise<{ state: MintQuote['state']; minted?: Sats }> {
-    return unavailable();
+    return this.unavailable();
   }
   send(_amount: Sats, _opts: { p2pk: CashuP2pkPubkey; mint: MintUrl }): Promise<LockedProofSet> {
-    return unavailable();
+    return this.unavailable();
   }
   receive(_set: LockedProofSet): Promise<Sats> {
-    return unavailable();
+    return this.unavailable();
   }
   meltQuote(_mint: MintUrl, _bolt11: string): Promise<MeltQuote> {
-    return unavailable();
+    return this.unavailable();
   }
   melt(_quote: MeltQuote): Promise<{ paid: boolean; preimage?: string; change: Sats }> {
-    return unavailable();
+    return this.unavailable();
   }
   keyset(_mint: MintUrl, _keysetId: string): Promise<MintKeyset> {
-    return unavailable();
+    return this.unavailable();
   }
   history(): Promise<readonly WalletHistoryEntry[]> {
-    return unavailable();
+    return this.unavailable();
   }
   onChange(_cb: (e: WalletChangeEvent) => void): () => void {
     return () => undefined;
+  }
+}
+
+/**
+ * Stage 3 (ADR 0013): the wallet the adapter holds for the app's lifetime, delegating to the
+ * money plane of whatever signer is unlocked NOW (`set` on every signer change) — or answering
+ * `payments-unavailable` while there is none. `onChange` listeners outlive the swaps.
+ */
+export class SwitchingWallet implements Wallet {
+  private current: Wallet | undefined;
+  private off: (() => void) | null = null;
+  private readonly none = new UnavailableWallet(NO_WALLET_YET);
+  private readonly listeners = new Set<(e: WalletChangeEvent) => void>();
+
+  set(w: Wallet | undefined): void {
+    if (w === this.current) return;
+    this.off?.();
+    this.off = null;
+    this.current = w;
+    if (w !== undefined)
+      this.off = w.onChange((e) => {
+        for (const cb of this.listeners) {
+          try {
+            cb(e);
+          } catch {
+            // a listener's failure is its own
+          }
+        }
+      });
+  }
+  private w(): Wallet {
+    return this.current ?? this.none;
+  }
+  mints(): Promise<readonly MintUrl[]> {
+    return this.w().mints();
+  }
+  balance(mint: MintUrl): Promise<Sats> {
+    return this.w().balance(mint);
+  }
+  balances(): Promise<ReadonlyMap<MintUrl, Sats>> {
+    return this.w().balances();
+  }
+  p2pkPubkey(): Promise<CashuP2pkPubkey> {
+    return this.w().p2pkPubkey();
+  }
+  mintQuote(mint: MintUrl, amount: Sats): Promise<MintQuote> {
+    return this.w().mintQuote(mint, amount);
+  }
+  pollQuote(quote: MintQuote): Promise<{ state: MintQuote['state']; minted?: Sats }> {
+    return this.w().pollQuote(quote);
+  }
+  send(amount: Sats, opts: { p2pk: CashuP2pkPubkey; mint: MintUrl }): Promise<LockedProofSet> {
+    return this.w().send(amount, opts);
+  }
+  receive(set: LockedProofSet): Promise<Sats> {
+    return this.w().receive(set);
+  }
+  meltQuote(mint: MintUrl, bolt11: string): Promise<MeltQuote> {
+    return this.w().meltQuote(mint, bolt11);
+  }
+  melt(quote: MeltQuote): Promise<{ paid: boolean; preimage?: string; change: Sats }> {
+    return this.w().melt(quote);
+  }
+  keyset(mint: MintUrl, keysetId: string): Promise<MintKeyset> {
+    return this.w().keyset(mint, keysetId);
+  }
+  history(opts?: {
+    readonly limit?: number;
+    readonly mint?: MintUrl;
+  }): Promise<readonly WalletHistoryEntry[]> {
+    return this.w().history(opts);
+  }
+  onChange(cb: (e: WalletChangeEvent) => void): () => void {
+    this.listeners.add(cb);
+    return () => {
+      this.listeners.delete(cb);
+    };
   }
 }
 

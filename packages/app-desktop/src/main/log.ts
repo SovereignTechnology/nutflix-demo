@@ -28,7 +28,13 @@ export type LogEvent =
   | 'gate.refused'
   | 'media.link-dropped'
   | 'media.proxy-failed'
-  | 'image.timeout';
+  | 'image.timeout'
+  // ADR 0013
+  | 'prompt.load-failed'
+  | 'prompt.window-failed'
+  | 'prompt.bad-answer'
+  | 'prompt.refused-sender'
+  | 'keychain.ready';
 
 const RANK: Record<LogLevel, number> = { debug: 0, info: 1, warn: 2, error: 3 };
 const FIELD_NAME = /^[a-z][A-Za-z0-9]{0,31}$/;

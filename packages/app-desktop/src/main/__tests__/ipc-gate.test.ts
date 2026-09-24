@@ -378,10 +378,36 @@ describe('IPC gate — money gate (Stage 2 hook)', () => {
     expect(seen[0]?.known).toEqual(current.ok ? current.result : undefined);
   });
 
-  it('never asks for anything else', async () => {
+  it('ADR 0013: sign-out is asked first; a refusal never reaches the host, a yes does', async () => {
+    const h = createHarness();
+    const seen: unknown[] = [];
+    let answer = false;
+    const gate = h.gate as unknown as {
+      deps: { moneyGate: { confirm: (r: unknown) => Promise<boolean> } };
+    };
+    gate.deps.moneyGate.confirm = (r) => {
+      seen.push(r);
+      return Promise.resolve(answer);
+    };
+    expectError(await h.gate.call(h.ev(), callMsg('desktop.signer.signOut', [])), 'forbidden');
+    await h.host.settled();
+    expect(h.host.received.filter((m) => m.kind === 'call')).toHaveLength(0);
+    answer = true;
+    await h.gate.call(h.ev(), callMsg('desktop.signer.signOut', []));
+    await h.host.settled();
+    expect(seen).toEqual([
+      { wc: 1, method: 'desktop.signer.signOut' },
+      { wc: 1, method: 'desktop.signer.signOut' },
+    ]);
+    expect(h.host.received.filter((m) => m.kind === 'call')).toHaveLength(1);
+  });
+
+  it('never asks for anything else (a signer connect names a kind only; the prompt window asks)', async () => {
     const h = createHarness();
     await h.gate.call(h.ev(), callMsg('wallet.balances', []));
     await h.gate.call(h.ev(), callMsg('video', [VIDEO.id]));
+    await h.gate.call(h.ev(), callMsg('desktop.signer.connect', [{ kind: 'local' }]));
+    await h.gate.call(h.ev(), callMsg('desktop.signer.lock', []));
     expect(h.money.asked).toEqual([]);
   });
 });

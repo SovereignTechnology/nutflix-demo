@@ -18,10 +18,11 @@ import {
   isTopic,
   isVideoManifest,
   isSeederStatusWire,
+  promptAnswerFits,
   validateArgs,
 } from '../guards.js';
 import type { Guard } from '../guards.js';
-import { EXCLUDED_METHODS, IPC_V, LIMITS, TOPIC_METHODS } from '../protocol.js';
+import { EXCLUDED_METHODS, IPC_V, LIMITS, MAX_SECRET_BYTES, TOPIC_METHODS } from '../protocol.js';
 import type { Method } from '../protocol.js';
 import { dehydrate } from '../wiremap.js';
 import { INVALID, SID, TOKEN, UPLOAD_ID, VALID } from './samples.js';
@@ -70,7 +71,8 @@ function hostile(): unknown[] {
 describe('validateArgs — coverage', () => {
   it('has a guard for every method, and every guard has valid samples', () => {
     expect(new Set(METHODS)).toEqual(new Set(methods));
-    expect(METHODS.length).toBe(49);
+    // 49 + the five `desktop.signer.*` shell methods (ADR 0013).
+    expect(METHODS.length).toBe(54);
   });
 
   it('D3: wallet.send / wallet.receive (and the engine-internal wallet calls) are not methods', () => {
@@ -258,6 +260,110 @@ describe('message envelopes', () => {
     );
     expect(isHostOut({ kind: 'image', req: 1, bytes: null, type: null })).toBe(true);
     expect(isHostOut({ kind: 'image', req: 1, bytes: [1], type: 'image/png' })).toBe(false);
+  });
+
+  it('ADR 0013: prompt and keychain messages carry data only, secrets as bounded bytes', () => {
+    const b = (s: string): Uint8Array => new TextEncoder().encode(s);
+    // host → main
+    for (const form of [
+      { kind: 'local-setup', hasKey: false, keychain: true },
+      { kind: 'unlock-passphrase', retry: true },
+      { kind: 'new-passphrase' },
+      { kind: 'import-nsec' },
+      { kind: 'bunker', keychain: false },
+      { kind: 'create-wallet' },
+    ])
+      expect(isHostOut({ kind: 'prompt', req: 1, form }), JSON.stringify(form)).toBe(true);
+    for (const form of [
+      { kind: 'local-setup', hasKey: false },
+      { kind: 'unlock-passphrase' },
+      { kind: 'new-passphrase', title: 'Type your seed words here' }, // no prose from upstream
+      { kind: 'export-key' },
+      null,
+    ])
+      expect(isHostOut({ kind: 'prompt', req: 1, form }), JSON.stringify(form)).toBe(false);
+    expect(isHostOut({ kind: 'prompt-cancel', req: 1 })).toBe(true);
+    expect(isHostOut({ kind: 'keychain', req: 1, op: 'get', slot: 'passphrase' })).toBe(true);
+    expect(isHostOut({ kind: 'keychain', req: 1, op: 'forget', slot: 'nip46' })).toBe(true);
+    expect(isHostOut({ kind: 'keychain', req: 1, op: 'put', slot: 'nip46', value: b('x') })).toBe(
+      true,
+    );
+    expect(isHostOut({ kind: 'keychain', req: 1, op: 'put', slot: 'nip46' })).toBe(false);
+    expect(isHostOut({ kind: 'keychain', req: 1, op: 'get', slot: 'nip46', value: b('x') })).toBe(
+      false,
+    );
+    expect(isHostOut({ kind: 'keychain', req: 1, op: 'get', slot: 'nsec' })).toBe(false);
+    expect(
+      isHostOut({
+        kind: 'keychain',
+        req: 1,
+        op: 'put',
+        slot: 'passphrase',
+        value: new Uint8Array(MAX_SECRET_BYTES + 1),
+      }),
+    ).toBe(false);
+    expect(
+      isHostOut({ kind: 'keychain', req: 1, op: 'put', slot: 'passphrase', value: 'plaintext' }),
+    ).toBe(false);
+    // main → host
+    expect(isHostIn({ kind: 'prompt-answer', req: 1, answer: null })).toBe(true);
+    expect(
+      isHostIn({ kind: 'prompt-answer', req: 1, answer: { kind: 'secret', value: b('pw') } }),
+    ).toBe(true);
+    expect(
+      isHostIn({
+        kind: 'prompt-answer',
+        req: 1,
+        answer: { kind: 'bunker', uri: b('bunker://x'), remember: false },
+      }),
+    ).toBe(true);
+    expect(
+      isHostIn({
+        kind: 'prompt-answer',
+        req: 1,
+        answer: { kind: 'local-setup', method: 'keychain', flow: 'import' },
+      }),
+    ).toBe(true);
+    for (const answer of [
+      { kind: 'secret', value: 'a string, not bytes' },
+      { kind: 'secret', value: new Uint8Array(0) },
+      { kind: 'secret', value: new Uint8Array(MAX_SECRET_BYTES + 1) },
+      { kind: 'bunker', uri: b('x') },
+      { kind: 'local-setup', method: 'plaintext', flow: 'generate' },
+      { kind: 'create-wallet', create: 'yes' },
+    ])
+      expect(isHostIn({ kind: 'prompt-answer', req: 1, answer }), JSON.stringify(answer)).toBe(
+        false,
+      );
+    expect(isHostIn({ kind: 'keychain-result', req: 1, ok: true, value: null })).toBe(true);
+    expect(isHostIn({ kind: 'keychain-result', req: 1, ok: true, value: b('pw') })).toBe(true);
+    expect(isHostIn({ kind: 'keychain-result', req: 1, ok: 'yes', value: null })).toBe(false);
+  });
+
+  it('ADR 0013: an answer fits only the question it answers, with only what was offered', () => {
+    const secret = { kind: 'secret', value: new Uint8Array([1]) } as const;
+    const setup = (method: 'passphrase' | 'keychain', flow: 'unlock' | 'import' | 'generate') =>
+      ({ kind: 'local-setup', method, flow }) as const;
+    const noKey = { kind: 'local-setup', hasKey: false, keychain: false } as const;
+    const hasKey = { kind: 'local-setup', hasKey: true, keychain: true } as const;
+    expect(promptAnswerFits(noKey, setup('passphrase', 'generate'))).toBe(true);
+    expect(promptAnswerFits(noKey, setup('passphrase', 'import'))).toBe(true);
+    expect(promptAnswerFits(noKey, setup('passphrase', 'unlock'))).toBe(false);
+    expect(promptAnswerFits(noKey, setup('keychain', 'generate'))).toBe(false);
+    expect(promptAnswerFits(hasKey, setup('keychain', 'unlock'))).toBe(true);
+    expect(promptAnswerFits(hasKey, setup('passphrase', 'generate'))).toBe(false);
+    expect(promptAnswerFits({ kind: 'import-nsec' }, secret)).toBe(true);
+    expect(promptAnswerFits({ kind: 'create-wallet' }, secret)).toBe(false);
+    const bunker = { kind: 'bunker', uri: new Uint8Array([1]), remember: true } as const;
+    expect(promptAnswerFits({ kind: 'bunker', keychain: true }, bunker)).toBe(true);
+    expect(promptAnswerFits({ kind: 'bunker', keychain: false }, bunker)).toBe(false);
+    expect(
+      promptAnswerFits({ kind: 'bunker', keychain: false }, { ...bunker, remember: false }),
+    ).toBe(true);
+    expect(promptAnswerFits({ kind: 'unlock-passphrase', retry: false }, bunker)).toBe(false);
+    expect(
+      promptAnswerFits({ kind: 'create-wallet' }, { kind: 'create-wallet', create: true }),
+    ).toBe(true);
   });
 });
 

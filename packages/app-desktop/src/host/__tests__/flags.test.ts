@@ -28,6 +28,15 @@ describe('parseHostArgs', () => {
     });
   });
 
+  it('ADR 0013: --keychain (main found a real OS keychain) is a plain switch', () => {
+    expect(parseHostArgs([...BASE, '--keychain']).flags).toEqual({
+      devMocks: false,
+      devFixtures: false,
+      keychain: true,
+    });
+    expect(() => parseHostArgs([...BASE, '--keychain=basic_text'])).toThrow(HostArgsError);
+  });
+
   it('REFUSES --dev-fixtures without --dev-mocks (design §5a)', () => {
     expect(() => parseHostArgs([...BASE, '--dev-fixtures'])).toThrow(
       /--dev-fixtures is refused without --dev-mocks/,

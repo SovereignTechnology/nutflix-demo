@@ -12,8 +12,8 @@
  *      same webContents, unexpired) or the call is answered `file-token-invalid`;
  *   5. the confirm gate (`money-gate.ts`, a native dialog in main) — `wallet.melt`,
  *      `seeder.melt`, `nutzap`; an `updateSettings` patch that adds trusted mints or turns an
- *      auto top-up on; and `studio.upload`, naming the file the token resolved to (security
- *      review F7/F8).
+ *      auto top-up on; `studio.upload`, naming the file the token resolved to (security
+ *      review F7/F8); and `desktop.signer.signOut` (ADR 0013).
  *
  * Only then is a `HostIn` posted to the host `utilityProcess`, which re-validates it. Handlers
  * never throw across `ipcMain.handle`: every path resolves a `ReplyMsg` (L6-0 rule). Replies
@@ -322,6 +322,8 @@ export class IpcGate {
       };
     else if (isMoneyMethod(msg.method))
       question = { wc: st.wc.id, method: msg.method, args: msg.args } as MoneyRequest;
+    else if (msg.method === 'desktop.signer.signOut')
+      question = { wc: st.wc.id, method: 'desktop.signer.signOut' };
     if (question !== undefined) {
       const ok = await this.deps.moneyGate.confirm(question).catch(() => false);
       if (!ok) {

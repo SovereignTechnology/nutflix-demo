@@ -9,7 +9,7 @@ import { StrictMode } from 'react';
 import { createRoot } from 'react-dom/client';
 import { adapterFromBridge } from './adapter/rehydrate.js';
 import type { NutflixBridge } from './bridge-types.js';
-import { Shell } from './App.js';
+import { Shell, type SignerFlow } from './App.js';
 import { createShellModel } from './model.js';
 
 function boot(root: HTMLElement): void {
@@ -19,6 +19,18 @@ function boot(root: HTMLElement): void {
     return;
   }
   const model = createShellModel(adapterFromBridge(bridge));
+  const s = bridge.desktop.signer;
+  const signerFlow: SignerFlow = {
+    info: () => s.info(),
+    connect: (kind) => s.connect({ kind }),
+    unlock: () => s.unlock(),
+    lock: () => s.lock(),
+    signOut: () => s.signOut(),
+    onChange: (cb) =>
+      s.onStatus(() => {
+        cb();
+      }),
+  };
   createRoot(root).render(
     <StrictMode>
       <Shell
@@ -26,6 +38,7 @@ function boot(root: HTMLElement): void {
         coordinator={model.coordinator}
         router={model.router}
         probeFfmpeg={(recheck) => bridge.desktop.ffmpeg({ recheck })}
+        signerFlow={signerFlow}
       />
     </StrictMode>,
   );

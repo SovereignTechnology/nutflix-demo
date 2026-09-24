@@ -189,6 +189,11 @@ export const VALID: Samples = {
     [{ autoTopUp: { belowSats: sats(0), fromMint: MINT } }],
   ],
   'desktop.ffmpeg': [[{ recheck: false }], [{ recheck: true }]],
+  'desktop.signer.info': [[]],
+  'desktop.signer.connect': [[{ kind: 'local' }], [{ kind: 'nip46' }]],
+  'desktop.signer.unlock': [[]],
+  'desktop.signer.lock': [[]],
+  'desktop.signer.signOut': [[]],
 };
 
 /** Hand-picked invalid argument lists per method (on top of the generic mutations). */
@@ -299,4 +304,13 @@ export const INVALID: Partial<Record<Method, readonly unknown[][]>> = {
     [{ unknownSetting: true }],
   ],
   'desktop.ffmpeg': [[{}], [{ recheck: 'yes' }], [{ recheck: true, path: '/usr/bin/ffmpeg' }]],
+  // The renderer names a kind only: no NIP-07 on desktop, and never a URI, flow or passphrase.
+  'desktop.signer.connect': [
+    [{ kind: 'nip07' }],
+    [{ kind: 'nip46', uri: 'bunker://' + 'a'.repeat(64) + '?relay=wss://r.example' }],
+    [{ kind: 'local', flow: 'generate' }],
+    [{ kind: 'local', passphrase: 'hunter2' }],
+    [{}],
+  ],
+  'desktop.signer.signOut': [[true]],
 };

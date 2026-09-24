@@ -34,7 +34,14 @@ export {
   type BunkerLike,
   type Nip07Provider,
 } from './remote.js';
-export { connectBunker, parseBunkerUri } from './nip46-connect.js';
+export {
+  BUNKER_SETUP_TIMEOUT_MS,
+  connectBunker,
+  parseBunkerUri,
+  resumeBunker,
+  type BunkerOptions,
+  type BunkerSession,
+} from './nip46-connect.js';
 export {
   SignerManager,
   type KeyStore,

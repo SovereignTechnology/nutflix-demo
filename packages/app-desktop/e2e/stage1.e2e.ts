@@ -163,16 +163,18 @@ void describe(
         METHODS: readonly string[];
         EXCLUDED_METHODS: Record<string, string>;
         TOPIC_METHODS: Record<string, string>;
+        SHELL_TOPIC_METHODS: Record<string, string>;
       };
       const expected = new Set<string>(['platform']);
       for (const m of [
         ...ipc.METHODS.filter((x) => !x.startsWith('session.')),
         ...Object.keys(ipc.EXCLUDED_METHODS),
         ...Object.keys(ipc.TOPIC_METHODS),
+        ...Object.keys(ipc.SHELL_TOPIC_METHODS),
       ]) {
-        const [head] = m.split('.');
-        if (head !== undefined && head !== m) expected.add(head);
-        expected.add(m);
+        // Every dotted prefix is an object key too (`desktop`, `desktop.signer`, …).
+        const parts = m.split('.');
+        for (let i = 1; i <= parts.length; i++) expected.add(parts.slice(0, i).join('.'));
       }
       const tree: string[] = await page.evaluate(KEY_TREE_SOURCE);
       assert.deepEqual(tree, [...expected].sort());

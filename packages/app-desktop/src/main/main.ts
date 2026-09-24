@@ -12,6 +12,7 @@
  *   dist/worker/entry.js      the Bare worker entry the host spawns (lane L6-C; tsc output)
  */
 import { randomBytes } from 'node:crypto';
+import * as fsp from 'node:fs/promises';
 import { lstat, readFile, realpath } from 'node:fs/promises';
 import { basename, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -23,25 +24,36 @@ import {
   ipcMain,
   net,
   protocol,
+  safeStorage,
   session,
   utilityProcess,
   webContents as allWebContents,
   type MessageBoxOptions,
   type WebContents,
 } from 'electron';
-import type { HostOut } from '../ipc/protocol.js';
+import { isPromptForm } from '../ipc/guards.js';
+import type { HostIn, HostOut, PromptAnswer } from '../ipc/protocol.js';
 import { CHANNEL } from '../ipc/protocol.js';
-import { createAppProtocolHandler } from './app-protocol.js';
+import { PROMPT_FILES, createAppProtocolHandler } from './app-protocol.js';
 import { HOST_ENTRY, WORKER_ENTRY, hostArgs, parseMainArgs } from './args.js';
 import { FileTokenRegistry } from './file-tokens.js';
 import { HostLink } from './host-link.js';
 import { IpcGate } from './ipc-gate.js';
 import { createLogger } from './log.js';
 import { ImageRequests, MediaLinks, createMediaProtocolHandler } from './media.js';
+import { KeychainStore, keychainUsable } from './keychain.js';
 import { createMoneyGate, type ConfirmPrompt } from './money-gate.js';
-import { APP_URL, MEDIA_SCHEME, APP_SCHEME, privilegedSchemes } from './schemes.js';
+import { PROMPT_CHANNEL, PromptService, type PromptSender } from './prompt.js';
+import {
+  APP_URL,
+  MEDIA_SCHEME,
+  APP_SCHEME,
+  PROMPT_HOST,
+  PROMPT_URL,
+  privilegedSchemes,
+} from './schemes.js';
 import { hardenWebContents, installSessionPolicy, sandboxBypassSwitch } from './security.js';
-import { createMainWindow } from './window.js';
+import { createMainWindow, createPromptWindow } from './window.js';
 
 const log = createLogger((line) => {
   process.stderr.write(`${line}\n`);
@@ -82,6 +94,88 @@ const links = new MediaLinks(log);
 let host: HostLink | undefined;
 const post = (msg: Parameters<HostLink['post']>[0]): boolean => host?.post(msg) ?? false;
 const images = new ImageRequests(post, 30_000, log);
+/** The app window (the prompt window is modal to it). */
+let mainWindow: BrowserWindow | undefined;
+
+// ADR 0013: main's trusted prompt window. The page's two calls are accepted only from the open
+// prompt window (`PromptService.accept`); the IPC gate refuses that webContents for everything.
+const prompts = new PromptService({
+  openWindow: () => {
+    const parent = mainWindow !== undefined && !mainWindow.isDestroyed() ? mainWindow : undefined;
+    const win = createPromptWindow(BrowserWindow, join(distDir, 'prompt-preload.cjs'), parent);
+    win.once('ready-to-show', () => {
+      win.show();
+    });
+    win.webContents.on('did-fail-load', () => {
+      log('error', 'prompt.load-failed');
+      if (!win.isDestroyed()) win.close();
+    });
+    void win.loadURL(PROMPT_URL);
+    return {
+      webContentsId: win.webContents.id,
+      close: () => {
+        if (!win.isDestroyed()) win.close();
+      },
+      onClosed: (cb) => {
+        win.once('closed', cb);
+      },
+    };
+  },
+  answer: (req, answer) => {
+    if (e2ePrompts.has(req)) {
+      // --e2e-hooks: a synthetic question (below) — only the answer's shape is kept.
+      e2ePrompts.set(req, summarizeAnswer(answer));
+      return;
+    }
+    post({ kind: 'prompt-answer', req, answer });
+  },
+  log: (level, event) => {
+    log(level, event);
+  },
+});
+/** Bound in `start()` (safeStorage answers only after `ready`). */
+let keychain: KeychainStore | undefined;
+
+/**
+ * `--e2e-hooks` only: prompt-window questions the e2e suite opened itself (never the host's), by
+ * request id (above the host's range), and what came back — kind and byte length, never a value.
+ */
+const e2ePrompts = new Map<number, { kind: string; bytes: number } | null | 'pending'>();
+let e2ePromptSeq = 2_000_000_000;
+function summarizeAnswer(a: PromptAnswer | null): { kind: string; bytes: number } | null {
+  if (a === null) return null;
+  if (a.kind === 'secret') return { kind: a.kind, bytes: a.value.byteLength };
+  if (a.kind === 'bunker') return { kind: a.kind, bytes: a.uri.byteLength };
+  if (a.kind === 'create-wallet') return { kind: `create-wallet:${String(a.create)}`, bytes: 0 };
+  return { kind: `local-setup:${a.method}:${a.flow}`, bytes: 0 };
+}
+
+/** Keychain requests from the host; every one is answered, secrets wiped once posted. */
+async function onKeychain(out: Extract<HostOut, { kind: 'keychain' }>): Promise<void> {
+  const k = keychain;
+  let reply: Extract<HostIn, { kind: 'keychain-result' }>;
+  if (k === undefined) reply = { kind: 'keychain-result', req: out.req, ok: false, value: null };
+  else if (out.op === 'get') {
+    const value = await k.get(out.slot);
+    reply = { kind: 'keychain-result', req: out.req, ok: k.usable, value };
+  } else if (out.op === 'put') {
+    const ok = out.value === undefined ? false : await k.put(out.slot, out.value);
+    reply = { kind: 'keychain-result', req: out.req, ok, value: null };
+  } else {
+    reply = { kind: 'keychain-result', req: out.req, ok: await k.forget(out.slot), value: null };
+  }
+  post(reply);
+  reply.value?.fill(0);
+}
+
+function promptSender(e: Electron.IpcMainInvokeEvent): PromptSender {
+  const frame = e.senderFrame;
+  return {
+    senderId: e.sender.id,
+    frameUrl: frame?.url,
+    topFrame: frame !== null && frame.parent === null,
+  };
+}
 /**
  * The confirm gate's native dialog (security review F7/F8): modal to the asking window, Cancel
  * the default and the Escape answer, the text built by `money-gate.ts` from guarded arguments.
@@ -136,6 +230,15 @@ function onHostOut(out: HostOut): void {
     case 'image':
       images.resolve(out.req, out.bytes, out.type);
       return;
+    case 'prompt':
+      prompts.ask(out.req, out.form);
+      return;
+    case 'prompt-cancel':
+      prompts.cancel(out.req);
+      return;
+    case 'keychain':
+      void onKeychain(out);
+      return;
     case 'reply':
     case 'sub-reply':
     case 'event':
@@ -146,6 +249,7 @@ function onHostOut(out: HostOut): void {
 
 function showWindow(): void {
   const win = createMainWindow(BrowserWindow, join(distDir, 'preload.cjs'));
+  mainWindow = win;
   const wc: WebContents = win.webContents;
   appWebContents.add(wc.id);
   win.once('ready-to-show', () => {
@@ -167,10 +271,46 @@ function start(): void {
       : null,
   );
   installSessionPolicy(session.defaultSession);
-  protocol.handle(
-    APP_SCHEME,
-    createAppProtocolHandler({ root: join(distDir, 'renderer'), readFile, realpath }),
-  );
+  const appFiles = createAppProtocolHandler({
+    root: join(distDir, 'renderer'),
+    readFile,
+    realpath,
+  });
+  // ADR 0013: the prompt page, at its own origin, from its own directory and file list.
+  const promptFiles = createAppProtocolHandler({
+    root: join(distDir, 'prompt'),
+    files: PROMPT_FILES,
+    host: PROMPT_HOST,
+    readFile,
+    realpath,
+  });
+  protocol.handle(APP_SCHEME, (req) => {
+    let host = '';
+    try {
+      host = new URL(req.url).host;
+    } catch {
+      // appFiles answers 404
+    }
+    return host === PROMPT_HOST ? promptFiles(req) : appFiles(req);
+  });
+  const keychainOk = keychainUsable(safeStorage, process.platform);
+  keychain = new KeychainStore({
+    dir: join(app.getPath('userData'), 'keychain'),
+    usable: keychainOk,
+    safeStorage: {
+      isEncryptionAvailable: () => safeStorage.isEncryptionAvailable(),
+      getSelectedStorageBackend: () =>
+        process.platform === 'linux' ? safeStorage.getSelectedStorageBackend() : 'os',
+      encryptStringAsync: async (text) =>
+        new Uint8Array(await safeStorage.encryptStringAsync(text)),
+      decryptStringAsync: async (b) =>
+        safeStorage.decryptStringAsync(Buffer.from(b.buffer, b.byteOffset, b.byteLength)),
+    },
+    fs: fsp,
+    join,
+    posix: process.platform !== 'win32',
+  });
+  log('info', 'keychain.ready', { usable: keychainOk });
   const media = createMediaProtocolHandler({
     links,
     images,
@@ -194,6 +334,8 @@ function start(): void {
   ipcMain.handle(CHANNEL.call, (e, raw: unknown) => gate.call(e, raw));
   ipcMain.handle(CHANNEL.sub, (e, raw: unknown) => gate.sub(e, raw));
   ipcMain.handle(CHANNEL.grant, (e, raw: unknown) => gate.grant(e, raw));
+  ipcMain.handle(PROMPT_CHANNEL.init, (e) => prompts.init(promptSender(e)));
+  ipcMain.handle(PROMPT_CHANNEL.answer, (e, raw: unknown) => prompts.submit(promptSender(e), raw));
 
   host = new HostLink({
     spawn: () =>
@@ -202,6 +344,7 @@ function start(): void {
         hostArgs(opts, {
           userData: app.getPath('userData'),
           workerEntry: join(distDir, WORKER_ENTRY),
+          keychain: keychainOk,
         }),
         { serviceName: 'nutflix-host', stdio: 'inherit' },
       ),
@@ -210,9 +353,12 @@ function start(): void {
       gate.hostDown();
       links.clear();
       images.failAll();
+      prompts.cancelAll();
     },
     onRestart: () => {
-      for (const w of BrowserWindow.getAllWindows()) w.webContents.reload();
+      // Only app windows: a prompt window belongs to the host that is gone (closed on down).
+      for (const w of BrowserWindow.getAllWindows())
+        if (appWebContents.has(w.webContents.id)) w.webContents.reload();
     },
     now: () => Date.now(),
     log,
@@ -227,6 +373,17 @@ function start(): void {
       mediaRangeStarts: (): number[] => [...mediaRangeStarts],
       fileTokens: (): number => tokens.count(),
       hostRunning: (): boolean => host?.running ?? false,
+      /** ADR 0013: open the prompt window with a question (the form is guarded like the host's). */
+      openPrompt: (form: unknown): number => {
+        if (!isPromptForm(form)) return 0;
+        const req = ++e2ePromptSeq;
+        e2ePrompts.set(req, 'pending');
+        prompts.ask(req, form);
+        return req;
+      },
+      promptAnswer: (req: number): { kind: string; bytes: number } | null | 'pending' | undefined =>
+        e2ePrompts.get(req),
+      promptWindowId: (): number | null => prompts.windowId,
     });
   }
   showWindow();

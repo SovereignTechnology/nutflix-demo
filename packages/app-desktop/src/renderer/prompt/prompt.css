@@ -1,0 +1,119 @@
+/* Main's trusted prompt window (ADR 0013). Self-contained: it loads nothing from the app. */
+:root {
+  color-scheme: dark;
+  --bg: #0f0f0f;
+  --panel: #1a1a1a;
+  --line: #333;
+  --text: #f1f1f1;
+  --muted: #aaa;
+  --accent: #f5a623;
+  --error: #ff6b6b;
+  --warning: #ffd479;
+  font:
+    14px/1.45 system-ui,
+    -apple-system,
+    'Segoe UI',
+    Roboto,
+    sans-serif;
+}
+* {
+  box-sizing: border-box;
+}
+html,
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+}
+main {
+  padding: 20px 24px;
+}
+h1 {
+  font-size: 18px;
+  margin: 0 0 12px;
+}
+p {
+  margin: 0 0 12px;
+}
+fieldset {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  margin: 0 0 12px;
+  padding: 8px 12px;
+}
+legend {
+  color: var(--muted);
+  padding: 0 4px;
+}
+.choice,
+.check {
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+  padding: 6px 0;
+  cursor: pointer;
+}
+.choice__text,
+.check > span {
+  display: flex;
+  flex-direction: column;
+}
+.choice--disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+.hint {
+  color: var(--muted);
+  font-size: 12px;
+}
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 0 0 12px;
+}
+input[type='password'],
+input[type='text'] {
+  background: var(--panel);
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 8px 10px;
+  font: inherit;
+}
+input:focus-visible,
+button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+.error {
+  color: var(--error);
+}
+.warning {
+  color: var(--warning);
+}
+.actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 16px;
+}
+button {
+  background: var(--panel);
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 8px 14px;
+  font: inherit;
+  cursor: pointer;
+}
+button.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #111;
+  font-weight: 600;
+}
+button:disabled {
+  opacity: 0.6;
+  cursor: default;
+}

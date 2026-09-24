@@ -64,6 +64,17 @@ export const CHANNEL = {
 export type Channel = (typeof CHANNEL)[keyof typeof CHANNEL];
 
 /**
+ * ADR 0013: the prompt page's two `ipcMain.handle` channels (its own preload, its own origin).
+ * Main accepts them only from the open prompt window; the app window's preload never uses them.
+ */
+export const PROMPT_CHANNEL = {
+  /** `invoke(init)` → the `PromptForm` to show, or `null`. */
+  init: 'nf-prompt:init',
+  /** `invoke(answer, PageAnswer | null)` → `true` when main took it. */
+  answer: 'nf-prompt:answer',
+} as const;
+
+/**
  * Hard caps enforced by the guards (and, for the last two, by main's IPC gate per
  * webContents). A value over a cap is rejected, never truncated.
  */
@@ -201,6 +212,74 @@ export interface FfmpegStatus {
   readonly os?: 'macos' | 'windows' | 'linux' | undefined;
 }
 
+// ---- the signer connect flow (Stage 3, ADR 0013) ------------------------------------------
+
+/**
+ * How the local key is unlocked, or that the signer is remote (the user's choice):
+ *   `passphrase`  typed into main's trusted prompt window at every launch;
+ *   `keychain`    the passphrase sealed by the OS keychain (Electron `safeStorage`), so the app
+ *                 unlocks by itself;
+ *   `nip46`       a remote signer (bunker); the key never touches this device.
+ */
+export type UnlockMethod = 'passphrase' | 'keychain' | 'nip46';
+export const UNLOCK_METHODS = [
+  'passphrase',
+  'keychain',
+  'nip46',
+] as const satisfies readonly UnlockMethod[];
+
+/** `desktop.signer.info`: public facts for the Settings screen. Never key material. */
+export interface DesktopSignerInfo {
+  /** The last method the user chose; `null` = never connected, or signed out. */
+  readonly method: UnlockMethod | null;
+  readonly hasLocalKey: boolean;
+  /** The OS keychain can seal secrets here (never Linux's `basic_text` fallback). */
+  readonly keychain: boolean;
+  /** A NIP-46 session is remembered in the keychain (reconnects at launch). */
+  readonly remembered: boolean;
+}
+
+/**
+ * What the renderer may ask for: only WHICH kind of signer. Everything secret — the unlock
+ * method, a passphrase, an nsec, a bunker URI — is chosen or typed in main's prompt window.
+ */
+export interface SignerConnectWire {
+  readonly kind: 'local' | 'nip46';
+}
+
+/**
+ * A question main's trusted prompt window asks (host → main). Data only: the window's own page
+ * holds every word it shows, so neither the host nor anything upstream supplies prose.
+ */
+export type PromptForm =
+  /** Choose how to unlock; with no key yet, also create or import. */
+  | { readonly kind: 'local-setup'; readonly hasKey: boolean; readonly keychain: boolean }
+  | { readonly kind: 'unlock-passphrase'; readonly retry: boolean }
+  | { readonly kind: 'new-passphrase' }
+  | { readonly kind: 'import-nsec' }
+  | { readonly kind: 'bunker'; readonly keychain: boolean }
+  /** No NIP-60 wallet was found for an existing identity: create one? (default: no) */
+  | { readonly kind: 'create-wallet' };
+export type PromptKind = PromptForm['kind'];
+
+/** The window's answer (main → host); `null` = cancelled. Secrets are UTF-8 bytes. */
+export type PromptAnswer =
+  | {
+      readonly kind: 'local-setup';
+      readonly method: 'passphrase' | 'keychain';
+      readonly flow: 'unlock' | 'import' | 'generate';
+    }
+  | { readonly kind: 'secret'; readonly value: Uint8Array }
+  | { readonly kind: 'bunker'; readonly uri: Uint8Array; readonly remember: boolean }
+  | { readonly kind: 'create-wallet'; readonly create: boolean };
+
+/** What main's keychain holds, one sealed file each. */
+export type KeychainSlot = 'passphrase' | 'nip46';
+export const KEYCHAIN_SLOTS = ['passphrase', 'nip46'] as const satisfies readonly KeychainSlot[];
+
+/** Longest secret that crosses main ⇄ host (a bunker URI with a few relays). */
+export const MAX_SECRET_BYTES = 2048;
+
 // ---- the method table -------------------------------------------------------------------
 
 interface HistoryItem {
@@ -305,6 +384,15 @@ export interface MethodTable {
   // shell-only
   /** Pre-v5 stand-in for a `studio.ffmpeg()` contract method (Studio `ffmpeg`/`onRecheckFfmpeg`). */
   'desktop.ffmpeg': [args: [opts: { readonly recheck: boolean }], result: FfmpegStatus];
+  /** Stage 3 (ADR 0013): the signer connect flow; status changes arrive on `signer.status`. */
+  'desktop.signer.info': [args: [], result: DesktopSignerInfo];
+  /** Runs the flow in main's prompt window; resolves the new status (rejects `cancelled`). */
+  'desktop.signer.connect': [args: [req: SignerConnectWire], result: SignerStatus];
+  /** Unlock again with the chosen method (a locked local key, a remembered bunker). */
+  'desktop.signer.unlock': [args: [], result: SignerStatus];
+  'desktop.signer.lock': [args: [], result: undefined];
+  /** Main confirms first: forgets the signer and everything the keychain holds for it. */
+  'desktop.signer.signOut': [args: [], result: undefined];
 }
 export type Method = keyof MethodTable;
 export type ArgsOf<M extends Method> = MethodTable[M][0];
@@ -331,6 +419,11 @@ export const TOPIC_METHODS = {
 } as const satisfies Record<string, Topic['t']>;
 export type TopicMethod = keyof typeof TOPIC_METHODS;
 
+/** Shell-only listeners on the bridge (not adapter members) → their topic (ADR 0013). */
+export const SHELL_TOPIC_METHODS = {
+  'desktop.signer.onStatus': 'signer.status',
+} as const satisfies Record<string, Topic['t']>;
+
 /** Methods that exist only on the wire (PlaySession methods and shell extras). */
 export type ShellMethod = Extract<Method, `session.${string}` | `desktop.${string}`>;
 
@@ -342,7 +435,9 @@ export type Topic =
   | { readonly t: 'wallet.change' }
   | { readonly t: 'session.peers'; readonly sid: SessionId }
   | { readonly t: 'session.spend'; readonly sid: SessionId }
-  | { readonly t: 'upload.progress'; readonly uploadId: UploadId };
+  | { readonly t: 'upload.progress'; readonly uploadId: UploadId }
+  /** Shell-only (ADR 0013): the signer connected, locked, unlocked or signed out. */
+  | { readonly t: 'signer.status' };
 export type TopicName = Topic['t'];
 export const TOPIC_NAMES = [
   'seeder.status',
@@ -351,6 +446,7 @@ export const TOPIC_NAMES = [
   'session.peers',
   'session.spend',
   'upload.progress',
+  'signer.status',
 ] as const satisfies readonly TopicName[];
 
 /** `EventMsg.payload` per topic. */
@@ -361,6 +457,7 @@ export interface TopicPayload {
   'session.peers': readonly PeerSpend[];
   'session.spend': { readonly total: Sats; readonly ratePerMin: Sats };
   'upload.progress': UploadProgressWire;
+  'signer.status': SignerStatus;
 }
 
 // ---- errors -----------------------------------------------------------------------------
@@ -392,6 +489,10 @@ export const SHELL_ERROR_CODES = [
   'session-closed',
   'backend-down',
   'rate-limited',
+  /** Stage 3 (ADR 0013): the user dismissed main's prompt window. */
+  'cancelled',
+  /** Stage 3 (ADR 0013): a NIP-46 bunker did not answer, or answered wrongly. */
+  'remote-signer',
   'internal',
 ] as const;
 
@@ -460,7 +561,16 @@ export type HostIn =
   /** The webContents was destroyed: drop its subscriptions, close its sessions. */
   | { readonly kind: 'wc-gone'; readonly wc: number }
   /** `nf-media://img/<id>` was requested; answer with an `image` HostOut carrying `req`. */
-  | { readonly kind: 'image'; readonly req: number; readonly id: string };
+  | { readonly kind: 'image'; readonly req: number; readonly id: string }
+  /** ADR 0013: the prompt window's answer to `prompt` `req` (`null` = cancelled or closed). */
+  | { readonly kind: 'prompt-answer'; readonly req: number; readonly answer: PromptAnswer | null }
+  /** ADR 0013: the outcome of `keychain` `req`; `value` only for a `get` that found one. */
+  | {
+      readonly kind: 'keychain-result';
+      readonly req: number;
+      readonly ok: boolean;
+      readonly value: Uint8Array | null;
+    };
 
 /** Host → main. */
 export type HostOut =
@@ -478,6 +588,21 @@ export type HostOut =
       readonly req: number;
       readonly bytes: Uint8Array | null;
       readonly type: ImageMime | null;
+    }
+  /** ADR 0013: ask the user in main's trusted prompt window; answered by `prompt-answer`. */
+  | { readonly kind: 'prompt'; readonly req: number; readonly form: PromptForm }
+  /** ADR 0013: the host no longer needs the answer (timeout, shutdown): close the window. */
+  | { readonly kind: 'prompt-cancel'; readonly req: number }
+  /**
+   * ADR 0013: main's OS-keychain store (Electron `safeStorage`). `put` carries `value`; every op
+   * is answered by `keychain-result`.
+   */
+  | {
+      readonly kind: 'keychain';
+      readonly req: number;
+      readonly op: 'get' | 'put' | 'forget';
+      readonly slot: KeychainSlot;
+      readonly value?: Uint8Array;
     };
 
 // ---- guard type -------------------------------------------------------------------------

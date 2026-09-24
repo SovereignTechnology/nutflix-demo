@@ -102,7 +102,11 @@ export interface SupervisorOptions {
   readonly init: () => WorkerInit;
   readonly log: Logger;
   readonly onEvent: (ev: WorkerEvent) => void;
-  readonly handlers: HostRequestHandlers;
+  /**
+   * The worker's requests. A function is read per request, so the money handlers can follow the
+   * signer (ADR 0013: they change when it connects, locks or signs out).
+   */
+  readonly handlers: HostRequestHandlers | (() => HostRequestHandlers);
   /** Called on every state change (the host closes sessions on `down`). */
   readonly onState?: (state: WorkerState) => void;
   readonly restart?: RestartPolicy;
@@ -186,6 +190,36 @@ export class WorkerSupervisor {
   start(): void {
     if (this.stateValue !== 'idle') return;
     this.spawn();
+  }
+
+  /**
+   * A deliberate restart (ADR 0013: the signer changed): kill the worker, fail everything
+   * outstanding (`backend-down`; the state goes `down`, so the host closes play sessions), run
+   * `between` — the host swaps the money plane while no worker can talk to either plane — and
+   * spawn a fresh one, whose init then carries the new state. It does not count against the crash
+   * budget, and works from `failed` too (a new signer is a reason to try again). Stopped or never
+   * started: only runs `between`.
+   */
+  async restart(between: () => Promise<void>): Promise<void> {
+    const live = this.stateValue !== 'idle' && this.stateValue !== 'stopped';
+    if (live) {
+      this.gen++;
+      this.clearTimers();
+      this.teardown('restarting');
+      this.setState('down');
+    }
+    let failure: { readonly e: unknown } | undefined;
+    try {
+      await between();
+    } catch (e) {
+      failure = { e };
+    }
+    if (live && this.stateValue !== 'stopped') {
+      this.failures = 0;
+      this.starts.length = 0;
+      this.spawn();
+    }
+    if (failure !== undefined) throw failure.e;
   }
 
   /** Kills the worker and fails everything outstanding; no restart afterwards. */
@@ -508,7 +542,8 @@ export class WorkerSupervisor {
   private async onRequest(id: number, m: HostMethod, a: unknown): Promise<void> {
     const gen = this.gen;
     try {
-      const handler = this.o.handlers[m] as ((x: unknown) => Promise<unknown>) | undefined;
+      const table = typeof this.o.handlers === 'function' ? this.o.handlers() : this.o.handlers;
+      const handler = table[m] as ((x: unknown) => Promise<unknown>) | undefined;
       if (handler === undefined)
         throw hostError('payments-unavailable', 'no money plane: connect a signer first');
       const r = await handler(a);

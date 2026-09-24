@@ -5,8 +5,8 @@ Date: 2026-09-24
 ## Status
 
 Accepted for Stage 3 (lane "desktop runtime", branch `stage-3/desktop-runtime`). Implemented and
-tested end to end. The signer connect flow (a trusted passphrase prompt, the key file, the Settings
-bridge) is the next lane; until it lands the money plane opens only when a signer is injected.
+tested end to end. The signer connect flow that opens the money plane for a real user is ADR 0013
+(`stage-3/desktop-signer`).
 
 ## Context
 

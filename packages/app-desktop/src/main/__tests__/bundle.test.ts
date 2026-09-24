@@ -10,7 +10,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { APP_FILES } from '../app-protocol.js';
+import { APP_FILES, PROMPT_FILES } from '../app-protocol.js';
 
 const pkg = join(dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
 const html = readFileSync(join(pkg, 'static', 'index.html'), 'utf8');
@@ -47,11 +47,33 @@ describe('static/index.html', () => {
 });
 
 describe('scripts/bundle.ts', () => {
-  it('writes the four renderer files and the preload, nothing else', () => {
+  it('writes the four renderer files and the preload (+ the ADR 0013 prompt page), nothing else', () => {
     expect(result?.stderr).toBe('');
     expect(result?.status).toBe(0);
     expect(readdirSync(join(out, 'renderer')).sort()).toEqual([...APP_FILES].sort());
-    expect(readdirSync(out).sort()).toEqual(['preload.cjs', 'renderer']);
+    expect(readdirSync(join(out, 'prompt')).sort()).toEqual([...PROMPT_FILES].sort());
+    expect(readdirSync(out).sort()).toEqual([
+      'preload.cjs',
+      'prompt',
+      'prompt-preload.cjs',
+      'renderer',
+    ]);
+  });
+
+  it('ADR 0013: the prompt page is plain DOM, and its preload exposes only its two calls', () => {
+    const js = readFileSync(join(out, 'prompt', 'prompt.js'), 'utf8');
+    expect(js).not.toMatch(/\brequire\(|from"node:|from "node:|nostr-tools|cashu|nutflix\b/);
+    expect(js).toMatch(/nutflixPrompt/);
+    const pre = readFileSync(join(out, 'prompt-preload.cjs'), 'utf8');
+    expect(pre).toMatch(/exposeInMainWorld\("nutflixPrompt"/);
+    expect(pre).toMatch(/nf-prompt:init/);
+    expect(pre).toMatch(/nf-prompt:answer/);
+    expect(pre).not.toMatch(/exposeInMainWorld\("nutflix"/);
+    expect(pre).not.toMatch(/ipcRenderer\.(on|send)\b/);
+    const html = readFileSync(join(out, 'prompt', 'prompt.html'), 'utf8');
+    const refs = [...html.matchAll(/\b(?:src|href)="([^"]+)"/g)].map((m) => m[1]).sort();
+    expect(refs).toEqual(PROMPT_FILES.filter((f) => f !== 'prompt.html').sort());
+    expect(html).not.toMatch(/<script>|\sstyle=|\son[a-z]+=/i);
   });
 
   it('the renderer bundle is a browser ESM bundle with production React and no Node/core runtime', () => {

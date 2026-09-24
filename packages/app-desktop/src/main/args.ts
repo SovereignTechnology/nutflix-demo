@@ -60,6 +60,8 @@ export interface HostPaths {
   readonly userData: string;
   /** `<dist>/` + `WORKER_ENTRY`, resolved from main's own location. */
   readonly workerEntry: string;
+  /** ADR 0013: main found a real OS keychain (`keychainUsable`); the host may offer it. */
+  readonly keychain?: boolean;
 }
 
 /**
@@ -70,6 +72,7 @@ export interface HostPaths {
  */
 export function hostArgs(opts: MainOptions, paths: HostPaths): string[] {
   const args = [`--user-data-dir=${paths.userData}`, `--worker-entry=${paths.workerEntry}`];
+  if (paths.keychain === true) args.push('--keychain');
   if (opts.devMocks) args.push('--dev-mocks');
   if (opts.devFixtures) args.push('--dev-fixtures');
   return args;

@@ -18,7 +18,8 @@
  *             no `onToast` — Studio raises no toasts (its notices are in-place state)
  *   Wallet    `intent` (extras)
  *   Settings  `onSettingsChange` → theme + hoverPreview, `onToast` → shell stack;
- *             `onChangeSigner` omitted (no signer flow in Stage 1)
+ *             `onChangeSigner` → `desktop.signer.connect` (ADR 0013: the kind only — the flow
+ *             runs in main's trusted prompt window), when the host offers the signer flow
  *
  * Screens are keyed by route NAME only: Watch is not remounted watch → watch, Shorts not
  * shorts → shorts, Studio not across tabs. The coordinator learns the mounted screen in a
@@ -29,6 +30,7 @@ import {
   useCallback,
   useEffect,
   useLayoutEffect,
+  useMemo,
   useRef,
   useState,
   type ReactElement,
@@ -58,6 +60,35 @@ import { useCoordinator, useIdentity, useRouterState, useWalletTotal } from './s
 
 export const MAX_SHELL_TOASTS = 3;
 
+/**
+ * ADR 0013: the desktop signer flow (`bridge.desktop.signer`). Every secret is typed in main's
+ * prompt window; the shell only starts flows and re-reads identity when the status changes.
+ */
+export interface SignerFlow {
+  /** Resolves when the host offers the flow (rejects `forbidden` with --dev-mocks). */
+  info(): Promise<unknown>;
+  connect(kind: 'local' | 'nip46'): Promise<unknown>;
+  unlock(): Promise<unknown>;
+  lock(): Promise<unknown>;
+  /** Main confirms first (native dialog). */
+  signOut(): Promise<unknown>;
+  /** Signer status changes: connect, lock, unlock, sign out. */
+  onChange(cb: () => void): () => void;
+}
+
+/** A flow error worth a toast (`cancelled` = the user closed the prompt; `forbidden: not confirmed`). */
+function flowErrorToast(err: unknown): ToastItem | null {
+  const msg = err instanceof Error ? err.message : '';
+  if (msg.startsWith('cancelled') || msg === 'forbidden: not confirmed') return null;
+  const detail = msg.replace(/^[a-z-]+:\s*/, '');
+  return {
+    id: 'signer',
+    tone: 'error',
+    title: 'Signer',
+    description: detail === '' ? 'That did not work.' : detail,
+  };
+}
+
 export interface ShellProps {
   /** The coordinator-wrapped adapter (stable identity for the app's lifetime). */
   readonly adapter: NetworkAdapter;
@@ -65,6 +96,8 @@ export interface ShellProps {
   readonly router: Router;
   /** `desktop.ffmpeg` (pre-v5 stand-in for `studio.ffmpeg()`); absent = Studio learns on upload. */
   readonly probeFfmpeg?: ((recheck: boolean) => Promise<FfmpegStatus>) | undefined;
+  /** ADR 0013: the signer flow; absent (tests) or refused by the host (--dev-mocks) = none. */
+  readonly signerFlow?: SignerFlow | undefined;
 }
 
 /** Studio's `resolveFile`: the File itself — the preload, never the page, turns it into a token. */
@@ -99,12 +132,42 @@ export function connectRouter(router: Router, coordinator: PlaybackCoordinator):
   };
 }
 
-export function Shell({ adapter, coordinator, router, probeFfmpeg }: ShellProps): ReactElement {
+export function Shell({
+  adapter,
+  coordinator,
+  router,
+  probeFfmpeg,
+  signerFlow,
+}: ShellProps): ReactElement {
   const rs = useRouterState(router);
   const { route, extras } = rs.entry;
   const play = useCoordinator(coordinator);
-  const identity = useIdentity(adapter);
-  const balance = useWalletTotal(adapter, identity.status === 'signed-in');
+  // ---- the signer (ADR 0013): bumped on every status change, re-reading identity + wallet ----
+  const [signerGen, setSignerGen] = useState(0);
+  const [flowOn, setFlowOn] = useState(false);
+  useEffect(() => {
+    if (signerFlow === undefined) return undefined;
+    let alive = true;
+    signerFlow.info().then(
+      () => {
+        if (alive) setFlowOn(true);
+      },
+      () => undefined,
+    );
+    const off = signerFlow.onChange(() => {
+      setSignerGen((g) => g + 1);
+    });
+    return () => {
+      alive = false;
+      off();
+    };
+  }, [signerFlow]);
+  const identity = useIdentity(adapter, signerGen);
+  const balance = useWalletTotal(
+    adapter,
+    identity.status === 'signed-in' && identity.locked !== true,
+    signerGen,
+  );
   const navigate = router.navigate;
 
   // ---- settings: theme at boot and on every change; hoverPreview for Home ------------------
@@ -240,6 +303,43 @@ export function Shell({ adapter, coordinator, router, probeFfmpeg }: ShellProps)
     [router],
   );
 
+  // ---- signer actions (ADR 0013) ------------------------------------------------------------
+  const runFlow = useCallback(
+    async (f: () => Promise<unknown>): Promise<void> => {
+      try {
+        await f();
+      } catch (err) {
+        const t = flowErrorToast(err);
+        if (t !== null) pushToast(t);
+        throw err;
+      }
+    },
+    [pushToast],
+  );
+  const onChangeSigner = useCallback(
+    (kind: 'nip07' | 'nip46' | 'local'): Promise<void> => {
+      if (signerFlow === undefined || kind === 'nip07')
+        return runFlow(() =>
+          Promise.reject(
+            new Error('invalid-argument: browser extensions are not available on desktop'),
+          ),
+        );
+      return runFlow(() => signerFlow.connect(kind));
+    },
+    [runFlow, signerFlow],
+  );
+  const headerSigner = useMemo(
+    () =>
+      signerFlow === undefined
+        ? undefined
+        : {
+            unlock: () => runFlow(() => signerFlow.unlock()).catch(() => undefined),
+            lock: () => runFlow(() => signerFlow.lock()).catch(() => undefined),
+            signOut: () => runFlow(() => signerFlow.signOut()).catch(() => undefined),
+          },
+    [runFlow, signerFlow],
+  );
+
   // ---- the screen ---------------------------------------------------------------------------
   const common = { adapter, navigate } as const;
   let screen: ReactElement;
@@ -305,7 +405,14 @@ export function Shell({ adapter, coordinator, router, probeFfmpeg }: ShellProps)
       screen = <Wallet {...common} intent={extras.walletIntent} />;
       break;
     case 'settings':
-      screen = <Settings {...common} onSettingsChange={onSettingsChange} onToast={pushToast} />;
+      screen = (
+        <Settings
+          {...common}
+          onSettingsChange={onSettingsChange}
+          onToast={pushToast}
+          {...(flowOn ? { onChangeSigner } : {})}
+        />
+      );
       break;
   }
 
@@ -321,10 +428,14 @@ export function Shell({ adapter, coordinator, router, probeFfmpeg }: ShellProps)
         identity={identity}
         balance={balance}
         ratePerMin={play.ratePerMin}
+        signer={flowOn ? headerSigner : undefined}
       />
       <div className="nf-shell__body">
         <Sidebar route={route} navigate={navigate} />
-        <main className="nf-shell__main" key={screenKey}>
+        <main
+          className="nf-shell__main"
+          key={route.name === 'settings' ? `${screenKey}:${String(signerGen)}` : screenKey}
+        >
           {screen}
         </main>
       </div>

@@ -6,7 +6,8 @@
  *   - widens where money may go: an `updateSettings` patch that adds trusted mints or turns an
  *     auto top-up on (F4/F8);
  *   - publishes a file: `studio.upload`, naming the file main resolved from the SE-1 token (F7 —
- *     a compromised renderer PROCESS can mint a token for any path it knows).
+ *     a compromised renderer PROCESS can mint a token for any path it knows);
+ *   - signs out (`desktop.signer.signOut`, ADR 0013): it forgets the keychain's secrets.
  *
  * What the dialog says comes from the call's GUARDED arguments and from main's own state, never
  * from renderer-provided prose. `describe*` are pure and unit-tested; `createMoneyGate` wires them
@@ -44,7 +45,9 @@ export type ConfirmRequest =
       readonly wc: number;
       readonly method: 'studio.upload';
       readonly file: { readonly name: string; readonly size: number };
-    };
+    }
+  /** ADR 0013: signing out forgets the signer and what the OS keychain holds for it. */
+  | { readonly wc: number; readonly method: 'desktop.signer.signOut' };
 
 export interface ConfirmPrompt {
   readonly title: string;
@@ -210,8 +213,23 @@ export function describeUpload(file: {
   };
 }
 
+/** What to ask before signing out (ADR 0013): a compromised page must not do it silently. */
+export function describeSignOut(): GateDecision {
+  return {
+    kind: 'ask',
+    prompt: {
+      title: 'Sign out',
+      message: 'Sign out of Nutflix on this device?',
+      detail:
+        'Payments and publishing stop until you connect a signer again. A passphrase or remote-signer session remembered in the OS keychain is forgotten. Your encrypted key file stays on this device.',
+      confirmLabel: 'Sign out',
+    },
+  };
+}
+
 export function describe(req: ConfirmRequest): GateDecision {
   if (req.method === 'studio.upload') return describeUpload(req.file);
+  if (req.method === 'desktop.signer.signOut') return describeSignOut();
   if (req.method === 'updateSettings') return describeSettingsPatch(req.args[0], req.known);
   return describeMoneyCall(req);
 }
@@ -233,7 +251,12 @@ export function createMoneyGate(opts: MoneyGateOptions): MoneyGate {
         if (d.kind === 'allow') return true;
         if (d.kind === 'refuse') return false;
         // Mock sats only: no question for money or settings in dev mode — but a file is real.
-        if (opts.devMocks && req.method !== 'studio.upload') return true;
+        if (
+          opts.devMocks &&
+          req.method !== 'studio.upload' &&
+          req.method !== 'desktop.signer.signOut'
+        )
+          return true;
         if (opts.ask === undefined) return false;
         return (await opts.ask(req.wc, d.prompt)) === true;
       } catch {

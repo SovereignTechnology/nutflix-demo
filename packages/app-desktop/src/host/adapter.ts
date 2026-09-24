@@ -64,6 +64,7 @@ import { NostrCatalog } from './catalog/catalog.js';
 import type { FixtureCatalog } from './catalog/fixture-catalog.js';
 import { fail, hostError } from './errors.js';
 import type { IdentityProvider } from './identity.js';
+import type { DesktopSigner } from './signer/desktop-signer.js';
 import type { ImageService } from './images/images.js';
 import type { Logger } from './log.js';
 import { redact } from './log.js';
@@ -89,13 +90,16 @@ export interface DesktopAdapterOptions {
   /** The relay port: `SimplePoolAdapter` in production, `FakeRelayPool` in tests/offline dev. */
   readonly pool: nostr.PoolLike;
   readonly identity: IdentityProvider;
+  /** ADR 0013: the connect / unlock / lock / sign-out flow (absent with --dev-mocks or an injected signer). */
+  readonly signerFlow?: DesktopSigner;
   readonly wallet: WalletProvider;
   /**
-   * Stage 3 (ADR 0012): the money plane, when a signer is connected. Every play session is
-   * authorised with it BEFORE the worker opens the core — the worker's PAYs are paid only for
-   * registered sessions — and revoked when the session closes.
+   * Stage 3 (ADR 0012): the money plane of the unlocked signer, read at each play (ADR 0013: it
+   * changes when the signer connects, locks or signs out). Every play session is authorised with
+   * it BEFORE the worker opens the core — the worker's PAYs are paid only for registered
+   * sessions — and revoked on that same plane when the session closes.
    */
-  readonly money?: MoneyPlane;
+  readonly money?: () => MoneyPlane | undefined;
   readonly images: ImageService;
   /** `WorkerSupervisor.request`, bound. */
   readonly worker: WorkerCall;
@@ -246,6 +250,18 @@ export class DesktopNetworkAdapter implements NetworkAdapter {
 
   signer(): Promise<SignerStatus> {
     return this.o.identity.status();
+  }
+
+  /** `signer.status` topic (ADR 0013). */
+  onSignerStatus(cb: (s: SignerStatus) => void): Unsubscribe {
+    return this.o.identity.onStatus?.(cb) ?? ((): void => undefined);
+  }
+
+  /** The desktop signer flow (ADR 0013); refused where the signer is fixed. */
+  signerFlow(): DesktopSigner {
+    if (this.o.signerFlow === undefined)
+      fail('forbidden', 'the signer cannot be changed in this mode (--dev-mocks)');
+    return this.o.signerFlow;
   }
 
   me(): Promise<NostrPubkey | null> {
@@ -471,7 +487,8 @@ export class DesktopNetworkAdapter implements NetworkAdapter {
     const token = this.hex(32);
     await this.sessions.pauseOthers({ owner, sid });
     const prefetchSeconds = carry?.prefetchSeconds ?? this.o.settings.get().prefetchSeconds;
-    this.o.money?.authorizeSession(
+    const plane = this.o.money?.();
+    plane?.authorizeSession(
       sid,
       { core: r.hyper.core, blob: r.hyper.blob, policy: video.price },
       video.author,
@@ -492,7 +509,7 @@ export class DesktopNetworkAdapter implements NetworkAdapter {
         prefetchSeconds,
       });
     } catch (err) {
-      this.o.money?.revokeSession(sid);
+      plane?.revokeSession(sid);
       throw err;
     }
     const session = new HostPlaySession(
@@ -520,7 +537,7 @@ export class DesktopNetworkAdapter implements NetworkAdapter {
     );
     this.sessions.add(session);
     session.onClose(() => {
-      this.o.money?.revokeSession(sid);
+      plane?.revokeSession(sid);
     });
     // Main learns the link BEFORE anyone learns the token (HostOut ordering, protocol.ts).
     this.o.mediaLink(token, res.link);

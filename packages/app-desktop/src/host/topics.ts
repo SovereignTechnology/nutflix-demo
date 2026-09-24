@@ -75,6 +75,9 @@ export class TopicRegistry {
       case 'upload.progress':
         sub.off = a.onUploadProgress(wc, topic.uploadId, emit);
         break;
+      case 'signer.status':
+        sub.off = a.onSignerStatus(emit);
+        break;
     }
     if (subs === undefined) {
       subs = new Map();

@@ -9,6 +9,7 @@ import { mocks } from '@sovit/core';
 import {
   bolt11AmountSats,
   createMoneyGate,
+  describe as describe_,
   describeMoneyCall,
   describeSettingsPatch,
   describeUpload,
@@ -179,5 +180,21 @@ describe('createMoneyGate — fails closed', () => {
     expect(await gate.confirm(zap as never)).toBe(true);
     expect(await gate.confirm(upload as never)).toBe(false);
     expect(asked).toEqual(['Publish a video']);
+  });
+
+  it('ADR 0013: sign-out is always asked — also with --dev-mocks — and never on a missing dialog', async () => {
+    const out = { wc: 1, method: 'desktop.signer.signOut' } as const;
+    expect(describe_(out)).toMatchObject({ kind: 'ask', prompt: { confirmLabel: 'Sign out' } });
+    const asked: string[] = [];
+    const gate = createMoneyGate({
+      devMocks: true,
+      ask: (_wc, p) => {
+        asked.push(p.title);
+        return Promise.resolve(false);
+      },
+    });
+    expect(await gate.confirm(out)).toBe(false);
+    expect(asked).toEqual(['Sign out']);
+    expect(await createMoneyGate({ devMocks: false }).confirm(out)).toBe(false);
   });
 });

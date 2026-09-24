@@ -4,6 +4,8 @@
  * main exits when it is present), the protocols, the three IPC channels, the host spawn, the
  * window, and one message through each path (renderer call → host, host media-link → nf-media).
  */
+import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mocks } from '@sovit/core';
@@ -33,6 +35,9 @@ const fx = vi.hoisted(() => {
     primary: true,
     dialogs: [] as unknown[],
     dialogAnswer: 0,
+    /** ADR 0013: `safeStorage` — off (a Linux box with no keyring) unless a test turns it on. */
+    keychain: false,
+    keychainBackend: 'gnome_libsecret',
   };
   return state;
 });
@@ -53,12 +58,26 @@ vi.mock('electron', () => {
         fx.order.push('reload');
       },
     };
+    private destroyed = false;
+    private readonly closedListeners: (() => void)[] = [];
     constructor(options: Record<string, unknown>) {
       fx.windows.push({ options });
+      // Per boot: the app window is webContents 1, a prompt window 2, …
+      this.webContents.id = fx.windows.length;
       BrowserWindow.all.push(this);
     }
-    once(): void {
-      return undefined;
+    once(event?: string, fn?: () => void): void {
+      if (event === 'closed' && fn !== undefined) this.closedListeners.push(fn);
+    }
+    isDestroyed(): boolean {
+      return this.destroyed;
+    }
+    close(): void {
+      if (this.destroyed) return;
+      this.destroyed = true;
+      const w = fx.windows[this.webContents.id - 1];
+      if (w) (w as { closed?: boolean }).closed = true;
+      for (const l of this.closedListeners.splice(0)) l();
     }
     show(): void {
       return undefined;
@@ -104,6 +123,13 @@ vi.mock('electron', () => {
         }),
     },
     BrowserWindow,
+    safeStorage: {
+      isEncryptionAvailable: () => fx.keychain,
+      getSelectedStorageBackend: () => fx.keychainBackend,
+      encryptStringAsync: (t: string) => Promise.resolve(Buffer.from(`sealed:${t}`)),
+      decryptStringAsync: (b: Buffer) =>
+        Promise.resolve({ result: b.toString().replace(/^sealed:/, ''), shouldReEncrypt: false }),
+    },
     dialog: {
       showMessageBox: (...a: unknown[]) => {
         fx.dialogs.push(a.at(-1));
@@ -151,7 +177,8 @@ vi.mock('electron', () => {
         const child: FakeChild = { posted: [], listeners: new Map(), killed: false };
         fx.children.push(child);
         return {
-          postMessage: (m: unknown) => child.posted.push(m),
+          // parentPort clones: main may wipe its buffers after posting.
+          postMessage: (m: unknown) => child.posted.push(structuredClone(m)),
           on: (e: string, l: (x: unknown) => void) => {
             child.listeners.set(e, [...(child.listeners.get(e) ?? []), l]);
           },
@@ -183,6 +210,8 @@ beforeEach(() => {
   fx.primary = true;
   fx.dialogs.length = 0;
   fx.dialogAnswer = 0;
+  fx.keychain = false;
+  fx.keychainBackend = 'gnome_libsecret';
   fx.appListeners.clear();
   fx.protocols.clear();
   fx.ipc.clear();
@@ -235,10 +264,16 @@ describe('main.ts wiring (fake electron)', () => {
     },
   );
 
-  it('registers the two protocols, the three IPC channels, one window at app://nutflix/', async () => {
+  it('registers the two protocols, the three IPC channels + the two prompt ones, one window at app://nutflix/', async () => {
     await boot();
     expect([...fx.protocols.keys()].sort()).toEqual(['app', 'nf-media']);
-    expect([...fx.ipc.keys()].sort()).toEqual(['nf:call', 'nf:grant-file', 'nf:sub']);
+    expect([...fx.ipc.keys()].sort()).toEqual([
+      'nf-prompt:answer',
+      'nf-prompt:init',
+      'nf:call',
+      'nf:grant-file',
+      'nf:sub',
+    ]);
     expect(fx.windows).toHaveLength(1);
     expect(fx.windows[0]?.url).toBe('app://nutflix/index.html');
     const wp = fx.windows[0]?.options['webPreferences'] as Record<string, unknown>;
@@ -464,5 +499,102 @@ describe('main.ts wiring (fake electron)', () => {
     expect(fx.children[0]?.killed).toBe(true);
     for (const l of fx.children[0]?.listeners.get('exit') ?? []) l(0);
     expect(fx.forks).toHaveLength(1);
+  });
+
+  it('ADR 0013: --keychain is forwarded only for a real keychain (never basic_text)', async () => {
+    fx.keychain = true;
+    await boot();
+    expect(fx.forks[0]?.args).toContain('--keychain');
+    vi.resetModules();
+    fx.forks.length = 0;
+    fx.keychainBackend = 'basic_text';
+    await boot();
+    expect(fx.forks[0]?.args).not.toContain('--keychain');
+  });
+
+  it('ADR 0013: a host prompt opens the prompt window; only that window may read it or answer', async () => {
+    await boot();
+    const child = fx.children[0];
+    const deliver = (m: unknown): void => {
+      for (const l of child?.listeners.get('message') ?? []) l(m);
+    };
+    deliver({ kind: 'prompt', req: 5, form: { kind: 'unlock-passphrase', retry: false } });
+    expect(fx.windows).toHaveLength(2);
+    const pw = fx.windows[1];
+    expect(pw?.url).toBe('app://prompt/prompt.html');
+    expect(pw?.options['modal']).toBe(true);
+    const wp = pw?.options['webPreferences'] as Record<string, unknown>;
+    expect(String(wp['preload'])).toMatch(/[\\/]prompt-preload\.cjs$/);
+    expect(wp).toMatchObject({ contextIsolation: true, sandbox: true, nodeIntegration: false });
+    const init = fx.ipc.get('nf-prompt:init');
+    const answer = fx.ipc.get('nf-prompt:answer');
+    const ev = (id: number, url = 'app://prompt/prompt.html', parent: unknown = null): unknown => ({
+      sender: { id },
+      senderFrame: { url, parent },
+    });
+    // The app window (webContents 1), a subframe, the wrong origin: nothing.
+    expect(await init?.(ev(1, 'app://nutflix/index.html'), undefined)).toBeNull();
+    expect(await init?.(ev(2, 'app://prompt/prompt.html', {}), undefined)).toBeNull();
+    expect(await init?.(ev(2, 'app://nutflix/index.html'), undefined)).toBeNull();
+    expect(await answer?.(ev(1, 'app://nutflix/index.html'), { kind: 'secret', value: 'x' })).toBe(
+      false,
+    );
+    expect(await init?.(ev(2), undefined)).toEqual({ kind: 'unlock-passphrase', retry: false });
+    expect(await answer?.(ev(2), { kind: 'secret', value: 'the passphrase' })).toBe(true);
+    const posted = child?.posted.find((m) => (m as { kind?: string }).kind === 'prompt-answer') as
+      { req: number; answer: { kind: string; value: Uint8Array } } | undefined;
+    expect(posted?.req).toBe(5);
+    expect(new TextDecoder().decode(posted?.answer.value)).toBe('the passphrase');
+    expect((pw as { closed?: boolean }).closed).toBe(true);
+    // A host cancel for a question that is gone changes nothing; a new one opens a new window.
+    deliver({ kind: 'prompt-cancel', req: 5 });
+    deliver({ kind: 'prompt', req: 6, form: { kind: 'create-wallet' } });
+    expect(fx.windows).toHaveLength(3);
+    deliver({ kind: 'prompt-cancel', req: 6 });
+    expect((fx.windows[2] as { closed?: boolean }).closed).toBe(true);
+    expect(
+      child?.posted.filter((m) => (m as { kind?: string }).kind === 'prompt-answer'),
+    ).toHaveLength(1);
+  });
+
+  it('ADR 0013: keychain requests are answered through safeStorage, in a private userData dir', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'nf-main-kc-'));
+    try {
+      fx.keychain = true;
+      await boot(['--user-data-dir', dir]);
+      const child = fx.children[0];
+      const deliver = (m: unknown): void => {
+        for (const l of child?.listeners.get('message') ?? []) l(m);
+      };
+      const results = (): { req: number; ok: boolean; value: Uint8Array | null }[] =>
+        (child?.posted ?? []).filter(
+          (m) => (m as { kind?: string }).kind === 'keychain-result',
+        ) as { req: number; ok: boolean; value: Uint8Array | null }[];
+      deliver({
+        kind: 'keychain',
+        req: 1,
+        op: 'put',
+        slot: 'passphrase',
+        value: new TextEncoder().encode('sealed pass'),
+      });
+      await vi.waitFor(() => {
+        expect(results()).toHaveLength(1);
+      });
+      expect(results()[0]).toEqual({ kind: 'keychain-result', req: 1, ok: true, value: null });
+      const onDisk = await readFile(join(dir, 'keychain', 'passphrase.sealed'), 'utf8');
+      expect(onDisk.startsWith('sealed:')).toBe(true); // what the fake safeStorage wrote
+      deliver({ kind: 'keychain', req: 2, op: 'get', slot: 'passphrase' });
+      await vi.waitFor(() => {
+        expect(results()).toHaveLength(2);
+      });
+      expect(new TextDecoder().decode(results()[1]?.value ?? new Uint8Array())).toBe('sealed pass');
+      deliver({ kind: 'keychain', req: 3, op: 'forget', slot: 'passphrase' });
+      await vi.waitFor(() => {
+        expect(results()).toHaveLength(3);
+      });
+      expect(results()[2]?.ok).toBe(true);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 });

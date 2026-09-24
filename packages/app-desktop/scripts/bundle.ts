@@ -10,7 +10,14 @@
  *   src/renderer/shell.css → dist/renderer/shell.css (nothing is injected: CSP style-src 'self')
  *
  * Those four files are exactly `APP_FILES` in src/main/app-protocol.ts — all the `app:`
- * protocol serves. The build fails if the renderer bundle pulled in `@sovit/core` runtime code
+ * protocol serves at `app://nutflix`. ADR 0013 adds main's trusted prompt window, served at its
+ * own origin `app://prompt` from its own directory (`PROMPT_FILES`):
+ *
+ *   src/renderer/prompt/prompt.ts  → dist/prompt/prompt.js     ESM, plain DOM, nothing imported
+ *   static/prompt.html             → dist/prompt/prompt.html
+ *   src/renderer/prompt/prompt.css → dist/prompt/prompt.css
+ *   src/preload/prompt-preload.ts  → dist/prompt-preload.cjs   CJS, only itself + src/ipc
+ * The build fails if the renderer bundle pulled in `@sovit/core` runtime code
  * (nostr-tools, cashu-ts), Electron or a Node builtin, or if the preload bundle contains
  * anything but src/preload + src/ipc.
  *
@@ -29,6 +36,7 @@ const outFlag = process.argv.indexOf('--out');
 const outArg = outFlag === -1 ? undefined : process.argv[outFlag + 1];
 const dist = outArg === undefined ? join(pkg, 'dist') : resolve(outArg);
 const rendererOut = join(dist, 'renderer');
+const promptOut = join(dist, 'prompt');
 /** Electron 44.2.0 ships Chromium 152. */
 const TARGET = 'chrome152';
 
@@ -92,6 +100,52 @@ async function bundlePreload(): Promise<void> {
     fail(`preload bundle may only contain src/preload and src/ipc:\n  ${bad.join('\n  ')}`);
 }
 
+/** ADR 0013: the prompt page may contain nothing but itself (no UI kit, no core, no ipc code). */
+async function bundlePrompt(): Promise<void> {
+  const r = await build({
+    absWorkingDir: pkg,
+    entryPoints: ['src/renderer/prompt/prompt.ts'],
+    outfile: join(promptOut, 'prompt.js'),
+    bundle: true,
+    format: 'esm',
+    platform: 'browser',
+    target: TARGET,
+    minify: true,
+    sourcemap: false,
+    tsconfig: 'tsconfig.renderer.json',
+    legalComments: 'eof',
+    metafile: true,
+    logLevel: 'warning',
+  });
+  const own = join(pkg, 'src', 'renderer', 'prompt') + sep;
+  const bad = inputsOf(r.metafile).filter((p) => !p.startsWith(own));
+  if (bad.length > 0)
+    fail(`prompt bundle may only contain src/renderer/prompt:\n  ${bad.join('\n  ')}`);
+}
+
+async function bundlePromptPreload(): Promise<void> {
+  const r = await build({
+    absWorkingDir: pkg,
+    entryPoints: ['src/preload/prompt-preload.ts'],
+    outfile: join(dist, 'prompt-preload.cjs'),
+    bundle: true,
+    format: 'cjs',
+    platform: 'browser',
+    target: TARGET,
+    external: ['electron'],
+    minify: false,
+    sourcemap: false,
+    tsconfig: 'tsconfig.preload.json',
+    metafile: true,
+    logLevel: 'warning',
+  });
+  const self = join(pkg, 'src', 'preload', 'prompt-preload.ts');
+  const ipc = join(pkg, 'src', 'ipc') + sep;
+  const bad = inputsOf(r.metafile).filter((p) => p !== self && !p.startsWith(ipc));
+  if (bad.length > 0)
+    fail(`prompt preload may only contain itself and src/ipc:\n  ${bad.join('\n  ')}`);
+}
+
 async function copyStatic(): Promise<void> {
   const require = createRequire(import.meta.url);
   let uiCss: string;
@@ -104,10 +158,23 @@ async function copyStatic(): Promise<void> {
   await copyFile(join(pkg, 'static', 'index.html'), join(rendererOut, 'index.html'));
   await copyFile(uiCss, join(rendererOut, 'ui.css'));
   await copyFile(join(pkg, 'src', 'renderer', 'shell.css'), join(rendererOut, 'shell.css'));
+  await mkdir(promptOut, { recursive: true });
+  await copyFile(join(pkg, 'static', 'prompt.html'), join(promptOut, 'prompt.html'));
+  await copyFile(
+    join(pkg, 'src', 'renderer', 'prompt', 'prompt.css'),
+    join(promptOut, 'prompt.css'),
+  );
 }
 
 await mkdir(rendererOut, { recursive: true });
-await Promise.all([bundleRenderer(), bundlePreload(), copyStatic()]);
+await mkdir(promptOut, { recursive: true });
+await Promise.all([
+  bundleRenderer(),
+  bundlePreload(),
+  bundlePrompt(),
+  bundlePromptPreload(),
+  copyStatic(),
+]);
 process.stdout.write(
   `bundle: ${relative(process.cwd(), rendererOut) || '.'}/{index.html,app.js,ui.css,shell.css} + ${relative(process.cwd(), join(dist, 'preload.cjs'))}\n`,
 );

@@ -10,12 +10,12 @@
  */
 import { join } from 'node:path';
 
-import type { UnixSeconds } from '@sovit/core';
-import { mocks, nostr } from '@sovit/core';
+import type { Signer, UnixSeconds } from '@sovit/core';
+import { mocks, nostr, signer as signerMod } from '@sovit/core';
 
 import { toWireError, wireError } from '../ipc/errors.js';
 import { isHostIn, isMsgId, isWcId } from '../ipc/guards.js';
-import type { AnyCallMsg, HostIn, HostOut, ReplyMsg } from '../ipc/protocol.js';
+import type { AnyCallMsg, HostIn, HostOut, PromptAnswer, ReplyMsg } from '../ipc/protocol.js';
 import { IPC_V, LIMITS } from '../ipc/protocol.js';
 import { dehydrate } from '../ipc/wiremap.js';
 import type { WorkerInit } from '../ipc/worker-protocol.js';
@@ -38,7 +38,10 @@ import { WorkerSupervisor } from './worker/supervisor.js';
 import { MoneyPlane } from './money.js';
 import type { MoneyPlaneOptions } from './money.js';
 import type { WalletProvider } from './wallet.js';
-import { createWalletProvider } from './wallet.js';
+import { SwitchingWallet, createWalletProvider } from './wallet.js';
+import type { Nip46Connector } from './signer/desktop-signer.js';
+import { DesktopSigner } from './signer/desktop-signer.js';
+import { MainBridge } from './signer/main-bridge.js';
 import { TopicRegistry } from './topics.js';
 
 export interface HostOptions {
@@ -54,8 +57,14 @@ export interface HostOptions {
   /** Relay port; default `SimplePoolAdapter` (or an offline `FakeRelayPool` with fixtures). */
   readonly pool?: nostr.PoolLike;
   readonly imageTransport?: ImageTransport;
-  /** Signer seam; default `NoIdentity` (`DevViewerIdentity` with `--dev-mocks`). */
+  /**
+   * Signer seam. Default: the desktop signer flow (ADR 0013) — `DevViewerIdentity` with
+   * `--dev-mocks`. A test that injects one gets a fixed signer (no connect flow).
+   */
   readonly identity?: IdentityProvider;
+  /** Tests: the desktop signer's NIP-46 connector and KDF floor. */
+  readonly nip46?: Nip46Connector;
+  readonly signerCost?: signerMod.KdfCost;
   /** Tests: the mint transport of the money plane (the in-process `TestMint`). */
   readonly mintRequest?: MoneyPlaneOptions['mintRequest'];
   readonly timers?: Timers;
@@ -69,6 +78,9 @@ export class Host {
   readonly adapter: DesktopNetworkAdapter;
   readonly worker: WorkerSupervisor;
   readonly topics: TopicRegistry;
+  /** ADR 0013: main's prompt window and keychain, and the signer flow using them. */
+  readonly bridge: MainBridge | undefined;
+  readonly signerFlow: DesktopSigner | undefined;
   private readonly images: ImageService;
   /** Posts to main (dropped once stopped; a throwing transport is logged, never rethrown). */
   readonly post: (out: HostOut) => void;
@@ -83,10 +95,14 @@ export class Host {
     readonly images: ImageService;
     readonly post: (out: HostOut) => void;
     readonly log: Logger;
+    readonly bridge?: MainBridge;
+    readonly signerFlow?: DesktopSigner;
   }) {
     this.adapter = parts.adapter;
     this.worker = parts.worker;
     this.images = parts.images;
+    this.bridge = parts.bridge;
+    this.signerFlow = parts.signerFlow;
     this.post = (out) => {
       if (this.stopped) return;
       try {
@@ -121,10 +137,20 @@ export class Host {
       case 'image':
         void this.serveImage(msg.req, msg.id);
         return;
+      case 'prompt-answer':
+        if (this.bridge === undefined) signerMod.wipe(secretOf(msg.answer));
+        else this.bridge.onPromptAnswer(msg.req, msg.answer);
+        return;
+      case 'keychain-result':
+        if (this.bridge === undefined) signerMod.wipe(msg.value);
+        else this.bridge.onKeychainResult(msg.req, msg.ok, msg.value);
+        return;
     }
   }
 
   stop(): void {
+    this.bridge?.cancelAll();
+    void this.signerFlow?.close();
     this.worker.stop();
     this.adapter.onWorkerDown();
     this.stopped = true;
@@ -250,37 +276,82 @@ export async function createHost(o: HostOptions): Promise<Host> {
   // public network; FakeRelayPool is L1's offline pool.
   const pool =
     o.pool ?? (flags.devFixtures ? new nostr.FakeRelayPool() : new nostr.SimplePoolAdapter());
-  const identity =
-    o.identity ?? (flags.devMocks ? new DevViewerIdentity(mocks.ME) : new NoIdentity());
-  // Stage 3 (ADR 0012): with a connected signer (and never with --dev-mocks), the money plane —
-  // the user's NIP-60 wallet and the viewer engine; the worker then runs the real engines.
-  const signer = flags.devMocks ? undefined : identity.signer();
-  let money: MoneyPlane | undefined;
-  if (signer !== undefined)
+  // The supervisor, the adapter, main's link and the signer refer to each other; bound once built.
+  const late: {
+    adapter?: DesktopNetworkAdapter;
+    post?: (out: HostOut) => void;
+    worker?: WorkerSupervisor;
+  } = {};
+  const openMoney = (signer: Signer, create: boolean): Promise<MoneyPlane> =>
+    MoneyPlane.open({
+      signer,
+      pool,
+      relays: () => settings.get().relays,
+      defaultMints: () => settings.get().defaultMints,
+      log: log.child('money'),
+      ...(create ? { createWallet: true } : {}),
+      ...(o.mintRequest === undefined ? {} : { mintRequest: o.mintRequest }),
+      ...(o.now === undefined ? {} : { now: o.now }),
+    });
+
+  // ADR 0013: without an injected signer and without --dev-mocks, the user connects one through
+  // main's trusted prompt window, and the money plane follows it.
+  const switching = new SwitchingWallet();
+  let bridge: MainBridge | undefined;
+  let signerFlow: DesktopSigner | undefined;
+  if (o.identity === undefined && !flags.devMocks) {
+    bridge = new MainBridge({
+      post: (out) => late.post?.(out),
+      ...(o.timers === undefined ? {} : { timers: o.timers }),
+    });
+    const flow: DesktopSigner = new DesktopSigner({
+      dir: join(o.userData, 'signer'),
+      bridge,
+      keychain: flags.keychain === true,
+      log,
+      openMoney,
+      swap: async (change) => {
+        const run = async (): Promise<void> => {
+          await change();
+          switching.set(flow.money()?.wallet);
+          if ((flow.money()?.mints.length ?? 1) === 0)
+            log.warn('the wallet lists no mints: payments stay off until one is added in Settings');
+        };
+        await (late.worker === undefined ? run() : late.worker.restart(run));
+      },
+      ...(o.nip46 === undefined ? {} : { nip46: o.nip46 }),
+      ...(o.signerCost === undefined ? {} : { cost: o.signerCost }),
+    });
+    signerFlow = flow;
+  }
+  const identity: IdentityProvider =
+    signerFlow ??
+    o.identity ??
+    (flags.devMocks ? new DevViewerIdentity(mocks.ME) : new NoIdentity());
+
+  // An injected signer (tests; never with --dev-mocks) opens its money plane once, here.
+  const injected = flags.devMocks || signerFlow !== undefined ? undefined : identity.signer();
+  let fixedMoney: MoneyPlane | undefined;
+  if (injected !== undefined)
     try {
-      money = await MoneyPlane.open({
-        signer,
-        pool,
-        relays: () => settings.get().relays,
-        defaultMints: () => settings.get().defaultMints,
-        log: log.child('money'),
-        ...(o.mintRequest === undefined ? {} : { mintRequest: o.mintRequest }),
-        ...(o.now === undefined ? {} : { now: o.now }),
-      });
+      fixedMoney = await openMoney(injected, false);
     } catch (err) {
       // The code prefix only (`wallet-unreadable`, `relay-down`, …): never a key or a proof.
       const reason =
         err instanceof Error ? (/^[a-z-]+(?=:)/.exec(err.message)?.[0] ?? err.name) : 'unknown';
       log.error('the wallet could not be opened: payments stay unavailable', { reason });
     }
-  if (money?.mints.length === 0)
+  if (fixedMoney?.mints.length === 0)
     log.warn(
       'the wallet lists no mints: streaming payments stay off until one is added in Settings',
     );
+  const money = (): MoneyPlane | undefined => signerFlow?.money() ?? fixedMoney;
   const walletProvider: WalletProvider =
-    money === undefined
-      ? createWalletProvider(flags.devMocks)
-      : { kind: 'real', wallet: money.wallet };
+    signerFlow !== undefined
+      ? { kind: 'real', wallet: switching }
+      : fixedMoney === undefined
+        ? createWalletProvider(flags.devMocks)
+        : { kind: 'real', wallet: fixedMoney.wallet };
   const images = new ImageService({
     transport: o.imageTransport ?? httpsTransport(),
     log,
@@ -288,8 +359,6 @@ export async function createHost(o: HostOptions): Promise<Host> {
     ...(o.random === undefined ? {} : { random: o.random }),
   });
 
-  // The supervisor and the adapter refer to each other; the adapter is bound once built.
-  const late: { adapter?: DesktopNetworkAdapter; post?: (out: HostOut) => void } = {};
   const worker = new WorkerSupervisor({
     spawn: o.spawn,
     entry: o.workerEntry,
@@ -303,7 +372,7 @@ export async function createHost(o: HostOptions): Promise<Host> {
         prefetchSeconds: s.prefetchSeconds,
         ...(desktop.ffmpeg === undefined ? {} : { ffmpeg: desktop.ffmpeg }),
         // Payments need at least one mint to pay at and be paid at (Settings → mints).
-        ...(money === undefined || money.mints.length === 0 ? {} : { payments: money.payments() }),
+        ...paymentsInit(money()),
         ...(flags.devMocks || flags.devFixtures
           ? {
               dev: {
@@ -323,13 +392,14 @@ export async function createHost(o: HostOptions): Promise<Host> {
       // waiting for fixtures that are not coming.
       if (s === 'failed' || s === 'stopped') fixtures?.workerGone();
     },
-    handlers: {
-      ...(money === undefined ? {} : money.handlers()),
+    // Read per request: the money handlers follow the signer (ADR 0013).
+    handlers: () => ({
+      ...(money()?.handlers() ?? {}),
       'studio.publish': (draft) => {
         if (late.adapter === undefined) return Promise.reject(new Error('host not ready'));
         return late.adapter.publishUpload(draft);
       },
-    },
+    }),
     ...(o.timers === undefined ? {} : { timers: o.timers }),
     ...(o.restart === undefined ? {} : { restart: o.restart }),
     ...(o.workerStartTimeoutMs === undefined ? {} : { startTimeoutMs: o.workerStartTimeoutMs }),
@@ -340,8 +410,9 @@ export async function createHost(o: HostOptions): Promise<Host> {
     desktop,
     pool,
     identity,
+    ...(signerFlow === undefined ? {} : { signerFlow }),
     wallet: walletProvider,
-    ...(money === undefined ? {} : { money }),
+    money,
     images,
     worker: (m, a) => worker.request(m, a),
     mediaLink: (token, url) => {
@@ -352,9 +423,33 @@ export async function createHost(o: HostOptions): Promise<Host> {
     ...(o.random === undefined ? {} : { random: o.random }),
     ...(o.now === undefined ? {} : { now: o.now }),
   });
-  const host = new Host({ adapter, worker, images, post: o.post, log });
+  const host = new Host({
+    adapter,
+    worker,
+    images,
+    post: o.post,
+    log,
+    ...(bridge === undefined ? {} : { bridge }),
+    ...(signerFlow === undefined ? {} : { signerFlow }),
+  });
   late.adapter = adapter;
   late.post = host.post;
+  late.worker = worker;
   worker.start();
+  // Unlock by the chosen method (the keychain silently, a passphrase in main's window). In the
+  // background: the host answers main at once, and a dismissed prompt just leaves it locked.
+  void signerFlow?.start();
   return host;
+}
+
+/** `WorkerInit.payments` for a money plane with at least one mint (public values only). */
+function paymentsInit(m: MoneyPlane | undefined): Pick<WorkerInit, 'payments'> {
+  return m === undefined || m.mints.length === 0 ? {} : { payments: m.payments() };
+}
+
+/** The secret a prompt answer carries, to wipe when nobody asked. */
+function secretOf(a: PromptAnswer | null): Uint8Array | null {
+  if (a?.kind === 'secret') return a.value;
+  if (a?.kind === 'bunker') return a.uri;
+  return null;
 }

@@ -75,7 +75,8 @@ describe('MethodTable ⇔ NetworkAdapter (contracts v4)', () => {
       'wallet.onChange': 'wallet.change',
     });
     expectTypeOf<(typeof TOPIC_NAMES)[number]>().toEqualTypeOf<TopicName>();
-    expect(new Set(TOPIC_NAMES).size).toBe(6);
+    // + `signer.status` (ADR 0013), a shell-only topic like the session and upload ones.
+    expect(new Set(TOPIC_NAMES).size).toBe(7);
   });
 
   it('argument tuples equal the contract parameters', () => {

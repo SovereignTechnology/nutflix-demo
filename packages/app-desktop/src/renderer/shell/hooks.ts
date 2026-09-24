@@ -29,10 +29,16 @@ export type Identity =
       readonly pubkey: NostrPubkey;
       readonly profile: Profile | null;
       readonly avatarSrc: string | undefined;
+      /** ADR 0013: the signer names this key but cannot sign until it is unlocked. */
+      readonly locked?: boolean;
     };
 
-/** `me()` → `profile()` → `image(picture)` (T16: the adapter hash-checks/proxies it). */
-export function useIdentity(adapter: NetworkAdapter): Identity {
+/**
+ * `me()` → `profile()` → `image(picture)` (T16: the adapter hash-checks/proxies it), and whether
+ * the signer is locked (`signer()`). Re-read whenever `gen` changes (ADR 0013: the shell bumps it
+ * on every `signer.status` event).
+ */
+export function useIdentity(adapter: NetworkAdapter, gen = 0): Identity {
   const [id, setId] = useState<Identity>({ status: 'pending' });
   useEffect(() => {
     let alive = true;
@@ -40,21 +46,22 @@ export function useIdentity(adapter: NetworkAdapter): Identity {
     const isAlive = (): boolean => alive;
     void (async (): Promise<void> => {
       try {
-        const me = await adapter.me();
+        const [me, st] = await Promise.all([adapter.me(), adapter.signer().catch(() => null)]);
         if (!isAlive()) return;
         if (me === null) {
           setId({ status: 'signed-out' });
           return;
         }
-        setId({ status: 'signed-in', pubkey: me, profile: null, avatarSrc: undefined });
+        const locked = st?.pubkey === me && st.locked;
+        setId({ status: 'signed-in', pubkey: me, profile: null, avatarSrc: undefined, locked });
         const profile = await adapter.profile(me).catch(() => null);
         if (!isAlive()) return;
-        setId({ status: 'signed-in', pubkey: me, profile, avatarSrc: undefined });
+        setId({ status: 'signed-in', pubkey: me, profile, avatarSrc: undefined, locked });
         const pic = profile?.picture;
         if (pic === undefined || pic === '') return;
         const src = await adapter.image(pic).catch(() => undefined);
         if (isAlive() && src !== undefined) {
-          setId({ status: 'signed-in', pubkey: me, profile, avatarSrc: src });
+          setId({ status: 'signed-in', pubkey: me, profile, avatarSrc: src, locked });
         }
       } catch {
         if (isAlive()) setId({ status: 'signed-out' });
@@ -63,7 +70,7 @@ export function useIdentity(adapter: NetworkAdapter): Identity {
     return () => {
       alive = false;
     };
-  }, [adapter]);
+  }, [adapter, gen]);
   return id;
 }
 
@@ -72,7 +79,12 @@ export function useIdentity(adapter: NetworkAdapter): Identity {
  * (per mint) re-summed. `undefined` while loading or when there is no wallet to ask (signed
  * out: no wallet call is ever made, as on the Wallet screen).
  */
-export function useWalletTotal(adapter: NetworkAdapter, enabled: boolean): Sats | undefined {
+export function useWalletTotal(
+  adapter: NetworkAdapter,
+  enabled: boolean,
+  /** Re-read when this changes (the signer, and so the wallet behind it, changed). */
+  gen = 0,
+): Sats | undefined {
   const [total, setTotal] = useState<Sats | undefined>(undefined);
   useEffect(() => {
     if (!enabled) {
@@ -112,6 +124,6 @@ export function useWalletTotal(adapter: NetworkAdapter, enabled: boolean): Sats 
       alive = false;
       unsubscribe();
     };
-  }, [adapter, enabled]);
+  }, [adapter, enabled, gen]);
   return total;
 }

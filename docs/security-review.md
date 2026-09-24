@@ -46,7 +46,7 @@ directories" for this list. Each fix carries a test that fails without it, excep
 | F21 | **Open** | Packaging (dev flags compiled out, Electron fuses) |
 | F22 | **Fixed** | `app.requestSingleInstanceLock()`; a second launch focuses the first window |
 | F23 | **Fixed** | `Nip60ProofStore` verifies every event itself |
-| F24 | **Fixed for the seeder daemon** (`stage-3/seeder-runtime`) | Key file 0600 (`--keygen`, `O_EXCL`, refused when group/other can read it), headless unlock from the `seeder-key-passphrase` systemd credential (ADR 0011 §1). Open: the desktop's file `KeyStore` |
+| F24 | **Fixed** — seeder daemon (`stage-3/seeder-runtime`) and desktop (`stage-3/desktop-signer`) | Daemon: key file 0600 (`--keygen`, `O_EXCL`, refused when group/other can read it), headless unlock from the `seeder-key-passphrase` systemd credential (ADR 0011 §1). Desktop (ADR 0013): the file `KeyStore` writes 0600 in a 0700 dir through an `O_EXCL` temp file, reads with `O_NOFOLLOW` and refuses a symlink, another owner or a loose mode before any passphrase is asked; unlock is the user's choice — a passphrase in main's trusted prompt window, the OS keychain (`safeStorage`, never Linux `basic_text`), or a NIP-46 bunker |
 | F25 | **Open** | Only matters once Stage 3 opens external links |
 | F26 | **Partly fixed** | Natural batching (F30) cuts dust PAYs; explicit batching open (F5) |
 | F27 | **Fixed** (real-mint lane) | Hit by the network-drop test: a new session binding a pubkey now cuts any older live session of it (no ban) — one pay/1 channel per pubkey, so the per-pubkey carry is unambiguous |
@@ -57,6 +57,7 @@ directories" for this list. Each fix carries a test that fails without it, excep
 | F36 | **Fixed (new)** — seeder daemon and gateway | See §0b |
 | F37 | **Open (new) — latent: no production path fetches upstream yet** | See §0b |
 | F38 | **Fixed (new)** | See §0b |
+| F39 | **Fixed (new)** — desktop signer lane | See §0c |
 | F30 | **Fixed** | `UpstreamPayer` keeps the carry per channel, commits it on `ACK ok`, one PAY per core in flight |
 | F31 | **Fixed (engine)**; wired in the seeder daemon | `spentByUs` dep: a "spent" answer to a RETRIED redeem whose witness is our own signature is our lost swap — no ban, creator still paid. A first attempt answered "spent" is a double-spend even with our witness (a set we redeemed before a restart carries it too — found by the real-mint lane); the attempt is persisted before it is made. Open: NUT-13 deterministic outputs to recover the swapped proofs |
 
@@ -126,6 +127,16 @@ real-mint-swarm.integration.test.ts`). Both real-mint suites are opt-in
   on `session-open`, which fires before a swarm connection's Protomux exists, so every upstream
   swarm session ran without pay/1 (and the seeder cut it after its window). It now attaches on
   `Seeder.onSessionReady`; the swarm integration test fails without the fix.
+
+## 0c. Found by the desktop-signer lane's review (2026-09-24, `stage-3/desktop-signer`)
+
+- **F39 — Medium — fixed: a NIP-46 bunker's `auth_url` would reach the console.** nostr-tools'
+  `BunkerSigner` `console.warn`s the URL of an `auth_url` challenge when no `onauth` is set, and
+  such URLs often carry a session token. The desktop host's stdio is inherited by main, so it would
+  have reached the terminal / journal past the redacting logger. `core` `connectBunker` /
+  `resumeBunker` now default `onauth` to a no-op (a caller that supports the flow passes its own);
+  a test spies on `console.warn`. The rest of that review (the prompt throttle, the keychain-record
+  ordering, pool disposal): docs/reviews/2026-09-24-pre-push-desktop-signer.md.
 
 ## 1. Summary
 
@@ -585,13 +596,14 @@ finding's section above plus its row in §0. **Filing waits for Cameron's go-ahe
 | [High] F5: DLEQ verification off the event loop; explicit minPaySats batching tied to the credit pool |
 | [Medium] Seeder: the pending-PAY queue is unbounded while a mint is down, and `pending.json` is rewritten whole per change (quadratic) — an append-only journal plus an engine cap on queued PAYs (docs/reviews/2026-09-24-pre-push-seeder-runtime.md) |
 | [High, before upstream fetching is wired] F37: pace the gateway's upstream fetches — credit pool + ACK settlement in the shared `UpstreamPayer` |
-| [Medium] F10/F11/F12/F31: wire the seen-secret persistence, `checkSpent`, `persistPending`/`restorePending` and `spentByUs` in the desktop runtime (the seeder daemon and the gateway have them via `createNodeRuntime`) |
+| [Done] F10/F11/F12/F31 hooks in the desktop runtime — the worker's seeder engine persists seen secrets and pending PAYs and asks the host for `checkSpent` / `spentByUs` (ADR 0012) |
 | [Medium] F31: NUT-13 deterministic outputs + NUT-09 restore |
 | [Medium] F15: per-pubkey upload quota |
 | [Medium] F17: NUT-20 locked mint quotes; opaque quote handles over IPC |
 | [Medium] F4: execute auto top-ups with per-top-up and per-day caps |
 | [Low] F21: packaging — compile out dev flags, set Electron fuses |
-| [Low] F24: the desktop's file `KeyStore` (0600, atomic) |
+| [Done] F24: the desktop's file `KeyStore` (ADR 0013) |
+| [Low] Desktop signer: a "remove the key from this device" flow behind a native confirm (a forgotten passphrase is a dead end otherwise); NIP-46 `auth_url` support (ADR 0013 residual) |
 | [Low] F25: external-link confirm shows the real host |
 
 ## 7. Not verified

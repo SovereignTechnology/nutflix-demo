@@ -118,5 +118,14 @@ export interface NutflixBridge {
   notifications: Listen<Notification>;
   readonly desktop: {
     ffmpeg: Call<'desktop.ffmpeg'>;
+    /** ADR 0013: the signer connect flow (a kind only; secrets go to main's prompt window). */
+    readonly signer: {
+      info: Call<'desktop.signer.info'>;
+      connect: Call<'desktop.signer.connect'>;
+      unlock: Call<'desktop.signer.unlock'>;
+      lock: Call<'desktop.signer.lock'>;
+      signOut: Call<'desktop.signer.signOut'>;
+      onStatus: Listen<TopicPayload['signer.status']>;
+    };
   };
 }

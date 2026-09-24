@@ -100,5 +100,11 @@ export function handlers(a: DesktopNetworkAdapter): HandlerTable {
     settings: () => a.settings(),
     updateSettings: (_c, [patch]) => a.updateSettings(patch),
     'desktop.ffmpeg': (_c, [opts]) => a.ffmpeg(opts.recheck),
+    // ADR 0013: the renderer names a kind; the flow runs in main's prompt window.
+    'desktop.signer.info': () => a.signerFlow().info(),
+    'desktop.signer.connect': (_c, [req]) => a.signerFlow().connect(req),
+    'desktop.signer.unlock': () => a.signerFlow().unlock(),
+    'desktop.signer.lock': () => a.signerFlow().lock(),
+    'desktop.signer.signOut': () => a.signerFlow().signOut(),
   };
 }

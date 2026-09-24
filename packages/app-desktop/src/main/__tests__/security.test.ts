@@ -20,7 +20,7 @@ import {
   type HardenableWebContents,
   type PolicySession,
 } from '../security.js';
-import { createMainWindow, type BrowserWindowCtor } from '../window.js';
+import { createMainWindow, createPromptWindow, type BrowserWindowCtor } from '../window.js';
 import { isAppOrigin, isAppUrl, privilegedSchemes } from '../schemes.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -218,6 +218,30 @@ describe('the window (design §3 row 1)', () => {
     expect(wp && 'webviewTag' in wp).toBe(false);
     expect(wp && 'allowRunningInsecureContent' in wp).toBe(false);
     expect(wp && 'experimentalFeatures' in wp).toBe(false);
+  });
+
+  it('ADR 0013: the prompt window has the same literal posture, devtools off, modal to the app', () => {
+    let seen: BrowserWindowConstructorOptions | undefined;
+    const Ctor = function (this: unknown, o: BrowserWindowConstructorOptions) {
+      seen = o;
+    } as unknown as BrowserWindowCtor;
+    const parent = {} as never;
+    createPromptWindow(Ctor, '/app/dist/prompt-preload.cjs', parent);
+    expect(seen).toMatchObject({ parent, modal: true, resizable: false, show: false });
+    const wp = seen?.webPreferences;
+    expect(wp).toMatchObject({
+      preload: '/app/dist/prompt-preload.cjs',
+      contextIsolation: true,
+      sandbox: true,
+      nodeIntegration: false,
+      nodeIntegrationInWorker: false,
+      nodeIntegrationInSubFrames: false,
+      devTools: false,
+    });
+    expect(wp && 'webSecurity' in wp).toBe(false);
+    expect(wp && 'webviewTag' in wp).toBe(false);
+    createPromptWindow(Ctor, '/p.cjs', undefined);
+    expect(seen && 'parent' in seen).toBe(false);
   });
 
   it('scripts/electron-security-lint.mjs passes on this package and sees the window', () => {

@@ -40,6 +40,8 @@ import type {
   Guard,
   HostIn,
   HostOut,
+  PromptAnswer,
+  PromptForm,
   ImageMime,
   Method,
   MethodTable,
@@ -54,7 +56,14 @@ import type {
   WireError,
   WireMap,
 } from './protocol.js';
-import { ERROR_CODES, IMAGE_MIMES, IPC_V, LIMITS } from './protocol.js';
+import {
+  ERROR_CODES,
+  IMAGE_MIMES,
+  IPC_V,
+  KEYCHAIN_SLOTS,
+  LIMITS,
+  MAX_SECRET_BYTES,
+} from './protocol.js';
 
 export type { Guard };
 
@@ -468,6 +477,11 @@ export const validateArgs: { readonly [M in Method]: Guard<MethodTable[M][0]> } 
   settings: tuple([]),
   updateSettings: tuple([isSettingsPatch]),
   'desktop.ffmpeg': tuple([obj({ recheck: bool })]),
+  'desktop.signer.info': tuple([]),
+  'desktop.signer.connect': tuple([obj({ kind: oneOf(['local', 'nip46'] as const) })]),
+  'desktop.signer.unlock': tuple([]),
+  'desktop.signer.lock': tuple([]),
+  'desktop.signer.signOut': tuple([]),
 });
 
 function wrapAll<T extends Record<string, Guard<unknown>>>(table: T): T {
@@ -511,6 +525,7 @@ export const isTopic: Guard<Topic> = safe(
     obj({ t: oneOf(['seeder.status', 'notifications', 'wallet.change'] as const) }),
     obj({ t: oneOf(['session.peers', 'session.spend'] as const), sid: isSessionId }),
     obj({ t: literal('upload.progress'), uploadId: isUploadId }),
+    obj({ t: literal('signer.status') }),
   ),
 );
 
@@ -548,6 +563,60 @@ export const isEventMsg: Guard<EventMsg> = safe(obj({ v: isV, subId: isMsgId, pa
 
 const isUploadFile = obj({ path: isAbsolutePath, name: text(1, 1024), size: isCount });
 
+/** A secret crossing main ⇄ host: non-empty UTF-8 bytes, bounded. */
+const isSecretBytes: Guard<Uint8Array> = (x): x is Uint8Array =>
+  bytes(MAX_SECRET_BYTES)(x) && x.byteLength > 0;
+
+/** ADR 0013: a question for main's prompt window (data only; the page holds the words). */
+export const isPromptForm: Guard<PromptForm> = safe(
+  union(
+    obj({ kind: literal('local-setup'), hasKey: bool, keychain: bool }),
+    obj({ kind: literal('unlock-passphrase'), retry: bool }),
+    obj({ kind: oneOf(['new-passphrase', 'import-nsec', 'create-wallet'] as const) }),
+    obj({ kind: literal('bunker'), keychain: bool }),
+  ),
+);
+
+/** ADR 0013: the prompt window's answer (the host checks it matches the question it asked). */
+export const isPromptAnswer: Guard<PromptAnswer> = safe(
+  union(
+    obj({
+      kind: literal('local-setup'),
+      method: oneOf(['passphrase', 'keychain'] as const),
+      flow: oneOf(['unlock', 'import', 'generate'] as const),
+    }),
+    obj({ kind: literal('secret'), value: isSecretBytes }),
+    obj({ kind: literal('bunker'), uri: isSecretBytes, remember: bool }),
+    obj({ kind: literal('create-wallet'), create: bool }),
+  ),
+);
+
+const isKeychainSlot = oneOf(KEYCHAIN_SLOTS);
+
+/**
+ * ADR 0013: does `a` answer `form` — and only with what `form` offered? (Main checks the page's
+ * answer with it, the host checks main's.) An unlock method or flow the question did not offer,
+ * or "remember" without a keychain, does not fit.
+ */
+export function promptAnswerFits(form: PromptForm, a: PromptAnswer): boolean {
+  switch (form.kind) {
+    case 'local-setup':
+      return (
+        a.kind === 'local-setup' &&
+        (a.method === 'passphrase' || form.keychain) &&
+        (form.hasKey ? a.flow === 'unlock' : a.flow !== 'unlock')
+      );
+    case 'unlock-passphrase':
+    case 'new-passphrase':
+    case 'import-nsec':
+      return a.kind === 'secret';
+    case 'bunker':
+      return a.kind === 'bunker' && (!a.remember || form.keychain);
+    case 'create-wallet':
+      return a.kind === 'create-wallet';
+  }
+}
+
 /** Main → host. Calls and subs are re-validated in full (the host runs the guards again). */
 export const isHostIn: Guard<HostIn> = safe(
   union(
@@ -555,6 +624,13 @@ export const isHostIn: Guard<HostIn> = safe(
     obj({ kind: literal('sub'), wc: isWcId, msg: isSubMsg }),
     obj({ kind: literal('wc-gone'), wc: isWcId }),
     obj({ kind: literal('image'), req: isMsgId, id: matches(/^[A-Za-z0-9_-]{1,128}$/, 128) }),
+    obj({ kind: literal('prompt-answer'), req: isMsgId, answer: nullable(isPromptAnswer) }),
+    obj({
+      kind: literal('keychain-result'),
+      req: isMsgId,
+      ok: bool,
+      value: nullable(isSecretBytes),
+    }),
   ),
 );
 
@@ -576,6 +652,22 @@ export const isHostOut: Guard<HostOut> = safe(
       bytes: nullable(bytes(LIMITS.maxThumbnailBytes)),
       type: nullable(isImageMime),
     }),
+    obj({ kind: literal('prompt'), req: isMsgId, form: isPromptForm }),
+    obj({ kind: literal('prompt-cancel'), req: isMsgId }),
+    (x): x is Extract<HostOut, { kind: 'keychain' }> =>
+      obj({
+        kind: literal('keychain'),
+        req: isMsgId,
+        op: oneOf(['get', 'forget'] as const),
+        slot: isKeychainSlot,
+      })(x) ||
+      obj({
+        kind: literal('keychain'),
+        req: isMsgId,
+        op: literal('put'),
+        slot: isKeychainSlot,
+        value: isSecretBytes,
+      })(x),
   ),
 );
 

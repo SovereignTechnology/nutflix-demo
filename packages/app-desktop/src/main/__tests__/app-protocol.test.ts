@@ -8,7 +8,13 @@ import { readFile, realpath } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { APP_FILES, createAppProtocolHandler, resolveAppPath } from '../app-protocol.js';
+import {
+  APP_FILES,
+  PROMPT_FILES,
+  createAppProtocolHandler,
+  resolveAppPath,
+} from '../app-protocol.js';
+import { PROMPT_HOST } from '../schemes.js';
 import { APP_RESPONSE_HEADERS, CSP, MEDIA_RESPONSE_HEADERS } from '../csp.js';
 
 /** Design §3, verbatim. */
@@ -148,5 +154,43 @@ describe('app: protocol handler', () => {
       realpath: (p) => realpath(p),
     });
     expect((await h(new Request('app://nutflix/index.html'))).status).toBe(500);
+  });
+});
+
+describe('ADR 0013: the prompt page at its own origin', () => {
+  let proot = '';
+  beforeAll(() => {
+    proot = join(base, 'dist', 'prompt');
+    mkdirSync(proot, { recursive: true });
+    writeFileSync(join(proot, 'prompt.html'), '<!doctype html><title>p</title>');
+    writeFileSync(join(proot, 'prompt.js'), 'export {}');
+    writeFileSync(join(proot, 'prompt.css'), 'body{}');
+    writeFileSync(join(proot, 'index.html'), 'not served here');
+  });
+  const prompt = (): ((req: Request) => Promise<Response>) =>
+    createAppProtocolHandler({
+      root: proot,
+      files: PROMPT_FILES,
+      host: PROMPT_HOST,
+      readFile: async (p) => new Uint8Array(await readFile(p)),
+      realpath: (p) => realpath(p),
+    });
+
+  it('serves its three files, with the CSP, at app://prompt only', async () => {
+    for (const f of PROMPT_FILES) {
+      const res = await prompt()(new Request(`app://prompt/${f}`));
+      expect(res.status, f).toBe(200);
+      expect(res.headers.get('content-security-policy')).toBe(CSP);
+    }
+  });
+
+  it('neither origin serves the other one’s files; no default document for the prompt', async () => {
+    expect((await prompt()(new Request('app://prompt/index.html'))).status).toBe(404);
+    expect((await prompt()(new Request('app://prompt/'))).status).toBe(404);
+    expect((await prompt()(new Request('app://nutflix/prompt.html'))).status).toBe(404);
+    expect((await handler()(new Request('app://prompt/prompt.html'))).status).toBe(404);
+    expect((await handler()(new Request('app://nutflix/prompt.js'))).status).toBe(404);
+    expect(resolveAppPath('app://prompt/prompt.html')).toBeNull(); // default host is the app
+    expect(resolveAppPath('app://prompt/prompt.html', PROMPT_HOST)).toBe('prompt.html');
   });
 });

@@ -13,6 +13,8 @@ export interface IdentityProvider {
   status(): Promise<SignerStatus>;
   /** What `NetworkAdapter.me()` reports. */
   me(): Promise<NostrPubkey | null>;
+  /** ADR 0013: status changes (connect, lock, unlock, sign out); absent = it never changes. */
+  onStatus?(cb: (s: SignerStatus) => void): () => void;
 }
 
 /** Stage 1 default: nobody is signed in and nothing can be signed. */
