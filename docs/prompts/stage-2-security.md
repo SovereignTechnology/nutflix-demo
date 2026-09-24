@@ -41,6 +41,10 @@ The session prompt below already cites these; this list is for the person starti
   `src/host/wallet.ts` and `src/host/identity.ts` (`NoIdentity`). Implementing the audit surface
   is Stage 2. Wiring real providers into these seams is Stage 3 integration, unless the Stage 2
   exit criteria need it.
+  **The standalone seeder daemon needs more than a provider:** it does not yet attach pay/1 to
+  swarm sessions or send HELLO, and `session.mux` is still null at the seeder's own
+  `session-open` (a hook in `seeder.ts`, or a daemon-owned swarm like the desktop worker's
+  `PeerNode`). See `packages/seeder/src/cli/providers.ts` and `docs/lanes/Seeder-entry.md`.
 - **There is no web portal.** L7 was never started, and the TS app is Pear/desktop-only (ADR
   0006, unmerged, on `spec/nfx-suite-m0`). Part B's web items cover only what exists, i.e. the
   gateway's Blossom HTTP responses.

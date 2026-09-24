@@ -4,7 +4,8 @@
  * `node:child_process`). Bare resolves `node:*` as npm packages, so the full barrel cannot
  * load in the desktop worker; `package.json` maps the `bare` export condition here and the
  * worker injects its own `bare-*` adapters. Keep this file and `index.ts` in step: `index.ts`
- * is this module plus the Node adapters.
+ * is this module plus the Node adapters plus the daemon CLI (`cli/main.ts`, `cli/config-file.ts`,
+ * `cli/providers.ts` — Node only; `entry-hygiene.test.ts` proves this file never reaches them).
  *
  * Original header: @sovit/seeder — Corestore + Hyperblobs seeder daemon (build-plan §2.1, §2.3, §7).
  * Issued against CONTRACTS_VERSION = 2, re-issued at CONTRACTS_VERSION = 3 (ADR 0004).

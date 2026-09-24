@@ -15,8 +15,7 @@
     }
   },
   "files": [
-    "dist",
-    "systemd"
+    "dist"
   ],
   "scripts": {
     "build": "tsc -b",

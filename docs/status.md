@@ -87,6 +87,7 @@ present and 647 / 31 without one — that suite `skipIf`s when no binary is foun
 | **L6-A shell** | `lane/L6-A` | **merged 2026-09-23** (app-desktop 674 → 687+ tests; Electron main/preload/renderer, IPC gate, SE-1 tokens, playback coordinator; **Electron e2e + fidelity spike written, never run — pending D4**) | see git log |
 | **L6-C worker** | `lane/L6-C` | **merged 2026-09-23** (Bare data plane; day-1 probe 20/20 under real `bare`; gated playback server; credit-paced payer; **§5(a) two-seeder Stage 1 test green, ~2.2 s, 5/5 + under load**) | see git log | No worktree on the dev laptop and no cached Electron binary here (`node node_modules/electron/install.js`) | — |
 | **UI-followups** | `lane/UI-followups` | **merged 2026-09-23** (Library `onToast` → shell stack, Shorts element-pause stops paying, shell toast actions close their toast; ui 481 tests, app-desktop 1043; repo 2082 passed / 27 skipped) | `a2ea58d` |
+| **Seeder-entry** | `lane/Seeder-entry` | **merged 2026-09-23** (daemon entry behind `nutflix-seeder.service`, strict `seeder.json`, Stage 2 seam; seeder 116 tests; repo 128 files, 2111 passed / 27 skipped) | `c68232e` |
 | L7 web-shell | `lane/L7` | **NOT STARTED** — out of scope if ADR 0006 (unmerged, "Pear-runtime-only v0") is adopted | — |
 
 Lane reports: `docs/lanes/L1.md`, `L2.md` (incl. v3 section), `L3.md` (incl. markup section),
@@ -260,10 +261,20 @@ v4 (2026-09-23) was a small additive bump: reactions (`likes`/`dislikes`/`myReac
    in `VideoCard.css`. Fix in the next lane that touches `packages/ui/src/components/`.~~
 4. **Each L5 merge needs two wiring lines** from the orchestrator: the export in
    `packages/ui/src/screens/index.ts` and the `@import` in `packages/ui/src/screens/screens.css`.
-5. `packages/seeder` still ships **no self-executing entry point**, but
-   `deploy/systemd/nutflix-seeder.service` points at `dist/index.js --config`. Documented in
-   `deploy/systemd/README.md`; a shell (L6 worker or a Stage 2 service entry) must call
-   `runDaemon()`, or the seeder needs a `bin`.
+5. **DONE 2026-09-23 (lane Seeder-entry, `docs/lanes/Seeder-entry.md`).** `dist/index.js` is now
+   the daemon entry when it is the main module (`cli/main.ts`: `--config`, `--check`, exit
+   0/1/78; strict `seeder.json`, errors name paths never values; key material refused in
+   config). It refuses with 78 until Stage 2 providers exist (`cli/providers.ts`); `--check`
+   works today. **Found on the way:** `--jitless` removes WebAssembly and Node 22's undici needs
+   it on the first touch of the global `WebSocket` (nostr-tools, via `@sovit/core`) — the seeder
+   unit gained `--no-experimental-websocket` (a spawn test guards it; `MDWE-RESULTS.md` §6).
+   **Still open — the GATEWAY unit is broken the same way on Node 22** and a flag alone does not
+   fix it (its ESM `import … from 'node:http'` also loads undici): `node --jitless
+   --no-experimental-websocket packages/gateway/dist/index.js --check` dies on Node 22 and
+   works on Node 24. Owner L3 (Stage 3 deploy): load `http` via `createRequire` + the flag +
+   the `ExecStart` pin in `cli.test.ts`, or require Node ≥ 24 on hosts, or drop the MDWE +
+   `--jitless` pair. Also: converge the seeder's and the gateway's config validators (table in
+   the lane doc §2); `--check` does not report missing providers (a real start still refuses).
 6. **DONE 2026-09-23 (UI-fixes)** except the text-field component (still none). ~~**L4 component fixes owed** (hit by 4 lanes, each worked around in its own CSS): list-layout
    `.nf-card__body` also needs `flex-grow` (item 3 is one level of it); `VideoCardSkeleton` needs
    a `hideChannel` option; `Sheet` focuses Close first; **a11y bug: `VideoCard`'s thumbnail
