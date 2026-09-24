@@ -110,6 +110,26 @@ describe('LocalSigner', () => {
     expect((await fresh()).signSecret).toBeUndefined();
   });
 
+  it('walletP2pk is the compressed public half of the WALLET key (what witnesses verify against), survives lock() and unlock, and is null without a wallet key', async () => {
+    const wk = new Uint8Array(32).fill(13);
+    const expected = Buffer.from(getPubKeyFromPrivKey(wk)).toString('hex');
+    const { signer: s, file } = await LocalSigner.create({
+      passphrase: PW(),
+      cost: COST,
+      walletKey: wk,
+    });
+    expect(s.walletP2pk).toBe(expected);
+    expect(s.walletP2pk).toMatch(/^0[23][0-9a-f]{64}$/);
+    // Not derived from the Nostr key.
+    expect(s.walletP2pk!.slice(2)).not.toBe(await s.getPublicKey());
+    const secret = JSON.stringify(['P2PK', { nonce: 'cd', data: s.walletP2pk }]);
+    expect(schnorrVerifyMessage(await s.signSecret!(secret), secret, s.walletP2pk!)).toBe(true);
+    await s.lock();
+    expect(s.walletP2pk).toBe(expected);
+    expect((await LocalSigner.unlock(file, PW())).walletP2pk).toBe(expected);
+    expect((await fresh()).walletP2pk).toBeNull();
+  });
+
   // Stage 2 pre-push review (missed before: the test above only fed it a valid secret). The
   // wallet key signs SHA-256 of whatever it is given, so without a format check anything holding
   // the signer gets a general BIP-340 oracle for the key published in the user's kind 10019 —

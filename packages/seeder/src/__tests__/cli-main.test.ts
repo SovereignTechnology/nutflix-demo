@@ -1,10 +1,13 @@
 /**
  * The daemon entry behind `deploy/systemd/nutflix-seeder.service` (`cli/main.ts`):
- * argument parsing, config refusal (redacted, exit 78), `--check`, the Stage 1 provider
- * refusal, a real start through the `providers` test seam (`runDaemon()` with the parsed
- * config, READY, graceful close on a signal), and a runtime failure (exit 1).
+ * argument parsing, config refusal (redacted, exit 78), `--check`, `--keygen`, the real
+ * providers' refusals (no key file, no credential — exit 78 before anything is created), a real
+ * start through the `providers` test seam (`runDaemon()` with the parsed config, `attach` before
+ * start, READY, graceful close on a signal, then the runtime's `close`), and a runtime failure
+ * (exit 1).
  */
-import { writeFile } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
+import { mkdir, readFile, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 
 import { mocks } from '@sovit/core';
@@ -13,14 +16,18 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { DAEMON_ENV } from '../cli/config-file.js';
 import type { DaemonConfig } from '../cli/config-file.js';
 import { EXIT_CONFIG, USAGE, main, parseCliArgs } from '../cli/main.js';
-import { MISSING_PROVIDERS_REASON, getRuntimeDeps } from '../cli/providers.js';
+import { MISSING_PROVIDERS_REASON } from '../cli/providers.js';
 import type { RuntimeDeps } from '../cli/providers.js';
 import type { Seeder } from '../seeder.js';
 import { FakeProcess, until } from './fake-process.js';
 import { tmpDir } from './helpers.js';
 
 const P2PK = `02${'ab'.repeat(32)}`;
+const CREATOR = 'c1'.repeat(32);
+const RELAY = 'wss://relay.example';
 const MINT = 'https://mint.example';
+/** 32 bytes of test passphrase (a fixture, never a real credential). */
+const PASS = 'test-passphrase-0123456789abcdef';
 
 const cleanups: (() => Promise<void>)[] = [];
 afterEach(async () => {
@@ -38,7 +45,8 @@ function goodConfig(dataDir: string, extra: Record<string, unknown> = {}): strin
   return JSON.stringify({
     dataDir,
     swarm: null,
-    policy: { satsPerBlock: 3, mints: [MINT], creatorP2pk: P2PK },
+    relays: [RELAY],
+    policy: { satsPerBlock: 3, mints: [MINT], creatorP2pk: P2PK, creatorPubkey: CREATOR },
     ...extra,
   });
 }
@@ -48,17 +56,25 @@ const fakeDeps = (): RuntimeDeps => ({
 });
 
 describe('parseCliArgs', () => {
-  it('accepts --config/--check/--help; errors are fixed strings that never quote the token', () => {
+  it('accepts --config/--check/--keygen/--help; errors are fixed strings that never quote the token', () => {
     expect(parseCliArgs(['--config', '/etc/nutflix/seeder.json'])).toEqual({
       config: '/etc/nutflix/seeder.json',
       check: false,
+      keygen: false,
       help: false,
     });
     expect(parseCliArgs(['--check', '--config=x'])).toEqual({
       config: 'x',
       check: true,
+      keygen: false,
       help: false,
     });
+    expect(parseCliArgs(['--keygen', '--config', 'x'])).toMatchObject({ keygen: true });
+    expect(parseCliArgs(['--keygen', '--check'])).toEqual({
+      error: '--check and --keygen are exclusive',
+    });
+    // No flag takes the passphrase: it comes from stdin (keygen) or the credential (start).
+    expect(parseCliArgs(['--passphrase', 'x'])).toEqual({ error: 'unknown option' });
     expect(parseCliArgs(['-h'])).toMatchObject({ help: true });
     expect(parseCliArgs(['--nsec1sentinel'])).toEqual({ error: 'unknown option' });
     expect(parseCliArgs(['nsec1sentinel'])).toEqual({ error: 'unexpected positional argument' });
@@ -192,18 +208,59 @@ describe('main(): --check and providers', () => {
     expect([...viaEnv.runs, ...flagWins.runs]).toEqual([]); // no READY: nothing started
   });
 
-  it('Stage 1: no providers wired → 78 and the reason is logged', async () => {
+  it('a provider seam that returns nothing → 78 and the reason is logged', async () => {
     const dir = await scratch();
     const proc = new FakeProcess();
-    const cfg = goodConfig(path.join(dir, 'data'));
-    const parsed = { seeder: { dataDir: dir, diskCapBytes: 0 }, logLevel: 'info' } as DaemonConfig;
-    expect(getRuntimeDeps(parsed)).toBeUndefined();
-    const code = await main(['--config', 'c.json'], { proc, readFile: () => Promise.resolve(cfg) });
+    const code = await main(['--config', 'c.json'], {
+      proc,
+      readFile: () => Promise.resolve(goodConfig(path.join(dir, 'data'))),
+      providers: () => undefined,
+    });
     expect(code).toBe(EXIT_CONFIG);
     const line = proc.out.find((l) => l.includes('refusing to start'));
-    expect(line).toBeDefined();
     expect(line).toContain(MISSING_PROVIDERS_REASON);
     expect(proc.runs).toEqual([]);
+  });
+
+  it('the real providers: no key file → 78, the reason names it, and nothing is created on disk', async () => {
+    const dir = await scratch();
+    const data = path.join(dir, 'data');
+    const proc = new FakeProcess();
+    const code = await main(['--config', 'c.json'], {
+      proc,
+      readFile: () => Promise.resolve(goodConfig(data)),
+    });
+    expect(code).toBe(EXIT_CONFIG);
+    expect(proc.text()).toContain('runtime providers failed');
+    expect(proc.text()).toContain('no key file at');
+    expect(proc.text()).toContain('--keygen');
+    expect(existsSync(data)).toBe(false);
+    expect(proc.runs).toEqual([]);
+  });
+
+  it('the real providers: a key file but no systemd credential → 78; the passphrase is never taken from the environment', async () => {
+    const dir = await scratch();
+    const data = path.join(dir, 'data');
+    await mkdir(data, { mode: 0o700 });
+    const kg = new FakeProcess();
+    kg.stdin = `${PASS}\n`;
+    const made = await main(['--keygen', '--config', 'c.json'], {
+      proc: kg,
+      readFile: () => Promise.resolve(goodConfig(data)),
+    });
+    expect(made).toBe(0);
+    const proc = new FakeProcess();
+    // A passphrase in the environment is not a credential: still refused.
+    proc.vars.set('NUTFLIX_SEEDER_PASSPHRASE', PASS);
+    proc.vars.set('SEEDER_KEY_PASSPHRASE', PASS);
+    const code = await main(['--config', 'c.json'], {
+      proc,
+      readFile: () => Promise.resolve(goodConfig(data)),
+    });
+    expect(code).toBe(EXIT_CONFIG);
+    expect(proc.text()).toContain('no systemd credentials');
+    expect(proc.text()).not.toContain(PASS);
+    expect(existsSync(path.join(data, 'wallet'))).toBe(false);
   });
 
   it('a provider that throws → 78, and the logger redacts what it said', async () => {
@@ -232,17 +289,37 @@ describe('main(): starting with (fake) providers', () => {
       diskCapBytes: 1_048_576,
       blockSize: 4096,
       rateLimits: { maxStreamsPerKey: 1 },
-      policy: { satsPerBlock: 3, mints: [MINT], creatorP2pk: P2PK, split: { seeder: 60 } },
+      relays: [RELAY],
+      policy: {
+        satsPerBlock: 3,
+        mints: [MINT],
+        creatorP2pk: P2PK,
+        creatorPubkey: CREATOR,
+        split: { seeder: 60 },
+      },
       flushEveryBlocks: 8,
     });
     let seeder: Seeder | null = null;
     let providerSaw: DaemonConfig | null = null;
+    const order: string[] = [];
     void main(['--config', 'c.json'], {
       proc,
       readFile: () => Promise.resolve(cfg),
-      providers: (c) => {
+      providers: (c, ctx) => {
         providerSaw = c;
-        return fakeDeps();
+        expect(ctx.env(DAEMON_ENV.maxStreams)).toBe('7');
+        return {
+          ...fakeDeps(),
+          attach: () => {
+            // Before start(): `Seeder.start()` logs "seeder started".
+            const started = proc.out.some((l) => l.includes('seeder started'));
+            order.push(started ? 'attach-after-start' : 'attach');
+          },
+          close: () => {
+            order.push('runtime-close');
+            return Promise.resolve();
+          },
+        };
       },
       onStarted: (s) => {
         seeder = s;
@@ -270,15 +347,17 @@ describe('main(): starting with (fake) providers', () => {
     expect(s.stats().cores).toBe(1); // runDaemon's default `blobs` core
     expect(proc.runs).toEqual([{ cmd: 'systemd-notify', args: ['--ready'] }]);
     expect(proc.out.some((l) => l.includes('daemon ready'))).toBe(true);
-    expect(proc.out.some((l) => l.includes('"warn"') && l.includes('pay/1 is not attached'))).toBe(
-      true,
-    );
+    // The Stage 1 warning is gone: the runtime attaches pay/1.
+    expect(proc.out.some((l) => l.includes('pay/1 is not attached'))).toBe(false);
+    expect(order).toEqual(['attach']);
+    expect(proc.out.some((l) => l.includes('seeder started'))).toBe(true);
 
     // Count closes through the instance the hooks call.
     let closes = 0;
     const realClose = s.close.bind(s);
     s.close = () => {
       closes++;
+      order.push('seeder-close');
       return realClose();
     };
     proc.signal('SIGTERM');
@@ -286,6 +365,8 @@ describe('main(): starting with (fake) providers', () => {
     await until(() => proc.exits.length > 0, 'the shutdown hooks to exit');
     expect(proc.exits).toEqual([0]);
     expect(closes).toBe(1);
+    // The runtime closes after the seeder: its final flush still had relays and the key.
+    expect(order).toEqual(['attach', 'seeder-close', 'runtime-close']);
     expect(proc.out.some((l) => l.includes('closed cleanly'))).toBe(true);
     expect(proc.runs.at(-1)).toEqual({ cmd: 'systemd-notify', args: ['STOPPING=1'] });
   });
@@ -295,13 +376,87 @@ describe('main(): starting with (fake) providers', () => {
     const file = path.join(dir, 'not-a-dir');
     await writeFile(file, 'x');
     const proc = new FakeProcess();
+    let runtimeClosed = 0;
     const code = await main(['--config', 'c.json'], {
       proc,
       readFile: () => Promise.resolve(goodConfig(path.join(file, 'data'))),
-      providers: fakeDeps,
+      providers: () => ({
+        ...fakeDeps(),
+        close: () => {
+          runtimeClosed++;
+          return Promise.resolve();
+        },
+      }),
     });
     expect(code).toBe(1);
     expect(proc.text()).toContain('seeder failed to start');
     expect(proc.runs).toEqual([]);
+    // The runtime is released on a failed start too (key locked, state lock freed).
+    expect(runtimeClosed).toBe(1);
+  });
+});
+
+describe('main(): --keygen', () => {
+  it('creates a 0600 key file with a wallet key at keyFile, logs only the public key, and never overwrites', async () => {
+    const dir = await scratch();
+    const data = path.join(dir, 'data');
+    await mkdir(data, { mode: 0o700 });
+    const proc = new FakeProcess();
+    proc.stdin = `${PASS}\n`;
+    let consulted = 0;
+    const code = await main(['--keygen', '--config', 'c.json'], {
+      proc,
+      readFile: () => Promise.resolve(goodConfig(data)),
+      providers: () => {
+        consulted++;
+        return fakeDeps();
+      },
+    });
+    expect(code).toBe(0);
+    expect(consulted).toBe(0); // keygen starts nothing
+    const keyFile = path.join(data, 'identity.key');
+    expect((await stat(keyFile)).mode & 0o777).toBe(0o600);
+    const header = JSON.parse(await readFile(keyFile, 'utf8')) as {
+      pubkey: string;
+      walletKey: boolean;
+    };
+    expect(header.walletKey).toBe(true);
+    expect(proc.text()).toContain('key file created');
+    expect(proc.text()).toContain(header.pubkey); // the public key, for the operator
+    expect(proc.text()).not.toContain(PASS);
+
+    const again = new FakeProcess();
+    again.stdin = PASS;
+    expect(
+      await main(['--keygen', '--config', 'c.json'], {
+        proc: again,
+        readFile: () => Promise.resolve(goodConfig(data)),
+      }),
+    ).toBe(EXIT_CONFIG);
+    expect(again.text()).toContain('never overwrites');
+    expect(JSON.parse(await readFile(keyFile, 'utf8'))).toMatchObject({ pubkey: header.pubkey });
+  });
+
+  it('refuses a short passphrase and a terminal on stdin, and never prints the input', async () => {
+    const dir = await scratch();
+    const proc = new FakeProcess();
+    proc.stdin = 'short-SENTINEL\n';
+    expect(
+      await main(['--keygen', '--config', 'c.json'], {
+        proc,
+        readFile: () => Promise.resolve(goodConfig(dir)),
+      }),
+    ).toBe(EXIT_CONFIG);
+    expect(proc.text()).toContain('at least 16 bytes');
+    expect(proc.text()).not.toContain('SENTINEL');
+    const tty = new FakeProcess(); // stdin null = a terminal
+    expect(
+      await main(['--keygen', '--config', 'c.json'], {
+        proc: tty,
+        readFile: () => Promise.resolve(goodConfig(dir)),
+      }),
+    ).toBe(1);
+    expect(tty.text()).toContain('keygen failed');
+    expect(existsSync(path.join(dir, 'identity.key'))).toBe(false);
   });
 });

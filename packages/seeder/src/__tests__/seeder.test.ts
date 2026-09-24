@@ -362,6 +362,43 @@ describe('Seeder façade', () => {
     expect(second.cutReason).toBeNull();
   });
 
+  it('onSessionReady: a direct replication stream is reported once admitted, with its Protomux; a refused one never; unsubscribe stops it', async () => {
+    const a = await make({ maxStreams: 1 });
+    const b = await make();
+    const ready: { mux: boolean; noise: string }[] = [];
+    const off = a.seeder.onSessionReady((session) => {
+      ready.push({ mux: session.mux !== null, noise: session.noiseKeyHex });
+    });
+    const pipe = async () => {
+      const x = a.seeder.replicate(true);
+      const y = b.seeder.replicate(false);
+      x.on('error', () => undefined);
+      y.on('error', () => undefined);
+      x.pipe(y).pipe(x);
+      await y.noiseStream.opened;
+      await new Promise((r) => setTimeout(r, 30));
+      return { x, y };
+    };
+    const first = await pipe();
+    expect(ready).toEqual([{ mux: true, noise: toHex(first.y.noiseStream.publicKey!) }]);
+    // Over the global stream cap: refused at admission, never reported ready.
+    await pipe();
+    expect(a.events.some((e) => e.type === 'session-refused')).toBe(true);
+    expect(ready).toHaveLength(1);
+
+    // A listener that throws is contained (logged), not propagated into admission.
+    a.seeder.onSessionReady(() => {
+      throw new Error('listener bug');
+    });
+    off();
+    first.x.destroy();
+    await new Promise((r) => setTimeout(r, 30));
+    await pipe();
+    expect(a.seeder.sessions.size).toBe(1); // admitted…
+    expect(ready).toHaveLength(1); // …but the unsubscribed listener heard nothing
+    expect(a.log.lines.some((l) => l.includes('session-ready listener threw'))).toBe(true);
+  });
+
   it('policy() throws until configured; close() is idempotent and flushes', async () => {
     const s = await make();
     expect(() => s.seeder.policy()).toThrow(/PricePolicy/);

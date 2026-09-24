@@ -16,6 +16,13 @@ export {
 export { MemoryProofStore, proofTotal, type ProofStore, type WalletTx } from './store.js';
 export { Nip60ProofStore, type Nip60Relays } from './nip60.js';
 export {
+  cashuRequestFn,
+  type CashuRequestOptions,
+  type RawHttp,
+  type RawHttpRequest,
+  type RawHttpResponse,
+} from './transport.js';
+export {
   CashuMintConnections,
   CashuWallet,
   memoryWalletKey,

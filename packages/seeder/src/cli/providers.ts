@@ -1,43 +1,58 @@
 /**
  * Runtime provider seam for the seeder daemon entry (`cli/main.ts`) — the same pattern as the
- * gateway's `cli/providers.ts`. In Stage 1 every real dependency of a production seeder is
- * absent:
+ * gateway's `cli/providers.ts`. Stage 3 fills it: `getRuntimeDeps()` builds the daemon's runtime
+ * (`runtime/index.ts`, decisions in ADR 0011):
  *
- *   - `PaymentEngineSeeder` → `packages/core/src/payment/`      (locked until Stage 2)
- *   - `PayProtocol`         → `packages/core/src/pay-protocol/` (locked until Stage 2)
- *   - HELLO identity        → the `Signer` (`packages/core/src/signer/`, Stage 2)
+ *   - the identity: the encrypted key file (`DaemonConfig.keyFile`), unlocked with the systemd
+ *     credential `seeder-key-passphrase` from `$CREDENTIALS_DIRECTORY`;
+ *   - the real `PaymentEngineSeeder` over the node's own wallet (a 0600 proof file), with the
+ *     durable pending queue and seen set, rate-limited keysets and NIP-61 nutzaps;
+ *   - `attach`: `pay/1` + HELLO on every admitted session, and the node's kind 10019.
  *
- * so `getRuntimeDeps()` returns `undefined` and `main()` refuses to start with a clear,
- * redacted reason and exit 78 (EX_CONFIG).
- *
- * STAGE 2 — this is NOT a one-function change, unlike the gateway's seam. `RuntimeDeps`
- * carries only what `runDaemon()` consumes today: the engine. The daemon does not yet
- * attach `pay/1` to swarm sessions or send `HELLO` (the gateway and the desktop worker do
- * that in their own shells), so a daemon started with only an engine serves every peer
- * `windowBlocks` unpaid blocks and then cuts it — `main()` logs a `warn` saying exactly
- * that on every start. Stage 2 has to add, together:
- *   1. the engine here;
- *   2. a `PayProtocol` factory + a HELLO identity (pubkey, P2PK, challenge signing) here;
- *   3. the wiring: on each admitted swarm session, attach the protocol to `session.mux`,
- *      `seeder.attachPayProtocol()`, send `HELLO` from `seeder.policy()`. The seeder's own
- *      `SwarmManager` admits a connection BEFORE Corestore replicates on it, so `session.mux`
- *      is still null at `session-open`; either `Seeder` grows an on-session hook
- *      (`seeder.ts`, outside the Seeder-entry lane) or the daemon owns the swarm the way the
- *      desktop worker's `PeerNode` does. See docs/lanes/Seeder-entry.md "Stage 2".
- * Remove the start-up `warn` in `main.ts` in the same change.
+ * Any missing piece (no key file, no credential, a wallet file it cannot trust, another daemon on
+ * the same data directory) throws a `RuntimeSetupError`, which `main()` logs and turns into exit
+ * 78 before anything is created on disk.
  */
-import type { SeederDeps } from '../seeder.js';
+import type { Logger } from '../log/logger.js';
+import { createSeederRuntime } from '../runtime/index.js';
+import type { Seeder, SeederDeps } from '../seeder.js';
 import type { DaemonConfig } from './config-file.js';
 
 export interface RuntimeDeps {
-  /** The real `PaymentEngineSeeder` (Stage 2). Tests pass `mocks.MockPaymentEngine`. */
+  /** The `PaymentEngineSeeder`. Tests pass `mocks.MockPaymentEngine`. */
   readonly engine: SeederDeps['engine'];
+  /** With the created seeder, before `start()`: where `pay/1` is attached to its sessions. */
+  readonly attach?: (seeder: Seeder) => void;
+  /** After the seeder has closed (its final flush ran): release relays, lock the key. */
+  readonly close?: () => Promise<void>;
 }
 
-/** Stage 1: nothing to provide. A provider may be async (Stage 2 will open a wallet). */
-export function getRuntimeDeps(_config: DaemonConfig): RuntimeDeps | undefined {
-  return undefined;
+export interface ProviderContext {
+  readonly env: (name: string) => string | undefined;
+  readonly logger: Logger;
 }
 
+/** systemd sets it when the unit loads a credential (`LoadCredentialEncrypted=`). */
+export const CREDENTIALS_DIRECTORY_ENV = 'CREDENTIALS_DIRECTORY';
+
+export async function getRuntimeDeps(
+  config: DaemonConfig,
+  ctx: ProviderContext,
+): Promise<RuntimeDeps> {
+  const rt = await createSeederRuntime(config, {
+    credentialsDirectory: ctx.env(CREDENTIALS_DIRECTORY_ENV),
+    logger: ctx.logger,
+  });
+  ctx.logger.info('runtime ready', { publicKey: rt.pubkey });
+  return {
+    engine: rt.engine,
+    attach: (seeder) => {
+      rt.attach(seeder);
+    },
+    close: () => rt.close(),
+  };
+}
+
+/** What `main()` logs when a (test) provider seam returns nothing. */
 export const MISSING_PROVIDERS_REASON =
-  'no runtime providers wired: PaymentEngineSeeder, PayProtocol and the HELLO Signer land in Stage 2 (see packages/seeder/src/cli/providers.ts)';
+  'no runtime providers: the provider returned nothing (see packages/seeder/src/cli/providers.ts)';

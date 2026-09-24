@@ -9,12 +9,18 @@
  * Nothing here logs. Errors carry a code prefix (`signer-locked:`, `invalid-argument:`) and
  * never a key, a passphrase or plaintext.
  */
-import { parseP2PKSecret, schnorrSignMessage } from '@cashu/cashu-ts';
+import { getPubKeyFromPrivKey, parseP2PKSecret, schnorrSignMessage } from '@cashu/cashu-ts';
 import { decode as nip19Decode } from 'nostr-tools/nip19';
 import * as nip44 from 'nostr-tools/nip44';
 import { finalizeEvent, getPublicKey } from 'nostr-tools/pure';
 
-import type { NostrEvent, NostrPubkey, Signer, UnsignedNostrEvent } from '../contracts/index.js';
+import type {
+  CashuP2pkPubkey,
+  NostrEvent,
+  NostrPubkey,
+  Signer,
+  UnsignedNostrEvent,
+} from '../contracts/index.js';
 import { verifyIncoming } from '../nostr/event.js';
 import { openKeyFile, readKeyFileHeader, sealKeyFile, type KdfCost } from './keyfile.js';
 import { randomFill, secureAlloc, secureCopy, wipe, type SecureBuffer } from './secure.js';
@@ -108,6 +114,12 @@ function pubkeyOf(sk: Uint8Array): NostrPubkey {
   }
 }
 
+function hexOf(b: Uint8Array): string {
+  let s = '';
+  for (const x of b) s += x.toString(16).padStart(2, '0');
+  return s;
+}
+
 /** A fresh random secret key in secure memory (retries the ~2^-128 invalid-scalar case). */
 function generateSecretKey(): SecureBuffer {
   for (;;) {
@@ -125,6 +137,12 @@ function generateSecretKey(): SecureBuffer {
 export class LocalSigner implements Signer {
   readonly kind = 'local' as const;
   readonly signSecret?: (secret: string) => Promise<string>;
+  /**
+   * The wallet key's public half in the compressed form NUT-11 locks to (`02`/`03` + 64 hex):
+   * what a node advertises as its P2PK target (HELLO, kind 10019). `null` without a wallet key.
+   * Public data — kept after `lock()`, like the key file header's pubkey.
+   */
+  readonly walletP2pk: CashuP2pkPubkey | null;
 
   private sk: SecureBuffer | null;
   private walletKey: SecureBuffer | null;
@@ -134,8 +152,10 @@ export class LocalSigner implements Signer {
     this.sk = sk;
     this.walletKey = walletKey;
     this.pubkey = pubkeyOf(sk);
+    this.walletP2pk = null;
     if (walletKey !== null) {
       pubkeyOf(walletKey); // refuse an invalid wallet scalar up front
+      this.walletP2pk = hexOf(getPubKeyFromPrivKey(walletKey)) as CashuP2pkPubkey;
       this.signSecret = (secret) => this.signWitness(secret);
     }
   }

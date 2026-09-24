@@ -4,23 +4,32 @@
  * - `isMainModule` (the self-exec guard, symlinks resolved);
  * - the unit's ExecStart / Type and `package.json` main + export conditions (read-only);
  * - the BUILT `dist/index.js`, spawned with the node flags taken FROM the unit file: `--check`
- *   → 0, no providers → 78 + reason, bad config → 78 without the value, and the same through
- *   a symlink. This is the test that caught the `--jitless` crash (MDWE-RESULTS.md §6): an
- *   in-process test cannot see it, because vitest does not run under `--jitless`.
+ *   → 0, no key file → 78 + reason, bad config → 78 without the value, the same through a
+ *   symlink; then `--keygen` from a piped passphrase and a real start with the passphrase as a
+ *   credential file in `$CREDENTIALS_DIRECTORY` — the whole runtime (argon2id unlock, wallet,
+ *   engine, the `ws` relay pool) under `--jitless` — READY, a real mint loaded over HTTP (the
+ *   global `fetch` crashes under `--jitless`; the runtime must not use it), and a clean exit on
+ *   SIGTERM. This is
+ *   the test that caught the `--jitless` crash (MDWE-RESULTS.md §6): an in-process test cannot
+ *   see it, because vitest does not run under `--jitless`.
  *
  * The built-entry block needs `npm run build` first (`npm run ci` builds before testing) and
  * is skipped when `dist/` predates the daemon entry.
  */
 import { spawn } from 'node:child_process';
+import { createServer } from 'node:http';
+import type { AddressInfo } from 'node:net';
 import { existsSync, readFileSync } from 'node:fs';
-import { readFile, symlink, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, stat, symlink, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { MintOperationError } from '@cashu/cashu-ts';
+import { mocks } from '@sovit/core';
+import type { MintUrl } from '@sovit/core';
 import { afterEach, describe, expect, it } from 'vitest';
 
 import { parseCliArgs } from '../cli/main.js';
-import { MISSING_PROVIDERS_REASON } from '../cli/providers.js';
 import { isMainModule } from '../index.js';
 import { tmpDir } from './helpers.js';
 
@@ -31,6 +40,10 @@ const UNIT = path.join(ROOT, 'deploy/systemd/nutflix-seeder.service');
 const DIST_ENTRY = path.join(PKG, 'dist/index.js');
 const DIST_MAIN = path.join(PKG, 'dist/cli/main.js');
 const P2PK = `02${'ab'.repeat(32)}`;
+const CREATOR = 'c1'.repeat(32);
+/** A loopback port nothing listens on: the relay pool's connects are refused at once. */
+const DEAD_RELAY = 'ws://127.0.0.1:9';
+const PASS = 'entry-test-passphrase-0123456789';
 
 const cleanups: (() => Promise<void>)[] = [];
 afterEach(async () => {
@@ -74,6 +87,11 @@ describe('canonical systemd unit (deploy/systemd/nutflix-seeder.service, read-on
     expect(unit).toContain('\nType=simple\n');
     expect(unit).toContain('\nMemoryDenyWriteExecute=yes\n');
     expect(unit).toContain('\nStateDirectory=nutflix-seeder\n');
+    // The key passphrase arrives as a credential, under the id the runtime reads.
+    expect(unit).toMatch(/\nLoadCredentialEncrypted=seeder-key-passphrase:\S+\n/);
+    // …and nothing secret rides the environment.
+    for (const line of unit.split('\n').filter((l) => l.startsWith('Environment=')))
+      expect(line).not.toMatch(/PASS|NSEC|SECRET|_KEY/i);
     const pkg = JSON.parse(await readFile(path.join(PKG, 'package.json'), 'utf8')) as {
       main: string;
       exports: { '.': { bare: string; default: string } };
@@ -84,6 +102,7 @@ describe('canonical systemd unit (deploy/systemd/nutflix-seeder.service, read-on
     expect(parseCliArgs(['--config', '/etc/nutflix/seeder.json'])).toEqual({
       config: '/etc/nutflix/seeder.json',
       check: false,
+      keygen: false,
       help: false,
     });
   });
@@ -97,8 +116,18 @@ interface Run {
   readonly out: string;
 }
 
+interface RunOptions {
+  readonly env?: Readonly<Record<string, string>>;
+  /** Written to stdin, then stdin is closed (default: stdin ignored). */
+  readonly input?: string;
+  /** Once the output contains this, send SIGTERM (a daemon that started). */
+  readonly stopWhen?: string;
+  readonly ms?: number;
+}
+
 /** Spawn node with the unit's flags on `script`; bounded, with a clear failure message. */
-async function runEntry(script: string, args: readonly string[], ms = 30_000): Promise<Run> {
+async function runEntry(script: string, args: readonly string[], o: RunOptions = {}): Promise<Run> {
+  const ms = o.ms ?? 30_000;
   const argv = await execStart();
   const nodeFlags = argv.slice(
     1,
@@ -107,12 +136,21 @@ async function runEntry(script: string, args: readonly string[], ms = 30_000): P
   const child = spawn(process.execPath, [...nodeFlags, script, ...args], {
     cwd: ROOT,
     // A clean environment: nothing from the test runner (NUTFLIX_SEEDER_*, NODE_OPTIONS).
-    env: {},
-    stdio: ['ignore', 'pipe', 'pipe'],
+    env: { ...o.env },
+    stdio: [o.input === undefined ? 'ignore' : 'pipe', 'pipe', 'pipe'],
   });
+  if (o.input !== undefined) child.stdin?.end(o.input);
   let out = '';
-  child.stdout.on('data', (b: Buffer) => (out += b.toString('utf8')));
-  child.stderr.on('data', (b: Buffer) => (out += b.toString('utf8')));
+  let stopped = false;
+  const onData = (b: Buffer): void => {
+    out += b.toString('utf8');
+    if (o.stopWhen !== undefined && !stopped && out.includes(o.stopWhen)) {
+      stopped = true;
+      child.kill('SIGTERM');
+    }
+  };
+  child.stdout?.on('data', onData);
+  child.stderr?.on('data', onData);
   return new Promise<Run>((resolve, reject) => {
     const timer = setTimeout(() => {
       child.kill('SIGKILL');
@@ -132,7 +170,7 @@ async function runEntry(script: string, args: readonly string[], ms = 30_000): P
 }
 
 describe.skipIf(!built)('built entry (dist/index.js) with the unit node flags', () => {
-  it('--check → 0; no providers → 78 + reason; bad config → 78 without the value; same via a symlink', async () => {
+  it('--check → 0; no key file → 78 + reason; bad config → 78 without the value; same via a symlink', async () => {
     const t = await tmpDir('nutflix-seeder-dist-');
     cleanups.push(t.rm);
     const good = path.join(t.dir, 'seeder.json');
@@ -141,7 +179,13 @@ describe.skipIf(!built)('built entry (dist/index.js) with the unit node flags', 
       JSON.stringify({
         dataDir: path.join(t.dir, 'data'),
         swarm: null,
-        policy: { satsPerBlock: 1, mints: ['https://mint.example'], creatorP2pk: P2PK },
+        relays: [DEAD_RELAY],
+        policy: {
+          satsPerBlock: 1,
+          mints: ['https://mint.example'],
+          creatorP2pk: P2PK,
+          creatorPubkey: CREATOR,
+        },
       }),
     );
     const bad = path.join(t.dir, 'bad.json');
@@ -156,7 +200,8 @@ describe.skipIf(!built)('built entry (dist/index.js) with the unit node flags', 
     expect({ code: check.code, signal: check.signal }).toEqual({ code: 0, signal: null });
 
     const start = await runEntry(DIST_ENTRY, ['--config', good]);
-    expect(start.out).toContain(MISSING_PROVIDERS_REASON);
+    expect(start.out).toContain('refusing to start');
+    expect(start.out).toContain('no key file at');
     expect(start.code).toBe(78);
     expect(existsSync(path.join(t.dir, 'data'))).toBe(false); // refused before touching state
 
@@ -172,5 +217,111 @@ describe.skipIf(!built)('built entry (dist/index.js) with the unit node flags', 
       code: 0,
       ok: true,
     });
+  }, 120_000);
+
+  it('--keygen from a piped passphrase, then a real start with it as a systemd credential: READY under --jitless, clean exit on SIGTERM', async () => {
+    const t = await tmpDir('nutflix-seeder-dist-run-');
+    cleanups.push(t.rm);
+    const data = path.join(t.dir, 'data');
+    await mkdir(data, { mode: 0o700 });
+    const cfg = path.join(t.dir, 'seeder.json');
+    await writeFile(
+      cfg,
+      JSON.stringify({
+        dataDir: data,
+        swarm: null,
+        relays: [DEAD_RELAY],
+        policy: {
+          satsPerBlock: 1,
+          mints: ['https://mint.example'],
+          creatorP2pk: P2PK,
+          creatorPubkey: CREATOR,
+        },
+      }),
+    );
+    const keygen = await runEntry(DIST_ENTRY, ['--keygen', '--config', cfg], {
+      input: `${PASS}\n`,
+    });
+    expect({ code: keygen.code, out: keygen.out.includes('key file created') }).toEqual({
+      code: 0,
+      out: true,
+    });
+    expect(keygen.out).not.toContain(PASS);
+    expect((await stat(path.join(data, 'identity.key'))).mode & 0o777).toBe(0o600);
+
+    // A mint over real HTTP: the in-process TestMint behind a loopback server (JSON both ways,
+    // mint errors as 400 { code, detail }). The daemon loads every accepted mint at start.
+    const srv = createServer((req, res) => {
+      let body = '';
+      req.on('data', (c: Buffer) => (body += c.toString('utf8')));
+      req.on('end', () => {
+        mintHits++;
+        mint
+          .request({
+            endpoint: `${mintUrl}${req.url ?? '/'}`,
+            method: req.method ?? 'GET',
+            ...(body === '' ? {} : { requestBody: JSON.parse(body) as Record<string, unknown> }),
+          })
+          .then(
+            (out) => {
+              res.setHeader('Content-Type', 'application/json');
+              res.end(JSON.stringify(out));
+            },
+            (e: unknown) => {
+              res.statusCode = e instanceof MintOperationError ? 400 : 500;
+              res.end(
+                JSON.stringify(
+                  e instanceof MintOperationError ? { code: e.code, detail: e.message } : {},
+                ),
+              );
+            },
+          );
+      });
+    });
+    await new Promise<void>((r) => srv.listen(0, '127.0.0.1', r));
+    cleanups.push(
+      () =>
+        new Promise<void>((r) => {
+          srv.closeAllConnections();
+          srv.close(() => {
+            r();
+          });
+        }),
+    );
+    const mintUrl = `http://127.0.0.1:${String((srv.address() as AddressInfo).port)}` as MintUrl;
+    const mint = new mocks.TestMint({ url: mintUrl, seed: new Uint8Array(32).fill(0x2e) });
+    let mintHits = 0;
+    const cfgWithMint = path.join(t.dir, 'seeder-mint.json');
+    await writeFile(
+      cfgWithMint,
+      JSON.stringify({
+        dataDir: data,
+        swarm: null,
+        relays: [DEAD_RELAY],
+        policy: { satsPerBlock: 1, mints: [mintUrl], creatorP2pk: P2PK, creatorPubkey: CREATOR },
+      }),
+    );
+
+    // What systemd's LoadCredentialEncrypted= leaves behind: a private directory, one file.
+    const creds = path.join(t.dir, 'credentials');
+    await mkdir(creds, { mode: 0o700 });
+    await writeFile(path.join(creds, 'seeder-key-passphrase'), `${PASS}\n`, { mode: 0o400 });
+    const run = await runEntry(DIST_ENTRY, ['--config', cfgWithMint], {
+      env: { CREDENTIALS_DIRECTORY: creds },
+      stopWhen: '"mint loaded"',
+      ms: 60_000,
+    });
+    expect(run.out).toContain('"runtime ready"');
+    expect(run.out).toContain('"daemon ready"');
+    // The mint was reached over HTTP under --jitless, and its keyset loaded.
+    expect(run.out).toMatch(/"mint loaded".*"keysets":1/);
+    expect(mintHits).toBeGreaterThan(0);
+    expect(run.out).not.toContain('WebAssembly');
+    expect(run.out).not.toContain(PASS);
+    expect(run.out).toContain('closed cleanly');
+    expect({ code: run.code, signal: run.signal }).toEqual({ code: 0, signal: null });
+    // The state lock is released at exit, and the wallet directory is private.
+    expect(existsSync(path.join(data, 'wallet', 'lock'))).toBe(false);
+    expect((await stat(path.join(data, 'wallet'))).mode & 0o777).toBe(0o700);
   }, 120_000);
 });

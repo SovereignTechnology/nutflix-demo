@@ -8,6 +8,8 @@ export class FakeProcess implements SeederProcess {
   readonly err: string[] = [];
   readonly exits: number[] = [];
   readonly runs: { cmd: string; args: readonly string[] }[] = [];
+  /** What `readStdin` returns; `null` = a terminal (refused, like the Node adapter). */
+  stdin: string | null = null;
   private readonly handlers = new Map<SignalName, Set<() => void>>();
 
   env(name: string): string | undefined {
@@ -31,6 +33,12 @@ export class FakeProcess implements SeederProcess {
   run(cmd: string, args: readonly string[]): Promise<{ code: number }> {
     this.runs.push({ cmd, args });
     return Promise.resolve({ code: 0 });
+  }
+  readStdin(maxBytes: number): Promise<Uint8Array> {
+    if (this.stdin === null) return Promise.reject(new Error('stdin is a terminal'));
+    const b = Buffer.from(this.stdin);
+    if (b.length > maxBytes) return Promise.reject(new Error('stdin is longer than expected'));
+    return Promise.resolve(b);
   }
   signal(s: SignalName): void {
     for (const cb of this.handlers.get(s) ?? []) cb();

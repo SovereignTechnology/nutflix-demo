@@ -31,4 +31,20 @@ export const nodeProcess: SeederProcess = {
         resolve({ code: code ?? -1 });
       });
     }),
+  readStdin: async (maxBytes) => {
+    if (process.stdin.isTTY)
+      throw new Error('stdin is a terminal: pipe the input in (a typed passphrase would echo)');
+    const chunks: Buffer[] = [];
+    let size = 0;
+    try {
+      for await (const chunk of process.stdin as AsyncIterable<Buffer>) {
+        chunks.push(chunk);
+        size += chunk.length;
+        if (size > maxBytes) throw new Error('stdin is longer than expected');
+      }
+      return Buffer.concat(chunks);
+    } finally {
+      for (const c of chunks) c.fill(0);
+    }
+  },
 };

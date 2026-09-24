@@ -22,7 +22,16 @@
  *
  * Pure (no `node:` import); `main.ts` does the file I/O.
  */
-import type { CashuP2pkPubkey, MintUrl, PricePolicy, Sats } from '@sovit/core';
+import type {
+  CashuP2pkPubkey,
+  CoreKeyHex,
+  MintUrl,
+  NostrEventId,
+  NostrPubkey,
+  PricePolicy,
+  RelayUrl,
+  Sats,
+} from '@sovit/core';
 import { DEFAULT_BLOCK_SIZE, nostr } from '@sovit/core';
 
 import type { SeederConfig } from '../config.js';
@@ -42,6 +51,18 @@ import {
 export interface DaemonConfig {
   readonly seeder: SeederConfig;
   readonly logLevel: LogLevel;
+  /**
+   * The node's encrypted key file (Nostr identity + wallet P2PK key, `LocalSigner`). Default
+   * `<dataDir>/identity.key`. Its passphrase is a systemd credential, never config or env
+   * (`runtime/identity.ts`).
+   */
+  readonly keyFile: string;
+  /** Where creator nutzaps (kind 9321) and the node's kind 10019 are published. */
+  readonly relays: readonly RelayUrl[];
+  /** The creator's Nostr pubkey: the `p` of every nutzap carrying `policy.creatorP2pk` proofs. */
+  readonly creatorPubkey: NostrPubkey;
+  /** Core key → the video's event id: the nutzap's `e` tag, so paid views count per video. */
+  readonly videoEvents: ReadonlyMap<CoreKeyHex, NostrEventId>;
 }
 
 export type DaemonConfigResult =
@@ -67,6 +88,11 @@ type Obj = Readonly<Record<string, unknown>>;
 
 const LOG_LEVELS: readonly LogLevel[] = ['debug', 'info', 'warn', 'error'];
 const P2PK = /^0[23][0-9a-f]{64}$/;
+const HEX64 = /^[0-9a-f]{64}$/;
+/** Relays a daemon publishes to; each is a socket the node keeps open. */
+export const MAX_RELAYS = 8;
+/** Plain `ws://` is accepted only to a loopback relay (a local test relay). */
+const LOOPBACK_HOSTS = new Set(['localhost', '127.0.0.1', '[::1]']);
 /** Key names safe to print in a path; anything else is shown as `[…]`. */
 const SAFE_KEY = /^[A-Za-z_][A-Za-z0-9_]{0,63}$/;
 const MAX = Number.MAX_SAFE_INTEGER;
@@ -168,17 +194,35 @@ const TOP_KEYS = [
   'flushEveryBlocks',
   'flushEveryMs',
   'logLevel',
+  'identity',
+  'relays',
+  'videoEvents',
 ] as const;
-const POLICY_KEYS = ['satsPerBlock', 'blockSize', 'mints', 'split', 'creatorP2pk'] as const;
+const POLICY_KEYS = [
+  'satsPerBlock',
+  'blockSize',
+  'mints',
+  'split',
+  'creatorP2pk',
+  'creatorPubkey',
+] as const;
+const IDENTITY_KEYS = ['keyFile'] as const;
 const SPLIT_KEYS = ['seeder', 'creator'] as const;
 const RATE_KEYS = ['maxStreams', 'maxStreamsPerKey', 'connectsPerWindow', 'windowMs'] as const;
 const SWARM_KEYS = ['bootstrap', 'maxPeers', 'server', 'client'] as const;
 const BOOTSTRAP_KEYS = ['host', 'port'] as const;
 const KEY_MATERIAL =
-  'refused: key material is never read from the config file (Stage 2 key at rest, deploy/systemd/README.md)';
+  'refused: key material is never read from the config file (the encrypted key file, deploy/systemd/README.md)';
 const SWARM_REFUSED: ReadonlyMap<string, string> = new Map([
   ['keyPair', KEY_MATERIAL],
   ['seed', KEY_MATERIAL],
+]);
+const PASSPHRASE_REFUSED =
+  'refused: the key passphrase is never read from the config file — it is the systemd credential seeder-key-passphrase (deploy/systemd/README.md)';
+const IDENTITY_REFUSED: ReadonlyMap<string, string> = new Map([
+  ['passphrase', PASSPHRASE_REFUSED],
+  ['secretKey', KEY_MATERIAL],
+  ['nsec', KEY_MATERIAL],
 ]);
 
 /** A mint URL already in `@sovit/core`'s normalised form (so string comparison works). */
@@ -186,7 +230,11 @@ function isNormalisedMint(s: string): boolean {
   return nostr.normalizeMintUrl(s) === s;
 }
 
-function policySection(c: Checker, raw: Obj, blockSize: number): PricePolicy | undefined {
+function policySection(
+  c: Checker,
+  raw: Obj,
+  blockSize: number,
+): { readonly policy: PricePolicy; readonly creatorPubkey: NostrPubkey } | undefined {
   const P = '$.policy';
   if (!c.required(raw, 'policy', '$', 'the price PAY messages are verified against')) return;
   const o = c.obj(raw, 'policy', '$');
@@ -244,14 +292,96 @@ function policySection(c: Checker, raw: Obj, blockSize: number): PricePolicy | u
     else creatorP2pk = v;
   }
 
-  if (!hasSats || satsPerBlock === undefined || creatorP2pk === undefined) return;
+  let creatorPubkey: string | undefined;
+  if (
+    c.required(o, 'creatorPubkey', P, "the creator's Nostr pubkey, the recipient of its nutzaps")
+  ) {
+    const v = get(o, 'creatorPubkey');
+    if (typeof v !== 'string' || !HEX64.test(v))
+      c.add(`${P}.creatorPubkey`, 'expected 64 lower-case hex chars (x-only Nostr pubkey)');
+    else if (creatorP2pk?.slice(2) === v)
+      c.add(`${P}.creatorPubkey`, 'must not be the key creatorP2pk names (NIP-61)');
+    else creatorPubkey = v;
+  }
+
+  if (
+    !hasSats ||
+    satsPerBlock === undefined ||
+    creatorP2pk === undefined ||
+    creatorPubkey === undefined
+  )
+    return;
   return {
-    satsPerBlock: satsPerBlock as Sats,
-    blockSize,
-    mints,
-    split,
-    creatorP2pk: creatorP2pk as CashuP2pkPubkey,
+    policy: {
+      satsPerBlock: satsPerBlock as Sats,
+      blockSize,
+      mints,
+      split,
+      creatorP2pk: creatorP2pk as CashuP2pkPubkey,
+    },
+    creatorPubkey: creatorPubkey as NostrPubkey,
   };
+}
+
+function identitySection(c: Checker, raw: Obj, dataDir: string | undefined): string | undefined {
+  const P = '$.identity';
+  const o = c.obj(raw, 'identity', '$');
+  if (o !== undefined) c.keys(o, P, IDENTITY_KEYS, IDENTITY_REFUSED);
+  const keyFile = o === undefined ? undefined : c.str(o, 'keyFile', P);
+  if (keyFile !== undefined) {
+    if (!keyFile.startsWith('/')) c.add(`${P}.keyFile`, 'expected an absolute path');
+    return keyFile;
+  }
+  // The dataDir default: `StateDirectory=` is 0700 and the daemon's own.
+  return dataDir === undefined ? undefined : `${dataDir.replace(/\/+$/, '')}/identity.key`;
+}
+
+/** A relay URL in normalised form: `wss://`, or `ws://` to a loopback host only. */
+function relayError(u: unknown): string | null {
+  if (typeof u !== 'string' || nostr.normalizeRelayUrl(u) !== u)
+    return 'expected a relay URL in normalised form (wss://host[/path], no trailing slash)';
+  const url = new URL(u);
+  if (url.protocol === 'ws:' && !LOOPBACK_HOSTS.has(url.hostname))
+    return 'plain ws:// is accepted only to a loopback relay; use wss://';
+  return null;
+}
+
+function relaysSection(c: Checker, raw: Obj): RelayUrl[] {
+  const P = '$.relays';
+  const out: RelayUrl[] = [];
+  if (!c.required(raw, 'relays', '$', 'at least one relay for nutzaps and the kind 10019'))
+    return out;
+  const v = get(raw, 'relays');
+  if (!Array.isArray(v)) {
+    c.add(P, 'expected array of relay URLs');
+    return out;
+  }
+  if (v.length === 0 || v.length > MAX_RELAYS) {
+    c.add(P, `expected 1 to ${String(MAX_RELAYS)} relay URLs`);
+    return out;
+  }
+  v.forEach((u: unknown, i) => {
+    const err = relayError(u);
+    if (err !== null) c.add(`${P}[${i}]`, err);
+    else if (out.includes(u as RelayUrl)) c.add(`${P}[${i}]`, 'duplicate relay URL');
+    else out.push(u as RelayUrl);
+  });
+  return out;
+}
+
+function videoEventsSection(c: Checker, raw: Obj): Map<CoreKeyHex, NostrEventId> {
+  const P = '$.videoEvents';
+  const out = new Map<CoreKeyHex, NostrEventId>();
+  const o = c.obj(raw, 'videoEvents', '$');
+  if (o === undefined) return out;
+  for (const k of Object.keys(o)) {
+    const v = get(o, k);
+    if (!HEX64.test(k)) c.add(`${P}[…]`, 'expected keys to be 64 lower-case hex chars (core key)');
+    else if (typeof v !== 'string' || !HEX64.test(v))
+      c.add(`${P}.${k}`, 'expected 64 lower-case hex chars (video event id)');
+    else out.set(k as CoreKeyHex, v as NostrEventId);
+  }
+  return out;
 }
 
 function rateSection(c: Checker, raw: Obj): Partial<RateLimitConfig> | undefined {
@@ -344,7 +474,10 @@ export function validateDaemonConfig(
   const diskCapBytes = c.int(raw, 'diskCapBytes', '$', 0) ?? DEFAULT_DISK_CAP_BYTES;
   const rateLimits = rateSection(c, raw);
   const swarm = swarmSection(c, raw);
-  const policy = policySection(c, raw, blockSize ?? DEFAULT_BLOCK_SIZE);
+  const priced = policySection(c, raw, blockSize ?? DEFAULT_BLOCK_SIZE);
+  const keyFile = identitySection(c, raw, dataDir);
+  const relays = relaysSection(c, raw);
+  const videoEvents = videoEventsSection(c, raw);
   const flushEveryBlocks = c.int(raw, 'flushEveryBlocks', '$', 1);
   const flushEveryMs = c.int(raw, 'flushEveryMs', '$', 1);
 
@@ -356,7 +489,13 @@ export function validateDaemonConfig(
     else c.add('$.logLevel', 'expected debug | info | warn | error');
   }
 
-  if (c.errors.length > 0 || !hasDataDir || dataDir === undefined || policy === undefined)
+  if (
+    c.errors.length > 0 ||
+    !hasDataDir ||
+    dataDir === undefined ||
+    priced === undefined ||
+    keyFile === undefined
+  )
     return { ok: false, errors: c.errors.length > 0 ? c.errors : ['$: invalid config'] };
   return {
     ok: true,
@@ -368,11 +507,15 @@ export function validateDaemonConfig(
         diskCapBytes,
         ...(rateLimits !== undefined ? { rateLimits } : {}),
         swarm,
-        policy,
+        policy: priced.policy,
         ...(flushEveryBlocks !== undefined ? { flushEveryBlocks } : {}),
         ...(flushEveryMs !== undefined ? { flushEveryMs } : {}),
       },
       logLevel,
+      keyFile,
+      relays,
+      creatorPubkey: priced.creatorPubkey,
+      videoEvents,
     },
   };
 }

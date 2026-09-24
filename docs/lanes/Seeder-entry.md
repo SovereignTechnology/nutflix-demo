@@ -105,6 +105,13 @@ gateway reuses for its seeder-shaped fields):
 
 ## 3. Stage 2 seam — what Stage 2 must still do (NOT a one-function change)
 
+> **DONE 2026-09-24 in the Stage 3 seeder-runtime lane** (`stage-3/seeder-runtime`, ADR 0011).
+> All four points below landed: `getRuntimeDeps(config, ctx)` builds `runtime/index.ts` (key file
+> + systemd credential, wallet file, real engine, nutzaps); `RuntimeDeps` gained `attach` /
+> `close`; the trap in point 3 was solved with `Seeder.onSessionReady` (fires once replication
+> runs on a session, so `session.mux` is set); the start-up `warn` is gone. The text below is the
+> original hand-over, kept for the record.
+
 `RuntimeDeps` is `{ engine: SeederDeps['engine'] }`: exactly what `runDaemon()` consumes today.
 I deliberately did not add `payProtocol` / `identity` fields that nothing would read. The
 daemon does not attach `pay/1` to swarm sessions or send `HELLO` (the gateway and the desktop

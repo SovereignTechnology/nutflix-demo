@@ -152,3 +152,27 @@ Who triggers it:
   Node 22.22.0; without the flag it still dies. Guarded by `packages/gateway/src/__tests__/cli.test.ts`
   (runs the built entry with the flags read from the unit).
 
+
+## 7. The third door: the global `fetch` — every mint request (2026-09-24)
+
+Found by the Stage 3 seeder-runtime lane's pre-push review, before any real mint call had run
+under the unit's flags (every money-path test runs in vitest, which is not `--jitless`). Node
+v22.22.0:
+
+| Command | Result |
+|---|---|
+| `node --jitless --no-experimental-websocket -e "fetch('http://127.0.0.1:3399/v1/info')"` | **dies**: `ReferenceError: WebAssembly is not defined` at `lazyllhttp` — the process, not just the promise |
+
+`fetch` is undici too, and `--no-experimental-websocket` does not remove it. `@cashu/cashu-ts`
+sends every mint request through the global `fetch` unless given a `customRequest`, so the
+seeder daemon would have died at its first PAY (the keyset lookup) or its first flush.
+
+**Fixed for the seeder daemon**: `@sovit/core` `wallet.cashuRequestFn` (cashu-ts's `RequestFn`
+error contract over an injected raw HTTP call) + `packages/seeder/src/runtime/mint-http.ts`
+(`node:http(s)` through `createRequire`, Node's native parser). Verified under the unit flags
+against Nutshell 0.21.0. Guarded by `packages/seeder/src/__tests__/entry.test.ts`: the built entry,
+with the flags read from the unit, loads a mint over real HTTP at start (`"mint loaded"`); with
+the default transport it dies with this `ReferenceError` (checked by reverting the transport).
+**The gateway must use the same transport** when its runtime providers land — its units run the
+same flags. Anything else that calls `fetch` in a daemon (NIP-05, LNURL) needs the same
+treatment.

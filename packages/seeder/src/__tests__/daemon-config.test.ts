@@ -14,6 +14,8 @@ import {
 import type { DaemonConfigResult } from '../cli/config-file.js';
 
 const P2PK = `02${'ab'.repeat(32)}`;
+const CREATOR = 'c1'.repeat(32);
+const RELAY = 'wss://relay.example';
 const MINT = 'https://mint.example';
 const MINT_B = 'https://mint-b.example/Bitcoin';
 const GIB = 1024 ** 3;
@@ -21,7 +23,8 @@ const GIB = 1024 ** 3;
 function minimal(extra: Record<string, unknown> = {}): Record<string, unknown> {
   return {
     dataDir: '/var/lib/nutflix-seeder',
-    policy: { satsPerBlock: 2, mints: [MINT], creatorP2pk: P2PK },
+    relays: [RELAY],
+    policy: { satsPerBlock: 2, mints: [MINT], creatorP2pk: P2PK, creatorPubkey: CREATOR },
     ...extra,
   };
 }
@@ -36,12 +39,16 @@ function errorsOf(r: DaemonConfigResult): readonly string[] {
 }
 
 describe('daemon config file: accepted shapes', () => {
-  it('a minimal file gets the documented defaults (swarm ON, 50 GiB cap, 50/50 split, info)', () => {
+  it('a minimal file gets the documented defaults (swarm ON, 50 GiB cap, 50/50 split, info, key file in dataDir)', () => {
     const r = parse(minimal());
     expect(r).toEqual({
       ok: true,
       config: {
         logLevel: 'info',
+        keyFile: '/var/lib/nutflix-seeder/identity.key',
+        relays: [RELAY],
+        creatorPubkey: CREATOR,
+        videoEvents: new Map(),
         seeder: {
           dataDir: '/var/lib/nutflix-seeder',
           diskCapBytes: 50 * GIB,
@@ -58,9 +65,14 @@ describe('daemon config file: accepted shapes', () => {
     });
   });
 
-  it('covers every SeederConfig field (plus logLevel) exactly', () => {
+  it('covers every SeederConfig field (plus the daemon fields) exactly', () => {
+    const core = 'e0'.repeat(32);
+    const video = 'f0'.repeat(32);
     const r = parse({
       dataDir: '/srv/seed',
+      identity: { keyFile: '/etc/nutflix/seeder.key' },
+      relays: [RELAY, 'wss://relay-b.example/nostr', 'ws://127.0.0.1:7777'],
+      videoEvents: { [core]: video },
       storageDir: '/srv/seed/store',
       blockSize: 16_384,
       diskCapBytes: 1234,
@@ -77,6 +89,7 @@ describe('daemon config file: accepted shapes', () => {
         mints: [MINT, MINT_B],
         split: { seeder: 70, creator: 30 },
         creatorP2pk: `03${'cd'.repeat(32)}`,
+        creatorPubkey: CREATOR,
       },
       flushEveryBlocks: 32,
       flushEveryMs: 5000,
@@ -86,6 +99,10 @@ describe('daemon config file: accepted shapes', () => {
       ok: true,
       config: {
         logLevel: 'debug',
+        keyFile: '/etc/nutflix/seeder.key',
+        relays: [RELAY, 'wss://relay-b.example/nostr', 'ws://127.0.0.1:7777'],
+        creatorPubkey: CREATOR,
+        videoEvents: new Map([[core, video]]),
         seeder: {
           dataDir: '/srv/seed',
           storageDir: '/srv/seed/store',
@@ -141,11 +158,13 @@ describe('daemon config file: rejections name a path and never a value', () => {
     expect(errorsOf(parse({}))).toEqual([
       '$.dataDir: required (or NUTFLIX_SEEDER_DATA_DIR, or a single-directory STATE_DIRECTORY)',
       '$.policy: required (the price PAY messages are verified against)',
+      '$.relays: required (at least one relay for nutzaps and the kind 10019)',
     ]);
     expect(errorsOf(parse(minimal({ policy: {} })))).toEqual([
       '$.policy.satsPerBlock: required (integer sats per block)',
       '$.policy.mints: required (at least one mint URL)',
       "$.policy.creatorP2pk: required (the creator's Cashu P2PK pubkey)",
+      "$.policy.creatorPubkey: required (the creator's Nostr pubkey, the recipient of its nutzaps)",
     ]);
   });
 
@@ -260,8 +279,8 @@ describe('daemon config file: rejections name a path and never a value', () => {
       parse(minimal({ swarm: { keyPair: { secretKey: 'SENTINEL-sk' }, seed: 'SENTINEL-seed' } })),
     );
     expect(errs).toEqual([
-      '$.swarm.keyPair: refused: key material is never read from the config file (Stage 2 key at rest, deploy/systemd/README.md)',
-      '$.swarm.seed: refused: key material is never read from the config file (Stage 2 key at rest, deploy/systemd/README.md)',
+      '$.swarm.keyPair: refused: key material is never read from the config file (the encrypted key file, deploy/systemd/README.md)',
+      '$.swarm.seed: refused: key material is never read from the config file (the encrypted key file, deploy/systemd/README.md)',
     ]);
     expect(JSON.stringify(errs)).not.toContain('SENTINEL');
     expect(errorsOf(parse(minimal({ swarm: { server: false } })))).toEqual([
@@ -274,6 +293,109 @@ describe('daemon config file: rejections name a path and never a value', () => {
     expect(errorsOf(parse(minimal({ swarm: { bootstrap: [{ port: 1 }] } })))).toEqual([
       '$.swarm.bootstrap[0].host: required (non-empty string)',
     ]);
+  });
+});
+
+describe('daemon config file: the runtime fields (identity, relays, creator, videos)', () => {
+  it('identity.keyFile: absolute path only; the default follows dataDir, from the file or the environment', () => {
+    const own = parse(minimal({ identity: { keyFile: '/srv/k/seeder.key' } }));
+    expect(own.ok && own.config.keyFile).toBe('/srv/k/seeder.key');
+    expect(errorsOf(parse(minimal({ identity: { keyFile: 'seeder.key' } })))).toEqual([
+      '$.identity.keyFile: expected an absolute path',
+    ]);
+    const slash = parse(minimal({ dataDir: '/srv/data/' }));
+    expect(slash.ok && slash.config.keyFile).toBe('/srv/data/identity.key');
+    const { dataDir: _d, ...noDir } = minimal();
+    const st = parse(noDir, { [DAEMON_ENV.stateDirectory]: '/var/lib/nutflix-seeder' });
+    expect(st.ok && st.config.keyFile).toBe('/var/lib/nutflix-seeder/identity.key');
+    const env = parse(minimal(), { [DAEMON_ENV.dataDir]: '/env/data' });
+    expect(env.ok && env.config.keyFile).toBe('/env/data/identity.key');
+  });
+
+  it('identity: a passphrase or a key in the file is refused outright and never echoed', () => {
+    const errs = errorsOf(
+      parse(
+        minimal({
+          identity: {
+            passphrase: 'SENTINEL-pass',
+            nsec: 'nsec1SENTINEL',
+            secretKey: 'SENTINEL-sk',
+            other: 1,
+          },
+        }),
+      ),
+    );
+    expect(errs).toEqual([
+      '$.identity.passphrase: refused: the key passphrase is never read from the config file — it is the systemd credential seeder-key-passphrase (deploy/systemd/README.md)',
+      '$.identity.nsec: refused: key material is never read from the config file (the encrypted key file, deploy/systemd/README.md)',
+      '$.identity.secretKey: refused: key material is never read from the config file (the encrypted key file, deploy/systemd/README.md)',
+      '$.identity.other: unknown key',
+    ]);
+    expect(JSON.stringify(errs)).not.toContain('SENTINEL');
+    expect(errorsOf(parse(minimal({ identity: 'x' })))).toEqual(['$.identity: expected object']);
+  });
+
+  it('relays: 1 to MAX_RELAYS, normalised, wss (ws only to loopback), no duplicates — values never echoed', () => {
+    const errs = errorsOf(
+      parse(
+        minimal({
+          relays: [
+            'wss://SENTINEL.example',
+            'wss://relay.example/',
+            'ws://sentinel-host.example',
+            'https://sentinel.example',
+            7,
+            RELAY,
+            RELAY,
+          ],
+        }),
+      ),
+    );
+    expect(errs).toEqual([
+      '$.relays[0]: expected a relay URL in normalised form (wss://host[/path], no trailing slash)',
+      '$.relays[1]: expected a relay URL in normalised form (wss://host[/path], no trailing slash)',
+      '$.relays[2]: plain ws:// is accepted only to a loopback relay; use wss://',
+      '$.relays[3]: expected a relay URL in normalised form (wss://host[/path], no trailing slash)',
+      '$.relays[4]: expected a relay URL in normalised form (wss://host[/path], no trailing slash)',
+      '$.relays[6]: duplicate relay URL',
+    ]);
+    expect(JSON.stringify(errs).toLowerCase()).not.toContain('sentinel');
+    expect(errorsOf(parse(minimal({ relays: [] })))).toEqual([
+      '$.relays: expected 1 to 8 relay URLs',
+    ]);
+    const nine = Array.from({ length: 9 }, (_, i) => `wss://r${String(i)}.example`);
+    expect(errorsOf(parse(minimal({ relays: nine })))).toEqual([
+      '$.relays: expected 1 to 8 relay URLs',
+    ]);
+    expect(errorsOf(parse(minimal({ relays: RELAY })))).toEqual([
+      '$.relays: expected array of relay URLs',
+    ]);
+    for (const loop of ['ws://localhost:7000', 'ws://127.0.0.1', 'ws://[::1]:7000'])
+      expect(parse(minimal({ relays: [loop] })).ok, loop).toBe(true);
+  });
+
+  it('policy.creatorPubkey: 64 lower-case hex, and never the key creatorP2pk names (NIP-61)', () => {
+    const pol = minimal()['policy'] as Record<string, unknown>;
+    expect(
+      errorsOf(parse(minimal({ policy: { ...pol, creatorPubkey: 'C1'.repeat(32) } }))),
+    ).toEqual(['$.policy.creatorPubkey: expected 64 lower-case hex chars (x-only Nostr pubkey)']);
+    expect(errorsOf(parse(minimal({ policy: { ...pol, creatorPubkey: P2PK.slice(2) } })))).toEqual([
+      '$.policy.creatorPubkey: must not be the key creatorP2pk names (NIP-61)',
+    ]);
+  });
+
+  it('videoEvents: core key → event id, both 64 lower-case hex; odd keys are not echoed', () => {
+    const core = 'e0'.repeat(32);
+    const ok = parse(minimal({ videoEvents: { [core]: 'f0'.repeat(32) } }));
+    expect(ok.ok && [...ok.config.videoEvents]).toEqual([[core, 'f0'.repeat(32)]]);
+    const errs = errorsOf(
+      parse(minimal({ videoEvents: { 'SENTINEL-core': 'f0'.repeat(32), [core]: 'SENTINEL' } })),
+    );
+    expect(errs).toEqual([
+      '$.videoEvents[…]: expected keys to be 64 lower-case hex chars (core key)',
+      `$.videoEvents.${core}: expected 64 lower-case hex chars (video event id)`,
+    ]);
+    expect(JSON.stringify(errs)).not.toContain('SENTINEL');
   });
 });
 

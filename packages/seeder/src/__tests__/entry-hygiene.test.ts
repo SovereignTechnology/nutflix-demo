@@ -71,6 +71,7 @@ describe('portable.ts (bare export condition) import hygiene', () => {
           f === 'index.ts' ||
           f === 'cli/main.ts' ||
           f === 'cli/providers.ts' ||
+          f.startsWith('runtime/') ||
           f.startsWith('adapters/node/'),
       ),
     ).toEqual([]);
@@ -79,7 +80,12 @@ describe('portable.ts (bare export condition) import hygiene', () => {
   it('positive control: index.ts does reach cli/main.ts, the Node adapters and node: builtins', async () => {
     const g = await walk('index.ts');
     expect(rel(g)).toEqual(
-      expect.arrayContaining(['cli/main.ts', 'cli/config-file.ts', 'adapters/node/index.ts']),
+      expect.arrayContaining([
+        'cli/main.ts',
+        'cli/config-file.ts',
+        'adapters/node/index.ts',
+        'runtime/index.ts',
+      ]),
     );
     expect([...g.external.keys()]).toEqual(
       expect.arrayContaining(['node:fs', 'node:url', 'node:util', 'node:fs/promises']),

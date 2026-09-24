@@ -76,14 +76,34 @@ export interface RunDaemonOptions {
   readonly logger: Logger;
   /** Cores to open on boot (default: the `blobs` core). */
   readonly cores?: readonly string[];
+  /** With the created seeder, before `start()` — e.g. attach `pay/1` to its sessions. */
+  readonly beforeStart?: (seeder: Seeder) => void;
+  /** After `seeder.close()` on shutdown — e.g. close relays, lock the key. */
+  readonly afterClose?: () => Promise<void>;
 }
 
 /** Resolves with the running seeder; the process exits through the signal hooks. */
 export async function runDaemon(o: RunDaemonOptions): Promise<Seeder> {
   const seeder = await Seeder.create(o.config, { ...o.deps, logger: o.logger });
-  for (const name of o.cores ?? ['blobs']) await seeder.openCore(name);
+  try {
+    for (const name of o.cores ?? ['blobs']) await seeder.openCore(name);
+    o.beforeStart?.(seeder);
+  } catch (err) {
+    await seeder.close().catch(() => undefined);
+    throw err;
+  }
   seeder.start();
-  installShutdownHooks({ proc: o.proc, logger: o.logger, close: () => seeder.close() });
+  installShutdownHooks({
+    proc: o.proc,
+    logger: o.logger,
+    close: async () => {
+      try {
+        await seeder.close();
+      } finally {
+        await o.afterClose?.();
+      }
+    },
+  });
   await sdNotify(o.proc, 'READY=1', o.logger);
   o.logger.info('daemon ready', { ...seeder.stats() });
   return seeder;

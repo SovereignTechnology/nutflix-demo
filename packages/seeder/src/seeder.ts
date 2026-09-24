@@ -100,6 +100,7 @@ export class Seeder {
   readonly scheduler: FlushScheduler;
   private readonly engine: PaymentEngineSeeder;
   private readonly listeners = new Set<(e: SeederEvent) => void>();
+  private readonly readyListeners = new Set<(session: PeerSession) => void>();
   private readonly gates = new Map<string, () => void>();
   private readonly protocols = new Map<PeerSession, PayProtocol>();
   private readonly unsubs: (() => void)[] = [];
@@ -244,6 +245,17 @@ export class Seeder {
     return () => this.listeners.delete(cb);
   }
 
+  /**
+   * Called with every admitted session once replication runs on it, so `session.mux` is set:
+   * where a shell attaches `pay/1`. `session-open` is too early for a swarm connection — it fires
+   * at admission, before `store.replicate(conn)` creates the connection's Protomux. Direct streams
+   * (`replicate()`) already carry one at admission; they are reported right after it.
+   */
+  onSessionReady(cb: (session: PeerSession) => void): () => void {
+    this.readyListeners.add(cb);
+    return () => this.readyListeners.delete(cb);
+  }
+
   // ------------------------------------------------------------------ blobs
 
   openCore(name?: string): Promise<SeedCore> {
@@ -313,7 +325,9 @@ export class Seeder {
     const noise = stream.noiseStream;
     const admit = (): void => {
       const s = this.sessions.admit(noise, null);
-      if (s !== null) this.log.debug('direct stream admitted', { noiseKey: s.noiseKeyHex });
+      if (s === null) return;
+      this.log.debug('direct stream admitted', { noiseKey: s.noiseKeyHex });
+      this.sessionReady(s);
     };
     if (noise.remotePublicKey !== null) admit();
     else noise.once('connect', admit);
@@ -511,6 +525,18 @@ export class Seeder {
   private onSwarmSession(session: PeerSession, conn: SwarmConnection, _info: PeerInfo): void {
     this.blobs.store.replicate(conn);
     this.log.info('swarm session', { noiseKey: session.noiseKeyHex });
+    this.sessionReady(session);
+  }
+
+  private sessionReady(session: PeerSession): void {
+    if (session.closed) return;
+    for (const cb of this.readyListeners) {
+      try {
+        cb(session);
+      } catch (err) {
+        this.log.error('session-ready listener threw', { error: err });
+      }
+    }
   }
 
   private wireEvents(): void {

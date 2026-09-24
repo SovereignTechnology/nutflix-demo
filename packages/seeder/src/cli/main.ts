@@ -6,6 +6,9 @@
  *
  *   --config <path>   JSON config (`config-file.ts`); `NUTFLIX_SEEDER_CONFIG` is the fallback
  *   --check           validate the config and exit 0/78 without starting anything
+ *   --keygen          create the node's key file at `keyFile` (never overwrites), sealed under
+ *                     the passphrase read from STDIN — pipe it from `systemd-creds decrypt` so it
+ *                     is the same bytes as the unit's credential (deploy/systemd/README.md)
  *
  * No `--dev-mocks`: nothing consumes it, and the desktop worker has its own.
  *
@@ -30,7 +33,9 @@ import type { DaemonConfig, DaemonConfigResult } from './config-file.js';
 import { DAEMON_ENV, parseDaemonConfigText } from './config-file.js';
 import { runDaemon } from './daemon.js';
 import { envValue } from './env.js';
-import type { RuntimeDeps } from './providers.js';
+import { RuntimeSetupError } from '../runtime/files.js';
+import { MIN_PASSPHRASE_BYTES, createKeyFile } from '../runtime/identity.js';
+import type { ProviderContext, RuntimeDeps } from './providers.js';
 import { MISSING_PROVIDERS_REASON, getRuntimeDeps } from './providers.js';
 
 export const EXIT_CONFIG = 78;
@@ -41,6 +46,7 @@ export interface MainOptions {
   /** Test seam: replaces `getRuntimeDeps`. */
   readonly providers?: (
     config: DaemonConfig,
+    ctx: ProviderContext,
   ) => RuntimeDeps | undefined | Promise<RuntimeDeps | undefined>;
   /** Called with the running seeder (tests keep a handle to it). */
   readonly onStarted?: (seeder: Seeder) => void;
@@ -49,11 +55,12 @@ export interface MainOptions {
 export interface ParsedArgs {
   readonly config: string | undefined;
   readonly check: boolean;
+  readonly keygen: boolean;
   readonly help: boolean;
 }
 
 export const USAGE =
-  'usage: nutflix-seeder --config <seeder.json> [--check]\n' +
+  'usage: nutflix-seeder --config <seeder.json> [--check | --keygen]\n' +
   `  env: ${DAEMON_ENV.configPath}, ${DAEMON_ENV.dataDir}, ${DAEMON_ENV.diskCapBytes}, ${DAEMON_ENV.maxStreams}, ${DAEMON_ENV.logLevel}, ${DAEMON_ENV.stateDirectory}`;
 
 /** `node:util` parseArgs error codes → fixed text. The raw message quotes the offending token. */
@@ -70,12 +77,19 @@ export function parseCliArgs(argv: readonly string[]): ParsedArgs | { readonly e
       options: {
         config: { type: 'string' },
         check: { type: 'boolean', default: false },
+        keygen: { type: 'boolean', default: false },
         help: { type: 'boolean', short: 'h', default: false },
       },
       strict: true,
       allowPositionals: false,
     });
-    return { config: values.config, check: values.check, help: values.help };
+    if (values.check && values.keygen) return { error: '--check and --keygen are exclusive' };
+    return {
+      config: values.config,
+      check: values.check,
+      keygen: values.keygen,
+      help: values.help,
+    };
   } catch (err) {
     const code = (err as { code?: unknown } | null)?.code;
     return {
@@ -151,9 +165,11 @@ export async function main(argv: readonly string[], o: MainOptions = {}): Promis
 
   const logger = createLogger({ sink, level: config.logLevel });
 
+  if (args.keygen) return keygen(config, logger, proc);
+
   let deps: RuntimeDeps | undefined;
   try {
-    deps = await (o.providers ?? getRuntimeDeps)(config);
+    deps = await (o.providers ?? getRuntimeDeps)(config, { env: (n) => proc.env(n), logger });
   } catch (err) {
     logger.error('runtime providers failed — refusing to start', { error: err });
     return EXIT_CONFIG;
@@ -170,15 +186,43 @@ export async function main(argv: readonly string[], o: MainOptions = {}): Promis
       deps: { engine: deps.engine, fs: nodeAdapters.fs, crypto: nodeAdapters.crypto },
       proc,
       logger,
+      ...(deps.attach === undefined ? {} : { beforeStart: deps.attach }),
+      ...(deps.close === undefined ? {} : { afterClose: deps.close }),
     });
   } catch (err) {
     logger.error('seeder failed to start', { error: err });
+    await deps.close?.().catch(() => undefined);
     return 1;
   }
-  // Stage 2 removes this together with the pay/1 wiring (cli/providers.ts header).
-  logger.warn(
-    'pay/1 is not attached to swarm sessions yet: every peer is cut after windowBlocks unpaid blocks',
-  );
   o.onStarted?.(seeder);
   return new Promise<number>(() => undefined);
+}
+
+/** Longest `--keygen` stdin read: a passphrase, not a file. */
+const MAX_STDIN_BYTES = 8192;
+
+/** `--keygen`: create the key file; the passphrase comes from stdin, never argv or env. */
+async function keygen(config: DaemonConfig, logger: Logger, proc: SeederProcess): Promise<number> {
+  let input: Uint8Array | null = null;
+  try {
+    if (proc.readStdin === undefined)
+      throw new RuntimeSetupError('this host cannot read a passphrase from stdin');
+    input = await proc.readStdin(MAX_STDIN_BYTES);
+    let n = input.length;
+    if (n > 0 && input[n - 1] === 0x0a) n--;
+    if (n > 0 && input[n - 1] === 0x0d) n--;
+    const passphrase = input.subarray(0, n);
+    if (passphrase.length < MIN_PASSPHRASE_BYTES)
+      throw new RuntimeSetupError(
+        `the passphrase on stdin must be at least ${String(MIN_PASSPHRASE_BYTES)} bytes`,
+      );
+    const { pubkey } = await createKeyFile({ keyFile: config.keyFile, passphrase });
+    logger.info('key file created', { keyFile: config.keyFile, publicKey: pubkey });
+    return 0;
+  } catch (err) {
+    logger.error('keygen failed', { error: err });
+    return err instanceof RuntimeSetupError ? EXIT_CONFIG : 1;
+  } finally {
+    input?.fill(0);
+  }
 }

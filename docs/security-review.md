@@ -32,9 +32,9 @@ directories" for this list. Each fix carries a test that fails without it, excep
 | F7 | **Fixed** | `studio.upload` asks with a native dialog naming the file main resolved from the token |
 | F8 | **Fixed** | The money gate is a native dialog (`dialog.showMessageBox`, Cancel default) built from guarded args; `seeder.melt` cross-checks the invoice amount; settings patches that add mints or turn on auto top-up are asked about too |
 | F9 | **Fixed** | The seeder records each `PRICE` boundary per session × core and verifies a PAY at the price in force for its blocks; `setCorePolicy` now announces per-core `PRICE` |
-| F10 | **Mitigated** | F12's `restorePending` puts the unflushed secrets back in the seen set; the `persist` hook for the rest is wired with the runtime providers (Stage 3) |
-| F11 | **Fixed (engine)** | `checkSpent` dep: a spent creator set is a double-spend (ban, no nutzap) — checked once, before the first nutzap; `CashuWallet.checkSpent` provides it |
-| F12 | **Fixed (engine)** | `persistPending` (synchronous, before the ACK) + `restorePending`; the host wires the store in Stage 3 |
+| F10 | **Fixed (seeder daemon)** (`stage-3/seeder-runtime`) | F12's `restorePending` puts the unflushed secrets back in the seen set; the daemon appends every accepted secret to `wallet/seen.jsonl` and restores the newest 250 000 at start (ADR 0011 §3). Gateway and desktop: with their runtimes |
+| F11 | **Fixed (engine)**; wired in the seeder daemon | `checkSpent` dep: a spent creator set is a double-spend (ban, no nutzap) — checked once, before the first nutzap; `CashuWallet.checkSpent` provides it |
+| F12 | **Fixed (seeder daemon)** (`stage-3/seeder-runtime`) | `persistPending` (synchronous, before the ACK) + `restorePending`; the daemon writes `wallet/pending.json` synchronously and atomically (fsync) and a new runtime redeems it — integration-tested with a crash before the flush. Gateway and desktop: with their runtimes |
 | F13 | **Fixed** | Peer identifiers in log fields become a per-process alias (`peer#17`) |
 | F14 | **Fixed** | `trustProxy` reads the rightmost `X-Forwarded-For` entry |
 | F15 | **Fixed** | Uploads over 8 MiB must send `X-SHA-256` (no unauthenticated spooling of large bodies); default MIME allowlist (F3). Open: per-pubkey quota; whether uploads should default to allow-list-only (decision) |
@@ -46,7 +46,7 @@ directories" for this list. Each fix carries a test that fails without it, excep
 | F21 | **Open** | Packaging (dev flags compiled out, Electron fuses) |
 | F22 | **Fixed** | `app.requestSingleInstanceLock()`; a second launch focuses the first window |
 | F23 | **Fixed** | `Nip60ProofStore` verifies every event itself |
-| F24 | **Open** | The `KeyStore` adapter and headless unlock come with the runtime providers |
+| F24 | **Fixed for the seeder daemon** (`stage-3/seeder-runtime`) | Key file 0600 (`--keygen`, `O_EXCL`, refused when group/other can read it), headless unlock from the `seeder-key-passphrase` systemd credential (ADR 0011 §1). Open: the desktop's file `KeyStore` |
 | F25 | **Open** | Only matters once Stage 3 opens external links |
 | F26 | **Partly fixed** | Natural batching (F30) cuts dust PAYs; explicit batching open (F5) |
 | F27 | **Fixed** (real-mint lane) | Hit by the network-drop test: a new session binding a pubkey now cuts any older live session of it (no ban) — one pay/1 channel per pubkey, so the per-pubkey carry is unambiguous |
@@ -54,8 +54,9 @@ directories" for this list. Each fix carries a test that fails without it, excep
 | F33 | **Open (new)** | See §0a |
 | F34 | **Fixed (new)** | See §0a |
 | F35 | **Fixed (new)** | See §0a |
+| F36 | **Fixed for the seeder daemon (new)** | See §0b |
 | F30 | **Fixed** | `UpstreamPayer` keeps the carry per channel, commits it on `ACK ok`, one PAY per core in flight |
-| F31 | **Fixed (engine)** | `spentByUs` dep: a "spent" answer to a RETRIED redeem whose witness is our own signature is our lost swap — no ban, creator still paid. A first attempt answered "spent" is a double-spend even with our witness (a set we redeemed before a restart carries it too — found by the real-mint lane); the attempt is persisted before it is made. Open: NUT-13 deterministic outputs to recover the swapped proofs |
+| F31 | **Fixed (engine)**; wired in the seeder daemon | `spentByUs` dep: a "spent" answer to a RETRIED redeem whose witness is our own signature is our lost swap — no ban, creator still paid. A first attempt answered "spent" is a double-spend even with our witness (a set we redeemed before a restart carries it too — found by the real-mint lane); the attempt is persisted before it is made. Open: NUT-13 deterministic outputs to recover the swapped proofs |
 
 ## 0a. Found by the real-mint lane (2026-09-24, `stage-3/real-mint`)
 
@@ -94,6 +95,17 @@ real-mint-swarm.integration.test.ts`). Both real-mint suites are opt-in
   the new channel then failed `carryIn` until the window cut the viewer. Seen once in the
   network-drop test. The engine now keeps a channel epoch per account (`rebind` advances it) and
   refuses a PAY queued under an older epoch (engine test fails without the fix).
+
+## 0b. Found by the seeder-runtime lane (2026-09-24, `stage-3/seeder-runtime`)
+
+- **F36 — High — fixed for the seeder daemon: the global `fetch` crashes a `--jitless` daemon.**
+  Node 22's `fetch` is undici, whose parser is WebAssembly; the units run `--jitless`, so the
+  first mint request through cashu-ts's default transport kills the process (reproduced on Node
+  22.22.0; deploy/systemd/MDWE-RESULTS.md §7). Every money-path test ran in vitest, never under
+  the unit's flags, so nothing had caught it. The daemon now sends mint requests over
+  `node:http(s)` (`wallet.cashuRequestFn` keeps cashu-ts's error contract, which `spend.ts` needs
+  to tell a double-spend); the built-entry test loads a mint over real HTTP under the unit's
+  flags. Open: the gateway's runtime must use the same transport.
 
 ## 1. Summary
 
@@ -551,14 +563,15 @@ finding's section above plus its row in §0. **Filing waits for Cameron's go-ahe
 |---|
 | [Medium] F33: duplicate block deliveries — cap at the quoted price or single-peer ranges (decision) |
 | [High] F5: DLEQ verification off the event loop; explicit minPaySats batching tied to the credit pool |
-| [Medium] F10: wire the seen-secret persistence (the `persist` hook exists) |
-| [Medium] F11/F12/F31: wire `checkSpent`, `persistPending`/`restorePending`, `spentByUs` in the seeder runtime providers |
+| [Medium] Seeder: the pending-PAY queue is unbounded while a mint is down, and `pending.json` is rewritten whole per change (quadratic) — an append-only journal plus an engine cap on queued PAYs (docs/reviews/2026-09-24-pre-push-seeder-runtime.md) |
+| [High] F36: the gateway runtime's mint requests over `wallet.cashuRequestFn` + `node:http(s)`, never the global `fetch` (a crash under `--jitless`) |
+| [Medium] F10/F11/F12/F31: wire the seen-secret persistence, `checkSpent`, `persistPending`/`restorePending` and `spentByUs` in the gateway and desktop runtimes (the seeder daemon's `runtime/` is the pattern) |
 | [Medium] F31: NUT-13 deterministic outputs + NUT-09 restore |
 | [Medium] F15: per-pubkey upload quota |
 | [Medium] F17: NUT-20 locked mint quotes; opaque quote handles over IPC |
 | [Medium] F4: execute auto top-ups with per-top-up and per-day caps |
 | [Low] F21: packaging — compile out dev flags, set Electron fuses |
-| [Low] F24: file `KeyStore` (0600, atomic) + headless unlock via systemd credentials |
+| [Low] F24: the desktop's file `KeyStore` (0600, atomic) |
 | [Low] F25: external-link confirm shows the real host |
 
 ## 7. Not verified

@@ -391,7 +391,7 @@ bump: reactions (`likes`/`dislikes`/`myReaction`, `unreact`). The list as record
 **0006 = NFX suite** (on the unmerged `spec/nfx-suite-m0`), **0008 = nfx master plan** (written in
 `~/Projects/nfx`, forked from `spec/nfx-suite-m0`). This repo never uses either number, so a later
 merge between the two histories cannot produce two ADRs with one number. **The next ADR here is
-0010.** Taken so far: 0001–0005, 0007, 0009.
+0012.** Taken so far: 0001–0005, 0007, 0009, 0010, 0011.
 
 ### Inputs from Cameron — ANSWERED 2026-09-23 (ADR 0007)
 
@@ -446,13 +446,15 @@ Wallet QR (pass = decodes to text starting `lnbc5000n1pj9x7`).
 | Lane | Branch | Status |
 |---|---|---|
 | Real-mint testing (execution plan §4) | `stage-3/real-mint` (on `stage-2/review-fixes`) | **done** — Nutshell 0.21.0 and cdk-mintd 0.18.1 (FakeWallet, 100 ppk fee): the `pay1` tag verified (F6), three seeders + viewer, double-spends, a network drop; fixed what it found (F34 dust → batched redeems and nutzaps, F35 stale-channel PAYs, F27 superseded sessions, F31 replay-after-restart); open: F33 duplicate deliveries (decision). `scripts/real-mint/README.md` |
+| Seeder daemon runtime (build plan Phase 3) | `stage-3/seeder-runtime` (on `stage-3/real-mint`) | **done** — `nutflix-seeder.service` runs for real (ADR 0011): key file + `seeder-key-passphrase` systemd credential (`--keygen` from stdin), 0600 wallet file, the real engine with every hook (pending PAYs and seen secrets on disk, rate-limited keysets, NUT-07), NIP-61 nutzaps + kind 10019 over a `ws` relay pool, `pay/1` + HELLO on swarm sessions (`Seeder.onSessionReady`), one daemon per data dir. F10, F12, F24 (daemon) done; F11/F31 wired. Found and fixed **F36**: Node 22's global `fetch` crashes a `--jitless` daemon at the first mint request — mint requests now go over `node:http(s)` (`wallet.cashuRequestFn`), verified under the unit flags against Nutshell. Open for Cameron: ADR 0011 §7 (wallet storage, nutzap recipient per core, paid-views metric, melt-out) |
 
 Owed from Stage 2 (ADR 0010 Consequences, `docs/security-review.md` §0 and §6). The F1–F4 and
 F30 blockers were fixed on `stage-2/review-fixes` (2026-09-24); F6 verified on two real mints
-(`stage-3/real-mint`). Still owed: the runtime
-providers (desktop worker, seeder, gateway `cli/providers.ts`: real engines wired with
-`checkSpent` / `spentByUs` / `persistPending` + seen-set persistence, `BlossomAuthImpl` with
-`serverHost`, HELLO signer, key-file `KeyStore` at 0600 — F10, F11, F12, F24, F31); DLEQ off the
+(`stage-3/real-mint`); the seeder daemon's runtime is done (`stage-3/seeder-runtime`, ADR 0011).
+Still owed: the runtime providers of the desktop worker and the gateway `cli/providers.ts` (real
+engines wired with `checkSpent` / `spentByUs` / `persistPending` + seen-set persistence — the
+seeder's `runtime/` is the pattern — `BlossomAuthImpl` with `serverHost`, HELLO signer, the
+desktop's key-file `KeyStore` at 0600); the seeder's melt-out (ADR 0011 §7); DLEQ off the
 event loop and explicit `minPaySats` batching (F5);
 executing auto top-ups with caps (F4); NUT-20 quotes (F17); NUT-13 outputs (F31); packaging
 (F21); the `NetworkAdapter`/IPC signer bridge + `SignerStatus` "none"; the deferred

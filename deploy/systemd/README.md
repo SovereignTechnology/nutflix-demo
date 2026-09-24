@@ -15,6 +15,7 @@ install -m 0644 nutflix.sysusers.conf /etc/sysusers.d/nutflix.conf && systemd-sy
 install -m 0644 nutflix-seeder.service nutflix-gateway.service /etc/systemd/system/
 mkdir -p /etc/nutflix && install -m 0640 -o root -g nutflix-seeder seeder.json /etc/nutflix/
 systemctl daemon-reload
+# seeder only: the key passphrase credential and the key file, once — see "Seeder key file and passphrase"
 systemctl enable --now nutflix-seeder            # and/or nutflix-gateway
 systemd-analyze security nutflix-seeder          # sanity: should sit in the "SAFE" band
 ```
@@ -26,7 +27,7 @@ The application tree is expected at `/opt/nutflix` (a `git checkout` + `npm ci -
 - **`ExecStart`**: `node --jitless --no-experimental-websocket <package main> --config /etc/nutflix/<svc>.json` in both units. Keep `--jitless` (see below); on Node 22 it also needs `--no-experimental-websocket` (`MDWE-RESULTS.md` §6).
   - **Gateway: confirmed by L3** (`docs/lanes/L3.md` "systemd entry-point confirmation"). `packages/gateway/dist/index.js` self-runs only as the main module, takes `--config`, exits 78 (`EX_CONFIG`) on a bad config so `Restart=on-failure` + `StartLimitBurst` fail fast, and `STATE_DIRECTORY` fills a missing `dataDir`. `Type=simple` is right (`sdNotify` is a no-op without `NOTIFY_SOCKET`).
   - **Seeder: runnable, confirmed by lane Seeder-entry** (`docs/lanes/Seeder-entry.md`). `packages/seeder/dist/index.js` self-runs only when it is the process's main module (`isMainModule`, symlinks resolved; importing `@sovit/seeder`, as the gateway does, runs nothing), takes `--config <path>` (fallback `NUTFLIX_SEEDER_CONFIG`) and `--check`, and exits **0** clean, **1** on a runtime failure, **78** (`EX_CONFIG`) on bad arguments, a missing/unreadable/invalid config, or missing runtime providers. `STATE_DIRECTORY` fills a missing `dataDir`, so `StateDirectory=nutflix-seeder` works unchanged; `Type=simple` fits (`sdNotify` is a no-op without `NOTIFY_SOCKET`); SIGTERM/SIGINT/SIGHUP → one graceful `Seeder.close()` (hard exit 1 after 25 s, under `TimeoutStopSec=30s`).
-    - **Until Stage 2 it refuses to start, on purpose:** the real `PaymentEngineSeeder`, `PayProtocol` and HELLO signer are in the locked dirs, so `packages/seeder/src/cli/providers.ts` returns nothing and every start logs `refusing to start` + the reason and exits 78. With `Restart=on-failure` + `StartLimitBurst=5` the unit gives up after 5 tries in 5 minutes rather than looping. Enable it only once Stage 2 has landed; until then use `--check`.
+    - **Runs for real since the Stage 3 seeder-runtime lane** (ADR 0011): `cli/providers.ts` unlocks the key file with the `seeder-key-passphrase` credential, opens the wallet, builds the real payment engine and attaches `pay/1` + HELLO to every swarm session. Without the key file or the credential it logs `runtime providers failed — refusing to start` + the reason and exits 78 before creating anything; with `Restart=on-failure` + `StartLimitBurst=5` the unit gives up after 5 tries in 5 minutes rather than looping.
     - **`--check` works today**: `sudo -u nutflix-seeder node --jitless --no-experimental-websocket /opt/nutflix/packages/seeder/dist/index.js --check --config /etc/nutflix/seeder.json` validates the file (and the env overrides) and exits 0/78 without touching state. `sudo` does not set `STATE_DIRECTORY`: if the file relies on it for `dataDir`, prefix the command with `STATE_DIRECTORY=/var/lib/nutflix-seeder` (via `sudo -u nutflix-seeder env …`). Errors name JSON paths (`$.policy.creatorP2pk: …`), never values, so the output is safe to paste.
     - **The one unit change** (2026-09-23): `ExecStart` gained `--no-experimental-websocket`. Without it the real entry dies one tick after start on Node 22 (`ReferenceError: WebAssembly is not defined`, from Node's own `undici`, which `--jitless` cannot run) — see `MDWE-RESULTS.md` §6. The flag is accepted and harmless on Node 24.
     - The seeder's own `renderSystemdUnit()` and duplicate unit file were **removed in the L2-v3 re-issue**; this directory is the only source of the units.
@@ -52,12 +53,39 @@ Every key is checked (`packages/seeder/src/cli/config-file.ts`); an unknown key 
     "mints": ["https://mint.example"],    // ★ ≥ 1, normalised (lower-case host, no trailing slash), no duplicates
     "split": { "seeder": 50, "creator": 50 }, // default 50/50; must sum to 100
     "creatorP2pk": "02…64 hex…",          // ★ creator's Cashu P2PK pubkey (02/03 + 64 lower-case hex)
+    "creatorPubkey": "…64 hex…",          // ★ creator's Nostr pubkey: the `p` of its nutzaps (never the creatorP2pk key)
     "blockSize": 65536                    // optional; must equal the top-level blockSize
   },
+  "relays": ["wss://relay.example"],      // ★ 1–8: where nutzaps (kind 9321) and the node's kind 10019 go; wss:// (ws:// only to loopback)
+  "identity": { "keyFile": "/var/lib/nutflix-seeder/identity.key" }, // default <dataDir>/identity.key; absolute path.
+                                          // passphrase / nsec / secretKey are REFUSED: the passphrase is a systemd credential
+  "videoEvents": { "<core key hex>": "<video event id hex>" }, // optional: the nutzap `e` tag per core
   "flushEveryBlocks": 64, "flushEveryMs": 60000, // default: the engine's config, else 64 / 60 s
   "logLevel": "info"                      // debug | info | warn | error
 }
 ```
+
+### Seeder key file and passphrase
+
+The daemon's identity is one encrypted key file (argon2id + XChaCha20-Poly1305; the node's Nostr key and a separate wallet key) whose passphrase arrives as the encrypted systemd credential `seeder-key-passphrase` (`LoadCredentialEncrypted=` in the unit; systemd ≥ 250). PID 1 decrypts it into a private ramfs only the service sees; it is never in the environment, the config or argv (ADR 0011 §1). Once, as root:
+
+```sh
+# 1. A random passphrase, straight into the encrypted credential (never on disk in clear).
+#    --name must be the credential id the unit loads, not the file name.
+install -d -m 0700 /etc/credstore.encrypted
+head -c 32 /dev/urandom | base64 -w0 \
+  | systemd-creds encrypt --name=seeder-key-passphrase - /etc/credstore.encrypted/nutflix-seeder-key-passphrase
+# 2. The key file, sealed under the same bytes, owned by the service user (0600, never overwritten).
+install -d -m 0700 -o nutflix-seeder -g nutflix-seeder /var/lib/nutflix-seeder
+systemd-creds decrypt --name=seeder-key-passphrase /etc/credstore.encrypted/nutflix-seeder-key-passphrase - \
+  | sudo -u nutflix-seeder env STATE_DIRECTORY=/var/lib/nutflix-seeder \
+      node --jitless --no-experimental-websocket /opt/nutflix/packages/seeder/dist/index.js \
+      --keygen --config /etc/nutflix/seeder.json
+```
+
+`--keygen` reads the passphrase from stdin (a terminal is refused: it would echo), writes `keyFile` and logs only the node's public key. Keep a copy of the passphrase somewhere offline (a password manager) and back up `identity.key` (it is encrypted); without both the wallet key is gone. On a host without `LoadCredentialEncrypted=` (systemd < 250) use `LoadCredential=seeder-key-passphrase:/etc/nutflix/seeder-key-passphrase` with a root-owned 0600 file — protected by file mode only.
+
+What the daemon keeps under `<dataDir>/wallet/` (0700; every file 0600): `proofs.json` — the seeder's ecash, **bearer money**: melt it out rather than copying it around; `pending.json` — PAYs accepted but not yet redeemed or nutzapped (a restart finishes them); `seen.jsonl` — accepted proof secrets (a replay cache); `lock` — one daemon per data directory. A `proofs.json` or `pending.json` that does not parse stops the daemon instead of being overwritten: recover what it holds before moving it aside.
 
 Precedence, per value: **`NUTFLIX_SEEDER_*` env > file > `STATE_DIRECTORY` (fills `dataDir` only) > default**; config path: **`--config` > `NUTFLIX_SEEDER_CONFIG`**. Env overrides: `NUTFLIX_SEEDER_DATA_DIR`, `NUTFLIX_SEEDER_DISK_CAP_BYTES`, `NUTFLIX_SEEDER_MAX_STREAMS` (→ `rateLimits.maxStreams`), `NUTFLIX_SEEDER_LOG_LEVEL`. An empty assignment (`Environment=NAME=`) counts as unset; numbers must be plain decimal digits. None of these is secret, so `Environment=` is acceptable for them — nothing secret belongs in this file or the environment. The file is not secret either (the policy is published in every video manifest); `0640 root:nutflix-seeder` as in the install block keeps it read-only to the daemon.
 
@@ -67,7 +95,7 @@ Precedence, per value: **`NUTFLIX_SEEDER_*` env > file > `STATE_DIRECTORY` (fill
 - **`http.trustProxy`.** Default `false`. Set `"http": { "trustProxy": true }` in the JSON **only when the listener is reachable solely through the reverse proxy** (loopback bind, or a firewall that admits only the proxy). With it on, the gateway takes the client address for rate-limit buckets from the LAST `X-Forwarded-For` entry — the one the proxy appends; the earlier entries are whatever the client sent (security review F14). This assumes exactly one proxy that appends (nginx `proxy_add_x_forwarded_for`; Caddy replaces the header, which also works). If anything other than the proxy can reach the port, a client can choose its own bucket by sending that header. The gateway never reads `X-Forwarded-Proto` (descriptor URLs come from `publicUrl` above).
 - **Proxy requirements** (from L3): forward `/`-rooted paths unchanged (Blossom endpoints must live at the root, BUD-01); pass `Upgrade`/`Connection` for `ws.path` (default `/ws`); disable request buffering and raise the proxy body limit to ≥ `http.maxUploadBytes` for `PUT /upload`; forward `Range` untouched.
 - **Paths**: state in `/var/lib/nutflix-<svc>` (`$STATE_DIRECTORY`), runtime sockets in `/run/nutflix-<svc>` (`$RUNTIME_DIRECTORY`), config in `/etc/nutflix` (`$CONFIGURATION_DIRECTORY`, read-only). The daemons should read those environment variables rather than hard-code paths.
-- **Key at rest** (§7: argon2id-derived passphrase key, never env vars): lives under the state directory (mode 0700 by `StateDirectoryMode`), decrypted at start with a passphrase read from `/etc/nutflix/<svc>.json`'s referenced file or a systemd credential (`LoadCredentialEncrypted=`, which the unit does not add yet because the key format is L2's). `Environment=` is deliberately not used for anything secret.
+- **Key at rest** (§7: argon2id-derived passphrase key, never env vars): the seeder does this now (key file under the state directory, passphrase as the `seeder-key-passphrase` credential — "Seeder key file and passphrase" above). The gateway's runtime providers are still to come and should follow the same pattern. `Environment=` is deliberately not used for anything secret.
 - **TLS**: the gateway binds an unprivileged port on loopback/LAN and a reverse proxy terminates TLS. The proxy is where `_headers.txt` from `scripts/csp-sri.mjs` goes.
 
 ## Directive-by-directive
@@ -82,6 +110,7 @@ Both units share the same block; the gateway differs only in resource caps.
 | `WorkingDirectory=/opt/nutflix` | The read-only application tree. |
 | `StateDirectory=` + `StateDirectoryMode=0700` | The **only** persistent writable location: corestore, key-at-rest blob, ban list. systemd creates it, chowns it, and adds it to the read-write set under `ProtectSystem=strict`. |
 | `RuntimeDirectory=` (0700) | `/run/nutflix-<svc>` for a control socket; wiped on stop. |
+| `LoadCredentialEncrypted=seeder-key-passphrase:…` (seeder) | The key file's passphrase (§7 "never env vars"). PID 1 decrypts it before exec — TPM2 and/or the host key — into `$CREDENTIALS_DIRECTORY`, a private ramfs no other unit sees, so the sandbox directives below do not need to allow TPM or credstore access. A missing credential fails the start. The gateway gets the same line when its runtime lands. |
 | `ConfigurationDirectory=nutflix` | `/etc/nutflix` exists and is readable; it is **not** added to `ReadWritePaths`, so config stays read-only to the daemon. |
 | `UMask=0077` | Anything the daemon creates (corestore files, key blobs) is private by default. Verified the process sees `077`. |
 | `ProtectSystem=strict` | §7. Entire filesystem read-only except the directories systemd carved out above. A compromised process cannot modify its own code, `/etc`, or `/usr`. |
@@ -135,7 +164,6 @@ Both units share the same block; the gateway differs only in resource caps.
 - `DynamicUser=yes` — would replace the sysusers accounts and implies most of the above. Rejected for now: persistent state under `/var/lib/private` plus the operator-facing key-at-rest file is easier to reason about with a stable UID. Revisit if the operator story changes.
 - `PrivateUsers=yes` — maps the service user into a private user namespace; hardens further but is known to interact badly with `StateDirectory` ownership on some systemd versions and could not be tested without a system manager here.
 - `PrivateNetwork=yes` / `IPAddressDeny=` — the seeder must talk to arbitrary peers; a gateway that only ever sees a reverse proxy could add `IPAddressAllow=localhost` + `IPAddressDeny=any` for its *inbound* side, but the embedded seeder's outbound swarm traffic makes a blanket deny wrong.
-- `LoadCredentialEncrypted=` for the passphrase — the right mechanism (never env vars) but the key-at-rest format is lane L2's; add it when that lands.
 - `ExecPaths=`/`NoExecPaths=` — `ProtectSystem=strict` plus MDWE already prevents executing anything written at runtime; explicit `NoExecPaths=/var/lib/nutflix-*` would be a cheap extra once state layout is fixed.
 
 ## Verifying on a real host
