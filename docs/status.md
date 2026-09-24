@@ -404,11 +404,11 @@ merge between the two histories cannot produce two ADRs with one number. **The n
 |---|---|
 | First-run relays (the host ships damus, nos.lol, primal; a fresh install contacts them) | **Keep the three defaults** — works out of the box; the privacy cost is accepted for v0 and revisited in Stage 3 (ADR 0009) |
 
-**Waiting on Cameron (2026-09-23):** approval to tag `stage-1`; the start of Stage 2 and its
-model/session; one phone scan of the Wallet QR (sent to him; pass = decodes to text starting
-`lnbc5000n1pj9x7`). `spec/nfx-suite-m0` (ADR 0006) stays unmerged.
+**Cameron, 2026-09-23:** `stage-1` tagged (on `1b0b4d9`, pushed to origin and the backup mirror); **Stage 2
+approved to start now in a fresh session** per `docs/prompts/stage-2-security.md`. Still open:
+one phone scan of the Wallet QR (pass = decodes to text starting `lnbc5000n1pj9x7`). `spec/nfx-suite-m0` (ADR 0006) stays unmerged.
 
-## Stage 2 — audit surface (single Fable 5.1 session): READY, NOT STARTED
+## Stage 2 — audit surface (single Fable 5.1 session): APPROVED 2026-09-23, starting in a fresh session
 
 Prompt updated 2026-09-23 (`docs/prompts/stage-2-security.md`: PART 0 = contracts v5 + the
 mock fixes, then the five locked modules, then the seam review). **Cameron starts it** and
