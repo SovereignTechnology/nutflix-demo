@@ -53,7 +53,7 @@ LOW: the unit's `LoadCredentialEncrypted=`, docs, tests.
 | # | Severity | Finding | State |
 |---|---|---|---|
 | F38 | High | The gateway attached pay/1 on `session-open`, before a swarm connection has a Protomux: it never paid an upstream swarm peer | **fixed**: `onSessionReady`; the swarm integration test fails without it (run) |
-| F37 | High | Upstream fetches are not paced to the unpaid window: with real engines a fast reader outruns its PAYs and the upstream seeder cuts and **bans** the gateway (6 outstanding vs window 5, every run, with the core correctly watched) | **open**: the next lane (credit pool + ACK settlement in the shared `UpstreamPayer`); the integration test paces its reader meanwhile; README warns operators |
+| F37 | High once wired | Upstream fetches are not paced to the unpaid window: with real engines a fast reader outruns its PAYs and the upstream seeder cuts and **bans** the gateway (6 outstanding vs window 5, every run, with the core correctly watched). **Latent**: nothing in the shipped gateway calls `openUpstreamCore` | **open**: credit pool + ACK settlement in the shared `UpstreamPayer` before upstream fetching is wired; the integration test paces its reader |
 | — | Low | Gateway argument errors echoed the offending token | fixed |
 
 Also caught while writing the test (not a product bug): opening an upstream core with
@@ -62,7 +62,7 @@ pays.
 
 ## Residual
 
-- F37 (above) blocks relying on the gateway for upstream fetches.
+- F37 (above) must be fixed before anything wires upstream fetching into the gateway.
 - A payout threshold low enough to drain the wallet leaves the gateway unable to pay upstream.
   Operators should set it above their upstream spend, or run without payout on a busy gateway.
 - The gateway's `identity` block duplicates what the key file holds. It is kept because the

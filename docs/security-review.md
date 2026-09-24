@@ -55,7 +55,7 @@ directories" for this list. Each fix carries a test that fails without it, excep
 | F34 | **Fixed (new)** | See §0a |
 | F35 | **Fixed (new)** | See §0a |
 | F36 | **Fixed (new)** — seeder daemon and gateway | See §0b |
-| F37 | **Open (new, High)** | See §0b — the next lane |
+| F37 | **Open (new) — latent: no production path fetches upstream yet** | See §0b |
 | F38 | **Fixed (new)** | See §0b |
 | F30 | **Fixed** | `UpstreamPayer` keeps the carry per channel, commits it on `ACK ok`, one PAY per core in flight |
 | F31 | **Fixed (engine)**; wired in the seeder daemon | `spentByUs` dep: a "spent" answer to a RETRIED redeem whose witness is our own signature is our lost swap — no ban, creator still paid. A first attempt answered "spent" is a double-spend even with our witness (a set we redeemed before a restart carries it too — found by the real-mint lane); the attempt is persisted before it is made. Open: NUT-13 deterministic outputs to recover the swapped proofs |
@@ -109,15 +109,19 @@ real-mint-swarm.integration.test.ts`). Both real-mint suites are opt-in
   to tell a double-spend); the built-entry test loads a mint over real HTTP under the unit's
   flags. The gateway's runtime uses the same transport (`stage-3/gateway-runtime`), with the same
   built-entry guard.
-- **F37 — High — open: the gateway does not pace upstream fetches to the unpaid window.** Found by
-  the gateway runtime's swarm integration test. With real engines a PAY takes longer to make
+- **F37 — High once wired, latent today — open: the gateway does not pace upstream fetches to the
+  unpaid window.** Found by the gateway runtime's swarm integration test. Latent: nothing in the
+  shipped gateway fetches upstream on its own — `Gateway.openUpstreamCore` has no production
+  caller (Blossom `GET` serves only blobs the gateway holds), so today it bites only an embedder
+  that calls the API. With real engines a PAY takes longer to make
   (P2PK outputs, DLEQ) than blocks take to arrive on a fast link, so a client reading a blob the
   gateway does not hold at full speed has the upstream seeder send more unpaid blocks than its
   window: the seeder cuts AND BANS the gateway (measured: 6 outstanding against a window of 5,
   every run). The desktop already paces with a credit pool settled by ACKs
   (`app-desktop/src/worker/playback/credit.ts`); the gateway has no equivalent. Fix: move the
   credit pool and ACK settlement into the shared `UpstreamPayer` and gate the gateway's upstream
-  reads on it. Until then the gateway must not be relied on to fetch from upstream seeders.
+  reads on it — required before anything wires upstream fetching (e.g. a Blossom miss that falls
+  through to the swarm).
 - **F38 — High — fixed: the gateway could never pay an upstream swarm peer.** It attached pay/1
   on `session-open`, which fires before a swarm connection's Protomux exists, so every upstream
   swarm session ran without pay/1 (and the seeder cut it after its window). It now attaches on
@@ -580,7 +584,7 @@ finding's section above plus its row in §0. **Filing waits for Cameron's go-ahe
 | [Medium] F33: duplicate block deliveries — cap at the quoted price or single-peer ranges (decision) |
 | [High] F5: DLEQ verification off the event loop; explicit minPaySats batching tied to the credit pool |
 | [Medium] Seeder: the pending-PAY queue is unbounded while a mint is down, and `pending.json` is rewritten whole per change (quadratic) — an append-only journal plus an engine cap on queued PAYs (docs/reviews/2026-09-24-pre-push-seeder-runtime.md) |
-| [High] F37: pace the gateway's upstream fetches — credit pool + ACK settlement in the shared `UpstreamPayer` |
+| [High, before upstream fetching is wired] F37: pace the gateway's upstream fetches — credit pool + ACK settlement in the shared `UpstreamPayer` |
 | [Medium] F10/F11/F12/F31: wire the seen-secret persistence, `checkSpent`, `persistPending`/`restorePending` and `spentByUs` in the desktop runtime (the seeder daemon and the gateway have them via `createNodeRuntime`) |
 | [Medium] F31: NUT-13 deterministic outputs + NUT-09 restore |
 | [Medium] F15: per-pubkey upload quota |

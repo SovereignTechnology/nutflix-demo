@@ -139,7 +139,7 @@ systemd-creds decrypt --name=gateway-key-passphrase /etc/credstore.encrypted/nut
 
 New keys in `gateway.json` (same rules as the seeder's): `relays` ★ (1–8, `wss://`), `policy.creatorPubkey` ★, `identity.keyFile` (default `<dataDir>/identity.key`), `payout`, `videoEvents`.
 
-**Upstream fetching is not paced yet (security review F37):** the gateway does not yet hold its upstream requests to the seeders' unpaid window, so a client reading a blob the gateway does not have at full speed can outrun its payments and get the gateway cut — and banned — by upstream seeders. Serving blobs the gateway holds (uploads, mirrors) is unaffected. Until the fix lands, do not rely on the gateway to fetch from upstream seeders.
+**Upstream fetching (security review F37):** the gateway serves the blobs it holds (uploads, mirrors); nothing in it fetches from upstream seeders on its own yet. The `Gateway.openUpstreamCore` API does, but does not yet pace its requests to the seeders' unpaid window, so a fast reader through it gets the gateway cut and banned upstream. Pacing lands before any upstream fetching is wired into the gateway.
 
 ## Directive-by-directive
 

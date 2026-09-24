@@ -223,7 +223,8 @@ What differs for the gateway:
   when a swarm connection has no Protomux yet, so it never paid an upstream swarm peer; it now
   uses `Seeder.onSessionReady`, like the daemon (a swarm integration test fails without it).
 - **Open: upstream pacing (F37).** The gateway does not hold upstream requests to the seeders'
-  unpaid window; a fast reader outruns its PAYs and gets it cut and banned. The desktop solved this
+  unpaid window; a fast reader outruns its PAYs and gets it cut and banned. Latent: nothing in the
+  shipped gateway fetches upstream on its own (`openUpstreamCore` is API-only). The desktop solved this
   with a credit pool settled by ACKs (`app-desktop/src/worker/playback/credit.ts`); the next lane
   moves that into the shared `UpstreamPayer` so the gateway and the desktop use one implementation.
 
