@@ -1,0 +1,445 @@
+# Security review — Stage 2 (PART B)
+
+Date: 2026-09-23. Reviewer: the Stage 2 session (`stage-2/2026-09-23`, on top of `stage-1`).
+Scope: the seams listed in `docs/prompts/stage-2-security.md` PART B, plus the residual risks of
+the five modules Stage 2 implemented (signer, `wallet/spend.ts`, payment, pay-protocol,
+gateway auth). There is no web portal; only the gateway's web-facing responses were reviewed.
+
+Method: every claim below was checked against the source at `f398f9f` (file:line references are
+to that tree), and against measurements where a number is given. Findings are ranked by what an
+attacker gains and how cheaply. **None is fixed here** unless it sat inside the five Stage 2
+directories. PART B forbids fixes elsewhere, so each finding carries a concrete fix and a
+test, to be filed as a `stage-3` issue (§6).
+
+**Exposure today is nil for the money findings.** No runtime provider is wired: the desktop
+worker, the seeder and the gateway CLIs all refuse to start without `--dev-mocks`
+(`*/providers.ts` return `undefined`), so no real ecash moves until Stage 3 wires the Stage 2
+modules in. That makes F1–F4 **Stage 3 blockers**: each must be fixed before a real wallet is
+connected.
+
+## 1. Summary
+
+| ID | Sev | Finding | Where |
+|---|---|---|---|
+| F1 | **Critical** | A seeder's `PRICE` raises what a viewer pays above the manifest price the user was shown | `gateway/src/upstream/payer.ts:154-158, 303-319` (used by the desktop `ViewerPayer`) |
+| F2 | High | The gateway's default upstream policy trusts the seeder's HELLO for price, split and mints | `gateway/src/upstream/payer.ts:326-340`, `gateway.ts:157` |
+| F3 | High | Blossom serves the uploader's `Content-Type` on the gateway origin (HTML/SVG → stored XSS), CORS `*`, no `nosniff`/CSP | `gateway/src/blossom/handler.ts:90-92, 146-151, 289-293`; `config.ts:144-154` |
+| F4 | High | Auto top-up (v5 normative) funds whatever mint a manifest names, automatically | `core/src/contracts/network-adapter.ts:188-193`; `app-desktop/src/host/adapter.ts:818` |
+| F5 | High | DLEQ verification costs 11 ms/proof (20 ms under `--jitless`) on the event loop; per-block PAYs cap a seeder at ~5 HD viewers per core | `core/src/payment/engine.ts:762`; `app-desktop/src/worker/pay/viewer-payer.ts` (`payEveryBlocks: 1`) |
+| F6 | High | The `pay1` creator-set binding (NUT-10 tag) is unverified against a real mint | `core/src/payment/engine.ts:297`, ADR 0010 §6 |
+| F7 | Medium | SE-1 residual: a compromised renderer process can get a token for any path and publish the file | `app-desktop/src/main/file-tokens.ts`, `ipc-gate.ts` |
+| F8 | Medium | The money gate is still a stub (fails closed); settings that move money are not gated at all | `app-desktop/src/main/money-gate.ts:33-35`, `ipc/protocol.ts` (`updateSettings`) |
+| F9 | Medium | The seeder verifies every PAY against its CURRENT policy, so a price change rejects honest PAYs | `seeder/src/payment/pay-bridge.ts`, `core/src/payment/engine.ts:418` |
+| F10 | Medium | The seen-secret set is memory-only with FIFO eviction; a restart re-opens replay until flush | `core/src/payment/seen.ts:11-51` |
+| F11 | Medium | A viewer can double-spend the CREATOR set undetected (the seeder never checks it) | `core/src/payment/engine.ts` flush (~l. 620-660) |
+| F12 | Medium | Accepted-but-unflushed proofs and failed nutzaps live only in memory: a crash loses that income | `core/src/payment/engine.ts:228, 513, 620-666` |
+| F13 | Medium | Full peer identifiers (Nostr pubkeys, Noise keys) are logged at info level | `seeder/src/net/peer-session.ts:206,212,232,266`; `seeder/src/seeder.ts:306,472`; `gateway/src/blossom/handler.ts:540-545,718`; `seeder/src/log/redact.ts` (by design) |
+| F14 | Medium | `trustProxy` takes the FIRST `X-Forwarded-For` hop: clients pick their rate-limit bucket behind an appending proxy | `gateway/src/gateway.ts:447-454` |
+| F15 | Medium | Gateway defaults: open uploads (any key, any MIME, 2 GiB, no quota); body spooled before auth without `X-SHA-256` | `gateway/src/config.ts:123-154`; `blossom/handler.ts:462-494` |
+| F16 | Medium | The gateway unit dies at start on Node 22 (`--jitless` + undici) — known, still open | `deploy/systemd/nutflix-gateway.service`; `deploy/systemd/MDWE-RESULTS.md` §6 |
+| F17 | Medium | Mint quotes are not NUT-20-locked: a quote id is a bearer claim on the minted ecash | `core/src/wallet/wallet.ts:154` |
+| F18 | Medium | Host image fetches reveal the viewer's IP to any thumbnail/avatar host a Nostr event names | `app-desktop/src/host/images/*` |
+| F19 | Low | Watch does not compare the session's policy with the quoted price (Shorts does) | `ui/src/screens/Watch/Watch.tsx:456` vs `Shorts/Shorts.tsx:744` |
+| F20 | Low | `StoredReport.signatureVerified: false` is now stale (the auth boundary verifies it) | `gateway/src/blossom/store.ts:125`, `handler.ts:712` |
+| F21 | Low | Dev flags ship in the production binary; Electron fuses / asar integrity not set | `app-desktop/src/main/args.ts`; packaging |
+| F22 | Low | No single-instance lock on the desktop app (two processes on one `userData`) | `app-desktop/src/main/main.ts` |
+| F23 | Low | The NIP-60 store trusts its injected relay layer to have verified signatures | `core/src/wallet/nip60.ts:101-105` |
+| F24 | Low | Key files: the `KeyStore` adapter (Stage 3) must write 0600 atomically; headless unlock undefined | `core/src/signer/control.ts` (`KeyStore`), systemd units |
+| F25 | Low | Markdown link text may differ from its target (matters once Stage 3 opens links) | `ui/src/components/Markdown/parse.ts:166-204` |
+| F26 | Low | Advisory minimum PAY: dust PAYs cost seeders mint input fees | ADR 0010 §3.3 |
+| F27 | Low | Two concurrent channels from one pubkey collide on the carry (rebind resets it) | `core/src/payment/engine.ts` (rebind) |
+| F28 | Info | Bans are keyed on free identities; the window, not the ban, bounds loss | `seeder/src/store/ban-list.ts` |
+| F29 | Info | BlossomAuth's `server`-tag rule follows nostr-tools, not BUD-11 text (not vendored) | `gateway/src/auth/blossom-auth.ts`, ADR 0010 §8 |
+
+## 2. Findings
+
+### F1 — Critical — `PRICE` can raise the price above the manifest
+
+**What.** `UpstreamPayer` stores every `PRICE` a peer sends (`payer.ts:154-158`) and
+`resolvePolicy` applies it unconditionally: `{ ...base, satsPerBlock: p.satsPerBlock }`
+(`payer.ts:315-317`). The desktop `ViewerPayer` wraps `UpstreamPayer` and only checks the
+HELLO's price against the manifest (`viewer-payer.ts:229`). A `PRICE` sent *after* the HELLO
+bypasses that check.
+
+**Impact.** A malicious seeder sends a HELLO at the manifest price, then
+`PRICE { satsPerBlock: 10^6, effectiveFromBlock: next }`. The viewer's engine computes
+`amount = blocks × satsPerBlock` and `wallet.send`s it: the balance at that mint drains, up to
+`MAX_PAY_SATS`, with no user interaction beyond pressing Play. It breaks the product's core
+promise ("never pay more than the price shown", ADR 0007 c) for the desktop viewer and for the
+gateway (F2).
+
+**Fix.** A `PRICE` may only LOWER the price: `min(p.satsPerBlock, base.satsPerBlock)`. A
+PRICE above the manifest price stops payment to that peer for that core and logs it (the peer
+then window-cuts us, which is the correct outcome). Put the clamp in `UpstreamPayer` so both
+consumers get it. Also clamp in `ViewerPayer.resolvePolicy`. Defence in depth: have the
+viewer engine's `pay()` refuse `amount > blocks × policy.satsPerBlock` for the policy it was
+handed.
+
+**Test.** An upstream peer sends HELLO at the manifest price, then PRICE ×1000 → the next PAY
+is at the manifest price or absent, never above it. The same test runs against `ViewerPayer`.
+
+### F2 — High — gateway pays upstream on the seeder's own terms
+
+**What.** `helloPolicyResolver` (the gateway default, `gateway.ts:157`) builds the upstream
+policy from the HELLO: `satsPerBlock: hello.satsPerBlock`, `mints: hello.acceptedMints`,
+`split: hello.split` (`payer.ts:326-340`). Only `creatorP2pk` and `blockSize` come from
+configuration.
+
+**Impact.** Any upstream seeder names its price (drains the gateway's wallet at a mint it
+holds) and its split (`{seeder: 100, creator: 0}` diverts the creator's share). Combined with
+F1, the seeder can also change the price mid-stream.
+
+**Fix.** Pay upstream only on the MANIFEST policy of the core (price, split, mints, creator
+P2PK). The gateway already reads manifests for its own markup, and `config.upstream.policies`
+is the per-core source. No manifest policy for a core → do not pay (the resolver already
+supports `null`). HELLO values may only narrow: mints ∩ manifest mints, price ≤ manifest.
+Never take the split from a HELLO (the desktop `ViewerPayer` already ignores it).
+
+**Test.** HELLO asking 10× the manifest price → not paid. A HELLO split of 100/0 → PAY split
+per the manifest. A core with no manifest policy → no PAY.
+
+### F3 — High — stored XSS / content confusion on the gateway origin
+
+**What.** `PUT /upload` stores the uploader's `Content-Type` (`mimeOf`, `handler.ts:146-151`;
+the default `allowedMimeTypes: null` accepts any). `GET /<sha256>` serves it back verbatim
+(`handler.ts:291`) with `Access-Control-Allow-Origin: *`, and without `X-Content-Type-Options`,
+`Content-Security-Policy` or `Content-Disposition`.
+
+**Impact.** Anyone who can upload (by default anyone with a fresh key, F15) can host
+`text/html` or `image/svg+xml` with script on the gateway's origin: phishing under the
+operator's domain, and any same-origin surface is exposed. The sharpest edge is NIP-07
+extensions, which grant signing permission per origin. A user who let the gateway origin sign
+upload tokens would have an attacker page sign whatever it asks.
+
+**Fix.** On every blob response send `X-Content-Type-Options: nosniff` and
+`Content-Security-Policy: sandbox; default-src 'none'`. Default `allowedMimeTypes` to a
+media allowlist (`video/*`, `audio/*`, `image/jpeg|png|webp|gif`, `text/vtt`), and never serve
+`text/html`, `application/xhtml+xml`, `image/svg+xml`, `text/xml` or `application/javascript`
+inline: send `application/octet-stream` with `Content-Disposition: attachment` instead.
+Better still, serve blobs from a separate cookieless origin from anything a browser trusts.
+
+**Test.** Upload with `Content-Type: text/html` → refused by default. With a permissive
+allowlist, GET returns `application/octet-stream` + `attachment` + `nosniff` + CSP sandbox.
+
+### F4 — High — auto top-up moves money into manifest-named mints
+
+**What.** v5 made auto top-up normative (ADR 0010 item 5): when the balance at "the mint a
+payment is about to draw from" falls below `belowSats`, melt at `fromMint` and mint there
+(`network-adapter.ts:188-193`). The paying mint comes from the video's manifest. Stage 1 only
+logs "would be due" (`host/adapter.ts:818-823`); Stage 3 executes it.
+
+**Impact.** A creator who lists a mint they run makes every auto-top-up viewer pay Lightning
+invoices from that mint, unattended. The creator's mint receives real sats and issues ecash
+it can later refuse to honour. The trigger repeats per payment, bounded only by the
+user's balance at `fromMint`.
+
+**Fix.** Top up only into mints on the user's own trusted list (Settings → mints), never a
+mint first seen in a manifest. Cap each top-up and each day (a new setting). Require the money
+gate's native confirm the first time a mint is funded. Log each top-up in wallet history.
+
+**Test.** A manifest naming an unknown mint → no top-up, and play fails `no-balance`. A
+trusted mint → a top-up within the cap. The second top-up in a day beyond the cap is refused.
+
+### F5 — High — DLEQ CPU cost and per-block PAYs
+
+**What (measured on this box, TestMint keyset, cashu-ts 4.10.0 `hasValidDleq`):**
+**11.2 ms per proof** with the JIT and **19.9 ms under `--jitless`**, which is how both
+systemd units run Node. Minting costs 12.9 / 23.3 ms per proof. `verify` checks DLEQ on BOTH
+sets, synchronously on the main thread, for up to `MAX_PROOFS_PER_SET = 64` proofs each
+(`engine.ts:123`). The desktop viewer pays after every block (`payEveryBlocks: 1`).
+
+**Impact.** At 2.5 Mbit/s and 64 KiB blocks a viewer sends ≈5 PAYs/s × ≥2 proofs, about
+200 ms of seeder CPU per second (jitless). **One core saturates at ~5 HD viewers**, and every
+other session stalls meanwhile (one event loop). An attacker paying with 1-sat proofs (real
+but cheap) buys ~20 ms of CPU per sat. A forged DLEQ against a known keyset is banned on the
+first proof (cheap for us). The costly case is valid proofs split fine.
+
+**Fix (in order of leverage).**
+1. Batch: pay per ½ window, not per block. This is the "payers batch to `minPaySats`" item
+   ADR 0010 already owes Stage 3; it cuts PAY count by 10–30×.
+2. Cap proofs per set at `popcount(amount) + 2`. An honest wallet needs no more; a
+   fine-split set is `malformed` before any curve operation.
+3. Verify DLEQ in a `worker_threads` pool (Node) off the event loop.
+4. Optionally, verify DLEQ for a random sample of each set and rely on the flush swap to
+   catch the rest. A forgery is then caught one batch later and banned; the loss stays
+   bounded by the window. This is an explicit trade, and SECURITY.md invariant 2 would need
+   amending.
+
+**Test.** A benchmark in CI at `--jitless` (budget per PAY); a set of 64 × 1-sat proofs for a
+64-sat PAY → `malformed` without a DLEQ call (spy).
+
+### F6 — High — the `pay1` binding is unverified against a real mint
+
+**What.** v5 binds the creator set to its seeder with a NUT-10 tag `['pay1', <seeder P2PK>]`
+(ADR 0010 §6, `engine.ts:297`). TestMint accepts it. No real mint (nutshell, cdk) was run.
+
+**Impact.** If a production mint rejects unknown tags at swap, or strips them, every creator
+share is unredeemable or unbound. Creators would be paid nothing, or the replay protection
+the tag buys would vanish silently.
+
+**Fix.** A Stage 3 regtest job against nutshell and cdk-mintd: mint, send with the tag,
+swap as the creator. If either mint rejects it, move the binding into the secret's `data`
+domain (a per-seeder derived key) and amend ADR 0010 §6.
+
+### F7 — Medium — SE-1 residual
+
+**What.** SE-1 is implemented (single-use, webContents-bound, 10-minute tokens;
+`studio.upload` takes only a token). But main mints a token for whatever absolute path the
+`nf:grant-file` message names (`file-tokens.ts` header, "Residual"). Page JavaScript cannot
+reach that channel (context isolation, no `ipcRenderer` in the bridge). A compromised renderer
+*process* can, and it can then call `studio.upload` itself.
+
+**Impact.** A renderer RCE, which is exactly what the Chromium sandbox assumes can happen,
+publishes any user-readable file to the public network (transcoded, but a file is a file).
+
+**Fix.** Have main own the choice. Either `dialog.showOpenDialog` in main, or a main-process
+confirm naming the file (basename, size) before relaying `studio.upload`. The drop path then
+needs the same confirm.
+
+### F8 — Medium — the money gate is a stub, and settings are ungated
+
+**What.** `createMoneyGate` returns `devMocks` (`money-gate.ts:33-35`). It correctly fails
+closed without `--dev-mocks`, but Stage 2 did not replace it with the native dialog the design
+calls for. Separately, `updateSettings` is ungated: the renderer can rewrite relays, mints and
+`autoTopUp`.
+
+**Fix.** Stage 3 implements `dialog.showMessageBox` in main for `wallet.melt`,
+`seeder.melt` and `nutzap`, with amount, mint and destination decoded in main from the
+validated args. For melt, decode the bolt11 amount in main, never from renderer text. Add
+settings patches touching `mints` or `autoTopUp` to the gated set (see F4).
+
+### F9 — Medium — PRICE change rejects honest PAYs
+
+The seeder verifies each PAY against its current policy. After a `PRICE` with
+`effectiveFromBlock = N`, an honest PAY for blocks below N at the old price is `wrong-amount`.
+Enough of those window-cut the viewer. Already owed to Stage 3 in ADR 0010 Consequences.
+**Fix:** the engine keeps the policy history per core and prices each block by the policy
+in force when it was uploaded. **Test:** a PRICE mid-stream, then a PAY for the earlier range
+at the old price → accepted.
+
+### F10 — Medium — seen-secret set not persisted
+
+`SeenSecrets` is in memory, capacity 1 000 000, FIFO eviction (`seen.ts:11-51`). After a
+restart (or eviction), a replay of already-accepted proofs passes `verify`; the flush swap
+then finds them spent and bans the peer. **Loss:** up to one window of blocks per identity
+per restart. **Fix:** implement the `persist` hook (append-only file of secret hashes, or
+`Y = hash_to_curve(secret)` values, which reveal nothing spendable), pruned by keyset
+rotation. **Test:** accept a PAY, restart the engine with the same store, replay → `double-spend`.
+
+### F11 — Medium — creator-set double-spend goes undetected
+
+The seeder redeems only its own set. The creator set is nutzapped to the creator unexamined.
+A viewer who double-spends the creator proofs cheats the creator, and the seeder neither
+notices nor bans. **Fix:** at flush (and, if cheap enough, at verify), NUT-07
+`checkstate` the creator proofs by `Y`. Checkstate needs no ownership. A spent creator
+proof → `double-spend` ban, the same as the seeder set. **Test:** spend the creator set at the
+mint before flush → the peer is banned, and no nutzap is published.
+
+### F12 — Medium — unflushed proofs are memory-only
+
+A verified PAY is queued (`engine.ts:513`) and redeemed at the next flush; a nutzap that fails
+stays queued (`engine.ts:666`). The queue is an in-memory array (`engine.ts:228`). A graceful
+stop flushes it (`flush-scheduler.ts:50`); a crash, OOM kill or power loss drops it. The
+proofs are P2PK-locked to the seeder (or the creator), so nobody else can spend them, and
+nobody can ever recover them. **Loss:** up to `flushEveryBlocks` / `flushEveryMs` of
+income, plus every creator share whose nutzap had failed. **Fix:** persist the queue before
+ACKing (0600, or the NIP-60 store, which is already encrypted to self), and resume flushing at
+start. **Test:** accept a PAY, build a new engine on the same store without flushing, flush →
+redeemed and nutzapped.
+
+### F13 — Medium — peer identifiers in logs
+
+`redact.ts` deliberately keeps full values in public-identifier fields (`pubkey`, `peer`,
+`noiseKey`, …), and the seeder logs them at info on bind, rebind, cut and session admission.
+The gateway logs uploader and reporter pubkeys (`handler.ts:540-545, 718`). Journald then
+holds a durable record of which Nostr identities fetched from, uploaded to or reported via this
+host. **Fix:** log a keyed, per-boot hash (e.g. first 8 bytes of
+`HMAC(boot_key, value)`), which correlates within a run and not across runs. Keep full
+values at debug only. Add a test that `info` output of a full session contains no 64-hex run.
+
+### F14 — Medium — `X-Forwarded-For` first hop
+
+With `trustProxy: true`, `clientKey` takes the first XFF entry (`gateway.ts:447-454`).
+Proxies that append (nginx `proxy_add_x_forwarded_for`) leave the client's own header first,
+so a client picks any bucket and escapes the per-client limits. (Caddy's default replaces the
+header, so the risk depends on the proxy.) **Fix:** take the entry N hops from the right, N =
+number of trusted proxies (default 1), or a proxy-set `X-Real-IP`. **Test:** a request with
+`X-Forwarded-For: 1.2.3.4, <proxy-added>` is bucketed on the proxy-added value.
+
+### F15 — Medium — open uploads by default
+
+Defaults: `allowUpload: true`, no allow list, `allowedMimeTypes: null`, 2 GiB per upload,
+16 concurrent per client, no per-pubkey quota (`config.ts:123-154`). Without `X-SHA-256` the
+body is spooled to disk before the token is checked (`handler.ts:462-494`); the spool is
+removed afterwards, but disk I/O and space are spent unauthenticated. **Fix:** ship with
+uploads off or allow-list-only (BlossomAuth now implements allow-list mode, ADR 0010 §8).
+Add a per-pubkey byte quota. Require `X-SHA-256` (or a `Content-Length` below a small
+threshold) before spooling.
+
+### F16 — Medium — gateway unit broken on Node 22 (known)
+
+`MDWE-RESULTS.md` §6 already records it: under `--jitless`, touching `node:http` (the
+gateway's server) loads undici, which needs WebAssembly, and the process dies one tick after
+start on Node 22. The seeder unit is fixed; the gateway unit is not, and it also lacks
+`--no-experimental-websocket`. **Fix:** require Node ≥ 24 on gateway hosts (works there) and
+add the flag. Or load `http` through `createRequire` as the note suggests.
+
+### F17 — Medium — mint quotes are bearer
+
+`mintQuote` uses `createMintQuoteBolt11` (`wallet.ts:154`) without NUT-20. Whoever learns the
+quote id after the invoice is paid can mint the ecash first. Quote ids cross IPC to the
+renderer (`wallet.mintQuote` / `pollQuote`). **Fix:** use NUT-20 locked quotes (sign the mint
+request with the wallet key) when the mint advertises NUT-20; keep quote ids out of the
+renderer (hand it an opaque handle).
+
+### F18 — Medium — image fetches leak the viewer's IP
+
+The host fetch is well guarded: https only, DNS-level private-address refusal (no rebinding
+window), 3 re-validated redirects, 5 MiB, magic-byte sniffing, sha256 when given. But every
+thumbnail and avatar URL in a Nostr event makes the viewer's machine contact that host, with
+a distinctive `user-agent: nutflix-desktop` (`net.ts:231`). That is a tracking pixel for any
+publisher. **Fix:** prefer Blossom URLs with an `x` hash, fetched through a gateway or over
+the swarm. Drop the distinctive user agent. Offer a "load remote images" setting (default: only
+hash-addressed images).
+
+### F19–F29 — Low / Info
+
+- **F19.** Watch refuses a session whose rendition differs from the quote, but does not
+  compare `session.policy`, as Shorts does (`renditionPriceSats(rendition, session.policy) >
+  shown`). Event ids are content hashes, so the host cannot hand back a different price for
+  the same id today. Add the check anyway, before any addressable-event resolution lands.
+- **F20.** `StoredReport.signatureVerified` is typed `false`. Since A.5 the auth boundary
+  verifies the report's signature under verb `report`. Record `true` (type `boolean`) when
+  `authorize` succeeded against a real `BlossomAuth`.
+- **F21.** `--dev-mocks`, `--dev-fixtures` and `--e2e-hooks` are parsed in every build. None
+  moves real money (mocks only; counters only), but production builds should compile them
+  out. Packaging must also set Electron fuses (`RunAsNode` off, `EnableNodeOptionsEnvironmentVariable`
+  off, `EnableNodeCliInspectArguments` off, `EnableEmbeddedAsarIntegrityValidation` on,
+  `OnlyLoadAppFromAsar` on).
+- **F22.** No `app.requestSingleInstanceLock()`: two app instances on one `userData` share the
+  settings file and the worker's storage. Corestore's lock stops the second worker, but the
+  host's settings writes race.
+- **F23.** `Nip60ProofStore` filters `authors: [me]` and re-checks `ev.pubkey`. It relies on
+  the injected `relays.query` to have verified signatures. Forged token events fail NIP-44
+  decryption (the self-conversation key needs our secret), but a forged kind-5 would hide
+  proofs. Call `verifyIncoming` on every event in `reload()` (defence in depth, about 1 ms per
+  event).
+- **F24.** The signer's key file is sound (argon2id13 + XChaCha20-Poly1305, header as AD,
+  bounded KDF cost), but *writing* it is the injected `KeyStore`'s job: Stage 3's adapter must
+  write atomically at 0600 under a 0700 directory. Headless daemons (seeder, gateway) need an
+  unlock story, e.g. `LoadCredentialEncrypted=` with a systemd-creds or TPM-sealed passphrase.
+  Never an env var.
+- **F25.** Markdown links render `[text](href)` with the text shown. Links open nothing today
+  (window-open denied), but Stage 3's external-link confirm must show the real host.
+- **F26.** ADR 0010 §3.3 made the minimum PAY advisory (an enforced minimum deadlocks
+  multi-seeder viewers). Dust PAYs then cost seeders the mint's `input_fee_ppk` at swap. This
+  is the same fix as F5 (1).
+- **F27.** Carry is per channel × core, and a rebind resets `to`'s carry to `from`'s. Two
+  simultaneous channels from one pubkey to one seeder fight over it, and the loser's PAYs
+  become `wrong-amount`. Either key carry by channel id rather than pubkey, or refuse a second
+  concurrent channel per pubkey.
+- **F28.** Bans persist (Noise + Nostr, `BanList`), but identities are free. The per-identity
+  loss bound is the window (`windowBlocks × satsPerBlock`), plus the session rate limits.
+  Inherent; recorded so nobody relies on bans alone.
+- **F29.** BUD-11 is not vendored. The `server` scoping rule (ADR 0010 §8) mirrors nostr-tools'
+  Blossom client and only ever *refuses* tokens that name other servers. Vendor BUD-11 and
+  re-check.
+
+## 3. Checklist coverage
+
+| Item | Result |
+|---|---|
+| webPreferences | `contextIsolation`, `sandbox`, `nodeIntegration*` false as literals, `webviewTag`/`webSecurity` at secure defaults (`main/window.ts`); `app.enableSandbox()`; `--no-sandbox`/`--disable-gpu-sandbox`/`--no-zygote` refused at start (exit 78). **Pass** |
+| Preload surface, `EXCLUDED_METHODS` | One key `window.nutflix`; no `ipcRenderer`/generic invoke; `wallet.send/receive/p2pkPubkey/keyset` stubs reject `forbidden` (D3). **Pass**; ungated settings → F8 |
+| IPC gate | Top-frame + `app://nutflix` origin + app-webContents checks, method allowlist + per-method guards, inflight/sub/grant caps, SE-1 swap, money gate before relay, replies matched per (webContents, id). **Pass** |
+| File tokens (SE-1) | Single use, webContents-bound, TTL, `lstat` regular file (no symlink/device). **Pass**; residual → F7 |
+| CSP | Response header from `app:`; `default-src 'none'`, `connect-src 'none'`, no inline, `frame-ancestors 'none'`; `nf-media:` responses `sandbox`. **Pass** |
+| Navigation / permissions | `setWindowOpenHandler` deny; `will-navigate`/`-frame-navigate`/`-redirect`/`-attach-webview` prevented; only `fullscreen` + `clipboard-sanitized-write` for the top app frame; device permissions false; downloads and spell-check dictionaries off. **Pass** |
+| `app:` handler | GET/HEAD, fixed file list, encoded-separator and dot-segment refusal before decode, realpath containment. **Pass** |
+| `nf-media:` proxy | Loopback-only link regex re-checked per fetch, single-range regex (malformed → 416, never widened), `redirect: 'error'`, fixed `video/mp4`. **Pass** |
+| Worker playback server | 127.0.0.1, 256-bit server token + 128-bit per-session path token, `resolve` allowlist (live session AND exact core/blob/type) before any store access, per-request gated adapter without `.core` (no bulk prefetch). **Pass** |
+| Pacing / credit pool | Paused → no requests; allowance = prefetch + paced × 1.25; global `CreditPool` ≤ window, settled on ACK. **Pass**; scaling → F5 |
+| Money gate | Stub, fails closed → F8 |
+| Host image fetch (T16) | https, DNS-level private refusal, redirects, size, sniffing, hash. **Pass**; privacy → F18 |
+| Seeder / gateway rate limits | Seeder: per-noise-key streams + connects per window (`RateLimiter`); gateway: per-client HTTP concurrency/rate, WS connection cap, header/body idle timeouts. **Pass**; XFF → F14; CPU → F5 |
+| Ban persistence | `BanList` persisted (Noise + Nostr); engine bans and mint-reported double-spends reach it. **Pass**; F28 |
+| Log redaction | Cashu tokens, nsec, proof-shaped objects, secret-named fields scrubbed; 64-hex in free text truncated. All 171 logger calls in `packages/*/src` were grepped and those with identifier/URL/key fields read: no secret found; peer identifiers → F13. The five Stage 2 directories log nothing. |
+| Key file permissions | Gateway spool 0700, spool/report/owner files 0600; desktop settings 0700/0600 atomic; systemd `UMask=0077`, `StateDirectoryMode=0700`. Key-file writing → F24 |
+| systemd units | Full hardening set (`ProtectSystem=strict`, empty capability set, `@system-service` filter, MDWE + `--jitless`, `NODE_OPTIONS=` pinned, resource caps). **Pass**; gateway Node 22 → F16 |
+| Dependencies | `.npmrc`: `ignore-scripts`, `save-exact`, lockfile mandatory. Lockfile: 611 entries, all with integrity, all from registry.npmjs.org, 2 with install scripts (esbuild, fsevents — never run). `npm audit --omit=dev`: 0 vulnerabilities. `npm audit signatures`: 499/499 registry-signed, 205 attested. `scripts/provenance-report.mjs`: 594 signed, 282 attested; **9 direct deps without provenance** (bare-encoding, hyperswarm, nostr-tools, sodium-javascript, sodium-native, sodium-universal, streamx, uqr, ws), to re-read on every bump. Stage 2 added `@cashu/cashu-ts` 4.10.0, `sodium-universal` 5.0.1, `compact-encoding` 3.4.0 to core (nostr-tools was already there). **Pass** |
+| Nostr read paths | Exactly one signature check in the repo: `core/src/nostr/event.ts` `classifyIncoming` (fresh object → `verifyEvent`, defeating the spread pitfall). Every read goes through `NostrClient`; Stage 2's remote signer, HELLO and BlossomAuth reuse it. **Pass**; F23 |
+| Markdown | Fixed subset rendered as React elements; http(s) links only; `nostr:` as chips; no raw-HTML sink anywhere in `packages/ui`, `app-desktop`, `app-web`. **Pass**; F25 |
+| Thumbnail hash checks | `sha256` enforced when the manifest carries it; bytes sniffed (JPEG/PNG/WebP only, no SVG). **Pass** |
+| Price shown vs charged | Card and Watch quote the default rendition (`quoteFor` = `play(id)`'s rendition); Watch refuses a session at another rendition; a quality switch keeps the old session unless the new one matches, then toasts the delta; autoplay-next shows the price through the countdown and refuses a higher re-quote; Shorts refuses `charged > shown`; the mini-player carries the same session (no re-price). Host charges `video.price` of the same content-addressed event. **Pass** in the UI; **F1 breaks it below the UI**; F19 |
+| SE-1 … SE-5 | §4 |
+| Gateway web responses | F3, F14, F15; CORS `*` on everything is Blossom-conformant but only safe once F3 lands; `OPTIONS` fine; error bodies are fixed strings (`X-Reason`), no reflection. |
+
+## 4. SE-1 … SE-5 (docs/reviews/2026-09-23-pre-push-l5-v4.md)
+
+| | Status |
+|---|---|
+| SE-1 | **Fixed** by file tokens (L6-A); residual F7 |
+| SE-2 | **Fixed**: `renderer/coordinator.ts` owns every session; host backstop ≤ 1 unpaused per webContents; `wc-gone` closes all; e2e asserts one open session after Watch→Watch |
+| SE-3 | **Fixed**: Shorts `onPlaybackStart` wired to the coordinator |
+| SE-4 | **Fixed** for Stage 1 (`autoTopUpDue` false for `belowSats <= 0`, tested; v5 normative); executing top-ups is Stage 3, see F4 |
+| SE-5 | **Fixed**: `unreact` publishes a kind-5 naming only the viewer's own kind-7 ids, never `-` (tested) |
+
+## 5. Stage 2 modules — what holds, what is residual
+
+- **Signer.** Keys live in `sodium_malloc` buffers, compared with `sodium_memcmp` and wiped on
+  lock. The key file is argon2id13 + XChaCha20-Poly1305 with the header as AD and KDF cost
+  bounds on read. The wallet P2PK key is separate from the Nostr key (NIP-60/61 require it).
+  Remote signers (NIP-46 bunker over wss only, NIP-07) have every reply re-verified.
+  Residual: F24.
+- **Wallet / `spend.ts`.** Per-mint lock; `send` post-checks sum, DLEQ (with `r`) and the lock
+  policy of every produced proof; melt commits spent only on PAID, else reconciles via NUT-07.
+  Residual: F17, F23.
+- **Payment engine.** Pay-after-verify, exact amounts, both sets P2PK-checked
+  (`checkPayLock`: no locktime/refund/extra keys), DLEQ offline against the cached keyset
+  (forged → ban), window accounting on distinct blocks, local double-spend check at verify, ban
+  on a mint-reported double-spend. Residual: F5, F6, F9, F10, F11, F12, F27.
+- **pay/1.** Strict codec (exact consumption, caps on every length), and the HELLO is bound to
+  the Noise handshake hash and sender key. PAY/ACK/PRICE are delivered as they arrive, even
+  before the HELLO, on purpose (ADR 0004 d: a PAY may race its sender's HELLO). The seeder
+  counts those blocks as provisional until the pubkey binds, and a bad HELLO closes the
+  channel. Residual: F1 is in the consumer, not the protocol.
+- **Gateway auth.** ADR 0010 §8. Residual: F29; the handler-side F3, F15 and F20.
+
+## 6. Stage 3 issues
+
+To be filed on GitLab as one issue per finding, labelled `stage-3` and `security`, severity in
+the title, body = the finding's section above. **Filing waits for Cameron's go-ahead**
+(outward-facing). F1–F4 are blockers for wiring any real wallet.
+
+| Issue title |
+|---|
+| [Critical] F1: clamp PRICE to the manifest price in UpstreamPayer / ViewerPayer |
+| [High] F2: gateway pays upstream on the manifest policy, never HELLO terms |
+| [High] F3: Blossom GET — nosniff, CSP sandbox, media allowlist, attachment for active types |
+| [High] F4: auto top-up only into trusted mints, capped, confirmed first time |
+| [High] F5: batch PAYs, cap proofs per set, DLEQ off the event loop |
+| [High] F6: regtest-verify the pay1 NUT-10 tag on nutshell and cdk |
+| [Medium] F7: main-owned file choice / confirm before studio.upload |
+| [Medium] F8: native money-gate dialog; gate money-relevant settings |
+| [Medium] F9: price blocks by the policy in force when uploaded |
+| [Medium] F10: persist the seen-secret set |
+| [Medium] F11: NUT-07 checkstate the creator set at flush |
+| [Medium] F12: persist the pending redeem/nutzap queue |
+| [Medium] F13: hash peer identifiers in info logs |
+| [Medium] F14: rightmost trusted X-Forwarded-For hop |
+| [Medium] F15: gateway upload defaults, per-pubkey quota, no pre-auth spooling |
+| [Medium] F16: gateway unit on Node 22 (Node ≥ 24 + --no-experimental-websocket) |
+| [Medium] F17: NUT-20 locked mint quotes; opaque quote handles over IPC |
+| [Medium] F18: hash-addressed images by default; drop the distinctive user agent |
+| [Low] F19–F27: one issue each; F28–F29 recorded, no issue |
+
+## 7. Not verified
+
+- Real mints (nutshell, cdk): the `pay1` tag (F6), NUT-07/NUT-20 behaviour, fee handling.
+- Electron at runtime beyond the Stage 1 e2e (webPreferences, key allowlist, one session):
+  this review read the code and its unit tests; it did not attack a running app.
+- The web build's served headers (`scripts/csp-sri.mjs`): out of scope (no web portal).
+- Remote-signer interop against real bunkers and NIP-07 extensions.
+- BUD-11 text (F29).
+- Performance numbers are from one laptop (the dev laptop, Node 22); F5's budget needs a
+  measurement on target hardware.
