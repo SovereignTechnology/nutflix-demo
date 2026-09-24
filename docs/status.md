@@ -408,9 +408,9 @@ merge between the two histories cannot produce two ADRs with one number. **The n
 approved to start now in a fresh session** per `docs/prompts/stage-2-security.md`. Still open:
 one phone scan of the Wallet QR (pass = decodes to text starting `lnbc5000n1pj9x7`). `spec/nfx-suite-m0` (ADR 0006) stays unmerged.
 
-## Stage 2 — audit surface (single Fable 5.1 session): APPROVED 2026-09-23, starting in a fresh session
+## Stage 2 — audit surface (single session): APPROVED 2026-09-23, starting in a fresh session
 
 Prompt updated 2026-09-23 (`docs/prompts/stage-2-security.md`: PART 0 = contracts v5 + the
-mock fixes, then the five locked modules, then the seam review). **Cameron starts it** and
-confirms the model/session; the plan says one Fable 5.1 (high) session, no subagents.
+mock fixes, then the five locked modules, then the seam review). One session, one worktree, no
+subagents. **Model: Opus 5.5 (high), Cameron's choice 2026-09-23** (the plan had named Fable 5.1).
 ## Stage 3 — integration and polish: NOT STARTED

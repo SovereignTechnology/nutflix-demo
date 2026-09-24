@@ -2,9 +2,9 @@
 
 ## Before starting
 
-- **Cameron starts Stage 2.** An orchestrator never starts it on its own. The plan says one
-  serial session, one worktree, no subagents, on **Fable 5.1 (high)** (execution plan §3). Confirm
-  the model and session with Cameron first.
+- **Cameron starts Stage 2.** An orchestrator never starts it on its own. One serial session,
+  one worktree, no subagents (execution plan §3). The plan named Fable 5.1 (high); **Cameron chose
+  Opus 5.5 (high) for it on 2026-09-23.**
 - Prerequisites: Stage 1 is tagged `stage-1`, `npm run ci` is green on `main`, and a fresh branch
   `stage-2/<date>` exists off `main`.
 - Run with `LOCKED_DIRS_UNLOCKED=1` so `scripts/check-locked-dirs.sh` permits implementation in
