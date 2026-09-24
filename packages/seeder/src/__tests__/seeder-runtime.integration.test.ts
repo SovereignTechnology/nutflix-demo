@@ -14,8 +14,10 @@
  *   - payout: a flush that takes the balance over the threshold sends it to the owner's wallet
  *     as a nutzap locked to the owner's key, which the owner redeems.
  */
+import { existsSync } from 'node:fs';
 import { mkdir, readFile, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import {
   NostrKind,
@@ -54,6 +56,9 @@ import { Seeder } from '../seeder.js';
 import { toHex } from '../util/hex.js';
 import { adapters, capturedLogger, tmpDir } from './helpers.js';
 import { until } from './fake-process.js';
+
+const DLEQ_WORKER = new URL('../../dist/runtime/dleq-worker.js', import.meta.url);
+const DLEQ_BUILT = existsSync(fileURLToPath(DLEQ_WORKER));
 
 vi.setConfig({ testTimeout: 120_000 });
 
@@ -123,6 +128,8 @@ async function daemon(
     logger: log.logger,
     mintRequest: (m) => (m === MINT ? mint.request : undefined),
     pool,
+    // F5: the real worker-thread DLEQ pool when the worker is built (CI builds first).
+    ...(DLEQ_BUILT ? { dleqWorkerUrl: DLEQ_WORKER } : {}),
   });
   const seeder = await Seeder.create(config.seeder, {
     engine: rt.engine,
@@ -317,6 +324,11 @@ describe('the seeder daemon runtime over hyperswarm', () => {
       [0, 3, true],
       [4, 7, true],
     ]);
+    // F5: with the worker built, those PAYs' DLEQ checks ran on the worker-thread pool.
+    if (DLEQ_BUILT)
+      expect(d.log.some((l) => JSON.stringify(l).includes('DLEQ checks off the event loop'))).toBe(
+        true,
+      );
     // Accepted PAYs are on disk before the flush (F12), 0600.
     const pendingFile = path.join(dataDir, 'wallet', 'pending.json');
     expect((await stat(pendingFile)).mode & 0o777).toBe(0o600);

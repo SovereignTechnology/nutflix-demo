@@ -134,6 +134,21 @@ export interface PaymentEngineDeps {
    * at start (security review F12).
    */
   readonly persistPending?: (items: readonly PendingPay[]) => void;
+  /**
+   * Seeder side: run the DLEQ checks off the event loop (security review F5: ~20 ms per proof
+   * under `--jitless`, and one event loop serves every session). Given, each PAY's checks go out
+   * as ONE call once every cheaper check passed; answer `proofDleqOk(check.proof, check.keyset)`
+   * for each, in order. A verifier that throws, or answers with the wrong length, falls back to
+   * the synchronous check — never to acceptance.
+   */
+  readonly dleq?: (checks: readonly DleqCheck[]) => Promise<readonly boolean[]>;
+}
+
+/** One proof-side DLEQ check (NUT-12) an off-thread verifier runs with `proofDleqOk`. */
+export interface DleqCheck {
+  readonly proof: CashuProof;
+  /** The mint keyset, reduced to the key for the proof's amount. */
+  readonly keyset: MintKeyset;
 }
 
 /** An accepted PAY not yet redeemed (`redeem`) or not yet forwarded to the creator (`nutzap`). */
@@ -287,7 +302,16 @@ interface Pending {
 
 type Decision =
   | { readonly kind: 'result'; readonly result: VerifyResult }
-  | { readonly kind: 'need-keysets'; readonly keys: readonly (readonly [MintUrl, string])[] };
+  | { readonly kind: 'need-keysets'; readonly keys: readonly (readonly [MintUrl, string])[] }
+  | {
+      readonly kind: 'need-dleq';
+      readonly checks: readonly { readonly key: string; readonly check: DleqCheck }[];
+    };
+
+/** Which proof a DLEQ answer belongs to (a secret is unique within an accepted PAY). */
+function dleqKey(mint: MintUrl, p: CashuProof): string {
+  return `${mint}|${p.id}|${String(p.amount)}|${p.C}|${p.secret}`;
+}
 
 export class RealPaymentEngine implements PaymentEngine {
   readonly config: PaymentEngineConfig;
@@ -469,6 +493,8 @@ export class RealPaymentEngine implements PaymentEngine {
     try {
       const first = this.decide(peer, msg, policy, null, epoch);
       if (first.kind === 'result') return first.result;
+      // Without keysets the decision can only ask for them.
+      if (first.kind !== 'need-keysets') return reject('malformed');
       const keysets = new Map<string, MintKeyset>();
       const lookup = this.deps.keyset;
       if (lookup !== undefined) {
@@ -482,7 +508,22 @@ export class RealPaymentEngine implements PaymentEngine {
           if (ks !== undefined) keysets.set(`${mint}|${id}`, ks);
         }
       }
-      const second = this.decide(peer, msg, policy, keysets, epoch);
+      let second = this.decide(peer, msg, policy, keysets, epoch, null);
+      if (second.kind === 'need-dleq') {
+        // Off the event loop (F5). Every other check runs again on the answers: state may move.
+        const answers = new Map<string, boolean>();
+        const verifier = this.deps.dleq;
+        if (verifier !== undefined) {
+          try {
+            const r = await verifier(second.checks.map((c) => c.check));
+            if (Array.isArray(r) && r.length === second.checks.length)
+              second.checks.forEach((c, i) => answers.set(c.key, r[i] === true));
+          } catch {
+            // falls back to the synchronous check for every proof (an empty answer map)
+          }
+        }
+        second = this.decide(peer, msg, policy, keysets, epoch, answers);
+      }
       return second.kind === 'result' ? second.result : reject('bad-dleq', 'keyset unavailable');
     } catch {
       return reject('malformed');
@@ -492,7 +533,9 @@ export class RealPaymentEngine implements PaymentEngine {
   /**
    * The whole decision, synchronous. With `keysets === null` it stops before the DLEQ stage and
    * asks for the keysets it needs; with keysets it runs every check again (state may have moved
-   * while they loaded) and, on acceptance, commits in the same tick.
+   * while they loaded). With an off-thread verifier (`deps.dleq`) and `dleq === null` it stops
+   * again and asks for the DLEQ answers; with them (a missing answer = the synchronous check) it
+   * runs everything once more and, on acceptance, commits in the same tick.
    */
   private decide(
     peer: NostrPubkey,
@@ -500,6 +543,7 @@ export class RealPaymentEngine implements PaymentEngine {
     policy: PricePolicy,
     keysets: ReadonlyMap<string, MintKeyset> | null,
     epoch: number,
+    dleq: ReadonlyMap<string, boolean> | null = null,
   ): Decision {
     const out = (reason: RejectReason, detail?: string): Decision => ({
       kind: 'result',
@@ -561,12 +605,28 @@ export class RealPaymentEngine implements PaymentEngine {
       }
     }
     if (keysets === null) return { kind: 'need-keysets', keys: needed };
+    const checks: { key: string; check: DleqCheck }[] = [];
     for (const set of [seederProofs, creatorProofs]) {
       for (const p of set.proofs) {
         const ks = keysets.get(`${set.mint}|${p.id}`);
         // An unknown keyset may be the seeder's stale cache (a rotation): refuse, never ban.
         if (ks?.unit !== 'sat' || ks.id !== p.id) return out('bad-dleq', 'unknown keyset');
-        if (!dleqOk(p, ks)) {
+        const key = ks.keys[p.amount];
+        checks.push({
+          key: dleqKey(set.mint, p),
+          check: {
+            proof: p,
+            keyset: { ...ks, keys: key === undefined ? {} : { [p.amount]: key } },
+          },
+        });
+      }
+    }
+    if (this.deps.dleq !== undefined && dleq === null) return { kind: 'need-dleq', checks };
+    for (const set of [seederProofs, creatorProofs]) {
+      for (const p of set.proofs) {
+        const ks = keysets.get(`${set.mint}|${p.id}`);
+        if (ks === undefined) return out('bad-dleq', 'unknown keyset');
+        if (!(dleq?.get(dleqKey(set.mint, p)) ?? dleqOk(p, ks))) {
           // A DLEQ that fails against a KNOWN keyset is a forgery, never an honest mistake — and
           // every attempt costs this seeder real CPU. Ban (T7, T11).
           if (!this.banMap.has(peer)) this.ban(peer, 'forged-proof');
@@ -1062,7 +1122,15 @@ function reject(reason: RejectReason, detail?: string): VerifyResult {
   return detail === undefined ? { ok: false, reason } : { ok: false, reason, detail };
 }
 
-/** NUT-12 proof-side DLEQ (needs `r`) against `ks`; any parse or curve error is a failure. */
+/**
+ * NUT-12 proof-side DLEQ (needs `r`) against `ks`; any parse or curve error is a failure. The one
+ * DLEQ rule: the engine runs it inline, an off-thread `PaymentEngineDeps.dleq` runs this same
+ * function. Never throws.
+ */
+export function proofDleqOk(p: CashuProof, ks: MintKeyset): boolean {
+  return dleqOk(p, ks);
+}
+
 function dleqOk(p: CashuProof, ks: MintKeyset): boolean {
   const d = p.dleq;
   if (d?.r === undefined || !HEX.test(d.s) || !HEX.test(d.e) || !HEX.test(d.r)) return false;

@@ -32,6 +32,8 @@ import {
   MAX_PROOFS_PER_SET,
   RealPaymentEngine,
   maxProofsFor,
+  proofDleqOk,
+  type DleqCheck,
   type PendingPay,
 } from '../engine.js';
 import { PAY1_TAG } from '../lock.js';
@@ -894,5 +896,110 @@ describe('real engine — flush robustness (security review F11, F12, F31)', () 
       ok: false,
       reason: 'double-spend',
     });
+  });
+});
+
+describe('F5: DLEQ checks off the event loop (deps.dleq)', () => {
+  type Verifier = (checks: readonly DleqCheck[]) => Promise<readonly boolean[]>;
+  function seederWith(dleq: Verifier): RealPaymentEngine {
+    const m = testMint(MINT_A);
+    return new RealPaymentEngine({
+      config: {
+        windowBlocks: 8,
+        ownP2pk: SEEDER_P2PK,
+        ownPubkey: SEEDER,
+        acceptedMints: [MINT_A],
+        flushEveryBlocks: 64,
+        flushEveryMs: 60_000,
+      },
+      seen: new SeenSecrets(),
+      keyset: (mint, id) =>
+        Promise.resolve(mint === MINT_A && id === m.keysetId ? m.keyset() : undefined),
+      redeem: (set) => Promise.resolve(total(set.proofs) as ReturnType<typeof sats>),
+      nutzap: () => Promise.resolve(),
+      dleq,
+    });
+  }
+  const honestRun: Verifier = (checks) =>
+    Promise.resolve(checks.map((c) => proofDleqOk(c.proof, c.keyset)));
+
+  it("sends every proof of a PAY in ONE call, each with only its amount's key, and honours the answers", async () => {
+    const calls: (readonly DleqCheck[])[] = [];
+    const seeder = seederWith((checks) => {
+      calls.push(checks);
+      return honestRun(checks);
+    });
+    const { viewer } = getPair('honest');
+    upload(seeder, VIEWER, 4);
+    const msg = await viewer.pay(range(0, 3), SEEDER_INFO, POLICY);
+    expect(await seeder.verify(VIEWER, msg, POLICY)).toMatchObject({ ok: true });
+    expect(calls).toHaveLength(1);
+    const proofs = [...msg.seederProofs.proofs, ...msg.creatorProofs.proofs];
+    expect(calls[0]).toHaveLength(proofs.length);
+    for (const [i, c] of (calls[0] ?? []).entries()) {
+      expect(c.proof).toBe(proofs[i]);
+      expect(Object.keys(c.keyset.keys)).toEqual([String(c.proof.amount)]);
+    }
+  });
+
+  it('a "false" from the verifier is a forgery: bad-dleq and a ban', async () => {
+    const seeder = seederWith((checks) => Promise.resolve(checks.map((_c, i) => i !== 0)));
+    const { viewer } = getPair('honest');
+    upload(seeder, VIEWER, 4);
+    const msg = await viewer.pay(range(0, 3), SEEDER_INFO, POLICY);
+    expect(await seeder.verify(VIEWER, msg, POLICY)).toMatchObject({
+      ok: false,
+      reason: 'bad-dleq',
+    });
+    expect(seeder.isBanned(VIEWER)).toBe(true);
+  });
+
+  it('a verifier that throws or answers the wrong length falls back to the synchronous check', async () => {
+    for (const broken of [
+      (() => Promise.reject(new Error('worker died'))) as Verifier,
+      (() => Promise.resolve([true])) as Verifier,
+    ]) {
+      const seeder = seederWith(broken);
+      const honest = getPair('honest').viewer;
+      upload(seeder, VIEWER, 4);
+      expect(
+        await seeder.verify(VIEWER, await honest.pay(range(0, 3), SEEDER_INFO, POLICY), POLICY),
+      ).toMatchObject({
+        ok: true,
+      });
+      // …and a forged DLEQ is still caught by the fallback, never accepted.
+      const forger = getPair('forge').viewer;
+      upload(seeder, OTHER_VIEWER, 4);
+      expect(
+        await seeder.verify(
+          OTHER_VIEWER,
+          await forger.pay(range(0, 3), SEEDER_INFO, POLICY),
+          POLICY,
+        ),
+      ).toMatchObject({ ok: false, reason: 'bad-dleq' });
+    }
+  });
+
+  it('state that moves while the verifier runs is seen: a peer banned meanwhile is refused', async () => {
+    let release: () => void = () => undefined;
+    const seeder = seederWith(async (checks) => {
+      await new Promise<void>((r) => {
+        release = r;
+      });
+      return honestRun(checks);
+    });
+    const { viewer } = getPair('honest');
+    upload(seeder, VIEWER, 4);
+    const msg = await viewer.pay(range(0, 3), SEEDER_INFO, POLICY);
+    const pending = seeder.verify(VIEWER, msg, POLICY);
+    await vi.waitFor(() => {
+      expect(release).not.toBe(undefined);
+    });
+    await new Promise((r) => setTimeout(r, 0));
+    // The peer blows its window while its PAY is being checked off-thread.
+    upload(seeder, VIEWER, 20, { from: 4 });
+    expect(seeder.isBanned(VIEWER)).toBe(true);
+    release();
+    expect(await pending).toMatchObject({ ok: false, reason: 'peer-banned' });
   });
 });

@@ -32,6 +32,8 @@ export {
   RealPaymentEngine,
   isPayMessageV5,
   maxProofsFor,
+  proofDleqOk,
+  type DleqCheck,
   type PaymentEngineDeps,
   type PendingPay,
 } from './engine.js';

@@ -40,6 +40,7 @@ import type {
 
 import type { DaemonConfig, PayoutConfig } from '../cli/config-file.js';
 import type { Logger } from '../log/logger.js';
+import { DleqPool, defaultDleqThreads } from './dleq-pool.js';
 import type { Seeder } from '../seeder.js';
 import { SeenLog, loadPending, pendingWriter } from './engine-state.js';
 import { RuntimeSetupError } from './files.js';
@@ -66,6 +67,8 @@ export interface SeederRuntimeOptions {
   readonly mintRequest?: RequestFn;
   /** Tests: a `FakeRelayPool`. Default: a real relay pool over `ws`. */
   readonly pool?: nostr.PoolLike;
+  /** Tests: the built DLEQ worker, for a runtime loaded from sources (default: next to this module). */
+  readonly dleqWorkerUrl?: URL;
 }
 
 /** What a node's runtime needs beyond the shell's own config (the daemon's, the gateway's). */
@@ -91,6 +94,11 @@ export interface NodeRuntimeOptions extends SeederRuntimeOptions {
    * with its own wiring (the gateway) passes `false`.
    */
   readonly wirePay: boolean;
+  /**
+   * DLEQ worker threads (security review F5): default `defaultDleqThreads()`; `0` checks on the
+   * event loop. Without the built worker file (vitest on sources) checks stay inline.
+   */
+  readonly dleqThreads?: number;
 }
 
 export interface SeederRuntime {
@@ -220,6 +228,7 @@ export async function createNodeRuntime(o: NodeRuntimeOptions): Promise<SeederRu
     throw err;
   }
 
+  let dleqPool: DleqPool | null = null;
   try {
     const store = await FileProofStore.open(
       join(walletDir, 'proofs.json'),
@@ -249,6 +258,12 @@ export async function createNodeRuntime(o: NodeRuntimeOptions): Promise<SeederRu
     const pendingPath = join(walletDir, 'pending.json');
     const pending = loadPending(pendingPath);
     const windowBlocks = o.windowBlocks;
+    dleqPool = DleqPool.open({
+      size: o.dleqThreads ?? defaultDleqThreads(),
+      logger: log,
+      ...(o.dleqWorkerUrl === undefined ? {} : { workerUrl: o.dleqWorkerUrl }),
+    });
+    if (dleqPool !== null) log.info('DLEQ checks off the event loop', { threads: dleqPool.size });
     const engine = new payment.RealPaymentEngine({
       config: {
         windowBlocks,
@@ -275,6 +290,7 @@ export async function createNodeRuntime(o: NodeRuntimeOptions): Promise<SeederRu
         recipientFor: o.recipientFor,
         ...(o.videoEventFor === undefined ? {} : { videoEventFor: o.videoEventFor }),
       }),
+      ...(dleqPool === null ? {} : { dleq: dleqPool.verify }),
     });
     const po = o.payout;
     if (po !== null && (po.pubkey === identity.pubkey || po.p2pk === identity.p2pk))
@@ -370,11 +386,13 @@ export async function createNodeRuntime(o: NodeRuntimeOptions): Promise<SeederRu
         for (const off of unsubs) off();
         await payout?.idle();
         pool.close();
+        await dleqPool?.close();
         await identity.signer.lock();
         release();
       },
     };
   } catch (err) {
+    await dleqPool?.close();
     await identity.signer.lock();
     release();
     throw err;

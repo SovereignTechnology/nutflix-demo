@@ -228,6 +228,32 @@ What differs for the gateway:
   with a credit pool settled by ACKs (`app-desktop/src/worker/playback/credit.ts`); the next lane
   moves that into the shared `UpstreamPayer` so the gateway and the desktop use one implementation.
 
+## 10. DLEQ checks off the event loop (`stage-3/dleq-batching`, security review F5)
+
+A proof-side DLEQ check costs ~20 ms under `--jitless`, and one event loop serves every session.
+The runtime (so the daemon and the gateway) now runs them on a small `worker_threads` pool
+(`runtime/dleq-pool.ts`; default one thread per spare core, at most four; `dleqThreads: 0`
+turns it off):
+
+- The engine gains an optional `PaymentEngineDeps.dleq`. Once every cheaper check has passed, a
+  PAY's DLEQ checks go out as ONE call (each with only the key for its proof's amount). The
+  engine then re-runs every other check on the answers, since state may have moved (a peer
+  banned meanwhile is refused).
+- The workers run core's own `proofDleqOk`: one DLEQ rule, inline or off-thread.
+- Failure is never acceptance. A worker that errors, exits, times out (30 s) or answers the wrong
+  count rejects, and the engine runs the synchronous check itself. A dead worker is replaced on
+  the next job.
+- The worker is the BUILT `dleq-worker.js`. Workers inherit the process's flags (`--jitless`
+  holds in them, tested in a child started with the unit's own `ExecStart` flags); passing V8
+  flags explicitly is refused by Node, so `execArgv` is left alone. Without the built file
+  (vitest on sources) the pool is off and the checks stay inline.
+
+Explicit `minPaySats` batching moves to the F37 lane: with the desktop's global credit pool, a
+batching threshold can deadlock (several seeders each holding a short unpaid run fill the pool),
+and the fix is the same mechanism F37 needs — the credit pool inside the shared `UpstreamPayer`,
+aware of each seeder's window, paying short runs under pressure. The desktop's Bare worker (a
+light, single-user seeder) still checks inline (`bare-worker` would be a new native dependency).
+
 ## Consequences
 
 - `nutflix-seeder.service` can run for real: `--keygen` once, `systemd-creds encrypt` once,
