@@ -183,7 +183,12 @@ export async function main(argv: readonly string[], o: MainOptions = {}): Promis
   try {
     seeder = await runDaemon({
       config: config.seeder,
-      deps: { engine: deps.engine, fs: nodeAdapters.fs, crypto: nodeAdapters.crypto },
+      deps: {
+        engine: deps.engine,
+        fs: nodeAdapters.fs,
+        crypto: nodeAdapters.crypto,
+        ...(deps.accepting === undefined ? {} : { accepting: deps.accepting }),
+      },
       proc,
       logger,
       ...(deps.attach === undefined ? {} : { beforeStart: deps.attach }),

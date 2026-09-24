@@ -594,7 +594,7 @@ finding's section above plus its row in §0. **Filing waits for Cameron's go-ahe
 |---|
 | [Medium] F33: duplicate block deliveries — cap at the quoted price or single-peer ranges (decision) |
 | [Done] F5: DLEQ off the event loop (Node) and batching on the credit pool (ADR 0011 §10–§11). Residual [Low]: DLEQ in the desktop's Bare worker; a credit pool sized per seeder window |
-| [Medium] Seeder: the pending-PAY queue is unbounded while a mint is down, and `pending.json` is rewritten whole per change (quadratic) — an append-only journal plus an engine cap on queued PAYs (docs/reviews/2026-09-24-pre-push-seeder-runtime.md) |
+| [Done] Seeder: an append-only pending-PAY journal and a cap that stops serving at `maxPendingPays` (daemon + gateway, ADR 0011 §12). Residual [Low]: the desktop worker's queue (one user) is still snapshotted whole, uncapped |
 | [Done] F37: the gateway's upstream fetches are paced (ADR 0011 §11) |
 | [Done] F10/F11/F12/F31 hooks in the desktop runtime — the worker's seeder engine persists seen secrets and pending PAYs and asks the host for `checkSpent` / `spentByUs` (ADR 0012) |
 | [Medium] F31: NUT-13 deterministic outputs + NUT-09 restore |

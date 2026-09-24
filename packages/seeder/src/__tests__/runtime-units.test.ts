@@ -28,7 +28,14 @@ import { afterEach, describe, expect, it } from 'vitest';
 
 import { validateDaemonConfig } from '../cli/config-file.js';
 import type { DaemonConfig } from '../cli/config-file.js';
-import { SeenLog, loadPending, pendingWriter } from '../runtime/engine-state.js';
+import {
+  JOURNAL_COMPACT_FACTOR,
+  PendingJournal,
+  SeenLog,
+  loadPending,
+  pendingWriter,
+  readPendingJournal,
+} from '../runtime/engine-state.js';
 import { RuntimeSetupError } from '../runtime/files.js';
 import {
   PASSPHRASE_CREDENTIAL,
@@ -289,6 +296,101 @@ describe('pending PAYs and seen secrets on disk', () => {
     expect(errors).toEqual([]);
     await writeFile(file, '{"format":"nutflix-seeder-pending","v":1,"items":{}}', { mode: 0o600 });
     expect(() => loadPending(file)).toThrow(/refusing to start rather than drop accepted payments/);
+  });
+
+  const variant = (n: number, extra: Partial<typeof item> = {}): typeof item => ({
+    ...item,
+    ...extra,
+    msg: {
+      ...item.msg,
+      range: { ...item.msg.range, fromBlock: n * 4, toBlock: n * 4 + 3 },
+      seederProofs: { ...item.msg.seederProofs, proofs: [proof(100 + n)] },
+      creatorProofs: { ...item.msg.creatorProofs, proofs: [proof(200 + n)] },
+    },
+  });
+  const lineCount = async (f: string): Promise<number> =>
+    (await readFile(f, 'utf8')).split('\n').filter((l) => l !== '').length;
+
+  it('the journal APPENDS what changed (never rewrites the queue), and replays to the live set', async () => {
+    const dir = await scratch();
+    const file = path.join(dir, 'pending.jsonl');
+    const j = PendingJournal.open(file, path.join(dir, 'pending.json'), () => undefined);
+    expect(j.items).toEqual([]);
+    expect((await stat(file)).mode & 0o777).toBe(0o600);
+    const a = variant(1);
+    const b = variant(2);
+    j.persist([a]);
+    expect(await lineCount(file)).toBe(2); // header + add
+    const before = await readFile(file, 'utf8');
+    j.persist([a, b]);
+    const after = await readFile(file, 'utf8');
+    expect(after.startsWith(before)).toBe(true); // appended, the earlier lines untouched
+    expect(await lineCount(file)).toBe(3);
+    // A PAY that moves on (redeem → nutzap) is one removal and one addition.
+    const aNutzap = { ...a, stage: 'nutzap' as const };
+    j.persist([aNutzap, b]);
+    expect(await lineCount(file)).toBe(5);
+    j.persist([b]);
+    j.close();
+    expect(readPendingJournal(file)).toEqual([b]);
+    const again = PendingJournal.open(file, path.join(dir, 'pending.json'), () => undefined);
+    expect(again.items).toEqual([b]);
+    // Reopening compacts: just the live PAY.
+    expect(await lineCount(file)).toBe(2);
+    again.close();
+  });
+
+  it('the journal compacts itself: its size stays bounded by the live queue', async () => {
+    const dir = await scratch();
+    const file = path.join(dir, 'pending.jsonl');
+    const j = PendingJournal.open(file, path.join(dir, 'pending.json'), () => undefined);
+    let worst = 0;
+    // A rolling queue of 3 over 500 changes: without compaction ~1000 lines.
+    for (let i = 0; i < 500; i++) {
+      j.persist([variant(i), variant(i + 1), variant(i + 2)]);
+      worst = Math.max(worst, await lineCount(file));
+    }
+    expect(worst).toBeLessThanOrEqual(Math.max(64, JOURNAL_COMPACT_FACTOR * 3) + 1 + 2);
+    j.close();
+    expect(readPendingJournal(file).map((x) => x.msg.range.fromBlock)).toEqual([
+      499 * 4,
+      500 * 4,
+      501 * 4,
+    ]);
+  });
+
+  it('a torn last line is a crash mid-append; any other damage refuses to start', async () => {
+    const dir = await scratch();
+    const file = path.join(dir, 'pending.jsonl');
+    const j = PendingJournal.open(file, path.join(dir, 'pending.json'), () => undefined);
+    j.persist([variant(1)]);
+    j.close();
+    const good = await readFile(file, 'utf8');
+    await writeFile(file, `${good}{"a":{"peer":"ab`, { mode: 0o600 });
+    expect(readPendingJournal(file)).toHaveLength(1);
+    await writeFile(file, `${good}not json\n${JSON.stringify({ d: 'x' })}\n`, { mode: 0o600 });
+    expect(() => readPendingJournal(file)).toThrow(/refusing to start rather than drop/);
+    await writeFile(file, `${JSON.stringify({ a: variant(1) })}\n`, { mode: 0o600 }); // no header
+    expect(() => readPendingJournal(file)).toThrow(RuntimeSetupError);
+    await writeFile(file, `${good}${JSON.stringify({ q: 1 })}\n`, { mode: 0o600 });
+    expect(() => readPendingJournal(file)).toThrow(RuntimeSetupError);
+    await writeFile(file, good, { mode: 0o644 });
+    await chmod(file, 0o644);
+    expect(() =>
+      PendingJournal.open(file, path.join(dir, 'pending.json'), () => undefined),
+    ).toThrow(RuntimeSetupError);
+  });
+
+  it('an old pending.json is migrated into the journal, then removed', async () => {
+    const dir = await scratch();
+    const legacy = path.join(dir, 'pending.json');
+    pendingWriter(legacy, () => undefined)([variant(1), variant(2)]);
+    const file = path.join(dir, 'pending.jsonl');
+    const j = PendingJournal.open(file, legacy, () => undefined);
+    expect(j.items).toHaveLength(2);
+    j.close();
+    await expect(stat(legacy)).rejects.toThrow();
+    expect(readPendingJournal(file)).toHaveLength(2);
   });
 
   it('a failed pending write is reported AND thrown (the engine swallows it, the log must not)', async () => {

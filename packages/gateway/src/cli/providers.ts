@@ -27,7 +27,7 @@ import type { GatewayDeps } from '../gateway.js';
 
 export type RuntimeDeps = Pick<
   GatewayDeps,
-  'seederEngine' | 'viewerEngine' | 'auth' | 'payProtocol' | 'identity'
+  'seederEngine' | 'viewerEngine' | 'auth' | 'payProtocol' | 'identity' | 'accepting'
 > & {
   /** With the gateway's seeder, before it starts: payout and the kind 10019. */
   readonly attach?: (seeder: Seeder) => void;
@@ -110,6 +110,7 @@ export async function getRuntimeDeps(
       rt.attach(seeder);
     },
     close: () => rt.close(),
+    accepting: rt.accepting,
   };
 }
 

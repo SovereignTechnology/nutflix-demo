@@ -102,6 +102,8 @@ export interface GatewayDeps {
   readonly logger?: Logger;
   /** Milliseconds since epoch. */
   readonly now?: () => number;
+  /** `SeederDeps.accepting`: the runtime's pending-PAY cap (sessions stop being served at it). */
+  readonly accepting?: () => boolean;
   readonly mirrorFetch?: MirrorFetch;
   readonly upstreamPolicy?: UpstreamPolicyResolver;
 }
@@ -253,6 +255,7 @@ export class Gateway {
         crypto,
         logger,
         ...(deps.now ? { now: deps.now } : {}),
+        ...(deps.accepting ? { accepting: deps.accepting } : {}),
       },
     );
     await seeder.openCore('blobs');

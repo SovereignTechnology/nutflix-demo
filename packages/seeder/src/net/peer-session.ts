@@ -53,6 +53,12 @@ export interface PeerSessionInfo {
 }
 
 export interface PeerSessionOptions {
+  /**
+   * `false` while this seeder must not take on more PAYs (its queue of accepted-but-unredeemed
+   * PAYs is at its cap — a mint outage): the next block is not sent, the session is cut ('local',
+   * no ban). Checked on every upload, before anything is recorded.
+   */
+  readonly accepting?: () => boolean;
   readonly noiseKey: Uint8Array;
   readonly stream: ReplicationStream;
   readonly engine: PaymentEngineSeeder;
@@ -102,6 +108,7 @@ export class PeerSession {
   private readonly peerInfo: PeerInfo | null;
   private readonly onBind: ((session: PeerSession, pubkey: NostrPubkey) => void) | undefined;
   private readonly onFirstUpload: PeerSessionOptions['onFirstUpload'];
+  private readonly accepting: PeerSessionOptions['accepting'];
 
   constructor(opts: PeerSessionOptions) {
     this.noiseKey = opts.noiseKey;
@@ -115,6 +122,7 @@ export class PeerSession {
     this.log = opts.logger.child({ noiseKey: this.noiseKeyHex });
     this.onBind = opts.onBind;
     this.onFirstUpload = opts.onFirstUpload;
+    this.accepting = opts.accepting;
     this.stream.once('close', () => {
       this.isClosed = true;
       opts.onClose?.(this);
@@ -190,6 +198,12 @@ export class PeerSession {
    */
   onUpload(coreKeyHex: string, index: number, byteLength: number): PeerWindow | null {
     if (this.cutWith !== null || this.isClosed) return null;
+    if (this.accepting !== undefined && !this.accepting()) {
+      // Back-pressure, not a verdict on the peer: it may come back once the queue drains.
+      this.log.warn('pending-PAY queue full — not serving, cutting the session');
+      this.cut('local');
+      return null;
+    }
     this.uploaded++;
     this.uploadedBytesTotal += byteLength;
     const first = !this.coresUploaded.has(coreKeyHex);

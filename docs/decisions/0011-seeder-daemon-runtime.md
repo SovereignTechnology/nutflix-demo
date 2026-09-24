@@ -283,6 +283,31 @@ One mechanism for both findings, shared by the gateway and the desktop (`@sovit/
   - with the default pool of 4, PAYs cover 2 blocks unless the pool is under pressure (the pool's
     size stays the minimum window).
 
+## 12. The pending-PAY queue during a mint outage (`stage-3/pending-journal`)
+
+While a mint is down nothing redeems: the engine's queue of accepted PAYs grew without bound, and
+`pending.json` was rewritten whole on every change (the seeder-runtime review's residual).
+
+- **An append-only journal** (`wallet/pending.jsonl`, `PendingJournal`):
+  - a header line, then one line per PAY added or gone, fsynced before the engine's synchronous
+    `persistPending` hook returns — so a viewer is still told "paid" only once its proofs are on
+    disk;
+  - a PAY that moves on (redeem → nutzap, a redeem tried) is one removal plus one addition;
+  - compaction rewrites just the live queue atomically once the journal passes
+    `max(64, 4 × live)` lines, and at every start;
+  - a torn LAST line is a crash mid-append; any other damage refuses to start;
+  - an old `pending.json` is migrated and removed.
+- **A cap** (`maxPendingPays`, default 4096):
+  - the runtime exposes `accepting()`; the daemon and the gateway pass it to their `Seeder`;
+  - while the queue is at the cap, a session's next block is not served — the session is cut
+    `local` (no ban) before anything is recorded — so the queue stays bounded by the cap plus
+    what is already in flight;
+  - PAYs for blocks already sent are still accepted;
+  - it serves again once a flush drains the queue;
+  - the transition is logged once each way.
+
+The desktop's worker (one user) still snapshots its smaller queue whole and has no cap.
+
 ## Consequences
 
 - `nutflix-seeder.service` can run for real: `--keygen` once, `systemd-creds encrypt` once,

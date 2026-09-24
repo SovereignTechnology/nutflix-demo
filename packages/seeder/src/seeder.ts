@@ -53,6 +53,12 @@ export interface SeederDeps {
   readonly crypto: SeederCrypto;
   readonly logger?: Logger;
   readonly now?: () => number;
+  /**
+   * `false` while no more PAYs should be taken on (the runtime's pending-PAY cap: the queue of
+   * accepted-but-unredeemed PAYs grows while a mint is down). Sessions then stop being served
+   * (cut 'local', no ban) until it drains.
+   */
+  readonly accepting?: () => boolean;
 }
 
 interface EngineConfigLike {
@@ -140,6 +146,7 @@ export class Seeder {
       // v5: the engine's effective window needs the core's price. A core with no policy
       // (no default either) is served unpriced — its PAYs cannot be verified anyway.
       pricing: (core) => this.pricingFor(core),
+      ...(deps.accepting ? { accepting: deps.accepting } : {}),
       ...(config.announceCorePrices
         ? {
             onFirstUpload: (session: PeerSession, core: CoreKeyHex) => {

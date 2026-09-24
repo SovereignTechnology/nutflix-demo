@@ -25,6 +25,8 @@ export interface RuntimeDeps {
   readonly attach?: (seeder: Seeder) => void;
   /** After the seeder has closed (its final flush ran): release relays, lock the key. */
   readonly close?: () => Promise<void>;
+  /** `SeederDeps.accepting`: the runtime's pending-PAY cap. */
+  readonly accepting?: () => boolean;
 }
 
 export interface ProviderContext {
@@ -50,6 +52,7 @@ export async function getRuntimeDeps(
       rt.attach(seeder);
     },
     close: () => rt.close(),
+    accepting: rt.accepting,
   };
 }
 

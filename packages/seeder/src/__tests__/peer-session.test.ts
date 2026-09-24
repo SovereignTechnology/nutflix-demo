@@ -46,7 +46,7 @@ describe('PeerSession', () => {
   });
   afterEach(() => cleanup());
 
-  async function make(windowBlocks = 4, withPeerInfo = true) {
+  async function make(windowBlocks = 4, withPeerInfo = true, accepting?: () => boolean) {
     const engine = honestEngine(windowBlocks);
     const banList = await loadedBanList(dir);
     const stream = new FakeStream(noiseKey(1));
@@ -58,9 +58,24 @@ describe('PeerSession', () => {
       banList,
       logger: log.logger,
       peerInfo,
+      ...(accepting === undefined ? {} : { accepting }),
     });
     return { engine, banList, stream, peerInfo, session };
   }
+
+  it('the pending-PAY cap: while not accepting, the next block is not served — a local cut, no ban, nothing recorded', async () => {
+    let ok = true;
+    const { engine, banList, stream, peerInfo, session } = await make(4, true, () => ok);
+    expect(session.onUpload('core', 0, 1024)?.outstanding).toBe(1);
+    ok = false;
+    expect(session.onUpload('core', 1, 1024)).toBeNull();
+    expect(stream.destroyed).toBe(true);
+    expect(session.info().cutReason).toBe('local');
+    expect(engine.window(session.accountId())?.uploaded).toBe(1); // block 1 never counted
+    expect(engine.isBanned(session.accountId())).toBe(false);
+    expect(banList.isNoiseBanned(noiseKey(1))).toBe(false);
+    expect(peerInfo?.banCalls).toEqual([]);
+  });
 
   it('records every upload synchronously and cuts on the block that crosses the window', async () => {
     const { engine, banList, stream, peerInfo, session } = await make(4);

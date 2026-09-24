@@ -9,7 +9,7 @@
  *   - the viewer's PAYs are ACKed by the real engine; a flush swaps the seeder share into the
  *     0600 wallet file (NIP-44 sealed to the node key) with the key file's wallet key, and
  *     publishes the creator share as one kind 9321 that the creator redeems;
- *   - F12 on disk: PAYs accepted but not flushed when the process dies are in `pending.json`,
+ *   - F12 on disk: PAYs accepted but not flushed when the process dies are in `pending.jsonl`,
  *     and a new runtime on the same data directory redeems them;
  *   - payout: a flush that takes the balance over the threshold sends it to the owner's wallet
  *     as a nutzap locked to the owner's key, which the owner redeems.
@@ -50,6 +50,7 @@ import { validateDaemonConfig } from '../cli/config-file.js';
 import type { DaemonConfig } from '../cli/config-file.js';
 import type { PeerSession } from '../net/peer-session.js';
 import { PASSPHRASE_CREDENTIAL, createKeyFile } from '../runtime/identity.js';
+import { readPendingJournal } from '../runtime/engine-state.js';
 import { createSeederRuntime } from '../runtime/index.js';
 import type { SeederRuntime } from '../runtime/index.js';
 import { Seeder } from '../seeder.js';
@@ -100,6 +101,7 @@ async function daemon(
   pool: nostr.PoolLike,
   videoEvents: Map<CoreKeyHex, NostrEventId>,
   extra: Record<string, unknown> = {},
+  runtime: { readonly maxPendingPays?: number } = {},
 ): Promise<DaemonNode> {
   const r = validateDaemonConfig({
     ...extra,
@@ -130,10 +132,13 @@ async function daemon(
     pool,
     // F5: the real worker-thread DLEQ pool when the worker is built (CI builds first).
     ...(DLEQ_BUILT ? { dleqWorkerUrl: DLEQ_WORKER } : {}),
+    ...runtime,
   });
   const seeder = await Seeder.create(config.seeder, {
     engine: rt.engine,
     logger: log.logger,
+    // As the daemon's main wires it: the runtime's pending-PAY cap.
+    accepting: rt.accepting,
     ...adapters,
   });
   let stopped = false;
@@ -330,10 +335,9 @@ describe('the seeder daemon runtime over hyperswarm', () => {
         true,
       );
     // Accepted PAYs are on disk before the flush (F12), 0600.
-    const pendingFile = path.join(dataDir, 'wallet', 'pending.json');
+    const pendingFile = path.join(dataDir, 'wallet', 'pending.jsonl');
     expect((await stat(pendingFile)).mode & 0o777).toBe(0o600);
-    const queued = JSON.parse(await readFile(pendingFile, 'utf8')) as { items: unknown[] };
-    expect(queued.items).toHaveLength(2);
+    expect(readPendingJournal(pendingFile)).toHaveLength(2);
 
     expect(await d.seeder.flushNow()).toEqual({ swapped: 8, nutzapped: 8, failed: 0 });
     // The seeder share is in the wallet file, redeemed with the key file's wallet key.
@@ -345,9 +349,7 @@ describe('the seeder daemon runtime over hyperswarm', () => {
     expect(JSON.parse(onDisk)).toMatchObject({ v: 2, enc: 'nip44-self' });
     expect(onDisk).not.toContain('"secret"');
     expect(onDisk).not.toContain('"C"');
-    expect((JSON.parse(await readFile(pendingFile, 'utf8')) as { items: unknown[] }).items).toEqual(
-      [],
-    );
+    expect(readPendingJournal(pendingFile)).toEqual([]);
 
     // One nutzap for both PAYs, signed by the daemon, to the creator, naming the video.
     const zaps = pool.published.filter((p) => p.event.kind === NostrKind.NutzapPayout);
@@ -386,6 +388,30 @@ describe('the seeder daemon runtime over hyperswarm', () => {
     const text = d.log.join('\n');
     expect(text).not.toContain(PASS);
     expect(text).not.toContain('"secret"');
+  });
+
+  it('the pending-PAY cap: with the queue full the daemon stops serving (a local cut, no ban) and serves again once a flush drains it', async () => {
+    const mint = new mocks.TestMint({ url: MINT, seed: new Uint8Array(32).fill(0x53) });
+    const pool = new nostr.FakeRelayPool();
+    const { dataDir, creds } = await setup();
+    const d = await daemon(dataDir, creds, mint, pool, new Map(), {}, { maxPendingPays: 1 });
+    const v = await viewer(mint);
+    const { core, vcore } = await connect(d, v, 8);
+    await payRange(v, vcore, core, 0, 3);
+    expect(d.rt.engine.pendingCount()).toBe(1);
+    expect(d.rt.accepting()).toBe(false);
+    // The next block is not served: the session is cut locally, the viewer is not banned.
+    expect(await vcore.core.get(4, { wait: true, timeout: 2000 }).catch(() => null)).toBeNull();
+    await until(
+      () => d.log.some((l) => l.includes('pending-PAY queue full — not serving')),
+      'the local cut',
+      10_000,
+    );
+    expect(d.rt.engine.isBanned(v.pubkey)).toBe(false);
+    expect(d.log.some((l) => l.includes('pending-PAY queue at its cap'))).toBe(true);
+    // The mint redeems again: the queue drains and the daemon accepts new work.
+    expect((await d.seeder.flushNow()).failed).toBe(0);
+    expect(d.rt.accepting()).toBe(true);
   });
 
   it('F12 on disk: PAYs ACKed but not flushed when the process dies are redeemed by the next runtime on the same data directory', async () => {

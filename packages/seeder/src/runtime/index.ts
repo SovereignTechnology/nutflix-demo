@@ -42,7 +42,7 @@ import type { DaemonConfig, PayoutConfig } from '../cli/config-file.js';
 import type { Logger } from '../log/logger.js';
 import { DleqPool, defaultDleqThreads } from './dleq-pool.js';
 import type { Seeder } from '../seeder.js';
-import { SeenLog, loadPending, pendingWriter } from './engine-state.js';
+import { PendingJournal, SeenLog } from './engine-state.js';
 import { RuntimeSetupError } from './files.js';
 import { PASSPHRASE_CREDENTIAL, unlockIdentity } from './identity.js';
 import { guardedKeyset } from './keysets.js';
@@ -69,7 +69,16 @@ export interface SeederRuntimeOptions {
   readonly pool?: nostr.PoolLike;
   /** Tests: the built DLEQ worker, for a runtime loaded from sources (default: next to this module). */
   readonly dleqWorkerUrl?: URL;
+  /**
+   * The most accepted-but-unredeemed PAYs held before sessions stop being served (default
+   * `DEFAULT_MAX_PENDING_PAYS`): while a mint is down nothing redeems, and the queue — in memory
+   * and in the journal — would otherwise grow without bound.
+   */
+  readonly maxPendingPays?: number;
 }
+
+/** See `SeederRuntimeOptions.maxPendingPays`. */
+export const DEFAULT_MAX_PENDING_PAYS = 4096;
 
 /** What a node's runtime needs beyond the shell's own config (the daemon's, the gateway's). */
 export interface NodeRuntimeOptions extends SeederRuntimeOptions {
@@ -112,6 +121,11 @@ export interface SeederRuntime {
   readonly payout: Payout | null;
   /** Before `seeder.start()`: pay/1 on every session, then the kind 10019 (best effort). */
   attach(seeder: Seeder): void;
+  /**
+   * `SeederDeps.accepting`: `false` while the pending-PAY queue is at `maxPendingPays` (a mint
+   * outage). Pass it to the `Seeder` this runtime pays for.
+   */
+  readonly accepting: () => boolean;
   /** After `seeder.close()` (its final flush has run): relays closed, key locked, lock freed. */
   close(): Promise<void>;
 }
@@ -229,6 +243,7 @@ export async function createNodeRuntime(o: NodeRuntimeOptions): Promise<SeederRu
   }
 
   let dleqPool: DleqPool | null = null;
+  let journal: PendingJournal | null = null;
   try {
     const store = await FileProofStore.open(
       join(walletDir, 'proofs.json'),
@@ -255,8 +270,16 @@ export async function createNodeRuntime(o: NodeRuntimeOptions): Promise<SeederRu
     seen.restore(seenLog.load());
 
     const pool = o.pool ?? createRelayPool();
-    const pendingPath = join(walletDir, 'pending.json');
-    const pending = loadPending(pendingPath);
+    journal = PendingJournal.open(
+      join(walletDir, 'pending.jsonl'),
+      join(walletDir, 'pending.json'),
+      (err) => {
+        log.error('pending-PAY write failed: accepted payments are in memory only', {
+          error: err,
+        });
+      },
+    );
+    const pending = journal.items;
     const windowBlocks = o.windowBlocks;
     dleqPool = DleqPool.open({
       size: o.dleqThreads ?? defaultDleqThreads(),
@@ -278,11 +301,7 @@ export async function createNodeRuntime(o: NodeRuntimeOptions): Promise<SeederRu
       redeem: (set) => wallet.receive(set),
       checkSpent: (set) => wallet.checkSpent(set),
       spentByUs: (set) => wallet.spentByUs(set),
-      persistPending: pendingWriter(pendingPath, (err) => {
-        log.error('pending-PAY write failed: accepted payments are in memory only', {
-          error: err,
-        });
-      }),
+      persistPending: journal.persist,
       nutzap: nutzapPublisher({
         signer: identity.signer,
         pool,
@@ -321,9 +340,29 @@ export async function createNodeRuntime(o: NodeRuntimeOptions): Promise<SeederRu
 
     const unsubs: (() => void)[] = [];
     let closed = false;
+    const maxPending = o.maxPendingPays ?? DEFAULT_MAX_PENDING_PAYS;
+    let full = false;
+    const accepting = (): boolean => {
+      const ok = engine.pendingCount() < maxPending;
+      if (ok === full) {
+        // Log each transition once, not per block.
+        full = !ok;
+        if (full)
+          log.warn('pending-PAY queue at its cap: not serving until the mint takes redeems again', {
+            pending: engine.pendingCount(),
+            cap: maxPending,
+          });
+        else
+          log.info('pending-PAY queue below its cap again: serving', {
+            pending: engine.pendingCount(),
+          });
+      }
+      return ok;
+    };
     return {
       engine,
       wallet,
+      accepting,
       pubkey: identity.pubkey,
       p2pk: identity.p2pk,
       signEvent: (e) => identity.signer.signEvent(e),
@@ -387,12 +426,14 @@ export async function createNodeRuntime(o: NodeRuntimeOptions): Promise<SeederRu
         await payout?.idle();
         pool.close();
         await dleqPool?.close();
+        journal?.close();
         await identity.signer.lock();
         release();
       },
     };
   } catch (err) {
     await dleqPool?.close();
+    journal?.close();
     await identity.signer.lock();
     release();
     throw err;
