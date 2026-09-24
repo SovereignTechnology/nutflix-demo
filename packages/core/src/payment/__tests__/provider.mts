@@ -1,11 +1,14 @@
 /**
  * L10 provider indirection — the Stage 2 seam for the adversary suite.
  *
- * Every payment test in this directory reaches the engine ONLY through this module, so the
- * Stage 2 session that implements `packages/core/src/payment/` unskips nothing and rewires
- * one place: make `getSeederEngine()` return the real `PaymentEngine` (and, once a wallet
- * that can mint test proofs exists, make `getPair('honest').viewer` the real viewer side;
- * the cheating modes can stay on the mock or become mutators over real proofs).
+ * Every payment test in this directory reaches the engine ONLY through this module. Stage 2
+ * rewired it (2026-09-23): `getSeederEngine()` returns the REAL engine (`payment/engine.ts`),
+ * and every viewer — honest or cheating — pays with REAL ecash from in-process `TestMint`s
+ * (one per fixture mint URL): real blind signatures, real DLEQ with the blinding factor, real
+ * NUT-11 secrets carrying the `pay1` binding. The cheating modes are mutations of those real
+ * PAYs. The seeder's cached keysets and its redemption come from the same mints, so DLEQ, the
+ * lock policy and double-spend state are all checked for real. `MockPaymentEngine` stays the
+ * lanes' reference model (its own tests live in `mocks/__tests__`).
  *
  * Why `.mts`: `packages/core/vitest.config.ts` includes `src/**\/__tests__/**\/*.ts`, so a
  * plain `provider.ts` would be collected as a test file and fail with "No test suite found".
@@ -32,9 +35,18 @@ import type {
   Sats,
   UnixSeconds,
   VerifyResult,
+  Wallet,
 } from '../../contracts/index.js';
 import { DEFAULT_BLOCK_SIZE, DEFAULT_WINDOW_BLOCKS } from '../../contracts/index.js';
-import { MockPaymentEngine, type MockPaymentMode } from '../../mocks/mock-payment-engine.js';
+import {
+  FORGED,
+  MockPaymentEngine,
+  type MockPaymentMode,
+} from '../../mocks/mock-payment-engine.js';
+import { TestMint } from '../../mocks/test-mint.js';
+import { RealPaymentEngine } from '../engine.js';
+import { PAY1_TAG } from '../lock.js';
+import { SeenSecrets } from '../seen.js';
 import { splitPay, splitSequence } from '../split.js';
 
 // ---------------------------------------------------------------------------------------
@@ -206,48 +218,232 @@ export interface EngineOptions {
   readonly now?: () => UnixSeconds;
 }
 
+// ---------------------------------------------------------------------------------------
+// Real ecash: one in-process mint per fixture mint URL, shared by every test in a file.
+// ---------------------------------------------------------------------------------------
+
+const MINTS = new Map<MintUrl, TestMint>();
+
+/** The `TestMint` behind a fixture mint URL (created on first use, deterministic keys). */
+export function testMint(url: MintUrl): TestMint {
+  let m = MINTS.get(url);
+  if (m === undefined) {
+    const seed = new Uint8Array(32).fill(MINTS.size + 1);
+    m = new TestMint({ url, seed });
+    MINTS.set(url, m);
+  }
+  return m;
+}
+
+/** A wallet whose `send` has the test mint issue fresh P2PK-locked proofs (no balance needed). */
+function issuingWallet(): Pick<Wallet, 'send'> {
+  return { send: getWalletSend };
+}
+
+function getWalletSend(
+  amount: Sats,
+  opts: {
+    readonly p2pk: CashuP2pkPubkey;
+    readonly mint: MintUrl;
+    readonly tags?: readonly (readonly string[])[];
+  },
+): Promise<LockedProofSet> {
+  const proofs = testMint(opts.mint).issue(amount, {
+    p2pk: opts.p2pk,
+    ...(opts.tags === undefined ? {} : { tags: opts.tags }),
+  });
+  return Promise.resolve({ mint: opts.mint, unit: 'sat', lockedTo: opts.p2pk, proofs });
+}
+
+/** Nutzaps the provider's seeders "published" (creator sets), for tests that look. */
+export const NUTZAPS: LockedProofSet[] = [];
+
 /**
- * Seeder-side engine under test (the audit surface: `verify`, `recordUpload`, windows,
- * bans, `flush`). Stage 2: return the real engine here.
+ * Seeder-side engine under test (the audit surface: `verify`, `recordUpload`, windows, bans,
+ * `flush`) — the REAL engine. Keysets come from the fixture mints; redemption spends the seeder
+ * set at its mint (a proof already spent there is a double-spend, `code: 'spent'`); nutzaps are
+ * recorded in `NUTZAPS`.
  */
 export function getSeederEngine(opts: EngineOptions = {}): PaymentEngine {
-  const config: Partial<PaymentEngineConfig> = {
+  const config: PaymentEngineConfig = {
     windowBlocks: DEFAULT_WINDOW_BLOCKS,
     ownP2pk: SEEDER_P2PK,
     ownPubkey: SEEDER,
     acceptedMints: [MINT_A],
+    flushEveryBlocks: 64,
+    flushEveryMs: 60_000,
     ...opts.config,
   };
-  return opts.now
-    ? new MockPaymentEngine({ mode: 'honest', config, now: opts.now })
-    : new MockPaymentEngine({ mode: 'honest', config });
+  return new RealPaymentEngine({
+    config,
+    ...(opts.now ? { now: opts.now } : {}),
+    seen: new SeenSecrets(),
+    keyset: (mint, id) => {
+      const m = MINTS.get(mint);
+      return Promise.resolve(m?.keysetId === id ? m.keyset() : undefined);
+    },
+    redeem: (set) => {
+      const m = testMint(set.mint);
+      if (set.proofs.some((p) => m.isSpent(p.secret)))
+        return Promise.reject(Object.assign(new Error('spent'), { code: 'spent' }));
+      m.markSpent(set.proofs);
+      return Promise.resolve(sumProofs(set.proofs) as Sats);
+    },
+    nutzap: (set) => {
+      NUTZAPS.push(set);
+      return Promise.resolve();
+    },
+  });
 }
 
 /**
- * Viewer-side message producer for a given adversary mode. `honest` must produce a PAY the
- * seeder accepts; every other mode must produce one it rejects (or, for `double-spend`, one
- * the swap batch catches).
+ * Viewer-side message producer for a given adversary mode: the REAL engine's `pay()` with real
+ * ecash, and for the cheating modes a mutation of what it produced. `honest` must produce a PAY
+ * the seeder accepts; every other mode one it rejects.
  */
 export function getViewerEngine(
   mode: AdversaryMode,
   opts: EngineOptions = {},
 ): PaymentEngineViewer {
-  return opts.now
-    ? new MockPaymentEngine({ mode, now: opts.now, viewerPubkey: VIEWER })
-    : new MockPaymentEngine({ mode, viewerPubkey: VIEWER });
+  const real = new RealPaymentEngine({
+    config: {
+      windowBlocks: DEFAULT_WINDOW_BLOCKS,
+      ownP2pk: VIEWER_P2PK,
+      ownPubkey: VIEWER,
+      acceptedMints: [],
+      flushEveryBlocks: 64,
+      flushEveryMs: 60_000,
+    },
+    ...(opts.now ? { now: opts.now } : {}),
+    wallet: issuingWallet(),
+  });
+  return new CheatingViewer(mode, real);
+}
+
+const VIEWER_P2PK = ('02' + 'aa'.repeat(32)) as CashuP2pkPubkey;
+
+/**
+ * The attack builder: the real engine's PAY, then the mode's mutation (the same attacks the
+ * mock's modes make). The real `pay()` refuses to pay at a mint the video does not list (an
+ * honest viewer never does); the tests that build exactly that PAY (T8) get it by widening the
+ * policy's mint list for the BUILD only — the seeder verifies against the real policy.
+ */
+class CheatingViewer implements PaymentEngineViewer {
+  private last: PayMessage | null = null;
+  private readonly extra = new Map<NostrPubkey, number>();
+
+  constructor(
+    private readonly mode: AdversaryMode,
+    private readonly real: RealPaymentEngine,
+  ) {}
+
+  async pay(
+    range: BlockRange,
+    seeder: {
+      readonly pubkey: NostrPubkey;
+      readonly p2pk: CashuP2pkPubkey;
+      readonly mint: MintUrl;
+    },
+    policy: PricePolicy,
+    opts?: { readonly carryIn?: number },
+  ): Promise<PayMessage> {
+    const buildPolicy = policy.mints.includes(seeder.mint)
+      ? policy
+      : { ...policy, mints: [...policy.mints, seeder.mint] };
+    const honest = await this.real.pay(range, seeder, buildPolicy, opts);
+    const mint = testMint(seeder.mint);
+    let msg: PayMessage = honest;
+    switch (this.mode) {
+      case 'honest':
+        break;
+      case 'stiff-creator': {
+        // The creator's share re-locked to the seeder's own key instead of the creator's.
+        const amount = sumProofs(honest.creatorProofs.proofs);
+        const proofs =
+          amount > 0
+            ? mint.issue(amount, { p2pk: seeder.p2pk, tags: [[PAY1_TAG, seeder.p2pk]] })
+            : [];
+        msg = {
+          ...honest,
+          creatorProofs: { ...honest.creatorProofs, lockedTo: seeder.p2pk, proofs },
+        };
+        break;
+      }
+      case 'stiff-seeder':
+        msg = { ...honest, seederProofs: { ...honest.seederProofs, proofs: [] } };
+        break;
+      case 'double-spend':
+        // Replay the previous PAY's proofs for a new range; the first PAY is honest.
+        if (this.last !== null)
+          msg = {
+            ...honest,
+            seederProofs: this.last.seederProofs,
+            creatorProofs: this.last.creatorProofs,
+          };
+        break;
+      case 'forge':
+        msg = {
+          ...honest,
+          seederProofs: {
+            ...honest.seederProofs,
+            proofs: honest.seederProofs.proofs.map((p) => ({
+              ...p,
+              dleq: { s: FORGED, e: FORGED },
+            })),
+          },
+        };
+        break;
+      case 'overpay': {
+        // One real 1-sat proof more in the seeder set.
+        const [one] = mint.issue(1, { p2pk: seeder.p2pk });
+        msg = {
+          ...honest,
+          seederProofs: {
+            ...honest.seederProofs,
+            proofs: [...honest.seederProofs.proofs, ...(one ? [one] : [])],
+          },
+        };
+        break;
+      }
+      case 'underpay': {
+        // The creator's share re-issued one sat short.
+        const amount = Math.max(0, sumProofs(honest.creatorProofs.proofs) - 1);
+        const proofs =
+          amount > 0
+            ? mint.issue(amount, { p2pk: policy.creatorP2pk, tags: [[PAY1_TAG, seeder.p2pk]] })
+            : [];
+        msg = { ...honest, creatorProofs: { ...honest.creatorProofs, proofs } };
+        break;
+      }
+    }
+    this.last = msg;
+    const onWire = sumProofs(msg.seederProofs.proofs) + sumProofs(msg.creatorProofs.proofs);
+    this.extra.set(seeder.pubkey, (this.extra.get(seeder.pubkey) ?? 0) + onWire);
+    return msg;
+  }
+
+  /** What this viewer actually put on the wire, per seeder (cheats included). */
+  spent(): { readonly total: Sats; readonly perPeer: ReadonlyMap<NostrPubkey, Sats> } {
+    let total = 0;
+    const perPeer = new Map<NostrPubkey, Sats>();
+    for (const [k, v] of this.extra) {
+      total += v;
+      perPeer.set(k, v as Sats);
+    }
+    return { total: total as Sats, perPeer };
+  }
 }
 
 /**
- * True while the seam still returns the reference model. Tests that pin behaviour the mock
- * deliberately stands in for (real NUT-11 secret parsing, real DLEQ) are `it.skipIf(usingMock())`
- * with a full body, so they run the moment Stage 2 rewires `getSeederEngine()`.
+ * True while the seam returned the reference model. Stage 2 wired the real engine, so the
+ * `it.skipIf(usingMock())` tests (real NUT-11 parsing, real DLEQ on `C`) now run.
  */
 export function usingMock(): boolean {
   return getSeederEngine() instanceof MockPaymentEngine;
 }
 
 /**
- * Make the mint behind `seeder` report `proofs` as already spent, as if they had been
+ * Make the mint behind a seeder report `proofs` as already spent, as if they had been
  * redeemed by a route this engine never saw. Drives the async-swap (flush) half of T5.
  */
 export function spendAtMint(seeder: PaymentEngine, proofs: readonly CashuProof[]): Promise<void> {
@@ -255,7 +451,8 @@ export function spendAtMint(seeder: PaymentEngine, proofs: readonly CashuProof[]
     seeder.markSpentAtMint(proofs.map((p) => p.secret));
     return Promise.resolve();
   }
-  return Promise.reject(new Error('spendAtMint: no test mint wired for this engine'));
+  for (const m of MINTS.values()) m.markSpent(proofs);
+  return Promise.resolve();
 }
 
 export interface AdversaryPair {

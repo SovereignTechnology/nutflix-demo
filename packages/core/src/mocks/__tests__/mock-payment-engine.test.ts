@@ -225,7 +225,7 @@ describe('MockPaymentEngine cheating modes are rejected (adversary seed for L10)
     const b = pair();
     upload(b.seeder, VIEWER, 4);
     const msg = await b.viewer.pay(range(0, 3), seederInfo, policy);
-    b.seeder.markSpentAtMint([msg.creatorProofs.proofs[0]!.secret]);
+    b.seeder.markSpentAtMint([msg.seederProofs.proofs[0]!.secret]);
     expect(await b.seeder.verify(VIEWER, msg, policy)).toMatchObject({ ok: true });
     expect(await b.seeder.flush()).toEqual({ swapped: 0, nutzapped: 0, failed: 1 });
     expect(b.seeder.isBanned(VIEWER)).toBe(true);

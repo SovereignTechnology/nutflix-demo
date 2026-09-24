@@ -6,7 +6,7 @@
  *
  * `honest` is the control: it must be accepted on every scenario the cheats are run on.
  */
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import * as fc from 'fast-check';
 
 import type { RejectReason } from '../../contracts/index.js';
@@ -29,6 +29,11 @@ import {
   upload,
   type CheatingMode,
 } from './provider.mjs';
+
+// The seam returns the REAL engine over real ecash (Stage 2): every property run mints and
+// DLEQ-verifies real proofs (~30 ms each in pure JS), so these files need more than the default
+// 5 s per test. The number of runs is unchanged.
+vi.setConfig({ testTimeout: 240_000 });
 
 /**
  * Mode → the SECURITY.md row it exercises → the reason offline `verify` must return.
@@ -196,7 +201,14 @@ describe('MockPaymentEngine cheating modes (each mode, each reason)', () => {
             expect(flush).toEqual({ swapped: one.seeder, nutzapped: one.creator, failed: 0 });
           } else {
             expect(v1).toMatchObject({ ok: false, reason: expected.offline });
-            expect(v2).toMatchObject({ ok: false, reason: expected.offline });
+            // A forged DLEQ against a known keyset bans the peer at once (the real engine's
+            // choice — the suite leaves bans on rejection to the implementation), so its next
+            // PAY is `peer-banned`; every other cheat is refused with the same reason again.
+            expect(v2).toMatchObject({
+              ok: false,
+              reason: expected.offline === 'bad-dleq' ? 'peer-banned' : expected.offline,
+            });
+            if (expected.offline === 'bad-dleq') expect(seeder.isBanned(VIEWER)).toBe(true);
             expect(flush).toEqual({ swapped: 0, nutzapped: 0, failed: 0 });
             expect(seeder.window(VIEWER)?.paid).toBe(0);
           }
@@ -287,7 +299,11 @@ describe('MockPaymentEngine cheating modes (each mode, each reason)', () => {
         expect(seeder.isBanned(VIEWER), mode).toBe(true);
       } else {
         expect(va, mode).toMatchObject({ ok: false, reason: offline });
-        expect(vb, mode).toMatchObject({ ok: false, reason: offline });
+        // A forgery bans (see the property above): the second PAY is then `peer-banned`.
+        expect(vb, mode).toMatchObject({
+          ok: false,
+          reason: offline === 'bad-dleq' ? 'peer-banned' : offline,
+        });
         expect(flush, mode).toEqual({ swapped: 0, nutzapped: 0, failed: 0 });
         expect(seeder.window(VIEWER)?.paid, mode).toBe(0);
       }

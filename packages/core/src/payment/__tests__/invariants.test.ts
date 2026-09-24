@@ -5,7 +5,7 @@
  * engine in Stage 2 through `provider.mts`.
  */
 import { readFile, readdir } from 'node:fs/promises';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import * as fc from 'fast-check';
 
 import type {
@@ -50,6 +50,11 @@ import {
   withCreatorSet,
   withSeederSet,
 } from './provider.mjs';
+
+// The seam returns the REAL engine over real ecash (Stage 2): every property run mints and
+// DLEQ-verifies real proofs (~30 ms each in pure JS), so these files need more than the default
+// 5 s per test. The number of runs is unchanged.
+vi.setConfig({ testTimeout: 240_000 });
 
 const REPO_ROOT = new URL('../../../../../', import.meta.url);
 
@@ -792,12 +797,12 @@ describe('SECURITY.md money-path invariants', () => {
     expect(seeder.isBanned(VIEWER)).toBe(false);
     expect(seeder.bans()).toHaveLength(0);
 
-    // The swap half: a proof the mint already saw spent passes offline verification, and
-    // the batch that swaps it bans the payer with the same durable entry.
+    // The swap half: a seeder-set proof the mint already saw spent passes offline
+    // verification, and the batch that swaps it bans the payer with the same durable entry.
     const s = getPair('honest');
     upload(s.seeder, VIEWER, 2);
     const spent = await s.viewer.pay(range(0, 1), SEEDER_INFO, POLICY);
-    await spendAtMint(s.seeder, spent.creatorProofs.proofs);
+    await spendAtMint(s.seeder, spent.seederProofs.proofs);
     expect(await s.seeder.verify(VIEWER, spent, POLICY)).toMatchObject({ ok: true });
     expect(s.seeder.bans()).toHaveLength(0);
     const beforeFlush = s.clock.current();

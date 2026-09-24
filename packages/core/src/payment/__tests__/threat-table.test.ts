@@ -9,7 +9,7 @@
  * names the owner of the runtime proof. See docs/lanes/L10.md for the full/pinned split.
  */
 import { readFile, readdir } from 'node:fs/promises';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import * as fc from 'fast-check';
 
 import type {
@@ -57,6 +57,11 @@ import {
   withCreatorSet,
   withSeederSet,
 } from './provider.mjs';
+
+// The seam returns the REAL engine over real ecash (Stage 2): every property run mints and
+// DLEQ-verifies real proofs (~30 ms each in pure JS), so these files need more than the default
+// 5 s per test. The number of runs is unchanged.
+vi.setConfig({ testTimeout: 240_000 });
 
 const REPO_ROOT = new URL('../../../../../', import.meta.url);
 
@@ -549,7 +554,12 @@ describe('SECURITY.md threat table', () => {
         reason: 'bad-dleq',
       });
       expect(seeder.window(VIEWER)?.paid).toBe(0);
-      expect(await seeder.verify(VIEWER, honest, POLICY)).toMatchObject({ ok: true });
+      // A forgery against a known keyset bans its sender (T11: each attempt costs DLEQ CPU)…
+      expect(seeder.isBanned(VIEWER)).toBe(true);
+      // …and the untampered message is accepted by a seeder the forger never touched.
+      const fresh = getSeederEngine();
+      upload(fresh, VIEWER, 4);
+      expect(await fresh.verify(VIEWER, honest, POLICY)).toMatchObject({ ok: true });
     },
   );
 

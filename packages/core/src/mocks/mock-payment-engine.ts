@@ -10,8 +10,9 @@
  *   - DLEQ valid          ⇔ `proof.dleq` present, `dleq.s`/`dleq.e` ≠ FORGED, secret starts `mock:`
  *   - P2PK lock (NUT-11)  ⇔ the secret's target segment is `lockedTo.slice(2, 10)`
  *   - `pay1` binding      ⇔ a creator-set secret ends `:pay1=<seeder p2pk .slice(2, 10)>`
- *   - double-spend        ⇔ a secret this seeder already accepted (at `verify`, v5) or one
- *                           marked spent at the "mint" (`markSpentAtMint`, found at `flush()`)
+ *   - double-spend        ⇔ a secret this seeder already accepted (at `verify`, v5) or a
+ *                           SEEDER-set secret marked spent at the "mint" (`markSpentAtMint`,
+ *                           found when `flush()` swaps it)
  *
  * Secret format: `mock:<instance>.<n>:<target8>[:pay1=<seeder8>]`. The instance part is
  * random per engine (v5 fix, L6-C request 2): two mock wallets paying one seeder used to
@@ -422,12 +423,14 @@ export class MockPaymentEngine implements PaymentEngine {
     const batch = this.pending.splice(0);
     for (const { peer, msg } of batch) {
       const all = [...msg.seederProofs.proofs, ...msg.creatorProofs.proofs];
-      if (all.some((p) => this.spentAtMint.has(p.secret))) {
+      // The seeder swaps only its own set; the creator set is published, not swapped, so only a
+      // spent SEEDER proof is a double-spend the batch can see (as in the real engine).
+      if (msg.seederProofs.proofs.some((p) => this.spentAtMint.has(p.secret))) {
         failed++;
         this.doubleSpend(peer, msg.seederProofs.mint, sum(all), 'spent at mint');
         continue;
       }
-      for (const p of all) this.spentAtMint.add(p.secret);
+      for (const p of msg.seederProofs.proofs) this.spentAtMint.add(p.secret);
       swapped += sum(msg.seederProofs.proofs);
       nutzapped += sum(msg.creatorProofs.proofs);
     }

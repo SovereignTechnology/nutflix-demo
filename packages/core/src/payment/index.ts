@@ -25,3 +25,11 @@ export {
   type PaySplit,
 } from './split.js';
 export { PAY1_TAG, checkPayLock, type LockVerdict } from './lock.js';
+export {
+  MAX_PROOFS_PER_SET,
+  RealPaymentEngine,
+  isPayMessageV5,
+  type PaymentEngineDeps,
+} from './engine.js';
+export { RangeSet } from './range-set.js';
+export { SeenSecrets, type SeenSecretsOptions } from './seen.js';
