@@ -173,6 +173,7 @@ error contract over an injected raw HTTP call) + `packages/seeder/src/runtime/mi
 against Nutshell 0.21.0. Guarded by `packages/seeder/src/__tests__/entry.test.ts`: the built entry,
 with the flags read from the unit, loads a mint over real HTTP at start (`"mint loaded"`); with
 the default transport it dies with this `ReferenceError` (checked by reverting the transport).
-**The gateway must use the same transport** when its runtime providers land — its units run the
-same flags. Anything else that calls `fetch` in a daemon (NIP-05, LNURL) needs the same
-treatment.
+The gateway uses the same transport since its runtime providers landed (`stage-3/gateway-runtime`:
+`createNodeRuntime`), guarded by `packages/gateway/src/__tests__/cli.test.ts`, which starts the
+built gateway under the unit flags and loads a mint over real HTTP. Anything else that calls
+`fetch` in a daemon (NIP-05, LNURL) needs the same treatment.

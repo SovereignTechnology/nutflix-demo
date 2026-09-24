@@ -27,14 +27,23 @@ import {
 import { join } from 'node:path';
 
 import { DEFAULT_WINDOW_BLOCKS, payment, wallet as walletMod } from '@sovit/core';
-import type { CashuP2pkPubkey, MintUrl, NostrPubkey, nostr } from '@sovit/core';
+import type {
+  CashuP2pkPubkey,
+  CoreKeyHex,
+  MintUrl,
+  NostrEventId,
+  NostrPubkey,
+  RelayUrl,
+  Signer,
+  nostr,
+} from '@sovit/core';
 
-import type { DaemonConfig } from '../cli/config-file.js';
+import type { DaemonConfig, PayoutConfig } from '../cli/config-file.js';
 import type { Logger } from '../log/logger.js';
 import type { Seeder } from '../seeder.js';
 import { SeenLog, loadPending, pendingWriter } from './engine-state.js';
 import { RuntimeSetupError } from './files.js';
-import { unlockIdentity } from './identity.js';
+import { PASSPHRASE_CREDENTIAL, unlockIdentity } from './identity.js';
 import { guardedKeyset } from './keysets.js';
 import { nodeMintRequest } from './mint-http.js';
 import { announceNutzapInfo, createRelayPool, nutzapPublisher } from './nostr-publish.js';
@@ -59,11 +68,38 @@ export interface SeederRuntimeOptions {
   readonly pool?: nostr.PoolLike;
 }
 
+/** What a node's runtime needs beyond the shell's own config (the daemon's, the gateway's). */
+export interface NodeRuntimeOptions extends SeederRuntimeOptions {
+  /** Where `wallet/` lives (the node's 0700 state directory). */
+  readonly dataDir: string;
+  readonly keyFile: string;
+  /** The systemd credential id holding the key file's passphrase. */
+  readonly credential: string;
+  /** Mints this node takes payment at (its HELLO's), and holds ecash at. */
+  readonly acceptedMints: readonly MintUrl[];
+  readonly windowBlocks: number;
+  readonly flushEveryBlocks: number;
+  readonly flushEveryMs: number;
+  /** Where nutzaps and the kind 10019 go. */
+  readonly relays: readonly RelayUrl[];
+  /** The creator Nostr pubkey whose clients look for nutzaps to `lockedTo` (`undefined` = none). */
+  readonly recipientFor: (lockedTo: CashuP2pkPubkey) => NostrPubkey | undefined;
+  readonly videoEventFor?: (core: CoreKeyHex) => NostrEventId | undefined;
+  readonly payout: PayoutConfig | null;
+  /**
+   * Attach `pay/1` + HELLO to every session of the seeder passed to `attach` (the daemon). A shell
+   * with its own wiring (the gateway) passes `false`.
+   */
+  readonly wirePay: boolean;
+}
+
 export interface SeederRuntime {
   readonly engine: payment.RealPaymentEngine;
   readonly wallet: walletMod.CashuWallet;
   readonly pubkey: NostrPubkey;
   readonly p2pk: CashuP2pkPubkey;
+  /** Signs as this node (HELLO for a shell that sends its own); nothing else of the key is exposed. */
+  readonly signEvent: Signer['signEvent'];
   /** `null` when `payout` is not configured (earnings stay in the wallet file). */
   readonly payout: Payout | null;
   /** Before `seeder.start()`: pay/1 on every session, then the kind 10019 (best effort). */
@@ -137,19 +173,43 @@ function acquireLock(path: string): () => void {
   throw new RuntimeSetupError(`could not take the state lock ${path}`);
 }
 
+/** The seeder daemon's runtime, from its config (`cli/config-file.ts`). */
 export async function createSeederRuntime(
   config: DaemonConfig,
   o: SeederRuntimeOptions,
 ): Promise<SeederRuntime> {
-  const log = o.logger.child({ component: 'runtime' });
   const policy = config.seeder.policy;
   if (policy === undefined) throw new RuntimeSetupError('the daemon needs a price policy');
-  // Read-only first: a daemon without its key or passphrase refuses before it creates anything.
-  const identity = await unlockIdentity({
+  return createNodeRuntime({
+    ...o,
+    dataDir: config.seeder.dataDir,
     keyFile: config.keyFile,
-    credentialsDirectory: o.credentialsDirectory,
+    credential: PASSPHRASE_CREDENTIAL,
+    acceptedMints: policy.mints,
+    windowBlocks: DEFAULT_WINDOW_BLOCKS,
+    flushEveryBlocks: config.seeder.flushEveryBlocks ?? 64,
+    flushEveryMs: config.seeder.flushEveryMs ?? 60_000,
+    relays: config.relays,
+    recipientFor: (lockedTo) =>
+      lockedTo.toLowerCase() === policy.creatorP2pk.toLowerCase()
+        ? config.creatorPubkey
+        : undefined,
+    videoEventFor: (core) => config.videoEvents.get(core),
+    payout: config.payout,
+    wirePay: true,
   });
-  const walletDir = join(config.seeder.dataDir, 'wallet');
+}
+
+/** A node's money runtime (ADR 0011): identity, wallet, seeder-side engine, nutzaps, payout. */
+export async function createNodeRuntime(o: NodeRuntimeOptions): Promise<SeederRuntime> {
+  const log = o.logger.child({ component: 'runtime' });
+  // Read-only first: a node without its key or passphrase refuses before it creates anything.
+  const identity = await unlockIdentity({
+    keyFile: o.keyFile,
+    credentialsDirectory: o.credentialsDirectory,
+    credential: o.credential,
+  });
+  const walletDir = join(o.dataDir, 'wallet');
   let release: () => void;
   try {
     mkdirSync(walletDir, { recursive: true, mode: 0o700 });
@@ -174,7 +234,7 @@ export async function createSeederRuntime(
       mints,
       store,
       key: walletMod.signerWalletKey(identity.signer, identity.p2pk),
-      configuredMints: policy.mints,
+      configuredMints: o.acceptedMints,
     });
 
     const seenLog = new SeenLog(join(walletDir, 'seen.jsonl'), SEEN_CAPACITY, (err) => {
@@ -188,15 +248,15 @@ export async function createSeederRuntime(
     const pool = o.pool ?? createRelayPool();
     const pendingPath = join(walletDir, 'pending.json');
     const pending = loadPending(pendingPath);
-    const windowBlocks = DEFAULT_WINDOW_BLOCKS;
+    const windowBlocks = o.windowBlocks;
     const engine = new payment.RealPaymentEngine({
       config: {
         windowBlocks,
-        acceptedMints: [...policy.mints],
+        acceptedMints: [...o.acceptedMints],
         ownP2pk: identity.p2pk,
         ownPubkey: identity.pubkey,
-        flushEveryBlocks: config.seeder.flushEveryBlocks ?? 64,
-        flushEveryMs: config.seeder.flushEveryMs ?? 60_000,
+        flushEveryBlocks: o.flushEveryBlocks,
+        flushEveryMs: o.flushEveryMs,
       },
       seen,
       keyset: guardedKeyset((m: MintUrl, id: string) => wallet.keyset(m, id)),
@@ -211,15 +271,12 @@ export async function createSeederRuntime(
       nutzap: nutzapPublisher({
         signer: identity.signer,
         pool,
-        relays: config.relays,
-        recipientFor: (lockedTo) =>
-          lockedTo.toLowerCase() === policy.creatorP2pk.toLowerCase()
-            ? config.creatorPubkey
-            : undefined,
-        videoEventFor: (core) => config.videoEvents.get(core),
+        relays: o.relays,
+        recipientFor: o.recipientFor,
+        ...(o.videoEventFor === undefined ? {} : { videoEventFor: o.videoEventFor }),
       }),
     });
-    const po = config.payout;
+    const po = o.payout;
     if (po !== null && (po.pubkey === identity.pubkey || po.p2pk === identity.p2pk))
       throw new RuntimeSetupError(
         'payout names this node’s own key: set payout.pubkey / payout.p2pk to the owner’s wallet',
@@ -253,16 +310,18 @@ export async function createSeederRuntime(
       wallet,
       pubkey: identity.pubkey,
       p2pk: identity.p2pk,
+      signEvent: (e) => identity.signer.signEvent(e),
       payout,
       attach(seeder) {
-        unsubs.push(
-          wirePay(seeder, {
-            signer: identity.signer,
-            p2pk: identity.p2pk,
-            windowBlocks,
-            logger: o.logger,
-          }),
-        );
+        if (o.wirePay)
+          unsubs.push(
+            wirePay(seeder, {
+              signer: identity.signer,
+              p2pk: identity.p2pk,
+              windowBlocks,
+              logger: o.logger,
+            }),
+          );
         if (payout === null)
           log.warn(
             'no payout configured: earnings stay in the wallet file (see payout in the config)',
@@ -278,7 +337,7 @@ export async function createSeederRuntime(
         }
         // Load every accepted mint now: the first PAY then verifies against keysets already in
         // memory, and an unreachable mint shows up at start, not at the first payment.
-        for (const m of policy.mints)
+        for (const m of o.acceptedMints)
           mints.wallet(m).then(
             (w) => {
               log.info('mint loaded', { mint: m, keysets: w.keyChain.getKeysets().length });
@@ -293,8 +352,8 @@ export async function createSeederRuntime(
         announceNutzapInfo({
           signer: identity.signer,
           pool,
-          relays: config.relays,
-          mints: policy.mints,
+          relays: o.relays,
+          mints: o.acceptedMints,
           p2pk: identity.p2pk,
         }).then(
           (ok) => {

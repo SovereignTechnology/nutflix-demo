@@ -203,6 +203,30 @@ amounts. Operators who mind use a dedicated wallet pubkey for `payout.pubkey`.
    nutzaps and in trending) and drop the view count until a private count exists — a change to the
    `VideoStats` contract, trending and three screens, for the UI polish lane (Cameron reviews it).
 
+## 9. The gateway on the same runtime (`stage-3/gateway-runtime`)
+
+`createNodeRuntime` is the seeder daemon's runtime with its config mapping taken out; the daemon
+(`createSeederRuntime`) and the gateway (`packages/gateway/src/cli/providers.ts`) both call it.
+What differs for the gateway:
+
+- **Credential** `gateway-key-passphrase` (the unit's `LoadCredentialEncrypted=`).
+- **Identity in the config.** The gateway's config names `identity.pubkey` / `identity.p2pk`
+  (its HELLO and dev-mocks use them), so the runtime refuses to start when they are not the key
+  file's: a HELLO naming another P2PK key would have viewers pay to a key the gateway cannot
+  redeem with. `--keygen` parses the config without them and prints both. The redacting logger
+  keeps a well-formed compressed key whole under the field `ownP2pk` only (the node's own).
+- **Two engines, one wallet.** The seeder-side engine (downstream PAYs, nutzaps, payout) and a
+  viewer-side engine paying UPSTREAM seeders (`UpstreamPayer`) share the sealed wallet.
+- **Blossom auth** is `BlossomAuthImpl` bound to `blossom.publicUrl`'s host.
+- **pay/1** stays the gateway's own (marked-up HELLO); `wirePay: false`.
+- **Swarm sessions (security review F38, fixed).** The gateway attached pay/1 on `session-open`,
+  when a swarm connection has no Protomux yet, so it never paid an upstream swarm peer; it now
+  uses `Seeder.onSessionReady`, like the daemon (a swarm integration test fails without it).
+- **Open: upstream pacing (F37).** The gateway does not hold upstream requests to the seeders'
+  unpaid window; a fast reader outruns its PAYs and gets it cut and banned. The desktop solved this
+  with a credit pool settled by ACKs (`app-desktop/src/worker/playback/credit.ts`); the next lane
+  moves that into the shared `UpstreamPayer` so the gateway and the desktop use one implementation.
+
 ## Consequences
 
 - `nutflix-seeder.service` can run for real: `--keygen` once, `systemd-creds encrypt` once,

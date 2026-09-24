@@ -35,6 +35,24 @@ export {
 export type { DaemonConfig, DaemonConfigResult } from './cli/config-file.js';
 export { getRuntimeDeps, MISSING_PROVIDERS_REASON } from './cli/providers.js';
 export type { RuntimeDeps } from './cli/providers.js';
+export { DEFAULT_PAYOUT_THRESHOLD_SATS, MAX_RELAYS } from './cli/config-file.js';
+export type { PayoutConfig } from './cli/config-file.js';
+
+// The node runtime (Node only; ADR 0011): what a shell needs to run paid — the gateway uses it.
+export { createNodeRuntime, createSeederRuntime, SEEN_CAPACITY } from './runtime/index.js';
+export type { NodeRuntimeOptions, SeederRuntime, SeederRuntimeOptions } from './runtime/index.js';
+export { RuntimeSetupError } from './runtime/files.js';
+export {
+  MIN_PASSPHRASE_BYTES,
+  PASSPHRASE_CREDENTIAL,
+  createKeyFile,
+  readPassphrase,
+  unlockIdentity,
+} from './runtime/identity.js';
+export type { NodeIdentity } from './runtime/identity.js';
+export { nodeMintRequest, nodeRawHttp } from './runtime/mint-http.js';
+export { Payout } from './runtime/payout.js';
+export type { OwnerCheck, PayoutResult } from './runtime/payout.js';
 
 /** True when `moduleUrl` is the script Node was started with (symlinks resolved). */
 export function isMainModule(moduleUrl: string, argv1: string | undefined): boolean {

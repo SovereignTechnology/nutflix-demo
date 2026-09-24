@@ -77,6 +77,13 @@ const PUBLIC_ID_FIELD_NAMES: ReadonlySet<string> = new Set([
   'topic',
 ]);
 
+/**
+ * Field names that carry THIS node's own Cashu P2PK key (33-byte compressed, 66 hex): public, and
+ * the operator needs it whole (it goes into the gateway's `identity.p2pk`). Anything else 66-hex
+ * is truncated like other long hex.
+ */
+const OWN_P2PK_FIELD_NAMES: ReadonlySet<string> = new Set(['ownp2pk']);
+
 /** Peer hex → alias, for this process only (never persisted, never logged in the clear). */
 const peerAliases = new Map<string, string>();
 const MAX_PEER_ALIASES = 50_000;
@@ -133,6 +140,8 @@ function redactValue(v: unknown, keyHint: string | null, depth: number): unknown
       if (PEER_ID_FIELD_NAMES.has(keyHint)) return peerAlias(v);
       if (PUBLIC_ID_FIELD_NAMES.has(keyHint)) return v;
     }
+    if (keyHint !== null && OWN_P2PK_FIELD_NAMES.has(keyHint) && /^0[23][0-9a-f]{64}$/.test(v))
+      return v;
     return redactString(v);
   }
   if (typeof v === 'number' || typeof v === 'boolean' || v === null || v === undefined) return v;

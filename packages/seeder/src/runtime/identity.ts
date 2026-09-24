@@ -19,7 +19,7 @@ import type { CashuP2pkPubkey, NostrPubkey } from '@sovit/core';
 
 import { RuntimeSetupError, assertPrivate } from './files.js';
 
-/** The systemd credential id the unit loads the key passphrase under. */
+/** The systemd credential id the seeder unit loads the key passphrase under. */
 export const PASSPHRASE_CREDENTIAL = 'seeder-key-passphrase';
 /** Anything shorter is not a credential anyone should seal a money key under. */
 export const MIN_PASSPHRASE_BYTES = 16;
@@ -46,27 +46,32 @@ function stripNewline(b: Uint8Array): Uint8Array {
  * `credentialsDirectory` is `$CREDENTIALS_DIRECTORY`, which systemd sets only when the unit
  * loads at least one credential.
  */
-export async function readPassphrase(credentialsDirectory: string | undefined): Promise<Buffer> {
+export async function readPassphrase(
+  credentialsDirectory: string | undefined,
+  credential: string = PASSPHRASE_CREDENTIAL,
+): Promise<Buffer> {
+  if (!/^[a-z0-9][a-z0-9_-]{0,63}$/.test(credential))
+    throw new RuntimeSetupError('a credential id is lower-case letters, digits, - and _');
   if (credentialsDirectory === undefined || credentialsDirectory === '')
     throw new RuntimeSetupError(
-      `no systemd credentials: the key passphrase is the credential ${PASSPHRASE_CREDENTIAL} ` +
+      `no systemd credentials: the key passphrase is the credential ${credential} ` +
         '(LoadCredentialEncrypted= in the unit, deploy/systemd/README.md); it is never read from the environment or the config',
     );
-  const path = join(credentialsDirectory, PASSPHRASE_CREDENTIAL);
+  const path = join(credentialsDirectory, credential);
   let raw: Buffer;
   try {
     raw = await readFile(path);
   } catch (err) {
     const code = (err as { code?: unknown } | null)?.code;
     throw new RuntimeSetupError(
-      `the credential ${PASSPHRASE_CREDENTIAL} could not be read${typeof code === 'string' ? ` (${code})` : ''}`,
+      `the credential ${credential} could not be read${typeof code === 'string' ? ` (${code})` : ''}`,
     );
   }
   const body = stripNewline(raw);
   if (body.length < MIN_PASSPHRASE_BYTES || body.length > MAX_PASSPHRASE_BYTES) {
     raw.fill(0);
     throw new RuntimeSetupError(
-      `the credential ${PASSPHRASE_CREDENTIAL} must hold ${String(MIN_PASSPHRASE_BYTES)} to ${String(MAX_PASSPHRASE_BYTES)} bytes`,
+      `the credential ${credential} must hold ${String(MIN_PASSPHRASE_BYTES)} to ${String(MAX_PASSPHRASE_BYTES)} bytes`,
     );
   }
   // A view into `raw`: wiping it wipes the whole read.
@@ -97,6 +102,8 @@ async function readKeyFile(keyFile: string): Promise<Uint8Array> {
 export async function unlockIdentity(o: {
   readonly keyFile: string;
   readonly credentialsDirectory: string | undefined;
+  /** The credential id (default `seeder-key-passphrase`; the gateway's is its own). */
+  readonly credential?: string;
 }): Promise<NodeIdentity> {
   const file = await readKeyFile(o.keyFile);
   let header: signerMod.KeyFileHeader;
@@ -111,7 +118,7 @@ export async function unlockIdentity(o: {
     throw new RuntimeSetupError(
       `the key file ${o.keyFile} carries no wallet key: a seeder must redeem what viewers lock to it — create a new one with --keygen`,
     );
-  const pass = await readPassphrase(o.credentialsDirectory);
+  const pass = await readPassphrase(o.credentialsDirectory, o.credential);
   let signer: signerMod.LocalSigner;
   try {
     signer = await signerMod.LocalSigner.unlock(file, pass);
@@ -138,7 +145,7 @@ export async function createKeyFile(o: {
   readonly keyFile: string;
   readonly passphrase: Uint8Array;
   readonly cost?: signerMod.KdfCost;
-}): Promise<{ readonly pubkey: NostrPubkey }> {
+}): Promise<{ readonly pubkey: NostrPubkey; readonly p2pk: CashuP2pkPubkey }> {
   if (o.passphrase.length < MIN_PASSPHRASE_BYTES || o.passphrase.length > MAX_PASSPHRASE_BYTES)
     throw new RuntimeSetupError(
       `the passphrase must be ${String(MIN_PASSPHRASE_BYTES)} to ${String(MAX_PASSPHRASE_BYTES)} bytes`,
@@ -157,7 +164,9 @@ export async function createKeyFile(o: {
     signerMod.wipe(walletKey);
   }
   const pubkey = await created.signer.getPublicKey();
+  const p2pk = created.signer.walletP2pk;
   await created.signer.lock();
+  if (p2pk === null) throw new RuntimeSetupError('the new key file has no wallet key');
   const fh = await open(o.keyFile, 'wx', 0o600).catch((err: unknown) => {
     const code = (err as { code?: unknown } | null)?.code;
     throw new RuntimeSetupError(
@@ -172,5 +181,5 @@ export async function createKeyFile(o: {
   } finally {
     await fh.close();
   }
-  return { pubkey };
+  return { pubkey, p2pk };
 }

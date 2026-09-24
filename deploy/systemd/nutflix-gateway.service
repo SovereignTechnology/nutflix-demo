@@ -31,6 +31,11 @@ WorkingDirectory=/opt/nutflix
 # for the same reason (MDWE-RESULTS.md §6). Guarded by packages/gateway/src/__tests__/cli.test.ts,
 # which runs the built entry with the flags read from this line.
 ExecStart=/usr/bin/node --jitless --no-experimental-websocket /opt/nutflix/packages/gateway/dist/index.js --config /etc/nutflix/gateway.json
+# The key file's passphrase (build-plan §7 "never env vars"): an encrypted systemd credential.
+# PID 1 decrypts it before exec into a private ramfs only this service sees; the gateway reads
+# $CREDENTIALS_DIRECTORY/gateway-key-passphrase and refuses to start without it (exit 78).
+# Create it once, and the key file with --keygen: README "Gateway key file and identity".
+LoadCredentialEncrypted=gateway-key-passphrase:/etc/credstore.encrypted/nutflix-gateway-key-passphrase
 Environment=NODE_ENV=production
 Environment=NODE_OPTIONS=
 UnsetEnvironment=NODE_EXTRA_CA_CERTS NODE_PATH NODE_DEBUG NODE_PENDING_DEPRECATION

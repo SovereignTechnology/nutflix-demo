@@ -203,3 +203,14 @@ declare module 'hyperswarm' {
 
   export default Hyperswarm;
 }
+
+// Test-only: a local DHT so integration tests never touch the public network (the seeder's
+// declaration of the same module, packages/seeder/src/types/holepunch.d.ts).
+declare module 'hyperdht/testnet.js' {
+  export interface Testnet {
+    readonly bootstrap: readonly { host: string; port: number }[];
+    destroy(): Promise<void>;
+  }
+  function createTestnet(size?: number): Promise<Testnet>;
+  export default createTestnet;
+}

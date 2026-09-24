@@ -11,13 +11,15 @@ import type {
   CashuP2pkPubkey,
   CoreKeyHex,
   MintUrl,
+  NostrEventId,
   NostrPubkey,
   PricePolicy,
+  RelayUrl,
   Sats,
 } from '@sovit/core';
-import { DEFAULT_BLOCK_SIZE } from '@sovit/core';
-import type { LogLevel, RateLimitConfig, SwarmConfig } from '@sovit/seeder';
-import { DEFAULT_RATE_LIMITS } from '@sovit/seeder';
+import { DEFAULT_BLOCK_SIZE, nostr } from '@sovit/core';
+import type { LogLevel, PayoutConfig, RateLimitConfig, SwarmConfig } from '@sovit/seeder';
+import { DEFAULT_PAYOUT_THRESHOLD_SATS, DEFAULT_RATE_LIMITS, MAX_RELAYS } from '@sovit/seeder';
 
 // --------------------------------------------------------------------------- shapes
 
@@ -124,6 +126,20 @@ export interface GatewayConfig {
   readonly logLevel: LogLevel;
   readonly flushEveryBlocks: number;
   readonly flushEveryMs: number;
+  /**
+   * The gateway's encrypted key file (`identity.keyFile`, default `<dataDir>/identity.key`): the
+   * Nostr key that signs HELLO and nutzaps, and the wallet key `identity.p2pk` names. The runtime
+   * refuses to start when `identity.pubkey` / `identity.p2pk` are not the key file's (ADR 0011).
+   */
+  readonly keyFile: string;
+  /** Where creator nutzaps (kind 9321), payouts and the gateway's kind 10019 go. */
+  readonly relays: readonly RelayUrl[];
+  /** The creator's Nostr pubkey: the `p` of nutzaps carrying `policy.creatorP2pk` proofs. */
+  readonly creatorPubkey: NostrPubkey;
+  /** Core key → video event id: the nutzap's `e` tag. */
+  readonly videoEvents: ReadonlyMap<CoreKeyHex, NostrEventId>;
+  /** Where the gateway's earnings go (the seeder's `payout`, ADR 0011 §7); `null` = they stay. */
+  readonly payout: PayoutConfig | null;
 }
 
 export const DEFAULT_HTTP_LIMITS: HttpLimits = {
@@ -196,6 +212,47 @@ export type ConfigResult =
 
 const HEX64 = /^[0-9a-f]{64}$/;
 const HEX66 = /^[0-9a-f]{66}$/;
+const P2PK = /^0[23][0-9a-f]{64}$/;
+const LOOPBACK = new Set(['localhost', '127.0.0.1', '[::1]']);
+const KEY_REFUSED =
+  'refused: key material is never read from the config file (the encrypted key file, deploy/systemd/README.md)';
+const IDENTITY_REFUSED: ReadonlyMap<string, string> = new Map([
+  [
+    'passphrase',
+    'refused: the key passphrase is never read from the config file — it is the systemd credential gateway-key-passphrase (deploy/systemd/README.md)',
+  ],
+  ['nsec', KEY_REFUSED],
+  ['secretKey', KEY_REFUSED],
+]);
+
+/** Relay URLs: 1..MAX_RELAYS, normalised, `wss://` (plain `ws://` only to loopback), unique. */
+function relayList(e: Errors, o: Record<string, unknown>, k: string, path: string): RelayUrl[] {
+  const v = o[k];
+  const out: RelayUrl[] = [];
+  if (!Array.isArray(v)) {
+    e.add(
+      `${path}.${k}`,
+      v === undefined
+        ? 'required (at least one relay for nutzaps and the kind 10019)'
+        : 'expected array of relay URLs',
+    );
+    return out;
+  }
+  if (v.length === 0 || v.length > MAX_RELAYS) {
+    e.add(`${path}.${k}`, `expected 1 to ${String(MAX_RELAYS)} relay URLs`);
+    return out;
+  }
+  v.forEach((u: unknown, i) => {
+    const at = `${path}.${k}[${String(i)}]`;
+    if (typeof u !== 'string' || nostr.normalizeRelayUrl(u) !== u)
+      e.add(at, 'expected a relay URL in normalised form (wss://host[/path], no trailing slash)');
+    else if (new URL(u).protocol === 'ws:' && !LOOPBACK.has(new URL(u).hostname))
+      e.add(at, 'plain ws:// is accepted only to a loopback relay; use wss://');
+    else if (out.includes(u as RelayUrl)) e.add(at, 'duplicate relay URL');
+    else out.push(u as RelayUrl);
+  });
+  return out;
+}
 const LOG_LEVELS: readonly LogLevel[] = ['debug', 'info', 'warn', 'error'];
 
 class Errors {
@@ -312,8 +369,16 @@ function policy(
   };
 }
 
+export interface ValidateOptions {
+  /**
+   * `--keygen` only: `identity.pubkey` / `identity.p2pk` may be absent (they come out of keygen);
+   * absent ones read as empty strings, which no runtime accepts.
+   */
+  readonly identityOptional?: boolean;
+}
+
 /** Validate a parsed JSON document into a `GatewayConfig`. Pure. */
-export function validateConfig(raw: unknown): ConfigResult {
+export function validateConfig(raw: unknown, opts: ValidateOptions = {}): ConfigResult {
   const e = new Errors();
   if (!isRecord(raw)) return { ok: false, errors: ['$: expected a JSON object'] };
   const P = '$';
@@ -331,11 +396,79 @@ export function validateConfig(raw: unknown): ConfigResult {
 
   const identRaw = sub(e, raw, 'identity', P);
   const pubkey = str(e, identRaw, 'pubkey', `${P}.identity`, '');
-  if (!HEX64.test(pubkey)) e.add(`${P}.identity.pubkey`, 'expected 64 lower-case hex chars');
+  const skip = (v: unknown): boolean => opts.identityOptional === true && v === undefined;
+  if (!HEX64.test(pubkey) && !skip(identRaw['pubkey']))
+    e.add(`${P}.identity.pubkey`, 'expected 64 lower-case hex chars');
   const p2pk = str(e, identRaw, 'p2pk', `${P}.identity`, '');
-  if (!HEX66.test(p2pk)) e.add(`${P}.identity.p2pk`, 'expected 66 lower-case hex chars');
+  if (!HEX66.test(p2pk) && !skip(identRaw['p2pk']))
+    e.add(`${P}.identity.p2pk`, 'expected 66 lower-case hex chars');
+  for (const k of Object.keys(identRaw)) {
+    const why = IDENTITY_REFUSED.get(k);
+    if (why !== undefined) e.add(`${P}.identity.${k}`, why);
+    else if (!['pubkey', 'p2pk', 'keyFile'].includes(k)) e.add(`${P}.identity[…]`, 'unknown key');
+  }
+  const keyFileRaw = str(e, identRaw, 'keyFile', `${P}.identity`, '');
+  if (keyFileRaw !== '' && !keyFileRaw.startsWith('/'))
+    e.add(`${P}.identity.keyFile`, 'expected an absolute path');
+  const keyFile = keyFileRaw !== '' ? keyFileRaw : `${dataDir.replace(/\/+$/, '')}/identity.key`;
 
-  const pol = policy(e, sub(e, raw, 'policy', P), `${P}.policy`, blockSize);
+  const basePolicyRaw = sub(e, raw, 'policy', P);
+  const pol = policy(e, basePolicyRaw, `${P}.policy`, blockSize);
+  const creatorPubkey = str(e, basePolicyRaw, 'creatorPubkey', `${P}.policy`, '');
+  if (!HEX64.test(creatorPubkey))
+    e.add(
+      `${P}.policy.creatorPubkey`,
+      "required: the creator's Nostr pubkey (64 lower-case hex chars), the recipient of its nutzaps",
+    );
+  else if (pol.creatorP2pk.slice(2) === creatorPubkey)
+    e.add(`${P}.policy.creatorPubkey`, 'must not be the key creatorP2pk names (NIP-61)');
+
+  const relays = relayList(e, raw, 'relays', P);
+  const videoEvents = new Map<CoreKeyHex, NostrEventId>();
+  const ve = sub(e, raw, 'videoEvents', P);
+  for (const [k, v] of Object.entries(ve)) {
+    if (!HEX64.test(k))
+      e.add(`${P}.videoEvents[…]`, 'keys must be 64 lower-case hex chars (core key)');
+    else if (typeof v !== 'string' || !HEX64.test(v))
+      e.add(
+        `${P}.videoEvents.${k.slice(0, 8)}…`,
+        'expected 64 lower-case hex chars (video event id)',
+      );
+    else videoEvents.set(k as CoreKeyHex, v as NostrEventId);
+  }
+  let payout: PayoutConfig | null = null;
+  if (raw['payout'] !== undefined) {
+    const po = sub(e, raw, 'payout', P);
+    for (const k of Object.keys(po))
+      if (!['pubkey', 'p2pk', 'thresholdSats', 'relays'].includes(k))
+        e.add(`${P}.payout[…]`, 'unknown key');
+    const opk = str(e, po, 'pubkey', `${P}.payout`, '');
+    if (!HEX64.test(opk))
+      e.add(`${P}.payout.pubkey`, "required: the owner's Nostr pubkey (64 lower-case hex chars)");
+    const op2 = str(e, po, 'p2pk', `${P}.payout`, '');
+    if (!P2PK.test(op2))
+      e.add(
+        `${P}.payout.p2pk`,
+        "required: the owner's wallet P2PK key (02/03 + 64 lower-case hex)",
+      );
+    else if (op2.slice(2) === opk)
+      e.add(`${P}.payout.p2pk`, 'must not be the key payout.pubkey names (NIP-61)');
+    const thresholdSats = int(
+      e,
+      po,
+      'thresholdSats',
+      `${P}.payout`,
+      DEFAULT_PAYOUT_THRESHOLD_SATS,
+      1,
+    );
+    const own = po['relays'] === undefined ? relays : relayList(e, po, 'relays', `${P}.payout`);
+    payout = {
+      pubkey: opk as NostrPubkey,
+      p2pk: op2 as CashuP2pkPubkey,
+      thresholdSats,
+      relays: own,
+    };
+  }
   const markupPercent = int(e, raw, 'markupPercent', P, 0, 0);
   const acceptedMints = strList(e, raw, 'acceptedMints', P, pol.mints, isMintUrl) as MintUrl[];
 
@@ -519,6 +652,11 @@ export function validateConfig(raw: unknown): ConfigResult {
       logLevel: logLevelRaw as LogLevel,
       flushEveryBlocks,
       flushEveryMs,
+      keyFile,
+      relays,
+      creatorPubkey: creatorPubkey as NostrPubkey,
+      videoEvents,
+      payout,
     },
   };
 }
@@ -541,6 +679,9 @@ const KNOWN_KEYS: ReadonlySet<string> = new Set([
   'logLevel',
   'flushEveryBlocks',
   'flushEveryMs',
+  'relays',
+  'videoEvents',
+  'payout',
 ]);
 
 /**
@@ -589,6 +730,7 @@ export function applyEnvOverrides(
 export function parseConfigText(
   text: string,
   env: (name: string) => string | undefined = () => undefined,
+  opts: ValidateOptions = {},
 ): ConfigResult {
   let raw: unknown;
   try {
@@ -596,7 +738,7 @@ export function parseConfigText(
   } catch {
     return { ok: false, errors: ['$: config file is not valid JSON'] };
   }
-  return validateConfig(applyEnvOverrides(raw, env));
+  return validateConfig(applyEnvOverrides(raw, env), opts);
 }
 
 /**

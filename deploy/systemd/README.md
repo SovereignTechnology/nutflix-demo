@@ -117,8 +117,29 @@ Precedence, per value: **`NUTFLIX_SEEDER_*` env > file > `STATE_DIRECTORY` (fill
 - **`http.trustProxy`.** Default `false`. Set `"http": { "trustProxy": true }` in the JSON **only when the listener is reachable solely through the reverse proxy** (loopback bind, or a firewall that admits only the proxy). With it on, the gateway takes the client address for rate-limit buckets from the LAST `X-Forwarded-For` entry — the one the proxy appends; the earlier entries are whatever the client sent (security review F14). This assumes exactly one proxy that appends (nginx `proxy_add_x_forwarded_for`; Caddy replaces the header, which also works). If anything other than the proxy can reach the port, a client can choose its own bucket by sending that header. The gateway never reads `X-Forwarded-Proto` (descriptor URLs come from `publicUrl` above).
 - **Proxy requirements** (from L3): forward `/`-rooted paths unchanged (Blossom endpoints must live at the root, BUD-01); pass `Upgrade`/`Connection` for `ws.path` (default `/ws`); disable request buffering and raise the proxy body limit to ≥ `http.maxUploadBytes` for `PUT /upload`; forward `Range` untouched.
 - **Paths**: state in `/var/lib/nutflix-<svc>` (`$STATE_DIRECTORY`), runtime sockets in `/run/nutflix-<svc>` (`$RUNTIME_DIRECTORY`), config in `/etc/nutflix` (`$CONFIGURATION_DIRECTORY`, read-only). The daemons should read those environment variables rather than hard-code paths.
-- **Key at rest** (§7: argon2id-derived passphrase key, never env vars): the seeder does this now (key file under the state directory, passphrase as the `seeder-key-passphrase` credential — "Seeder key file and passphrase" above). The gateway's runtime providers are still to come and should follow the same pattern. `Environment=` is deliberately not used for anything secret.
+- **Key at rest** (§7: argon2id-derived passphrase key, never env vars): both daemons use an encrypted key file under the state directory with its passphrase as a systemd credential — `seeder-key-passphrase` / `gateway-key-passphrase`. `Environment=` is deliberately not used for anything secret.
 - **TLS**: the gateway binds an unprivileged port on loopback/LAN and a reverse proxy terminates TLS. The proxy is where `_headers.txt` from `scripts/csp-sri.mjs` goes.
+
+### Gateway key file and identity
+
+The gateway runs on the same runtime as the seeder (ADR 0011 §9): an encrypted key file, the passphrase as the credential `gateway-key-passphrase`, a NIP-44 sealed wallet, nutzaps and optional `payout`. Its config names its identity publicly (`identity.pubkey`, `identity.p2pk`: the HELLO carries them), so `--keygen` prints both, and a start whose config does not match the key file is refused (viewers would lock payment to a key the gateway cannot redeem with).
+
+```sh
+install -d -m 0700 /etc/credstore.encrypted
+head -c 32 /dev/urandom | base64 -w0 \
+  | systemd-creds encrypt --name=gateway-key-passphrase - /etc/credstore.encrypted/nutflix-gateway-key-passphrase
+install -d -m 0700 -o nutflix-gateway -g nutflix-gateway /var/lib/nutflix-gateway
+# --keygen accepts a gateway.json without identity.pubkey/p2pk (they are what it prints)
+systemd-creds decrypt --name=gateway-key-passphrase /etc/credstore.encrypted/nutflix-gateway-key-passphrase - \
+  | sudo -u nutflix-gateway env STATE_DIRECTORY=/var/lib/nutflix-gateway \
+      node --jitless --no-experimental-websocket /opt/nutflix/packages/gateway/dist/index.js \
+      --keygen --config /etc/nutflix/gateway.json
+# → "key file created" … "publicKey":"…", "ownP2pk":"02…": put both into gateway.json's identity
+```
+
+New keys in `gateway.json` (same rules as the seeder's): `relays` ★ (1–8, `wss://`), `policy.creatorPubkey` ★, `identity.keyFile` (default `<dataDir>/identity.key`), `payout`, `videoEvents`.
+
+**Upstream fetching is not paced yet (security review F37):** the gateway does not yet hold its upstream requests to the seeders' unpaid window, so a client reading a blob the gateway does not have at full speed can outrun its payments and get the gateway cut — and banned — by upstream seeders. Serving blobs the gateway holds (uploads, mirrors) is unaffected. Until the fix lands, do not rely on the gateway to fetch from upstream seeders.
 
 ## Directive-by-directive
 

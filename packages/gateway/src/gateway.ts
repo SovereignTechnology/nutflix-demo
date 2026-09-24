@@ -36,6 +36,7 @@ import type {
 import { DEFAULT_WINDOW_BLOCKS, payProtocol } from '@sovit/core';
 import type {
   Logger,
+  PeerSession,
   PeerSessionInfo,
   SeedCore,
   SeederCrypto,
@@ -356,11 +357,17 @@ export class Gateway {
   }
 
   private wireSeeder(): void {
+    // pay/1 attaches once replication runs on a session: on a swarm connection the Protomux does not
+    // exist yet at `session-open`, so hooking that event left upstream swarm peers without pay/1.
+    this.unsubs.push(
+      this.seeder.onSessionReady((session) => {
+        this.onSessionReady(session);
+      }),
+    );
     this.unsubs.push(
       this.seeder.on((e: SeederEvent) => {
         switch (e.type) {
           case 'session-open':
-            this.onSessionOpen(e.session);
             break;
           case 'session-close': {
             const off = this.detachers.get(e.session.noiseKeyHex);
@@ -386,9 +393,8 @@ export class Gateway {
     );
   }
 
-  private onSessionOpen(info: PeerSessionInfo): void {
-    const session = this.seeder.session(info.noiseKeyHex);
-    if (!session) return;
+  private onSessionReady(session: PeerSession): void {
+    const info = session.info();
     if (this.deps.payProtocol === null) {
       this.log.warn('session without pay/1 (no protocol factory wired)', {
         noiseKey: info.noiseKeyHex,

@@ -43,6 +43,9 @@ export const GW_IDENTITY: GatewayDeps['identity'] = {
 };
 export const GW_P2PK = ('02' + 'ab'.repeat(32)) as CashuP2pkPubkey;
 export const CREATOR_P2PK = ('03' + 'cc'.repeat(32)) as CashuP2pkPubkey;
+/** The creator's Nostr pubkey (nutzap recipient) — a fixture, not a real identity. */
+export const CREATOR_PUBKEY = 'c1'.repeat(32) as NostrPubkey;
+export const RELAY = 'wss://relay.gw.test';
 
 export async function tmpDir(
   prefix = 'nutflix-l3-',
@@ -99,11 +102,13 @@ export function testConfig(dataDir: string, raw: Record<string, unknown> = {}): 
     diskCapBytes: 4 * 1024 * 1024,
     blockSize: BLOCK,
     identity: { pubkey: GW_PUBKEY, p2pk: GW_P2PK },
+    relays: [RELAY],
     policy: {
       satsPerBlock: 2,
       mints: [MINT_A, MINT_B],
       split: { seeder: 50, creator: 50 },
       creatorP2pk: CREATOR_P2PK,
+      creatorPubkey: CREATOR_PUBKEY,
     },
     acceptedMints: [MINT_A, MINT_B],
     rateLimits: { maxStreams: 16, maxStreamsPerKey: 4, connectsPerWindow: 100, windowMs: 1000 },

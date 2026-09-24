@@ -11,12 +11,18 @@ import {
   parseConfigText,
   validateConfig,
 } from '../config.js';
-import { CREATOR_P2PK, GW_P2PK, GW_PUBKEY, MINT_A } from './helpers.js';
+import { CREATOR_P2PK, CREATOR_PUBKEY, GW_P2PK, GW_PUBKEY, MINT_A, RELAY } from './helpers.js';
 
 const MINIMAL = {
   dataDir: '/var/lib/nutflix-gateway',
   identity: { pubkey: GW_PUBKEY, p2pk: GW_P2PK },
-  policy: { satsPerBlock: 3, mints: [MINT_A], creatorP2pk: CREATOR_P2PK },
+  relays: [RELAY],
+  policy: {
+    satsPerBlock: 3,
+    mints: [MINT_A],
+    creatorP2pk: CREATOR_P2PK,
+    creatorPubkey: CREATOR_PUBKEY,
+  },
 };
 
 describe('validateConfig', () => {
@@ -229,5 +235,101 @@ describe('validateConfig', () => {
       expect(both.errors).toEqual([expect.stringMatching(/^\$\.markupSatsPerBlock: /)]);
       expect(both.errors.join('\n')).not.toContain(' 2');
     }
+  });
+});
+
+describe('validateConfig: the runtime fields (key file, relays, creator, payout, videos)', () => {
+  const errs = (doc: Record<string, unknown>): readonly string[] => {
+    const r = validateConfig(doc);
+    return r.ok ? [] : r.errors;
+  };
+
+  it('defaults: key file in dataDir, the relays given, no payout, no videos; creatorPubkey carried', () => {
+    const r = validateConfig(MINIMAL);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.config.keyFile).toBe('/var/lib/nutflix-gateway/identity.key');
+    expect(r.config.relays).toEqual([RELAY]);
+    expect(r.config.creatorPubkey).toBe(CREATOR_PUBKEY);
+    expect(r.config.payout).toBeNull();
+    expect(r.config.videoEvents.size).toBe(0);
+  });
+
+  it('relays and policy.creatorPubkey are required; relays are normalised wss (ws only to loopback), unique, ≤ 8', () => {
+    const { relays: _r, ...noRelays } = MINIMAL;
+    expect(errs(noRelays)).toContain(
+      '$.relays: required (at least one relay for nutzaps and the kind 10019)',
+    );
+    expect(errs({ ...MINIMAL, policy: { ...MINIMAL.policy, creatorPubkey: undefined } })).toEqual([
+      "$.policy.creatorPubkey: required: the creator's Nostr pubkey (64 lower-case hex chars), the recipient of its nutzaps",
+    ]);
+    expect(
+      errs({ ...MINIMAL, policy: { ...MINIMAL.policy, creatorPubkey: CREATOR_P2PK.slice(2) } }),
+    ).toEqual(['$.policy.creatorPubkey: must not be the key creatorP2pk names (NIP-61)']);
+    const bad = errs({
+      ...MINIMAL,
+      relays: ['wss://SENTINEL.example', 'ws://sentinel-host.example', RELAY, RELAY],
+    });
+    expect(bad).toEqual([
+      '$.relays[0]: expected a relay URL in normalised form (wss://host[/path], no trailing slash)',
+      '$.relays[1]: plain ws:// is accepted only to a loopback relay; use wss://',
+      '$.relays[3]: duplicate relay URL',
+    ]);
+    expect(JSON.stringify(bad).toLowerCase()).not.toContain('sentinel');
+    expect(errs({ ...MINIMAL, relays: [] })).toEqual(['$.relays: expected 1 to 8 relay URLs']);
+    expect(validateConfig({ ...MINIMAL, relays: ['ws://127.0.0.1:7777'] }).ok).toBe(true);
+  });
+
+  it('identity: keyFile absolute; a passphrase or key in the file is refused and never echoed', () => {
+    const own = validateConfig({
+      ...MINIMAL,
+      identity: { ...MINIMAL.identity, keyFile: '/etc/nutflix/gw.key' },
+    });
+    expect(own.ok && own.config.keyFile).toBe('/etc/nutflix/gw.key');
+    expect(
+      errs({ ...MINIMAL, identity: { ...MINIMAL.identity, keyFile: 'relative.key' } }),
+    ).toEqual(['$.identity.keyFile: expected an absolute path']);
+    const refused = errs({
+      ...MINIMAL,
+      identity: { ...MINIMAL.identity, passphrase: 'SENTINEL', nsec: 'nsec1SENTINEL' },
+    });
+    expect(refused).toEqual([
+      '$.identity.passphrase: refused: the key passphrase is never read from the config file — it is the systemd credential gateway-key-passphrase (deploy/systemd/README.md)',
+      '$.identity.nsec: refused: key material is never read from the config file (the encrypted key file, deploy/systemd/README.md)',
+    ]);
+    expect(JSON.stringify(refused)).not.toContain('SENTINEL');
+    // --keygen parses without identity values; a normal start does not.
+    const { identity: _i, ...noIdentity } = MINIMAL;
+    expect(validateConfig(noIdentity, { identityOptional: true }).ok).toBe(true);
+    expect(validateConfig(noIdentity).ok).toBe(false);
+  });
+
+  it('payout: optional; the owner pubkey + P2PK required when present; threshold and relays default', () => {
+    const owner = '0e'.repeat(32);
+    const p2pk = `02${'0d'.repeat(32)}`;
+    const r = validateConfig({ ...MINIMAL, payout: { pubkey: owner, p2pk } });
+    expect(r.ok && r.config.payout).toEqual({
+      pubkey: owner,
+      p2pk,
+      thresholdSats: 1000,
+      relays: [RELAY],
+    });
+    expect(errs({ ...MINIMAL, payout: { pubkey: owner, p2pk: `02${owner}`, extra: 1 } })).toEqual([
+      '$.payout[…]: unknown key',
+      '$.payout.p2pk: must not be the key payout.pubkey names (NIP-61)',
+    ]);
+    expect(errs({ ...MINIMAL, payout: {} })).toEqual([
+      "$.payout.pubkey: required: the owner's Nostr pubkey (64 lower-case hex chars)",
+      "$.payout.p2pk: required: the owner's wallet P2PK key (02/03 + 64 lower-case hex)",
+    ]);
+  });
+
+  it('videoEvents: core key → event id', () => {
+    const core = 'e0'.repeat(32);
+    const r = validateConfig({ ...MINIMAL, videoEvents: { [core]: 'f0'.repeat(32) } });
+    expect(r.ok && [...r.config.videoEvents]).toEqual([[core, 'f0'.repeat(32)]]);
+    expect(errs({ ...MINIMAL, videoEvents: { nope: 'x' } })).toEqual([
+      '$.videoEvents[…]: keys must be 64 lower-case hex chars (core key)',
+    ]);
   });
 });

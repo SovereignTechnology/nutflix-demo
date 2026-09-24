@@ -39,6 +39,7 @@
   },
   "devDependencies": {
     "@types/ws": "8.18.1",
+    "hyperdht": "6.34.0",
     "nostr-tools": "2.25.2"
   }
 }

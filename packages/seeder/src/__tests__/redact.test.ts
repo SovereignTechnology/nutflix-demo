@@ -132,6 +132,17 @@ describe('redact (structured)', () => {
     expect(JSON.stringify(out)).not.toContain(OTHER);
   });
 
+  it("keeps the node's own P2PK key whole under `ownP2pk` only — well-formed keys only; 66-hex elsewhere is truncated", () => {
+    const own = `02${'ab'.repeat(32)}`;
+    expect(redact({ ownP2pk: own })).toEqual({ ownP2pk: own });
+    expect(redact({ p2pk: own })).not.toEqual({ p2pk: own });
+    expect(redact({ note: `key ${own}` })).not.toEqual({ note: `key ${own}` });
+    // Not a compressed key (prefix 04, or longer): no exception.
+    const junk = `04${'ab'.repeat(32)}`;
+    expect(redact({ ownP2pk: junk })).not.toEqual({ ownP2pk: junk });
+    expect(redact({ ownP2pk: `${own}00` })).not.toEqual({ ownP2pk: `${own}00` });
+  });
+
   it('handles errors, bytes, maps, sets, bigint, cycles-by-depth and never throws', () => {
     const err = new Error(`bad nsec1qqqqqqqqqqqqqqqq ${HEX64}`);
     const out = redact({

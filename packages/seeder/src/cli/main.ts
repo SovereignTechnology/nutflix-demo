@@ -216,8 +216,8 @@ async function keygen(config: DaemonConfig, logger: Logger, proc: SeederProcess)
       throw new RuntimeSetupError(
         `the passphrase on stdin must be at least ${String(MIN_PASSPHRASE_BYTES)} bytes`,
       );
-    const { pubkey } = await createKeyFile({ keyFile: config.keyFile, passphrase });
-    logger.info('key file created', { keyFile: config.keyFile, publicKey: pubkey });
+    const { pubkey, p2pk } = await createKeyFile({ keyFile: config.keyFile, passphrase });
+    logger.info('key file created', { keyFile: config.keyFile, publicKey: pubkey, ownP2pk: p2pk });
     return 0;
   } catch (err) {
     logger.error('keygen failed', { error: err });
