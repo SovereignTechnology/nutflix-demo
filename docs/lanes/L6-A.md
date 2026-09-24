@@ -136,44 +136,178 @@ packages/app-desktop/
   kept in the history entry and restored by Back, Library `playlistId`, Watch `startAtSec`,
   `onMiniPlayer`, `playlist`, Shorts `onPlaybackStart`, every screen the SAME wrapped adapter).
 
-### §5(b), D4, risk 5 — written, PENDING
+### §5(b), D4, risk 5 — GREEN (lane E2E-fix, 2026-09-23)
 
-`e2e/stage1.e2e.ts` and the fidelity spike `e2e/fidelity.e2e.ts` (+ `e2e/fidelity/*`) are complete
-but cannot run on the dev laptop until Cameron's D4 root step; `stage1` additionally needs L6-B and
-L6-C merged. Both are `node --test` suites (Node 24 type stripping, no vitest), skipped unless
+`e2e/stage1.e2e.ts` and the fidelity spike `e2e/fidelity.e2e.ts` (+ `e2e/fidelity/*`) run on
+the dev laptop since Cameron installed the AppArmor profile (D4), and each passes 3/3 in a row on
+the final build. Lane E2E-fix (`docs/lanes/E2E-fix.md`) lists the eight failures found on the
+way: two product bugs (the main → host argv, the dev-fixture boot race) and six suite/tooling
+assumptions. Both are `node --test` suites (Node 24 type stripping, no vitest), skipped unless
 `NUTFLIX_E2E=1`, and check their prerequisites first (the sandbox check REPORTS; it never works
-around). The Electron binary was extracted from the cached zip (`node node_modules/electron/
-install.js`); it was not launched.
+around).
 
 ## Running the Electron suites
 
-Prerequisites:
+Prerequisites (the dev laptop, verified 2026-09-23):
 
-1. **D4 (Cameron, root)** — one of:
-   `sudo chown root:root node_modules/electron/dist/chrome-sandbox && sudo chmod 4755 node_modules/electron/dist/chrome-sandbox`
-   (per checkout: `npm ci` replaces the file), or an AppArmor profile granting `userns` to
-   `…/node_modules/electron/dist/electron`, then run with `NUTFLIX_E2E_APPARMOR_PROFILE=1`. Never
-   `--no-sandbox`: main refuses to start with it.
-2. `node node_modules/electron/install.js` (extracts the cached zip; no download).
-3. `npm run build` + the bundle (`node packages/app-desktop/scripts/bundle.ts`), system `ffmpeg`.
-4. For `stage1` only: L6-B's host at `dist/host/main.js` and L6-C's worker merged, and the dev
-   fixture seam agreed (below).
+1. **D4 — Chromium's sandbox must be able to start.** Cameron installed
+   `/etc/apparmor.d/nutflix-electron`, which grants `userns` (the namespace sandbox under
+   `kernel.apparmor_restrict_unprivileged_userns=1`) to
+   `…/nutflix/{,.worktrees/*/}node_modules/electron/dist/electron`. Say so with
+   `NUTFLIX_E2E_APPARMOR_PROFILE=1` (a profile cannot be detected without root). The alternative,
+   per checkout (`npm ci` replaces the file): `sudo chown root:root
+   node_modules/electron/dist/chrome-sandbox && sudo chmod 4755
+   node_modules/electron/dist/chrome-sandbox`. **Never `--no-sandbox`, never
+   `chromiumSandbox: false`, never any sandbox-weakening switch**: main refuses them (exit 78).
+2. `node node_modules/electron/install.js` once per checkout (extracts the cached zip).
+3. `npm run build` (tsc + `ui.css` + the bundle) after every source change — `tsc -b` is
+   incremental, never hand-edit `dist/`. System `ffmpeg` (the fixtures are made per run).
+4. **An X11 display.** `DISPLAY` if the shell has one; otherwise the suites discover GNOME's
+   Xwayland themselves (`/tmp/.X11-unix/X<n>` owned by you + mutter's
+   `/run/user/<uid>/.mutter-Xwaylandauth.*`, whose PATH is passed as `XAUTHORITY` — the cookie is
+   never read). That X screen has no monitor (0×0), so the window opens clamped to its minimum size
+   and the suites resize it to 1280×800 after launch; nothing appears on the user's screen.
 
-Commands (from the repo root; run serially, never alongside CI — risk 9):
+Commands (from the repo root; serially, never alongside `npm run ci` — risk 9):
 
 ```
-NUTFLIX_E2E=1 node --test packages/app-desktop/e2e/fidelity.e2e.ts   # day 1: needs only D4
-NUTFLIX_E2E=1 node --test packages/app-desktop/e2e/stage1.e2e.ts     # after L6-B + L6-C
+NUTFLIX_E2E=1 NUTFLIX_E2E_APPARMOR_PROFILE=1 node --test packages/app-desktop/e2e/fidelity.e2e.ts  # ≈ 5 s
+NUTFLIX_E2E=1 NUTFLIX_E2E_APPARMOR_PROFILE=1 node --test packages/app-desktop/e2e/stage1.e2e.ts    # ≈ 11 s
 ```
 
-Display: each launch tries `--ozone-platform=headless` first, then `--ozone-platform=wayland` (if
-`WAYLAND_DISPLAY`), then `--ozone-platform=x11` (if `DISPLAY`, e.g. under `xvfb-run -a`); the error
-lists every strategy's failure. The fidelity run prints `FIDELITY FINDINGS {…}` — copy it into this
-document; it decides whether `contextBridge` passes Maps (the shell does not rely on it either way),
-whether a page `File`/`Blob` arrives as a preload-world instance (the preload checks by shape either
-way), and confirms `webUtils.getPathForFile` in a sandboxed preload, Range seeking through
-`protocol.handle` + `net.fetch`, an ESM `utilityProcess`, `bare-sidecar` from a `utilityProcess`, and
-the CSP header blocking inline script.
+Both at once, serially, from `packages/app-desktop` (≈ 15 s):
+`NUTFLIX_E2E=1 NUTFLIX_E2E_APPARMOR_PROFILE=1 node --test --test-concurrency=1 e2e/fidelity.e2e.ts e2e/stage1.e2e.ts`. `NUTFLIX_E2E_LOG=<file>` appends the app's own log lines
+(main, host, worker — already redacted) to a file for triage.
+
+What `e2e/support.ts` guarantees on every launch:
+
+- **`chromiumSandbox: true`** — playwright-core's `_electron.launch` otherwise PREPENDS
+  `--no-sandbox` on Linux (the first fidelity attempt reported `noSandboxSwitch: true` because of
+  it), and then **asserts the sandbox is really on** before any test runs: no bypass switch
+  (`no-sandbox`, `disable-gpu-sandbox`, `no-zygote`, `disable-setuid-sandbox`,
+  `disable-namespace-sandbox`, `disable-seccomp-filter-sandbox`) in main's command line or argv,
+  and the window's renderer has `Seccomp: 2` and its own PID namespace (`NSpid`, both from
+  `/proc/<pid>/status`). A regression stops the suite with "the Chromium sandbox is NOT on".
+- **Display = X11 only by default.** `--ozone-platform=headless` SEGFAULTS Electron 44.2.0 in the
+  main process at `new BrowserWindow` (a null function call; reproduced with a 10-line app, sandbox
+  on or off, with or without `--use-angle=swiftshader`/`--disable-gpu`), and
+  `--ozone-platform=wayland` hangs before `ready`. Both remain explicit opt-ins for a later
+  Electron (`NUTFLIX_E2E_DISPLAY=headless|wayland`); the default never tries them.
+- **Fixtures**: 90 s lavfi `testsrc`/`testsrc2` at a forced 2 Mbit/s (CBR x264, `nal-hrd=cbr`,
+  keyframe every 2 s, `+faststart`, `ultrafast`: ≈ 2 s each, ≈ 22.5 MB ≈ 343 blocks). The design's
+  6 s clip was one 64 KiB block: no second Range, barely a rate, and the video had ended before the
+  mini-player steps.
+
+The fidelity run prints `FIDELITY FINDINGS {…}` (below: "Fidelity findings").
+
+## Fidelity findings (first run, 2026-09-23)
+
+Electron 44.2.0 (Chrome 152, Node 24.20.0), sandboxed, GNOME Xwayland `:0`; the output of the last
+of three consecutive green runs of `fidelity.e2e.ts` (temp directory name elided):
+
+```json
+{
+  "rangeRequests": [
+    "bytes=0-",
+    "bytes=524288-",
+    "bytes=917504-",
+    "bytes=14974976-"
+  ],
+  "statuses": [
+    206,
+    206,
+    206,
+    206
+  ],
+  "noSandboxSwitch": false,
+  "webPreferences": {
+    "allowRunningInsecureContent": false,
+    "contextIsolation": true,
+    "disableDialogs": false,
+    "disablePopups": false,
+    "enableBlinkFeatures": "",
+    "experimentalFeatures": false,
+    "javascript": true,
+    "nodeIntegration": false,
+    "nodeIntegrationInSubFrames": false,
+    "nodeIntegrationInWorker": false,
+    "safeDialogs": false,
+    "safeDialogsMessage": "",
+    "sandbox": true,
+    "webSecurity": true,
+    "webviewTag": false
+  },
+  "utility": {
+    "esm": true,
+    "node": "24.20.0",
+    "bare": "ping"
+  },
+  "page": {
+    "mapIsMap": true,
+    "mapShape": "[object Map]",
+    "mapEntries": [
+      [
+        "https://mint.example",
+        21
+      ]
+    ],
+    "wireMap": {
+      "$map": [
+        [
+          "https://mint.example",
+          21
+        ]
+      ]
+    },
+    "bytesIsUint8Array": true,
+    "errorName": "Error",
+    "errorMessage": "no-seeders: nobody is seeding",
+    "errorCode": null,
+    "sessionSid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "sessionPause": "paused",
+    "callbackValue": 7,
+    "unsubscribe": "unsubscribed",
+    "constructedFilePath": "",
+    "kinds": {
+      "fileIsFile": true,
+      "blobIsBlob": true
+    },
+    "inlineScriptRan": false,
+    "hasRequire": "undefined",
+    "pickedPath": "/tmp/nf-fidelity-<random>/fixture.mp4",
+    "seekedTo": 60.000271,
+    "videoWidth": 640
+  },
+  "launch": {
+    "display": "x11 (GNOME Xwayland :0)",
+    "sandbox": {
+      "bypassSwitches": [],
+      "rendererSeccompFilter": true,
+      "rendererPidNamespace": true
+    }
+  }
+}
+```
+
+- **Maps across `contextBridge`**: a `Map` arrives as a `Map` (`mapIsMap: true`). The shell does not
+  rely on it — results stay `$map` on the wire and `rehydrate` rebuilds them (no change needed).
+- **Errors**: the message crosses with its `"<code>: "` prefix; the custom `.code` is dropped
+  (`errorCode: null`) — which is why `rehydrate.ts` rebuilds `.code` from the prefix.
+- **Functions and callbacks**: an object of functions (a PlaySession) and a callback subscription
+  are proxied and callable (`sessionPause`, `callbackValue: 7`, `unsubscribe`).
+- **`File` as a preload-world instance**: yes — a page `File`/`Blob` is `instanceof` the preload
+  world's `File`/`Blob` (`kinds`). The preload's shape check (deviation 11) stays as defence.
+- **`webUtils.getPathForFile` in a sandboxed preload**: works — a picked file gives its real path; a
+  page-constructed `File` gives `''`, so SE-1's refusal holds.
+- **Range seeking via `protocol.handle` + `net.fetch`**: works — every answer is a 206 through
+  `nf-media:`, and the seek to 60 s issues its own `bytes=14974976-`. Chromium also re-requests near
+  the start by itself (`bytes=524288-`, `bytes=917504-`); the suites no longer count those as the
+  seek's request.
+- **ESM `utilityProcess`**: starts (`esm: true`, Node 24.20.0).
+- **`bare-sidecar` from a `utilityProcess`**: works — Bare echoes `ping` over its IPC pipe.
+- **CSP blocks inline script**: yes (`inlineScriptRan: false`); the page has no `require`.
+- **Sandbox posture** (checked since E2E-fix): no bypass switch; the renderer runs under a
+  seccomp-bpf filter in its own PID namespace; `webPreferences.sandbox: true`.
 
 ## Deviations from the design (and why)
 
@@ -224,10 +358,12 @@ the CSP header blocking inline script.
 
 **L6-B (host)**
 
-- Entry: main forks **`dist/host/main.js`** (`HOST_ENTRY` in `main/main.ts`) as an ESM
+- Entry: main forks **`dist/host/main.js`** (`HOST_ENTRY` in `main/args.ts`) as an ESM
   `utilityProcess` with `serviceName: 'nutflix-host'`, `stdio: 'inherit'` and argv
-  `--user-data=<userData>` plus `--dev-mocks` / `--dev-fixtures` when main got them. Say if you
-  want another path or flag spelling.
+  `--user-data-dir=<userData>` `--worker-entry=<dist>/worker/entry.js` plus `--dev-mocks` /
+  `--dev-fixtures` when main got them — exactly what L6-B's `parseHostArgs` accepts. (It sent
+  `--user-data=<userData>` until lane E2E-fix; the host exited 2 on it. `host-link.test.ts` now
+  round-trips main's argv through the host's real parser.)
 - Every `HostOut` is `isHostOut`-checked; anything else is dropped (logged as a count). Media-link
   tokens must match `[A-Za-z0-9_-]{16,128}` — make them ≥ 128 bits random (the `nf-media:` proxy
   answers any registered token; the token is the only thing between another page and the bytes).
@@ -254,7 +390,8 @@ Electron process (inherited by host and worker) and expects `--dev-fixtures` to 
 playable videos (design §5a `fixture-catalog.ts` + `fixtures-net.ts`). Adjust whichever side when
 B and C are merged; the suite is written to be edited then.
 
-**Orchestrator — `package.json` changes this lane needs (not made: outside the allowlist)**
+**Orchestrator — `package.json` changes this lane needed** (made on main since; E2E-fix asks for
+`--test-concurrency=1` in `test:e2e`, see `docs/lanes/E2E-fix.md`)
 
 - `packages/app-desktop/package.json` scripts:
   - `"bundle": "node scripts/bundle.ts"`
@@ -303,8 +440,10 @@ post-commit sweep or the watch→watch remount rule each fails at least one test
 
 ## Open questions / decisions
 
-1. **L6-B host entry path and flags** (above) — confirm or tell this lane the real ones before merge.
-2. **Dev fixture seam for §5(b)** (`NUTFLIX_DEV_FIXTURES_JSON`) — agree between L6-B/L6-C/L6-A.
+1. ~~L6-B host entry path and flags~~ — resolved by lane E2E-fix (main now sends the host's
+   spelling; round-trip tested).
+2. ~~Dev fixture seam for §5(b)~~ — `NUTFLIX_DEV_FIXTURES_JSON` as merged by L6-C; the host
+   catalogue now waits for the worker's first `dev.fixtures` (E2E-fix).
 3. **Toasts**: add `onToast` to Library and Studio (screen change) so the shell owns one stack?
 4. **Shorts element pause** (deviation 13): should Shorts listen to its element's `pause` like Watch?
 5. **Residual SE-1 risk**: a fully compromised RENDERER PROCESS (not page script — context
