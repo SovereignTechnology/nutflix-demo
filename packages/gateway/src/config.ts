@@ -87,7 +87,16 @@ export interface BlossomConfig {
   readonly denyPubkeys: readonly NostrPubkey[];
   /** Require a kind-24242 token on `HEAD /upload` (default false: tokens are single-use). */
   readonly authHeadUpload: boolean;
+  /**
+   * Bytes one pubkey may own on this gateway — blobs it uploaded or mirrored, or claimed by
+   * uploading an existing one (security review F15). `null` = no quota. Default
+   * `DEFAULT_MAX_BYTES_PER_PUBKEY`; the disk cap still bounds everyone together.
+   */
+  readonly maxBytesPerPubkey: number | null;
 }
+
+/** Four full-size uploads (`maxUploadBytes` defaults to 2 GiB). */
+export const DEFAULT_MAX_BYTES_PER_PUBKEY = 8 * 1024 ** 3;
 
 export interface UpstreamConfig {
   /** Pay after every N verified blocks from a peer (contiguous run). Must be ≤ the window. */
@@ -193,6 +202,7 @@ export const DEFAULT_BLOSSOM: BlossomConfig = {
   allowPubkeys: [],
   denyPubkeys: [],
   authHeadUpload: false,
+  maxBytesPerPubkey: DEFAULT_MAX_BYTES_PER_PUBKEY,
 };
 
 export const DEFAULT_UPSTREAM: UpstreamConfig = {
@@ -596,6 +606,11 @@ export function validateConfig(raw: unknown, opts: ValidateOptions = {}): Config
     allowPubkeys: strList(e, b, 'allowPubkeys', `${P}.blossom`, [], isHex64) as NostrPubkey[],
     denyPubkeys: strList(e, b, 'denyPubkeys', `${P}.blossom`, [], isHex64) as NostrPubkey[],
     authHeadUpload: bool(e, b, 'authHeadUpload', `${P}.blossom`, B.authHeadUpload),
+    // Absent = the default quota; an explicit `null` = none (the operator's choice).
+    maxBytesPerPubkey:
+      b['maxBytesPerPubkey'] === null
+        ? null
+        : int(e, b, 'maxBytesPerPubkey', `${P}.blossom`, B.maxBytesPerPubkey ?? 0, 1),
   };
 
   const u = sub(e, raw, 'upstream', P);

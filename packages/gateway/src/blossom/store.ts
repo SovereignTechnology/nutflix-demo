@@ -91,6 +91,10 @@ export class OwnerIndex {
     if (changed) this.persist();
   }
 
+  owns(pubkey: NostrPubkey, sha256: string): boolean {
+    return this.map.get(pubkey)?.has(sha256) === true;
+  }
+
   list(pubkey: NostrPubkey): readonly Sha256Hex[] {
     return [...(this.map.get(pubkey) ?? [])] as Sha256Hex[];
   }

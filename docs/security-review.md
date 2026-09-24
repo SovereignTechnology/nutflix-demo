@@ -37,7 +37,7 @@ directories" for this list. Each fix carries a test that fails without it, excep
 | F12 | **Fixed (seeder daemon)** (`stage-3/seeder-runtime`) | `persistPending` (synchronous, before the ACK) + `restorePending`; the daemon writes `wallet/pending.json` synchronously and atomically (fsync) and a new runtime redeems it — integration-tested with a crash before the flush. Gateway and desktop: with their runtimes |
 | F13 | **Fixed** | Peer identifiers in log fields become a per-process alias (`peer#17`) |
 | F14 | **Fixed** | `trustProxy` reads the rightmost `X-Forwarded-For` entry |
-| F15 | **Fixed** | Uploads over 8 MiB must send `X-SHA-256` (no unauthenticated spooling of large bodies); default MIME allowlist (F3). Open: per-pubkey quota; whether uploads should default to allow-list-only (decision) |
+| F15 | **Fixed** | Uploads over 8 MiB must send `X-SHA-256` (no unauthenticated spooling of large bodies); default MIME allowlist (F3); a per-pubkey byte quota (`blossom.maxBytesPerPubkey`, default 8 GiB, `null` = none) on upload, mirror and authenticated `HEAD`, checked before a declared body is spooled, with in-flight bytes held (`stage-3/upload-quota`). Open: whether uploads should default to allow-list-only (decision) |
 | F16 | **Fixed** | The gateway loads `node:http` via `createRequire`; the unit gains `--no-experimental-websocket`; a spawn test runs the built entry with the unit's flags (verified on Node 22.22.0) |
 | F17 | **Open** | NUT-20 locked quotes need a signer method for mint requests — Stage 3 |
 | F18 | **Partly fixed** | The distinctive user agent is gone. Open: hash-addressed images only by default (decision) |
@@ -598,7 +598,7 @@ finding's section above plus its row in §0. **Filing waits for Cameron's go-ahe
 | [Done] F37: the gateway's upstream fetches are paced (ADR 0011 §11) |
 | [Done] F10/F11/F12/F31 hooks in the desktop runtime — the worker's seeder engine persists seen secrets and pending PAYs and asks the host for `checkSpent` / `spentByUs` (ADR 0012) |
 | [Medium] F31: NUT-13 deterministic outputs + NUT-09 restore |
-| [Medium] F15: per-pubkey upload quota |
+| [Done] F15: per-pubkey upload quota (`blossom.maxBytesPerPubkey`) |
 | [Medium] F17: NUT-20 locked mint quotes; opaque quote handles over IPC |
 | [Medium] F4: execute auto top-ups with per-top-up and per-day caps |
 | [Low] F21: packaging — compile out dev flags, set Electron fuses |

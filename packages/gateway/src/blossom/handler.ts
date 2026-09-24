@@ -29,6 +29,8 @@ import { resolveRange } from './range.js';
 import type { OwnerIndex, ReportStore, StoredReport } from './store.js';
 
 export const UPLOAD_SPOOL_DIR = 'upload-spool' as const;
+/** F15: what a pubkey over `blossom.maxBytesPerPubkey` is told. */
+export const QUOTA_REASON = 'upload quota exceeded for this pubkey';
 const HEX64 = /^[0-9a-f]{64}$/;
 const BLOB_PATH = /^\/([0-9a-fA-F]{64})(?:\.[A-Za-z0-9]{1,16})?$/;
 const LIST_PATH = /^\/list\/([0-9a-fA-F]{64})$/;
@@ -439,6 +441,40 @@ export class BlossomHandler {
 
   // ------------------------------------------------------------------ BUD-02 / BUD-06
 
+  /** F15: bytes of uploads in flight, per pubkey (two at once cannot both slip under the quota). */
+  private readonly reserved = new Map<string, number>();
+
+  /** Bytes `pubkey` owns now (blobs still stored) plus its uploads in flight. */
+  private usage(pubkey: NostrPubkey): number {
+    let n = this.reserved.get(pubkey) ?? 0;
+    for (const sha of this.owners.list(pubkey)) n += this.seeder.blob(sha)?.size ?? 0;
+    return n;
+  }
+
+  /**
+   * Would `bytes` more (for `sha`, `null` = not known yet) take `pubkey` over its quota? A blob it
+   * already owns costs nothing.
+   */
+  private overQuota(pubkey: NostrPubkey, sha: string | null, bytes: number): boolean {
+    const quota = this.cfg.maxBytesPerPubkey;
+    if (quota === null) return false;
+    if (sha !== null && this.owners.owns(pubkey, sha)) return false;
+    return this.usage(pubkey) + bytes > quota;
+  }
+
+  /** Hold `bytes` of `pubkey`'s quota while an upload runs; the returned function frees them. */
+  private reserve(pubkey: NostrPubkey, bytes: number): () => void {
+    this.reserved.set(pubkey, (this.reserved.get(pubkey) ?? 0) + bytes);
+    let done = false;
+    return () => {
+      if (done) return;
+      done = true;
+      const left = (this.reserved.get(pubkey) ?? 0) - bytes;
+      if (left > 0) this.reserved.set(pubkey, left);
+      else this.reserved.delete(pubkey);
+    };
+  }
+
   private spoolPath(): string {
     return path.join(this.spoolDir, `up-${String(this.now())}-${String(++this.spoolSeq)}.part`);
   }
@@ -474,6 +510,10 @@ export class BlossomHandler {
     if (this.cfg.authHeadUpload) {
       const pk = await this.authorize(req, res, 'upload', sha as Sha256Hex);
       if (pk === null) return;
+      if (this.overQuota(pk, sha, len)) {
+        fail(res, 413, QUOTA_REASON);
+        return;
+      }
     }
     if (!this.seeder.hasBlob(sha) && this.seeder.diskCap.freeBytes < len) {
       fail(res, 507, 'insufficient storage');
@@ -523,15 +563,40 @@ export class BlossomHandler {
     }
     // With a claimed hash the token is checked BEFORE any body byte is accepted.
     let pubkey: NostrPubkey | null = null;
+    let release: () => void = () => undefined;
     if (claimed !== undefined) {
       pubkey = await this.authorize(req, res, 'upload', claimed as Sha256Hex);
       if (pubkey === null) return;
+      // F15: the quota is checked, and the bytes held, before any body byte is accepted.
+      if (this.overQuota(pubkey, claimed, declared)) {
+        fail(res, 413, QUOTA_REASON);
+        return;
+      }
       if (this.seeder.diskCap.freeBytes < declared && !this.seeder.hasBlob(claimed)) {
         fail(res, 507, 'insufficient storage');
         return;
       }
+      release = this.reserve(pubkey, declared);
     }
+    try {
+      await this.storeUpload(req, res, { declared, claimed, mime, pubkey });
+    } finally {
+      release();
+    }
+  }
 
+  private async storeUpload(
+    req: IncomingMessage,
+    res: Res,
+    o: {
+      readonly declared: number;
+      readonly claimed: string | undefined;
+      readonly mime: string;
+      readonly pubkey: NostrPubkey | null;
+    },
+  ): Promise<void> {
+    const { declared, claimed, mime } = o;
+    let pubkey = o.pubkey;
     const tmp = this.spoolPath();
     const spooled = await spoolToFile(req, tmp, {
       maxBytes: this.limits.maxUploadBytes,
@@ -553,8 +618,15 @@ export class BlossomHandler {
         return;
       }
       const sha = spooled.sha256 as Sha256Hex;
-      pubkey ??= await this.authorize(req, res, 'upload', sha);
-      if (pubkey === null) return;
+      if (pubkey === null) {
+        // A small upload without X-SHA-256: authorised (and its quota checked) now.
+        pubkey = await this.authorize(req, res, 'upload', sha);
+        if (pubkey === null) return;
+        if (this.overQuota(pubkey, sha, spooled.size)) {
+          fail(res, 413, QUOTA_REASON);
+          return;
+        }
+      }
 
       // Dedupe / cap are decided HERE, before `putFile`: the seeder's `putStream` opens
       // its second read stream eagerly and never consumes it on those two early returns,
@@ -659,6 +731,10 @@ export class BlossomHandler {
 
     const existing = this.seeder.blob(sha);
     if (existing) {
+      if (this.overQuota(pubkey, sha, existing.size)) {
+        fail(res, 413, QUOTA_REASON);
+        return;
+      }
       this.owners.add(pubkey, sha);
       json(res, 200, this.descriptor(existing));
       return;
@@ -683,6 +759,31 @@ export class BlossomHandler {
       fail(res, 415, 'blob type not accepted');
       return;
     }
+    // F15: a declared length is checked and held before fetching; an undeclared one after.
+    const hold = origin.contentLength ?? 0;
+    if (this.overQuota(pubkey, sha, hold)) {
+      fail(res, 413, QUOTA_REASON);
+      return;
+    }
+    const release = this.reserve(pubkey, hold);
+    try {
+      await this.storeMirror(res, { origin, sha, mime, pubkey, target });
+    } finally {
+      release();
+    }
+  }
+
+  private async storeMirror(
+    res: Res,
+    o: {
+      readonly origin: NonNullable<Awaited<ReturnType<MirrorFetch>>>;
+      readonly sha: Sha256Hex;
+      readonly mime: string;
+      readonly pubkey: NostrPubkey;
+      readonly target: URL;
+    },
+  ): Promise<void> {
+    const { origin, sha, mime, pubkey, target } = o;
     const tmp = this.spoolPath();
     const spooled = await spoolIterableToFile(origin.body, tmp, this.limits.maxUploadBytes);
     if (!spooled.ok) {
@@ -693,6 +794,10 @@ export class BlossomHandler {
     try {
       if (spooled.sha256 !== sha) {
         fail(res, 409, 'mirrored blob hash does not match url');
+        return;
+      }
+      if (origin.contentLength === null && this.overQuota(pubkey, sha, spooled.size)) {
+        fail(res, 413, QUOTA_REASON);
         return;
       }
       if (this.seeder.diskCap.freeBytes < spooled.size) {

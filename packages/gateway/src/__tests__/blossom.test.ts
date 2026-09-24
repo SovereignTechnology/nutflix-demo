@@ -16,6 +16,7 @@ import { finalizeEvent, generateSecretKey, getPublicKey } from 'nostr-tools/pure
 import { BlossomAuthImpl } from '../auth/blossom-auth.js';
 import {
   MAX_UNHASHED_UPLOAD_BYTES,
+  QUOTA_REASON,
   UPLOAD_SPOOL_DIR,
   servedAs,
   sha256FromUrlPath,
@@ -150,6 +151,73 @@ function uploadHeaders(
     ...extra,
   };
 }
+
+describe('F15: a per-pubkey upload quota', () => {
+  const QUOTA = 6 * BLOCK;
+  const quotaRig = (auth: FakeBlossomAuth) =>
+    rig({
+      auth,
+      raw: { blossom: { publicUrl: 'http://gw.test', maxBytesPerPubkey: QUOTA } },
+    });
+  const put = (r: Rig, body: Uint8Array, hashed = true) =>
+    request(`${r.url}/upload`, {
+      method: 'PUT',
+      headers: uploadHeaders(body, hashed ? { 'X-SHA-256': sha(body) } : {}),
+      body: Buffer.from(body),
+    });
+
+  it('refuses the upload that would pass the quota, BEFORE its body is spooled; owned blobs cost nothing again', async () => {
+    const auth = new FakeBlossomAuth({ ok: true, pubkey: UPLOADER });
+    const r = await quotaRig(auth);
+    const a = fixtureBytes(4, 1);
+    expect((await put(r, a)).status).toBe(201);
+    expect((await put(r, a)).status).toBe(200); // already owned: no charge
+    const b = fixtureBytes(3, 2); // 4 + 3 > 6 blocks
+    const refused = await put(r, b);
+    expect(refused.status).toBe(413);
+    expect(refused.headers['x-reason']).toBe(QUOTA_REASON);
+    expect(r.gateway.seeder.hasBlob(sha(b))).toBe(false);
+    expect(await readdir(path.join(r.config.dataDir, UPLOAD_SPOOL_DIR))).toEqual([]);
+    expect((await put(r, fixtureBytes(2, 3))).status).toBe(201); // 4 + 2 = 6: fits
+  });
+
+  it('counts per pubkey, and also stops small uploads that skip X-SHA-256', async () => {
+    const auth = new FakeBlossomAuth({ ok: true, pubkey: UPLOADER });
+    const r = await quotaRig(auth);
+    expect((await put(r, fixtureBytes(6, 4))).status).toBe(201);
+    expect((await put(r, fixtureBytes(1, 5), false)).status).toBe(413);
+    auth.defaultResult = { ok: true, pubkey: pubkey('someone-else') };
+    expect((await put(r, fixtureBytes(1, 5), false)).status).toBe(201);
+  });
+
+  it('claiming an existing blob by uploading it counts toward the quota', async () => {
+    const auth = new FakeBlossomAuth({ ok: true, pubkey: pubkey('first') });
+    const r = await quotaRig(auth);
+    const big = fixtureBytes(5, 6);
+    expect((await put(r, big)).status).toBe(201);
+    auth.defaultResult = { ok: true, pubkey: UPLOADER };
+    expect((await put(r, fixtureBytes(2, 7))).status).toBe(201);
+    expect((await put(r, big)).status).toBe(413); // 2 + 5 > 6 for UPLOADER
+  });
+
+  it('two uploads at once cannot both slip under the quota (in-flight bytes are held)', async () => {
+    const auth = new FakeBlossomAuth({ ok: true, pubkey: UPLOADER });
+    const r = await quotaRig(auth);
+    const [a, b] = await Promise.all([put(r, fixtureBytes(4, 8)), put(r, fixtureBytes(4, 9))]);
+    expect([a.status, b.status].sort()).toEqual([201, 413]);
+  });
+
+  it('`null` lifts the quota; the default is 8 GiB', async () => {
+    const auth = new FakeBlossomAuth({ ok: true, pubkey: UPLOADER });
+    const off = await rig({
+      auth,
+      raw: { blossom: { publicUrl: 'http://gw.test', maxBytesPerPubkey: null } },
+    });
+    expect(off.config.blossom.maxBytesPerPubkey).toBeNull();
+    const dflt = await rig({ auth });
+    expect(dflt.config.blossom.maxBytesPerPubkey).toBe(8 * 1024 ** 3);
+  });
+});
 
 describe('BUD-02 PUT /upload through the BlossomAuth boundary', () => {
   it('201 + descriptor when the injected auth accepts; the gateway becomes the first seeder; /list sees it', async () => {
@@ -439,6 +507,38 @@ describe('BUD-06 HEAD /upload', () => {
 describe('BUD-04 PUT /mirror', () => {
   const blob = fixtureBytes(3, 11);
   const blobSha = sha(blob);
+
+  it('F15: a mirror counts toward the quota — declared lengths before the fetch', async () => {
+    const auth = new FakeBlossomAuth({ ok: true, pubkey: UPLOADER });
+    let fetched = 0;
+    const r = await rig({
+      auth,
+      deps: {
+        mirrorFetch: (url: URL) => {
+          fetched++;
+          return fetchOk(url);
+        },
+      },
+      raw: {
+        blossom: {
+          publicUrl: 'http://gw.test',
+          allowMirror: true,
+          mirrorAllowedHosts: ['cdn.example'],
+          maxBytesPerPubkey: 2 * BLOCK,
+        },
+      },
+    });
+    const res = await request(`${r.url}/mirror`, {
+      method: 'PUT',
+      headers: { Authorization: 'Nostr x' },
+      body: JSON.stringify({ url: `https://cdn.example/${blobSha}.mp4` }),
+    });
+    expect(res.status).toBe(413);
+    expect(res.headers['x-reason']).toBe(QUOTA_REASON);
+    expect(fetched).toBe(1); // the origin answered its length; nothing was spooled or stored
+    expect(r.gateway.seeder.hasBlob(blobSha)).toBe(false);
+  });
+
   const fetchOk = (url: URL) =>
     Promise.resolve(
       url.pathname.includes(blobSha)
