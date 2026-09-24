@@ -3,9 +3,10 @@
  *
  *   NUTFLIX_E2E=1 node --test packages/app-desktop/e2e/stage1.e2e.ts
  *
- * PENDING until (1) Cameron's D4 root step lets Chromium's sandbox start on the dev laptop and
- * (2) lanes L6-B (host) and L6-C (worker) are merged — see docs/lanes/L6-A.md "Running the
- * Electron suites". Prerequisites are checked first and reported, never worked around.
+ * Needs D4 (Cameron's AppArmor `userns` profile: run with NUTFLIX_E2E_APPARMOR_PROFILE=1), an
+ * X11 display (support.ts `displayStrategies`), `npm run build` and the system ffmpeg — see
+ * docs/lanes/L6-A.md "Running the Electron suites". Prerequisites are checked first and
+ * reported, never worked around.
  *
  * Launches `dist/main/main.js --dev-mocks --dev-fixtures --user-data-dir <tmp> --e2e-hooks`
  * with two lavfi fixture MP4s and asserts: the security posture (webPreferences, no
@@ -15,13 +16,14 @@
  * Watch → Watch leaves exactly one open session (main's media-link count is 1).
  */
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { after, before, describe, it } from 'node:test';
 import type { ElectronApplication, Page } from 'playwright-core';
 import {
   E2E,
+  FIXTURE,
   KEY_TREE_SOURCE,
   PKG,
   electronBinary,
@@ -32,17 +34,26 @@ import {
 } from './support.ts';
 
 /**
- * The dev-fixture seam this suite assumes (design §5a `host/catalog/fixture-catalog.ts` +
- * worker `dev/fixtures-net.ts`): with `--dev-fixtures`, the host/worker publish each entry as a
- * playable video. ADJUST to what L6-B/L6-C merged before the first run.
+ * The dev-fixture seam (design §5a `host/catalog/fixture-catalog.ts` + worker
+ * `dev/fixtures-net.ts`, as merged): with `--dev-fixtures`, the worker publishes each entry as a
+ * playable video served by its in-process seeders S1 (first half) + S2 (second half).
  */
 const FIXTURE_ENV = 'NUTFLIX_DEV_FIXTURES_JSON';
 const A = { title: 'E2E fixture A', description: 'See [the docs](https://example.com/docs).' };
 const B = { title: 'E2E fixture B', description: 'The second fixture.' };
 
+/**
+ * Where the seek lands: past the gate's lookahead from `bytes=0-` (the default 30 s prefetch
+ * window plus the paced allowance, L6-C deviation 1) and past Chromium's own read-ahead, so the
+ * seek needs a NEW Range request answered 206 — and early enough that the video is still
+ * playing through the mini-player steps that follow.
+ */
+const SEEK_TO = Math.round(FIXTURE.seconds * 0.55);
+
 interface E2eHooks {
   mediaLinks(): number;
   mediaStatuses(): Record<number, number>;
+  mediaRangeStarts(): number[];
   hostRunning(): boolean;
 }
 
@@ -57,6 +68,12 @@ const media206 = (app: ElectronApplication): Promise<number> =>
       (
         (globalThis as Record<symbol, unknown>)[Symbol.for('nutflix.e2e')] as E2eHooks
       ).mediaStatuses()[206] ?? 0,
+  );
+const rangeStarts = (app: ElectronApplication): Promise<number[]> =>
+  app.evaluate(() =>
+    (
+      (globalThis as Record<symbol, unknown>)[Symbol.for('nutflix.e2e')] as E2eHooks
+    ).mediaRangeStarts(),
   );
 const hostRunning = (app: ElectronApplication): Promise<boolean> =>
   app.evaluate(() =>
@@ -79,6 +96,8 @@ void describe(
     let dir = '';
     let app: ElectronApplication;
     let page: Page;
+    /** Bytes per second of fixture A (it is CBR): where a seek's Range must start. */
+    let bytesPerSecA = 0;
     const cspViolations: string[] = [];
 
     before(async () => {
@@ -89,6 +108,7 @@ void describe(
       dir = mkdtempSync(join(tmpdir(), 'nf-e2e-'));
       makeFixtureMp4(join(dir, 'a.mp4'), 'testsrc');
       makeFixtureMp4(join(dir, 'b.mp4'), 'testsrc2');
+      bytesPerSecA = statSync(join(dir, 'a.mp4')).size / FIXTURE.seconds;
       const fixtures = [
         { path: join(dir, 'a.mp4'), ...A },
         { path: join(dir, 'b.mp4'), ...B },
@@ -182,14 +202,23 @@ void describe(
         { timeout: 30_000 },
       );
       const before206 = await media206(app);
-      await page.evaluate(() => {
+      const beforeRanges = (await rangeStarts(app)).length;
+      await page.evaluate((t) => {
         const v = document.querySelector<HTMLVideoElement>('.nf-watch video');
-        if (v) v.currentTime = 4;
-      });
+        if (v) v.currentTime = t;
+      }, SEEK_TO);
       await page.waitForFunction(
-        () => (document.querySelector<HTMLVideoElement>('.nf-watch video')?.currentTime ?? 0) >= 4,
+        (t) => (document.querySelector<HTMLVideoElement>('.nf-watch video')?.currentTime ?? 0) >= t,
+        SEEK_TO,
+        { timeout: 30_000 },
       );
       await waitFor('a 206 after the seek', async () => (await media206(app)) > before206);
+      // …and it is the SEEK's: a new Range starting near SEEK_TO (keyframes every 2 s; Chromium
+      // also re-requests near the start on its own, which must not satisfy this).
+      const from = Math.floor((SEEK_TO - 4) * bytesPerSecA);
+      await waitFor(`a 206 Range starting at ≥ ${String(from)} after the seek`, async () =>
+        (await rangeStarts(app)).slice(beforeRanges).some((s) => s >= from),
+      );
     });
 
     void it('the WalletChip shows a streaming rate > 0', async () => {
@@ -201,9 +230,16 @@ void describe(
     });
 
     void it('a Markdown _blank link opens nothing', async () => {
-      const link = page.locator('.nf-watch a[href^="https://example.com"]').first();
-      if ((await link.count()) > 0) await link.click({ modifiers: [] });
+      // Fixture A's description carries the link; Watch renders it through `Markdown` as
+      // `<a target="_blank">`. It must exist — a missing link would make this pass vacuously.
+      const link = page.locator('.nf-watch a[href^="https://example.com"][target="_blank"]');
+      assert.equal(await link.count(), 1, 'the Markdown link is rendered');
+      const opened: string[] = [];
+      app.on('window', (w) => opened.push(w.url()));
+      await link.first().click({ modifiers: [] });
+      // Negative check: give a (wrongly allowed) window time to appear. Bounded, not a sync.
       await new Promise((r) => setTimeout(r, 500));
+      assert.deepEqual(opened, []);
       assert.equal(app.windows().length, 1);
       assert.equal(await page.evaluate(() => location.href), 'app://nutflix/index.html');
     });

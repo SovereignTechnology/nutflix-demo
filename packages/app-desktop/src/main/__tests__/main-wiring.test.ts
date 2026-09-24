@@ -4,6 +4,7 @@
  * main exits when it is present), the protocols, the three IPC channels, the host spawn, the
  * window, and one message through each path (renderer call → host, host media-link → nf-media).
  */
+import { dirname, join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mocks } from '@sovit/core';
 
@@ -239,7 +240,28 @@ describe('main.ts wiring (fake electron)', () => {
     expect(fx.paths.get('userData')).toBe('/tmp/e2e-ud');
     expect(fx.forks).toHaveLength(1);
     expect(fx.forks[0]?.path).toMatch(/[\\/]host[\\/]main\.js$/);
-    expect(fx.forks[0]?.args).toEqual(['--user-data=/tmp/e2e-ud', '--dev-mocks', '--dev-fixtures']);
+    // The worker entry is resolved next to main's own `dist/` (the sibling of `main/`).
+    const distDir = dirname(dirname(fx.forks[0]?.path ?? ''));
+    expect(fx.forks[0]?.args).toEqual([
+      '--user-data-dir=/tmp/e2e-ud',
+      `--worker-entry=${join(distDir, 'worker', 'entry.js')}`,
+      '--dev-mocks',
+      '--dev-fixtures',
+    ]);
+    // …and the host's real parser accepts exactly that argv (another project, by path).
+    const path = '../../host/flags.js';
+    const flags = (await import(/* @vite-ignore */ path)) as {
+      parseHostArgs(a: readonly string[]): {
+        userData: string;
+        workerEntry: string;
+        flags: Record<string, unknown>;
+      };
+    };
+    expect(flags.parseHostArgs(fx.forks[0]?.args ?? [])).toEqual({
+      userData: '/tmp/e2e-ud',
+      workerEntry: join(distDir, 'worker', 'entry.js'),
+      flags: { devMocks: true, devFixtures: true },
+    });
   });
 
   it('hardens every webContents created', async () => {
@@ -302,6 +324,41 @@ describe('main.ts wiring (fake electron)', () => {
         init: { method: 'GET', headers: { range: 'bytes=0-2' }, redirect: 'error' },
       },
     ]);
+  });
+
+  it('--e2e-hooks: nf-media status counts and 206 Range starts, numbers only; absent without the flag', async () => {
+    const E2E_KEY = Symbol.for('nutflix.e2e');
+    const g = globalThis as Record<symbol, unknown>;
+    Reflect.deleteProperty(g, E2E_KEY);
+    await boot();
+    expect(g[E2E_KEY]).toBeUndefined();
+
+    vi.resetModules();
+    await boot(['--e2e-hooks']);
+    const hooks = g[E2E_KEY] as {
+      mediaStatuses(): Record<number, number>;
+      mediaRangeStarts(): number[];
+      mediaLinks(): number;
+    };
+    expect(hooks).toBeDefined();
+    const child = fx.children.at(-1);
+    child?.listeners.get('message')?.[0]?.({
+      kind: 'media-link',
+      token: 'tok0123456789abcdef',
+      url: 'http://127.0.0.1:41000/x',
+    });
+    const media = fx.protocols.get('nf-media');
+    for (const range of ['bytes=0-', 'bytes=1048576-']) {
+      const res = await media?.(
+        new Request('nf-media://play/tok0123456789abcdef', { headers: { range } }),
+      );
+      expect(res?.status).toBe(206);
+    }
+    expect((await media?.(new Request('nf-media://play/unknown-token-0000')))?.status).toBe(404);
+    expect(hooks.mediaStatuses()).toEqual({ 206: 2, 404: 1 });
+    expect(hooks.mediaRangeStarts()).toEqual([0, 1_048_576]);
+    expect(hooks.mediaLinks()).toBe(1);
+    Reflect.deleteProperty(g, E2E_KEY);
   });
 
   it('drops host messages that fail isHostOut (a non-loopback media link never registers)', async () => {

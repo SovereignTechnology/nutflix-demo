@@ -44,9 +44,32 @@ export function parseMainArgs(argv: readonly string[]): MainOptions {
   return { devMocks, devFixtures, userDataDir, e2eHooks };
 }
 
-/** The host's argv (L6-B reads these). */
-export function hostArgs(opts: MainOptions, userData: string): string[] {
-  const args = [`--user-data=${userData}`];
+/** Relative to `dist/`: the host `utilityProcess` entry (lane L6-B). */
+export const HOST_ENTRY = 'host/main.js';
+
+/**
+ * Relative to `dist/`: the worker entry the host spawns with `bare-sidecar`. It is the `tsc`
+ * output, never a bundle: a bundle hoists `@sovit/core` above `bare-encoding/global` and the
+ * worker dies at load (D6, docs/lanes/L6-C.md).
+ */
+export const WORKER_ENTRY = 'worker/entry.js';
+
+/** The absolute paths main hands the host. */
+export interface HostPaths {
+  /** Electron's `userData` directory. */
+  readonly userData: string;
+  /** `<dist>/` + `WORKER_ENTRY`, resolved from main's own location. */
+  readonly workerEntry: string;
+}
+
+/**
+ * The host's argv: exactly what the host's strict `parseHostArgs` (`src/host/flags.ts`)
+ * accepts — `--user-data-dir=<abs>`, `--worker-entry=<abs>`, then only the dev flags. Anything
+ * else makes the host exit 2 and main respawn it until its budget is spent (every respawn
+ * reloads the window), so `host-link.test.ts` round-trips this through the host's real parser.
+ */
+export function hostArgs(opts: MainOptions, paths: HostPaths): string[] {
+  const args = [`--user-data-dir=${paths.userData}`, `--worker-entry=${paths.workerEntry}`];
   if (opts.devMocks) args.push('--dev-mocks');
   if (opts.devFixtures) args.push('--dev-fixtures');
   return args;

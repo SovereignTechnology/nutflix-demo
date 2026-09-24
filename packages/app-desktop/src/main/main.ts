@@ -9,6 +9,7 @@
  *   dist/preload.cjs          the bundled sandboxed preload
  *   dist/renderer/            index.html, app.js, ui.css, shell.css (served by `app:`)
  *   dist/host/main.js         the host utilityProcess entry (lane L6-B)
+ *   dist/worker/entry.js      the Bare worker entry the host spawns (lane L6-C; tsc output)
  */
 import { randomBytes } from 'node:crypto';
 import { lstat, readFile, realpath } from 'node:fs/promises';
@@ -28,7 +29,7 @@ import {
 import type { HostOut } from '../ipc/protocol.js';
 import { CHANNEL } from '../ipc/protocol.js';
 import { createAppProtocolHandler } from './app-protocol.js';
-import { hostArgs, parseMainArgs } from './args.js';
+import { HOST_ENTRY, WORKER_ENTRY, hostArgs, parseMainArgs } from './args.js';
 import { FileTokenRegistry } from './file-tokens.js';
 import { HostLink } from './host-link.js';
 import { IpcGate } from './ipc-gate.js';
@@ -38,9 +39,6 @@ import { createMoneyGate } from './money-gate.js';
 import { APP_URL, MEDIA_SCHEME, APP_SCHEME, privilegedSchemes } from './schemes.js';
 import { hardenWebContents, installSessionPolicy, sandboxBypassSwitch } from './security.js';
 import { createMainWindow } from './window.js';
-
-/** Relative to `dist/`: the host entry lane L6-B builds. */
-export const HOST_ENTRY = 'host/main.js';
 
 const log = createLogger((line) => {
   process.stderr.write(`${line}\n`);
@@ -149,9 +147,16 @@ function start(): void {
   });
   /** e2e only: response status counts of `nf-media:` (numbers, never URLs). */
   const mediaStatuses = new Map<number, number>();
+  /** e2e only: the first byte of every `nf-media:` Range answered 206, in order (numbers). */
+  const mediaRangeStarts: number[] = [];
   protocol.handle(MEDIA_SCHEME, async (req) => {
     const res = await media(req);
-    if (opts.e2eHooks) mediaStatuses.set(res.status, (mediaStatuses.get(res.status) ?? 0) + 1);
+    if (opts.e2eHooks) {
+      mediaStatuses.set(res.status, (mediaStatuses.get(res.status) ?? 0) + 1);
+      const start = /^bytes=(\d{1,15})-/.exec(req.headers.get('range') ?? '')?.[1];
+      if (res.status === 206 && start !== undefined && mediaRangeStarts.length < 4096)
+        mediaRangeStarts.push(Number(start));
+    }
     return res;
   });
   ipcMain.handle(CHANNEL.call, (e, raw: unknown) => gate.call(e, raw));
@@ -160,10 +165,14 @@ function start(): void {
 
   host = new HostLink({
     spawn: () =>
-      utilityProcess.fork(join(distDir, HOST_ENTRY), hostArgs(opts, app.getPath('userData')), {
-        serviceName: 'nutflix-host',
-        stdio: 'inherit',
-      }),
+      utilityProcess.fork(
+        join(distDir, HOST_ENTRY),
+        hostArgs(opts, {
+          userData: app.getPath('userData'),
+          workerEntry: join(distDir, WORKER_ENTRY),
+        }),
+        { serviceName: 'nutflix-host', stdio: 'inherit' },
+      ),
     onOut: onHostOut,
     onDown: () => {
       gate.hostDown();
@@ -183,6 +192,7 @@ function start(): void {
     (globalThis as Record<symbol, unknown>)[Symbol.for('nutflix.e2e')] = Object.freeze({
       mediaLinks: (): number => links.size,
       mediaStatuses: (): Record<number, number> => Object.fromEntries(mediaStatuses),
+      mediaRangeStarts: (): number[] => [...mediaRangeStarts],
       fileTokens: (): number => tokens.count(),
       hostRunning: (): boolean => host?.running ?? false,
     });
