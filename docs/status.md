@@ -86,6 +86,7 @@ present and 647 / 31 without one — that suite `skipIf`s when no binary is foun
 | **L6-B host** | `lane/L6-B` | **merged 2026-09-23** (app-desktop 422 → 674 tests; real `DesktopNetworkAdapter`, SE-4/SE-5, T16 image fetch with DNS-answer checks, 48+12-path conformance vs the mock) | see git log |
 | **L6-A shell** | `lane/L6-A` | **merged 2026-09-23** (app-desktop 674 → 687+ tests; Electron main/preload/renderer, IPC gate, SE-1 tokens, playback coordinator; **Electron e2e + fidelity spike written, never run — pending D4**) | see git log |
 | **L6-C worker** | `lane/L6-C` | **merged 2026-09-23** (Bare data plane; day-1 probe 20/20 under real `bare`; gated playback server; credit-paced payer; **§5(a) two-seeder Stage 1 test green, ~2.2 s, 5/5 + under load**) | see git log | No worktree on the dev laptop and no cached Electron binary here (`node node_modules/electron/install.js`) | — |
+| **UI-followups** | `lane/UI-followups` | **merged 2026-09-23** (Library `onToast` → shell stack, Shorts element-pause stops paying, shell toast actions close their toast; ui 481 tests, app-desktop 1043; repo 2082 passed / 27 skipped) | `a2ea58d` |
 | L7 web-shell | `lane/L7` | **NOT STARTED** — out of scope if ADR 0006 (unmerged, "Pear-runtime-only v0") is adopted | — |
 
 Lane reports: `docs/lanes/L1.md`, `L2.md` (incl. v3 section), `L3.md` (incl. markup section),
@@ -276,12 +277,22 @@ v4 (2026-09-23) was a small additive bump: reactions (`likes`/`dislikes`/`myReac
 8. **DONE 2026-09-23 (lane L3-flake): a real bug, not a flaky test** — `ws-duplex.ts` paused an already-closing socket on late frames (30 s stall); cut sockets are now tracked until their own close and terminated after `WS_CLOSE_GRACE_MS` = 5 s. Still load-sensitive: the seeder's "cut inside `upload` leaves EXACTLY windowBlocks" test (hit once at load ~20, green in isolation). Original note: **The gateway `ws-bridge` "non-paying WS client is cut" flake is now frequent** (≥ 5 hits
    this session at load 6–8; always green on re-run). Needs the durable fix in that test
    (L3's directory): raise its timeout or serialise it against the ffmpeg/Storybook load.
-9. **From L6-A:** Library and Studio should take `onToast` so the shell owns one toast stack;
-   Shorts should listen for its `<video>` element's `pause` (as Watch does) so a PiP/media-key
-   pause stops paying; residual SE-1 risk — a compromised renderer *process* can still request a
+9. **DONE 2026-09-23 (lane UI-followups, `docs/lanes/UI-followups.md`)** except the SE-1
+   residual. Library takes `onToast` (shell stack; late outcomes and their Undo/Retry still work
+   after unmount); Studio unchanged on purpose — it raises no toasts, every notice is in-place
+   state; Shorts pauses its session when its `<video>` pauses on its own (PiP, media keys, OS,
+   the coordinator) and resumes on an outside `play` while paused, never after `ended`; the
+   shell's `pushToast` wraps toast actions (dismiss, then run once — this also fixes Settings'
+   Retry toast, which never closed). The fixture seam `NUTFLIX_DEV_FIXTURES_JSON` was confirmed
+   by L6-C. **Still open:** residual SE-1 risk — a compromised renderer *process* can request a
    token for any regular file it can name → Stage 2: pick upload files via a main-process
-   `dialog`. The §5b fixture seam is assumed to be `NUTFLIX_DEV_FIXTURES_JSON` — reconcile with
-   L6-C at merge.
+   `dialog`. **New, from UI-followups (Stage 3 polish):** Watch, Wallet and Shorts still render
+   their own `ToastStack`, fixed bottom-left like the shell's, so two stacks can overlap — a
+   true single stack needs `onToast` on those three; repeated identical Settings failures stack
+   instead of replacing (a `replaceKey` on `ToastItem`, `packages/ui/src/components/`); a
+   media-key `play` after a short or video has ended does not resume paying (Replay stays
+   explicit — Watch and Shorts agree). L6-A deviation 13 was imprecise: the coordinator already
+   paused the short's element; the real gap was an outside pause leaving the session paying.
 10. Worktrees of merged lanes (`L5-*`) are archaeology — remove when convenient (branches stay);
    the PNGs live only in them (gitignored).
 
