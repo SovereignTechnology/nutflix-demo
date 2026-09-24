@@ -457,12 +457,13 @@ Wallet QR (pass = decodes to text starting `lnbc5000n1pj9x7`).
 | Upload quota (F15) | `stage-3/upload-quota` (on `stage-3/pending-journal`) | **done** — `blossom.maxBytesPerPubkey` (default 8 GiB, `null` = none): the bytes a pubkey owns on the gateway (uploaded, mirrored, or claimed by re-uploading), enforced on `PUT /upload`, `PUT /mirror` and authenticated `HEAD /upload`; a declared body is refused before it is spooled, and concurrent uploads hold their bytes. The default is Cameron's to change (with the pending allow-list-only decision) |
 | NUT-20 quotes (F17) | `stage-3/nut20-quotes` (on `stage-3/upload-quota`) | **done** — mint quotes are locked to the wallet key where the mint advertises NUT-20 and the key is in the process (the NIP-60 wallet), and the mint request is signed (amended message, legacy fallback — both via cashu-ts); an answer locked to another key is refused. Proven on Nutshell 0.21.0 and cdk-mintd 0.18.1. Quote ids no longer reach the desktop renderer: it gets opaque handles, scoped to the wallet that issued them (a signer change forgets them) |
 | Wallet journal (F31, ADR 0014) | `stage-3/wallet-journal` (on `stage-3/nut20-quotes`) | **done** — a mint answer lost after the mint executed no longer loses money: sends, receives and top-ups journal their outputs in the store before the request and restore what the mint signed with NUT-09 (a lost send still returns its locked set; a lost redeem is a success on the same call — no ban, creator paid, earnings kept). Retries reuse the journaled outputs; an unresolved send's inputs stay out of new selections. The daemon's and gateway's journal is in the sealed wallet file (survives a crash; swept at startup); the desktop's is in memory. Chosen over the review's NUT-13 suggestion (no new secret, safe for a multi-device NIP-60 wallet); NUT-13 seed backup is Cameron's call. Proven on Nutshell 0.21.0 and cdk-mintd 0.18.1 |
+| Packaged builds refuse dev flags (F21, part) | `stage-3/f21-dev-flags` (on `stage-3/wallet-journal`) | **done** — `app.isPackaged` + `--dev-mocks` / `--dev-fixtures` / `--e2e-hooks` exits 78 before anything is registered. The fuses wait for the packaging lane (they are set on the packaged binary) |
 
 Owed from Stage 2 (ADR 0010 Consequences, `docs/security-review.md` §0 and §6). The F1–F4 and
 F30 blockers were fixed on `stage-2/review-fixes` (2026-09-24); F6 verified on two real mints
 (`stage-3/real-mint`); the seeder daemon's runtime is done (`stage-3/seeder-runtime`, ADR 0011).
 Still owed: "paid views" → sats per video (ADR 0011 §8.4, UI polish);
 executing auto top-ups with caps (F4); packaging
-(F21); a contract-level `NetworkAdapter` signer control for the web shell (the desktop uses shell
+(F21: the fuses); a contract-level `NetworkAdapter` signer control for the web shell (the desktop uses shell
 methods, ADR 0013) + `SignerStatus` "none"; the deferred
 L5/L6-B/L6-C requests; the NIP-71 `minpay` tag in the manifest parser.

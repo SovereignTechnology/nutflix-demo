@@ -14,6 +14,17 @@ export interface MainOptions {
   readonly e2eHooks: boolean;
 }
 
+/**
+ * The flags a PACKAGED build refuses to start with (security review F21): a shipped binary is
+ * never a dev build, so its command line cannot switch on mocks, fixtures or the e2e hooks.
+ */
+export const DEV_FLAGS = ['--dev-mocks', '--dev-fixtures', '--e2e-hooks'] as const;
+
+/** The first dev flag in `argv`, if any. */
+export function devFlagIn(argv: readonly string[]): string | undefined {
+  return argv.find((a) => (DEV_FLAGS as readonly string[]).includes(a));
+}
+
 export function parseMainArgs(argv: readonly string[]): MainOptions {
   let devMocks = false;
   let devFixtures = false;

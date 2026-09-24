@@ -17,6 +17,7 @@ export type LogEvent =
   | 'app.start'
   | 'app.already-running'
   | 'app.sandbox-bypass-refused'
+  | 'app.dev-flag-refused'
   | 'window.created'
   | 'window.load-failed'
   | 'renderer.gone'

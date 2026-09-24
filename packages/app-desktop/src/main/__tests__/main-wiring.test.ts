@@ -40,6 +40,8 @@ const fx = vi.hoisted(() => {
     keychainBackend: 'gnome_libsecret',
     /** ADR 0013 addendum: what main asked the OS to open in the browser. */
     opened: [] as string[],
+    /** `app.isPackaged` (F21: a packaged build refuses the dev flags). */
+    packaged: false,
   };
   return state;
 });
@@ -95,6 +97,9 @@ vi.mock('electron', () => {
   }
   return {
     app: {
+      get isPackaged() {
+        return fx.packaged;
+      },
       commandLine: {
         hasSwitch: (s: string) => fx.switches.has(s),
         appendSwitch: (s: string) => {
@@ -221,6 +226,7 @@ beforeEach(() => {
   fx.keychain = false;
   fx.keychainBackend = 'gnome_libsecret';
   fx.opened.length = 0;
+  fx.packaged = false;
   fx.appListeners.clear();
   fx.protocols.clear();
   fx.ipc.clear();
@@ -259,6 +265,25 @@ describe('main.ts wiring (fake electron)', () => {
     expect(fx.order.slice(0, 3)).toEqual(['enableSandbox', 'registerSchemes', 'ready']);
     expect(fx.appended).toEqual([]);
     expect(fx.exitCode).toBeUndefined();
+  });
+
+  it.each(['--dev-mocks', '--dev-fixtures', '--e2e-hooks'])(
+    'a packaged build refuses %s (exit 78, nothing registered) — F21',
+    async (flag) => {
+      fx.packaged = true;
+      process.argv = [argv[0] ?? 'node', 'dist/main/main.js', flag];
+      await expect(import('../main.js')).rejects.toThrow(/packaged/);
+      expect(fx.exitCode).toBe(78);
+      expect(fx.order).toEqual([]);
+      expect(fx.protocols.size).toBe(0);
+    },
+  );
+
+  it('a packaged build without dev flags starts; an unpackaged one takes them (F21)', async () => {
+    fx.packaged = true;
+    await boot(['--user-data-dir=/tmp/nf-packaged']);
+    expect(fx.exitCode).toBeUndefined();
+    expect(fx.forks[0]?.args).not.toContain('--dev-mocks');
   });
 
   it.each(['no-sandbox', 'disable-gpu-sandbox', 'no-zygote'])(

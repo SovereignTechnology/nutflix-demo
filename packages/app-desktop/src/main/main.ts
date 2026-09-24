@@ -36,7 +36,7 @@ import { isPromptForm } from '../ipc/guards.js';
 import type { HostIn, HostOut, PromptAnswer } from '../ipc/protocol.js';
 import { CHANNEL } from '../ipc/protocol.js';
 import { PROMPT_FILES, createAppProtocolHandler } from './app-protocol.js';
-import { HOST_ENTRY, WORKER_ENTRY, hostArgs, parseMainArgs } from './args.js';
+import { HOST_ENTRY, WORKER_ENTRY, devFlagIn, hostArgs, parseMainArgs } from './args.js';
 import { FileTokenRegistry } from './file-tokens.js';
 import { HostLink } from './host-link.js';
 import { IpcGate } from './ipc-gate.js';
@@ -69,6 +69,12 @@ if (sandboxBypassSwitch(app.commandLine) !== undefined) {
   log('error', 'app.sandbox-bypass-refused');
   app.exit(78);
   throw new Error('refusing to run without the Chromium sandbox');
+}
+// Security review F21: a packaged build is never a dev build — refuse the dev flags outright.
+if (app.isPackaged && devFlagIn(process.argv.slice(1)) !== undefined) {
+  log('error', 'app.dev-flag-refused');
+  app.exit(78);
+  throw new Error('dev flags are refused in a packaged build');
 }
 app.enableSandbox();
 if (opts.userDataDir !== undefined) app.setPath('userData', opts.userDataDir);

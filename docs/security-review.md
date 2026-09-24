@@ -43,7 +43,7 @@ directories" for this list. Each fix carries a test that fails without it, excep
 | F18 | **Partly fixed** | The distinctive user agent is gone. Open: hash-addressed images only by default (decision) |
 | F19 | **Fixed** | Watch refuses a session whose policy charges more than the quote (play and quality switch) |
 | F20 | **Fixed** | `StoredReport.signatureVerified` is `true` after the auth boundary verified the report |
-| F21 | **Open** | Packaging (dev flags compiled out, Electron fuses) |
+| F21 | **Partly fixed** (`stage-3/f21-dev-flags`) | A packaged build (`app.isPackaged`) refuses `--dev-mocks`, `--dev-fixtures` and `--e2e-hooks` and exits 78 before anything is registered, like a sandbox bypass (tested). Open, with the packaging lane: the Electron fuses (`RunAsNode`, `EnableNodeOptionsEnvironmentVariable`, `EnableNodeCliInspectArguments` off; `EnableEmbeddedAsarIntegrityValidation`, `OnlyLoadAppFromAsar` on). They can only be flipped on a packaged binary, and nothing packages yet: forge/pear makers, targets and signing are decisions. No runtime check can replace them, since `NODE_OPTIONS`, `--inspect` and `ELECTRON_RUN_AS_NODE` act before main's code runs |
 | F22 | **Fixed** | `app.requestSingleInstanceLock()`; a second launch focuses the first window |
 | F23 | **Fixed** | `Nip60ProofStore` verifies every event itself |
 | F24 | **Fixed** — seeder daemon (`stage-3/seeder-runtime`) and desktop (`stage-3/desktop-signer`) | Daemon: key file 0600 (`--keygen`, `O_EXCL`, refused when group/other can read it), headless unlock from the `seeder-key-passphrase` systemd credential (ADR 0011 §1). Desktop (ADR 0013): the file `KeyStore` writes 0600 in a 0700 dir through an `O_EXCL` temp file, reads with `O_NOFOLLOW` and refuses a symlink, another owner or a loose mode before any passphrase is asked; unlock is the user's choice — a passphrase in main's trusted prompt window, the OS keychain (`safeStorage`, never Linux `basic_text`), or a NIP-46 bunker |
@@ -602,7 +602,7 @@ finding's section above plus its row in §0. **Filing waits for Cameron's go-ahe
 | [Done] F15: per-pubkey upload quota (`blossom.maxBytesPerPubkey`) |
 | [Done] F17: NUT-20 locked mint quotes; opaque quote handles over IPC. Residual [Low]: a signer-held wallet key (the seeder daemon) takes unlocked quotes — cashu-ts signs NUT-20 itself and needs the key as a string |
 | [Medium] F4: execute auto top-ups with per-top-up and per-day caps |
-| [Low] F21: packaging — compile out dev flags, set Electron fuses |
+| [Low] F21: packaging — set the Electron fuses when the app is packaged (the dev flags are already refused in a packaged build) |
 | [Done] F24: the desktop's file `KeyStore` (ADR 0013) |
 | [Done] Desktop signer: remove the key from this device; NIP-46 `auth_url` approval links (ADR 0013 §7) |
 | [Low] F25: external-link confirm shows the real host |
