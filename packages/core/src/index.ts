@@ -12,3 +12,4 @@ export * as manifest from './manifest/index.js';
 export * as media from './media/index.js';
 export * as payment from './payment/index.js';
 export * as signer from './signer/index.js';
+export * as wallet from './wallet/index.js';

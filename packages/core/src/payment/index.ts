@@ -24,3 +24,4 @@ export {
   splitSequence,
   type PaySplit,
 } from './split.js';
+export { PAY1_TAG, checkPayLock, type LockVerdict } from './lock.js';

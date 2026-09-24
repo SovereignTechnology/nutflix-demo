@@ -9,3 +9,4 @@ export * from './fixtures.js';
 export * from './mock-payment-engine.js';
 export * from './mock-wallet.js';
 export * from './mock-network-adapter.js';
+export * from './test-mint.js';
