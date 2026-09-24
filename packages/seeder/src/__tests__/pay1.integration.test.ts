@@ -213,7 +213,9 @@ describe('pay/1 over a real replication stream', () => {
     ]);
     expect(engine.window(viewerPubkey)).toMatchObject({ uploaded: 8, paid: 8, outstanding: 0 });
     expect(await engine.flush()).toEqual({ swapped: 8, nutzapped: 8, failed: 0 });
-    expect(nutzaps).toHaveLength(2);
+    // One nutzap for both PAYs: the engine batches creator sets per creator × mint × core per
+    // flush (security review F34 — at a real input fee, lone tiny nutzaps are unspendable).
+    expect(nutzaps).toHaveLength(1);
 
     // The last 4 blocks arrive — and the viewer pays for them with the PREVIOUS PAY's proofs:
     // refused at verify as a double-spend, the viewer banned and cut.

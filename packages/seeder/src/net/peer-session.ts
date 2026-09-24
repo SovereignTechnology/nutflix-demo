@@ -65,6 +65,13 @@ export interface PeerSessionOptions {
   readonly pricing?: (core: CoreKeyHex) => UploadPricing;
   /** Called exactly once when the underlying stream closes (after any cut). */
   readonly onClose?: (session: PeerSession) => void;
+  /**
+   * Called when this session is about to bind `pubkey` (a verified HELLO), BEFORE the engine
+   * rebind. The registry cuts any other live session holding the same pubkey there: the engine
+   * keeps one creator carry per pubkey × core, so two live channels would fight over it (a
+   * reconnect while the old connection lingers — found by the real-mint lane).
+   */
+  readonly onBind?: (session: PeerSession, pubkey: NostrPubkey) => void;
 }
 
 export class PeerSession {
@@ -87,6 +94,7 @@ export class PeerSession {
   private readonly banList: BanList;
   private readonly log: Logger;
   private readonly peerInfo: PeerInfo | null;
+  private readonly onBind: ((session: PeerSession, pubkey: NostrPubkey) => void) | undefined;
 
   constructor(opts: PeerSessionOptions) {
     this.noiseKey = opts.noiseKey;
@@ -98,6 +106,7 @@ export class PeerSession {
     this.pricing = opts.pricing ?? ((): UploadPricing => UNPRICED);
     this.openedAt = (opts.now ?? Date.now)();
     this.log = opts.logger.child({ noiseKey: this.noiseKeyHex });
+    this.onBind = opts.onBind;
     this.stream.once('close', () => {
       this.isClosed = true;
       opts.onClose?.(this);
@@ -227,6 +236,12 @@ export class PeerSession {
     const provisional = this.provisionalUploads;
     this.provisionalUploads = 0;
     if (!alreadyBound) {
+      // The newest channel of a pubkey wins: older live sessions of it are cut first.
+      try {
+        this.onBind?.(this, pubkey);
+      } catch {
+        // the registry's hook failing must not stop the bind
+      }
       const w = this.engine.rebind(this.noiseKeyHex as NostrPubkey, pubkey);
       if (w.outstanding > w.windowBlocks) {
         this.cut('window-exceeded');

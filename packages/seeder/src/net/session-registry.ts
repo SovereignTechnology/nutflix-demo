@@ -37,6 +37,8 @@ export interface SessionRegistryOptions {
 
 export class SessionRegistry {
   private readonly byNoise = new Map<string, PeerSession>();
+  /** Every session whose stream is still open (a same-key reconnect replaces `byNoise` only). */
+  private readonly live = new Set<PeerSession>();
   private readonly listeners = new Set<(e: SessionEvent) => void>();
   private readonly engine: PaymentEngineSeeder;
   private readonly banList: BanList;
@@ -116,13 +118,33 @@ export class SessionRegistry {
       ...(this.pricing ? { pricing: this.pricing } : {}),
       onClose: (s) => {
         admitted.release();
+        this.live.delete(s);
         if (this.byNoise.get(hex) === s) this.byNoise.delete(hex);
         this.emit({ type: 'close', session: s });
       },
+      onBind: (s, pubkey) => {
+        this.supersede(s, pubkey);
+      },
     });
+    this.live.add(session);
     this.byNoise.set(hex, session);
     this.emit({ type: 'open', session });
     return session;
+  }
+
+  /**
+   * `session` is binding `pubkey`: every OTHER live session of that pubkey is cut, without a ban
+   * (a reconnect whose old connection has not closed yet). One pay/1 channel per pubkey keeps the
+   * engine's per-pubkey carry unambiguous (security review F27).
+   */
+  private supersede(session: PeerSession, pubkey: NostrPubkey): void {
+    for (const other of [...this.live]) {
+      if (other === session || other.pubkey !== pubkey || other.closed) continue;
+      this.log.info('an older session of this peer is superseded — cutting', {
+        noiseKey: other.noiseKeyHex,
+      });
+      other.cut('local');
+    }
   }
 
   /**

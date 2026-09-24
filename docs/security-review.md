@@ -28,7 +28,7 @@ directories" for this list. Each fix carries a test that fails without it, excep
 | F3 | **Fixed** | Every Blossom response: `nosniff` + `CSP: sandbox`; only inert types inline (`servedAs`), everything else an `octet-stream` attachment; upload MIME allowlist by default (explicit `null` = any) |
 | F4 | **Fixed (policy)** | `autoTopUpDue` tops up only mints in `defaultMints`, and now follows the v5 direction (it had it backwards); contract text says so. Executing top-ups (with caps) is Stage 3 |
 | F5 | **Partly fixed** | Proofs per set capped at `bitLength(amount) + 6` (`maxProofsFor`); one unacknowledged PAY per core batches PAYs naturally (F30). Open: DLEQ off the event loop, explicit `minPaySats` batching tied to the credit pool |
-| F6 | **Open** | Needs a real mint (nutshell/cdk) — Stage 3 regtest |
+| F6 | **Verified on Nutshell 0.21.0 and cdk-mintd 0.18.1** (2026-09-24, `stage-3/real-mint`) | Both mints accept the `pay1` tag and still refuse the set without the creator's witness; the whole pay/1 path, three seeders, double-spends and a network drop pass against both (§0a) |
 | F7 | **Fixed** | `studio.upload` asks with a native dialog naming the file main resolved from the token |
 | F8 | **Fixed** | The money gate is a native dialog (`dialog.showMessageBox`, Cancel default) built from guarded args; `seeder.melt` cross-checks the invoice amount; settings patches that add mints or turn on auto top-up are asked about too |
 | F9 | **Fixed** | The seeder records each `PRICE` boundary per session × core and verifies a PAY at the price in force for its blocks; `setCorePolicy` now announces per-core `PRICE` |
@@ -49,10 +49,51 @@ directories" for this list. Each fix carries a test that fails without it, excep
 | F24 | **Open** | The `KeyStore` adapter and headless unlock come with the runtime providers |
 | F25 | **Open** | Only matters once Stage 3 opens external links |
 | F26 | **Partly fixed** | Natural batching (F30) cuts dust PAYs; explicit batching open (F5) |
-| F27 | **Open** | Concurrent channels from one pubkey (seeder carry is per pubkey) — Low |
+| F27 | **Fixed** (real-mint lane) | Hit by the network-drop test: a new session binding a pubkey now cuts any older live session of it (no ban) — one pay/1 channel per pubkey, so the per-pubkey carry is unambiguous |
 | F28, F29, F32 | Info | Recorded, no change |
+| F33 | **Open (new)** | See §0a |
+| F34 | **Fixed (new)** | See §0a |
+| F35 | **Fixed (new)** | See §0a |
 | F30 | **Fixed** | `UpstreamPayer` keeps the carry per channel, commits it on `ACK ok`, one PAY per core in flight |
-| F31 | **Fixed (engine)** | `spentByUs` dep: a "spent" redeem whose witness is our own signature is our lost swap — no ban, creator still paid. Open: NUT-13 deterministic outputs to recover the swapped proofs |
+| F31 | **Fixed (engine)** | `spentByUs` dep: a "spent" answer to a RETRIED redeem whose witness is our own signature is our lost swap — no ban, creator still paid. A first attempt answered "spent" is a double-spend even with our witness (a set we redeemed before a restart carries it too — found by the real-mint lane); the attempt is persisted before it is made. Open: NUT-13 deterministic outputs to recover the swapped proofs |
+
+## 0a. Found by the real-mint lane (2026-09-24, `stage-3/real-mint`)
+
+Nutshell 0.21.0 and cdk-mintd 0.18.1, both with a FakeWallet backend, a real 100 ppk input fee
+and v2 keyset ids — every scenario passes on both (`scripts/real-mint/README.md`); three
+seeders, a viewer and real `pay/1` over Hypercore (`packages/gateway/src/__tests__/
+real-mint-swarm.integration.test.ts`). Both real-mint suites are opt-in
+(`NUTFLIX_REAL_MINT_URL`); `scripts/real-mint/nutshell.sh` starts the mint.
+
+- **F33 — Medium — open: duplicate deliveries cost the viewer more than the price shown.**
+  Hypercore can fetch one block from two seeders (a raced request); each seeder counts what it
+  sent, and the payer pays each for it (not paying would window-cut the seeder). Measured: 29
+  deliveries paid for a 24-block video when three seeders raced unpaced. The desktop credit pool
+  and pacing make races rarer but not impossible. Fix options for Stage 3: cap a session's total
+  at the quoted price and absorb the rare duplicate as seeder loss (their window tolerates it),
+  or request each range from one peer. Needs a product decision (price shown vs. seeder fairness).
+- **F34 — High — fixed: dust could never be redeemed.** At a real input fee (100 ppk → ≥ 1 sat
+  per swap) a 1-sat seeder set alone cannot pay its fee (Nutshell: "no outputs provided"); the
+  engine redeemed per PAY, so such a PAY sat in the retry queue forever and its creator share was
+  never forwarded. The engine now redeems every accepted seeder set of a mint in ONE swap per
+  flush (dust waits until the batch is worth more than its fee); a "spent" batch is attributed per
+  PAY with `checkSpent`. TestMint now refuses a swap with no outputs, like Nutshell. Creator side:
+  the engine now publishes ONE nutzap per creator × mint × core per flush (the F11 check runs per
+  group and still bans only the PAY whose set was spent); a NIP-61 wallet should still redeem the
+  nutzaps it holds together.
+- **F27 — was Low, hit in practice — fixed: a reconnect while the old connection lingers.** The
+  seeder briefly held two live sessions for one pubkey; the new session's rebind reset the shared
+  carry and every PAY still arriving on the old channel failed `carryIn` (one run in four of the
+  network-drop test). A session binding a pubkey now cuts any other live session of it without a
+  ban (`SessionRegistry.supersede`; the registry tracks every live session, since a same-key
+  reconnect replaces its map entry). 8/8 runs pass since.
+- **F35 — Medium — fixed: a PAY from a replaced channel could break the new channel's carry.**
+  A PAY sent just before a connection dropped can still be verifying (keyset fetch) when the
+  viewer reconnects and the new channel's HELLO rebinds the account, restarting the carry at 0. If
+  that late PAY's `carryIn` happened to match, it committed and moved the carry, and every PAY on
+  the new channel then failed `carryIn` until the window cut the viewer. Seen once in the
+  network-drop test. The engine now keeps a channel epoch per account (`rebind` advances it) and
+  refuses a PAY queued under an older epoch (engine test fails without the fix).
 
 ## 1. Summary
 
@@ -508,7 +549,7 @@ finding's section above plus its row in §0. **Filing waits for Cameron's go-ahe
 
 | Issue title |
 |---|
-| [High] F6: regtest-verify the pay1 NUT-10 tag on nutshell and cdk |
+| [Medium] F33: duplicate block deliveries — cap at the quoted price or single-peer ranges (decision) |
 | [High] F5: DLEQ verification off the event loop; explicit minPaySats batching tied to the credit pool |
 | [Medium] F10: wire the seen-secret persistence (the `persist` hook exists) |
 | [Medium] F11/F12/F31: wire `checkSpent`, `persistPending`/`restorePending`, `spentByUs` in the seeder runtime providers |
@@ -519,7 +560,6 @@ finding's section above plus its row in §0. **Filing waits for Cameron's go-ahe
 | [Low] F21: packaging — compile out dev flags, set Electron fuses |
 | [Low] F24: file `KeyStore` (0600, atomic) + headless unlock via systemd credentials |
 | [Low] F25: external-link confirm shows the real host |
-| [Low] F27: concurrent channels from one pubkey |
 
 ## 7. Not verified
 

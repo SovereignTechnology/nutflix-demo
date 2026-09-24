@@ -357,6 +357,9 @@ export class TestMint {
     // Balance is checked on the outputs' declared amounts BEFORE anything is signed or spent.
     const outputs = body['outputs'];
     if (!Array.isArray(outputs)) throw new MintOperationError(11002, 'outputs must be a list');
+    // Like Nutshell: a swap must produce something (a lone proof worth only its fee is refused,
+    // not silently burned — found by the real-mint lane).
+    if (outputs.length === 0) throw new MintOperationError(11002, 'no outputs provided');
     const outTotal = (outputs as SerializedBlindedMessage[]).reduce((a, o) => a + num(o.amount), 0);
     if (outTotal + this.fee((body['inputs'] as unknown[]).length) !== inputs.total)
       throw new MintOperationError(11002, 'Transaction is not balanced');
@@ -410,6 +413,9 @@ export class TestMint {
       throw new MintOperationError(20002, 'Tokens have already been issued for quote');
     const outputs = body['outputs'];
     if (!Array.isArray(outputs)) throw new MintOperationError(11002, 'outputs must be a list');
+    // Like Nutshell: a swap must produce something (a lone proof worth only its fee is refused,
+    // not silently burned — found by the real-mint lane).
+    if (outputs.length === 0) throw new MintOperationError(11002, 'no outputs provided');
     const outTotal = (outputs as SerializedBlindedMessage[]).reduce((a, o) => a + num(o.amount), 0);
     if (outTotal !== q.amount) throw new MintOperationError(11002, 'Transaction is not balanced');
     const { signatures } = this.sign(outputs);

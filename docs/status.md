@@ -441,14 +441,19 @@ must run it against nutshell/cdk (F6). (3) Approve filing the `docs/security-rev
 issues on GitLab and pushing the branches. (4) Still open from Stage 1: one phone scan of the
 Wallet QR (pass = decodes to text starting `lnbc5000n1pj9x7`).
 
-## Stage 3 — integration and polish: NOT STARTED
+## Stage 3 — integration and polish: STARTED 2026-09-24
+
+| Lane | Branch | Status |
+|---|---|---|
+| Real-mint testing (execution plan §4) | `stage-3/real-mint` (on `stage-2/review-fixes`) | **done** — Nutshell 0.21.0 and cdk-mintd 0.18.1 (FakeWallet, 100 ppk fee): the `pay1` tag verified (F6), three seeders + viewer, double-spends, a network drop; fixed what it found (F34 dust → batched redeems and nutzaps, F35 stale-channel PAYs, F27 superseded sessions, F31 replay-after-restart); open: F33 duplicate deliveries (decision). `scripts/real-mint/README.md` |
 
 Owed from Stage 2 (ADR 0010 Consequences, `docs/security-review.md` §0 and §6). The F1–F4 and
-F30 blockers were fixed on `stage-2/review-fixes` (2026-09-24). Still owed: the runtime
+F30 blockers were fixed on `stage-2/review-fixes` (2026-09-24); F6 verified on two real mints
+(`stage-3/real-mint`). Still owed: the runtime
 providers (desktop worker, seeder, gateway `cli/providers.ts`: real engines wired with
 `checkSpent` / `spentByUs` / `persistPending` + seen-set persistence, `BlossomAuthImpl` with
-`serverHost`, HELLO signer, key-file `KeyStore` at 0600 — F10, F11, F12, F24, F31); a regtest
-check of the `pay1` tag (F6); DLEQ off the event loop and explicit `minPaySats` batching (F5);
+`serverHost`, HELLO signer, key-file `KeyStore` at 0600 — F10, F11, F12, F24, F31); DLEQ off the
+event loop and explicit `minPaySats` batching (F5);
 executing auto top-ups with caps (F4); NUT-20 quotes (F17); NUT-13 outputs (F31); packaging
 (F21); the `NetworkAdapter`/IPC signer bridge + `SignerStatus` "none"; the deferred
 L5/L6-B/L6-C requests; the NIP-71 `minpay` tag in the manifest parser.

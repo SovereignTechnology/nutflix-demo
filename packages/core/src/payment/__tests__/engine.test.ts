@@ -67,6 +67,8 @@ function hex(b: Uint8Array): string {
   return Array.from(b, (x) => x.toString(16).padStart(2, '0')).join('');
 }
 
+const total = (proofs: readonly CashuProof[]): number => proofs.reduce((a, p) => a + p.amount, 0);
+
 /** A deterministic test key pair (the scalar is a test fixture, never a real key). */
 function keyOf(fill: number): { sk: Uint8Array; pub: CashuP2pkPubkey } {
   const sk = new Uint8Array(32).fill(fill);
@@ -365,6 +367,43 @@ describe('real engine — races', () => {
   });
 });
 
+describe('real engine — a PAY from a replaced channel (real-mint lane, network drop)', () => {
+  // A PAY sent just before a connection dropped can still be verifying (its keyset loading) when
+  // the viewer reconnects and the new channel's HELLO rebinds the account — which restarts the
+  // carry at 0. Committed late, the old PAY would move that carry and every PAY on the new
+  // channel would fail `carryIn`. It is refused instead.
+  it('a PAY queued under the old channel and decided after the new channel bound is refused; the new channel pays from carry 0', async () => {
+    let release: () => void = () => undefined;
+    const gate = new Promise<void>((r) => (release = r));
+    let slow = true;
+    const base = getSeederEngine(WIDE_WINDOW);
+    const seeder = new RealPaymentEngine({
+      config: base.config,
+      seen: new SeenSecrets(),
+      keyset: async (mint, id) => {
+        if (slow) {
+          slow = false;
+          await gate;
+        }
+        const m = testMint(mint);
+        return m.keysetId === id ? m.keyset() : undefined;
+      },
+    });
+    // 70/30 at 3 sat: a 2-block PAY moves the carry (6 × 30 = 180 → creator 1, carry 80).
+    const p = policyWith({ satsPerBlock: sats(3), split: { seeder: 70, creator: 30 } });
+    upload(seeder, VIEWER, 4, { policy: p });
+    const { viewer } = getPair('honest');
+    const old = await viewer.pay(range(0, 1), SEEDER_INFO, p, { carryIn: 0 });
+    const late = seeder.verify(VIEWER, old, p); // queued on the old channel…
+    upload(seeder, NOISE_ID, 2, { policy: p, from: 2 });
+    seeder.rebind(NOISE_ID, VIEWER); // …the viewer reconnected: a new channel, carry 0
+    release();
+    expect(await late).toMatchObject({ ok: false, reason: 'malformed' });
+    const fresh = await viewer.pay(range(2, 3), SEEDER_INFO, p, { carryIn: 0 });
+    expect(await seeder.verify(VIEWER, fresh, p)).toMatchObject({ ok: true, blocks: 2 });
+  });
+});
+
 describe('real engine — flush never drops the creator’s money', () => {
   it('a mint outage keeps the item; a relay outage keeps the creator set without redeeming the seeder set twice', async () => {
     let mintDown = true;
@@ -596,9 +635,15 @@ describe('real engine — flush robustness (security review F11, F12, F31)', () 
       own?: boolean;
       persist?: (items: readonly PendingPay[]) => void;
       nutzap?: (set: LockedProofSet) => Promise<void>;
+      feePpk?: number;
+      onRedeem?: (n: number) => void;
     } = {},
   ) {
-    const mint = new TestMint({ url: MINT, seed: new Uint8Array(32).fill(41), inputFeePpk: 0 });
+    const mint = new TestMint({
+      url: MINT,
+      seed: new Uint8Array(32).fill(41),
+      inputFeePpk: deps.feePpk ?? 0,
+    });
     const conns = (): CashuMintConnections =>
       new CashuMintConnections({ request: () => mint.request });
     const seederKey = keyOf(51);
@@ -624,7 +669,10 @@ describe('real engine — flush robustness (security review F11, F12, F31)', () 
     const seederDeps = {
       config,
       keyset: (m: MintUrl, id: string) => seederWallet.keyset(m, id),
-      redeem: (set: { mint: MintUrl; proofs: readonly CashuProof[] }) => seederWallet.receive(set),
+      redeem: (set: { mint: MintUrl; proofs: readonly CashuProof[] }) => {
+        deps.onRedeem?.(set.proofs.length);
+        return seederWallet.receive(set);
+      },
       nutzap:
         deps.nutzap ??
         ((set: LockedProofSet) => {
@@ -662,7 +710,20 @@ describe('real engine — flush robustness (security review F11, F12, F31)', () 
     upload(seeder, VIEWER, 8, { core: CORE_B, policy });
     const msg = await viewer.pay(range(0, 3, CORE_B), who, policy);
     expect(await seeder.verify(VIEWER, msg, policy)).toMatchObject({ ok: true });
-    return { mint, seeder, seederWallet, seederDeps, msg, policy, zaps };
+    /** Another viewer, same wallet funds, paying `target` for `blocks` blocks at `p`. */
+    const otherViewer = async (
+      target: RealPaymentEngine,
+      blocks: number,
+      p: PricePolicy = policy,
+    ): Promise<PayMessage> => {
+      const v2 = new RealPaymentEngine({
+        config: { ...config, acceptedMints: [], ownPubkey: OTHER_VIEWER },
+        wallet: viewerWallet,
+      });
+      upload(target, OTHER_VIEWER, blocks, { core: CORE_B, policy: p });
+      return v2.pay(range(0, blocks - 1, CORE_B), who, p);
+    };
+    return { mint, seeder, seederWallet, seederDeps, msg, policy, zaps, otherViewer };
   }
 
   it('F31: a redeem whose response was lost is recognised as OUR spend — no ban, the creator is still paid', async () => {
@@ -688,6 +749,102 @@ describe('real engine — flush robustness (security review F11, F12, F31)', () 
     await legacy.seeder.flush();
     expect(await legacy.seeder.flush()).toMatchObject({ failed: 1 });
     expect(legacy.seeder.isBanned(VIEWER)).toBe(true);
+  });
+
+  // Found while planning the real-mint lane: a set we redeemed BEFORE a restart that lost the
+  // seen set also carries our witness. Only a retried redeem may be read as our own lost swap.
+  it('F31: a replay, after a restart, of a set we already redeemed is a double-spend even though the witness is ours', async () => {
+    const w = await world({ own: true });
+    expect(await w.seeder.flush()).toMatchObject({ swapped: 12, failed: 0 });
+    // Restart without the seen set: the replay passes the offline checks…
+    const after = new RealPaymentEngine({ ...w.seederDeps, seen: new SeenSecrets() });
+    upload(after, VIEWER, 8, { core: CORE_B, policy: w.policy });
+    const replay = { ...w.msg, range: { ...w.msg.range, fromBlock: 4, toBlock: 7 } };
+    expect(await after.verify(VIEWER, replay, w.policy)).toMatchObject({ ok: true });
+    // …but its FIRST redeem is answered "spent": a double-spend, ban.
+    expect(await after.flush()).toMatchObject({ swapped: 0, failed: 1 });
+    expect(after.isBanned(VIEWER)).toBe(true);
+  });
+
+  it('F31 + F12: a crash right after the redeem was sent restores as "tried", and the retry reads our own spend correctly', async () => {
+    const snapshots: (readonly PendingPay[])[] = [];
+    const w = await world({ own: true, persist: (items) => snapshots.push(items) });
+    w.mint.dropNextResponse();
+    await w.seeder.flush(); // the swap happened at the mint; we never heard back
+    const last = snapshots.at(-1)!;
+    expect(last[0]).toMatchObject({ stage: 'redeem', redeemTried: true });
+    const after = new RealPaymentEngine({ ...w.seederDeps, seen: new SeenSecrets() });
+    after.restorePending(last);
+    expect(await after.flush()).toEqual({ swapped: 12, nutzapped: 8, failed: 0 });
+    expect(after.isBanned(VIEWER)).toBe(false);
+  });
+
+  // Found by the real-mint lane (Nutshell, 100 ppk input fee): a 1-sat seeder set can never be
+  // redeemed alone — the fee eats it ("no outputs provided") — so the item sat in the retry
+  // queue forever and its creator share was never forwarded. Redeems are now batched per mint.
+  it('real-mint finding: several accepted PAYs are redeemed in ONE swap per mint', async () => {
+    const calls: number[] = [];
+    const w = await world({ onRedeem: (n) => calls.push(n) });
+    const second = await w.otherViewer(w.seeder, 2);
+    expect(await w.seeder.verify(OTHER_VIEWER, second, w.policy)).toMatchObject({ ok: true });
+    expect(await w.seeder.flush()).toMatchObject({ failed: 0 });
+    expect(calls).toEqual([w.msg.seederProofs.proofs.length + second.seederProofs.proofs.length]);
+    expect(w.seeder.pendingCount()).toBe(0);
+  });
+
+  it('real-mint finding: dust below the mint fee waits in the queue — kept, not dropped, not a double-spend', async () => {
+    const w = await world({ feePpk: 1000 }); // 1 sat per input: a lone 1-sat proof is worth nothing
+    await w.seeder.flush(); // the world's own PAY clears first
+    const dustPolicy = { ...w.policy, satsPerBlock: sats(1), split: { seeder: 50, creator: 50 } };
+    // 2 blocks × 1 sat at 50/50: a 1-sat seeder set, which alone cannot pay its own fee.
+    const dust = await w.otherViewer(w.seeder, 2, dustPolicy);
+    expect(total(dust.seederProofs.proofs)).toBe(1);
+    expect(await w.seeder.verify(OTHER_VIEWER, dust, dustPolicy)).toMatchObject({ ok: true });
+    expect(await w.seeder.flush()).toMatchObject({ swapped: 0, failed: 0 });
+    expect(w.seeder.pendingCount()).toBe(1);
+    expect(w.seeder.isBanned(OTHER_VIEWER)).toBe(false);
+  });
+
+  it('a batch holding one replayed set: only that PAY is a double-spend, the honest PAY in the same swap redeems (checkSpent attribution)', async () => {
+    const w = await world({ own: true, check: true });
+    expect(await w.seeder.flush()).toMatchObject({ swapped: 12 });
+    // Restart without the seen set; the viewer replays its redeemed set while another viewer pays
+    // honestly — both land in one batch.
+    const after = new RealPaymentEngine({ ...w.seederDeps, seen: new SeenSecrets() });
+    upload(after, VIEWER, 8, { core: CORE_B, policy: w.policy });
+    const replay = { ...w.msg, range: { ...w.msg.range, fromBlock: 4, toBlock: 7 } };
+    expect(await after.verify(VIEWER, replay, w.policy)).toMatchObject({ ok: true });
+    const honest = await w.otherViewer(after, 4);
+    expect(await after.verify(OTHER_VIEWER, honest, w.policy)).toMatchObject({ ok: true });
+    const r = await after.flush();
+    expect(r.failed).toBe(1);
+    expect(r.swapped).toBe(total(honest.seederProofs.proofs));
+    expect(after.isBanned(VIEWER)).toBe(true);
+    expect(after.isBanned(OTHER_VIEWER)).toBe(false);
+  });
+
+  it('F34: creator sets of one flush that share creator × mint × core go out as ONE nutzap; a double-spent one is dropped and only its viewer banned', async () => {
+    const w = await world({ check: true });
+    const honest = await w.otherViewer(w.seeder, 2);
+    expect(await w.seeder.verify(OTHER_VIEWER, honest, w.policy)).toMatchObject({ ok: true });
+    // The first viewer spent its creator set before we forwarded it.
+    w.mint.markSpent(w.msg.creatorProofs.proofs);
+    const r = await w.seeder.flush();
+    expect(r.failed).toBe(1);
+    expect(w.seeder.isBanned(VIEWER)).toBe(true);
+    expect(w.seeder.isBanned(OTHER_VIEWER)).toBe(false);
+    expect(w.zaps).toHaveLength(1);
+    expect(w.zaps[0]!.proofs).toEqual(honest.creatorProofs.proofs);
+    expect(r.nutzapped).toBe(total(honest.creatorProofs.proofs));
+    // Two honest viewers: one nutzap carrying both creator sets.
+    const w2 = await world();
+    const second = await w2.otherViewer(w2.seeder, 2);
+    expect(await w2.seeder.verify(OTHER_VIEWER, second, w2.policy)).toMatchObject({ ok: true });
+    await w2.seeder.flush();
+    expect(w2.zaps).toHaveLength(1);
+    expect(total(w2.zaps[0]!.proofs)).toBe(
+      total(w2.msg.creatorProofs.proofs) + total(second.creatorProofs.proofs),
+    );
   });
 
   it('F11: a creator set spent before it is forwarded is a double-spend of the creator share — ban, no nutzap', async () => {

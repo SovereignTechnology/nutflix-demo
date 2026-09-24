@@ -341,6 +341,27 @@ describe('Seeder façade', () => {
     expect(s.seeder.corePolicyMap().size).toBe(0);
   });
 
+  // Security review F27, hit by the real-mint lane: a viewer reconnected while its old connection
+  // lingered, the new session's rebind reset the per-pubkey carry, and every PAY still arriving
+  // on the old channel failed `carryIn`. The newest channel of a pubkey now wins.
+  it('a second live session binding the same pubkey supersedes the first: it is cut without a ban', async () => {
+    const s = await make();
+    const pk = pubkey('reconnecting');
+    const oldStream = new FakeStream(noiseKey(21));
+    const first = s.seeder.sessions.admit(oldStream)!;
+    expect(first.bindPubkey(pk)).toBe(true);
+    const second = s.seeder.sessions.admit(new FakeStream(noiseKey(22)))!;
+    expect(second.bindPubkey(pk)).toBe(true);
+    expect(first.cutReason).toBe('local');
+    expect(oldStream.destroyed).toBe(true);
+    expect(second.cutReason).toBeNull();
+    expect(s.seeder.banList.isPubkeyBanned(pk)).toBe(false);
+    // Another pubkey's session is untouched.
+    const other = s.seeder.sessions.admit(new FakeStream(noiseKey(23)))!;
+    expect(other.bindPubkey(pubkey('someone-else'))).toBe(true);
+    expect(second.cutReason).toBeNull();
+  });
+
   it('policy() throws until configured; close() is idempotent and flushes', async () => {
     const s = await make();
     expect(() => s.seeder.policy()).toThrow(/PricePolicy/);

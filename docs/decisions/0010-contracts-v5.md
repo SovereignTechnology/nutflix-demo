@@ -185,6 +185,11 @@ creator redeems. The spec says they must ignore it; Stage 3's integration run ag
 mint must confirm it before real money flows, because a mint that rejects the tag would make
 every creator share unredeemable.
 
+**Verified 2026-09-24 against Nutshell 0.21.0** (`packages/core/src/__tests__/
+real-mint.integration.test.ts`, opt-in): the mint accepts a P2PK secret carrying the `pay1` tag,
+refuses to spend it without the creator's witness, and the creator redeems it with one. **Same
+result on cdk-mintd 0.18.1**, the second implementation (security review F6, §0a).
+
 ## 7. HELLO is bound to the connection
 
 `HelloMessage.challenge = pay/1:<Noise handshake hash hex>:<sender Noise static key hex>`,

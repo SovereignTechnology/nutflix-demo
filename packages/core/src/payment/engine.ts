@@ -91,14 +91,18 @@ export interface PaymentEngineDeps {
     readonly mint: MintUrl;
     readonly proofs: readonly CashuProof[];
   }) => Promise<Sats>;
-  /** Seeder side: publish a creator set as a NIP-61 nutzap (kind 9321). */
+  /**
+   * Seeder side: publish creator proofs as ONE NIP-61 nutzap (kind 9321). The engine batches every
+   * creator set of a flush that shares creator key × mint × core into one call — at a real mint's
+   * input fee a lone 1-sat creator set is worthless, a batch is worth its sum less one fee
+   * (security review F34). `peers` are the viewers whose PAYs it forwards, `pays` how many.
+   */
   readonly nutzap?: (
     set: LockedProofSet,
     ctx: {
-      readonly peer: NostrPubkey;
       readonly core: CoreKeyHex;
-      readonly fromBlock: number;
-      readonly toBlock: number;
+      readonly peers: readonly NostrPubkey[];
+      readonly pays: number;
     },
   ) => Promise<void>;
   /** Seeder side: accepted proof secrets (restore from disk at start; persists new ones). */
@@ -139,6 +143,12 @@ export interface PendingPay {
   readonly stage: 'redeem' | 'nutzap';
   /** The creator set was checked at the mint already (F11: never re-checked after a restart). */
   readonly creatorChecked?: boolean;
+  /**
+   * A redeem of this seeder set was sent to the mint before (persisted BEFORE each attempt). Only
+   * then can a "spent" answer be our own lost swap (F31); on a first attempt it is a double-spend
+   * whatever the witness says — the witness of a replayed, already-redeemed set is ours too.
+   */
+  readonly redeemTried?: boolean;
 }
 
 // ---------------------------------------------------------------------------------------
@@ -271,6 +281,8 @@ interface Pending {
   stage: 'redeem' | 'nutzap';
   /** The creator set was checked at the mint already (F11: only before its FIRST nutzap). */
   creatorChecked?: boolean;
+  /** A redeem was sent to the mint before (F31; see `PendingPay.redeemTried`). */
+  redeemTried?: boolean;
 }
 
 type Decision =
@@ -285,6 +297,13 @@ export class RealPaymentEngine implements PaymentEngine {
   private readonly banMap = new Map<NostrPubkey, BanEntry>();
   private readonly pending: Pending[] = [];
   private readonly verifyChains = new Map<NostrPubkey, Promise<unknown>>();
+  /**
+   * Per account, how many times a new `pay/1` channel was bound to it (`rebind`). A PAY carries the
+   * epoch it was queued under; one from a channel that has since been replaced is refused, never
+   * committed — the new channel restarted the carry at 0, and a late commit from the old one would
+   * move it under the new channel's feet (found by the real-mint lane's network-drop test).
+   */
+  private readonly epochs = new Map<NostrPubkey, number>();
   private readonly windowListeners = new Set<(w: PeerWindow) => void>();
   private readonly doubleSpendListeners = new Set<
     (peer: NostrPubkey, d: { readonly mint: MintUrl; readonly amount: Sats }) => void
@@ -424,10 +443,11 @@ export class RealPaymentEngine implements PaymentEngine {
   // ===================================================================== seeder side
 
   verify(peer: NostrPubkey, msg: PayMessage, policy: PricePolicy): Promise<VerifyResult> {
+    const epoch = this.epochs.get(peer) ?? 0;
     const prev = this.verifyChains.get(peer) ?? Promise.resolve();
     const run = prev.then(
-      () => this.verifyOne(peer, msg, policy),
-      () => this.verifyOne(peer, msg, policy),
+      () => this.verifyOne(peer, msg, policy, epoch),
+      () => this.verifyOne(peer, msg, policy, epoch),
     );
     const settled = run.then(
       () => undefined,
@@ -444,9 +464,10 @@ export class RealPaymentEngine implements PaymentEngine {
     peer: NostrPubkey,
     msg: PayMessage,
     policy: PricePolicy,
+    epoch: number,
   ): Promise<VerifyResult> {
     try {
-      const first = this.decide(peer, msg, policy, null);
+      const first = this.decide(peer, msg, policy, null, epoch);
       if (first.kind === 'result') return first.result;
       const keysets = new Map<string, MintKeyset>();
       const lookup = this.deps.keyset;
@@ -461,7 +482,7 @@ export class RealPaymentEngine implements PaymentEngine {
           if (ks !== undefined) keysets.set(`${mint}|${id}`, ks);
         }
       }
-      const second = this.decide(peer, msg, policy, keysets);
+      const second = this.decide(peer, msg, policy, keysets, epoch);
       return second.kind === 'result' ? second.result : reject('bad-dleq', 'keyset unavailable');
     } catch {
       return reject('malformed');
@@ -478,12 +499,15 @@ export class RealPaymentEngine implements PaymentEngine {
     msg: PayMessage,
     policy: PricePolicy,
     keysets: ReadonlyMap<string, MintKeyset> | null,
+    epoch: number,
   ): Decision {
     const out = (reason: RejectReason, detail?: string): Decision => ({
       kind: 'result',
       result: reject(reason, detail),
     });
     if (this.banMap.has(peer)) return out('peer-banned');
+    if ((this.epochs.get(peer) ?? 0) !== epoch)
+      return out('malformed', 'sent on a channel that has since been replaced');
     if (!isPayMessageV5(msg)) return out('malformed');
     if (!isPolicyShape(policy)) return out('malformed', 'policy');
     const { range, carryIn, seederProofs, creatorProofs } = msg;
@@ -602,6 +626,7 @@ export class RealPaymentEngine implements PaymentEngine {
 
   rebind(from: NostrPubkey, to: NostrPubkey): PeerWindow {
     if (from === to) return this.snapshot(this.peerFor(to));
+    this.epochs.set(to, (this.epochs.get(to) ?? 0) + 1);
     const src = this.peers.get(from);
     const srcBan = this.banMap.get(from);
     const dst = this.peerFor(to);
@@ -689,79 +714,212 @@ export class RealPaymentEngine implements PaymentEngine {
     let failed = 0;
     const batch = this.pending.splice(0);
     const retry: Pending[] = [];
+
+    // Redeem stage: ONE swap per mint for every accepted seeder set (a real mint charges an input
+    // fee per swap — at 100 ppk a 1-sat set alone can never be redeemed; together they can).
+    const outcome = await this.redeemAll(batch, retry);
+    const forward: Pending[] = [];
     for (const item of batch) {
-      const { seederProofs, creatorProofs, range } = item.msg;
-      if (item.stage === 'redeem' && seederProofs.proofs.length > 0) {
-        const redeem = this.deps.redeem;
-        if (redeem === undefined) {
-          retry.push(item);
-          continue;
-        }
-        try {
-          await redeem({ mint: seederProofs.mint, proofs: seederProofs.proofs });
-        } catch (e) {
-          if ((e as { code?: unknown } | null)?.code !== 'spent') {
-            retry.push(item);
-            continue;
-          }
-          // Spent. By a double-spender — or by us, in a swap whose response was lost (F31)?
-          const ours = await this.ownSpend(seederProofs);
-          if (!ours) {
-            failed++;
-            this.doubleSpend(
-              item.peer,
-              seederProofs.mint,
-              sum(seederProofs.proofs) + sum(creatorProofs.proofs),
-            );
-            continue;
-          }
-        }
-        swapped += sum(seederProofs.proofs);
+      const { seederProofs, creatorProofs } = item.msg;
+      const o = outcome.get(item);
+      if (o === 'retry') {
+        retry.push(item);
+        continue;
       }
+      if (o === 'double-spend') {
+        failed++;
+        this.doubleSpend(
+          item.peer,
+          seederProofs.mint,
+          sum(seederProofs.proofs) + sum(creatorProofs.proofs),
+        );
+        continue;
+      }
+      if (o === 'redeemed') swapped += sum(seederProofs.proofs);
       item.stage = 'nutzap';
-      if (creatorProofs.proofs.length > 0) {
-        const nutzap = this.deps.nutzap;
-        if (nutzap === undefined) {
-          retry.push(item);
-          continue;
-        }
-        // F11: a creator set spent before we forwarded it is a double-spend of the creator's
-        // share. Checked once — a retry after a nutzap that may have reached a relay (and been
-        // redeemed by the creator) must not read the creator's own spend as fraud.
-        if (item.creatorChecked !== true && this.deps.checkSpent !== undefined) {
-          item.creatorChecked = true;
-          let spent: readonly boolean[] | null;
-          try {
-            spent = await this.deps.checkSpent({
-              mint: creatorProofs.mint,
-              proofs: creatorProofs.proofs,
-            });
-          } catch {
-            spent = null;
-          }
-          if (spent?.some(Boolean) === true) {
-            failed++;
-            this.doubleSpend(item.peer, creatorProofs.mint, sum(creatorProofs.proofs));
-            continue;
-          }
-        }
-        try {
-          await nutzap(creatorProofs, {
-            peer: item.peer,
-            core: range.core,
-            fromBlock: range.fromBlock,
-            toBlock: range.toBlock,
-          });
-        } catch {
-          retry.push(item);
-          continue;
-        }
-        nutzapped += sum(creatorProofs.proofs);
-      }
+      if (creatorProofs.proofs.length > 0) forward.push(item);
     }
+    const fwd = await this.forwardAll(forward, retry);
+    nutzapped += fwd.nutzapped;
+    failed += fwd.failed;
     this.pending.unshift(...retry);
     this.persist();
     return { swapped: swapped as Sats, nutzapped: nutzapped as Sats, failed };
+  }
+
+  /**
+   * Redeem every seeder set of `batch` still at the redeem stage: grouped by mint, one `redeem`
+   * per group. Returns, per item, `redeemed`, `retry` (mint outage, dust below the fee, no
+   * redeemer) or `double-spend`. Items with nothing to redeem get no entry.
+   */
+  private async redeemAll(
+    batch: readonly Pending[],
+    retry: readonly Pending[],
+  ): Promise<Map<Pending, 'redeemed' | 'retry' | 'double-spend'>> {
+    const out = new Map<Pending, 'redeemed' | 'retry' | 'double-spend'>();
+    const todo = batch.filter((i) => i.stage === 'redeem' && i.msg.seederProofs.proofs.length > 0);
+    if (todo.length === 0) return out;
+    if (this.deps.redeem === undefined) {
+      for (const i of todo) out.set(i, 'retry');
+      return out;
+    }
+    // Record every attempt before making it: a crash mid-swap must restore as "tried" (F31).
+    const retried = new Set(todo.filter((i) => i.redeemTried === true));
+    if (retried.size < todo.length) {
+      for (const i of todo) i.redeemTried = true;
+      this.persist([...this.pending, ...batch, ...retry]);
+    }
+    const byMint = new Map<MintUrl, Pending[]>();
+    for (const i of todo) {
+      const m = i.msg.seederProofs.mint;
+      byMint.set(m, [...(byMint.get(m) ?? []), i]);
+    }
+    for (const [mint, items] of byMint) await this.redeemGroup(mint, items, retried, out);
+    return out;
+  }
+
+  private async redeemGroup(
+    mint: MintUrl,
+    items: readonly Pending[],
+    retried: ReadonlySet<Pending>,
+    out: Map<Pending, 'redeemed' | 'retry' | 'double-spend'>,
+  ): Promise<void> {
+    const redeem = this.deps.redeem;
+    if (redeem === undefined) return;
+    const proofs = items.flatMap((i) => i.msg.seederProofs.proofs);
+    try {
+      await redeem({ mint, proofs });
+      for (const i of items) out.set(i, 'redeemed');
+      return;
+    } catch (e) {
+      if ((e as { code?: unknown } | null)?.code !== 'spent') {
+        for (const i of items) out.set(i, 'retry');
+        return;
+      }
+    }
+    // "Spent": which PAY? Spent by a double-spender — or by us, in an earlier attempt whose
+    // response was lost (F31)? Only a RETRY can be the latter: a replay of a set we redeemed long
+    // ago (before a restart that lost the seen set) carries our witness too.
+    const verdict = async (i: Pending): Promise<'redeemed' | 'double-spend'> =>
+      retried.has(i) && (await this.ownSpend(i.msg.seederProofs)) ? 'redeemed' : 'double-spend';
+    if (items.length === 1) {
+      const [only] = items;
+      if (only !== undefined) out.set(only, await verdict(only));
+      return;
+    }
+    const check = this.deps.checkSpent;
+    if (check === undefined) {
+      // No NUT-07 to attribute it: redeem one PAY at a time (the old, per-PAY behaviour).
+      for (const i of items) await this.redeemGroup(mint, [i], retried, out);
+      return;
+    }
+    let flags: readonly boolean[];
+    try {
+      flags = await check({ mint, proofs });
+    } catch {
+      for (const i of items) out.set(i, 'retry');
+      return;
+    }
+    const clean: Pending[] = [];
+    let k = 0;
+    for (const i of items) {
+      const n = i.msg.seederProofs.proofs.length;
+      const spent = flags.slice(k, k + n).some(Boolean);
+      k += n;
+      if (spent) out.set(i, await verdict(i));
+      else clean.push(i);
+    }
+    // The rest were not spent: redeem them together now (no recursion into another "spent"
+    // split unless the mint changes its mind — then they come back next flush).
+    if (clean.length > 0) {
+      try {
+        await redeem({ mint, proofs: clean.flatMap((i) => i.msg.seederProofs.proofs) });
+        for (const i of clean) out.set(i, 'redeemed');
+      } catch {
+        for (const i of clean) out.set(i, 'retry');
+      }
+    }
+  }
+
+  /**
+   * Forward the creator sets of `items` (all at the nutzap stage): grouped by creator key × mint ×
+   * core, one `nutzap` per group (F34). Before a set's FIRST nutzap its proofs are checked at the
+   * mint (F11): a spent one is a double-spend of the creator's share — ban, not forwarded. Only
+   * once: a retry after a nutzap that may have landed (and been redeemed by the creator) must not
+   * read the creator's own spend as fraud.
+   */
+  private async forwardAll(
+    items: readonly Pending[],
+    retry: Pending[],
+  ): Promise<{ nutzapped: number; failed: number }> {
+    let nutzapped = 0;
+    let failed = 0;
+    const nutzap = this.deps.nutzap;
+    if (nutzap === undefined) {
+      retry.push(...items);
+      return { nutzapped, failed };
+    }
+    const groups = new Map<string, Pending[]>();
+    for (const i of items) {
+      const c = i.msg.creatorProofs;
+      const k = `${c.lockedTo.toLowerCase()}|${c.mint}|${i.msg.range.core}`;
+      groups.set(k, [...(groups.get(k) ?? []), i]);
+    }
+    for (const group of groups.values()) {
+      let send = group;
+      const unchecked = group.filter((i) => i.creatorChecked !== true);
+      const check = this.deps.checkSpent;
+      if (check !== undefined && unchecked.length > 0) {
+        for (const i of unchecked) i.creatorChecked = true;
+        const first = unchecked[0];
+        let flags: readonly boolean[] | null = null;
+        if (first !== undefined)
+          try {
+            flags = await check({
+              mint: first.msg.creatorProofs.mint,
+              proofs: unchecked.flatMap((i) => i.msg.creatorProofs.proofs),
+            });
+          } catch {
+            flags = null; // a failed check does not block the nutzap
+          }
+        if (flags !== null) {
+          const spent = new Set<Pending>();
+          let k = 0;
+          for (const i of unchecked) {
+            const n = i.msg.creatorProofs.proofs.length;
+            if (flags.slice(k, k + n).some(Boolean)) spent.add(i);
+            k += n;
+          }
+          for (const i of spent) {
+            failed++;
+            this.doubleSpend(i.peer, i.msg.creatorProofs.mint, sum(i.msg.creatorProofs.proofs));
+          }
+          send = group.filter((i) => !spent.has(i));
+        }
+      }
+      const head = send[0];
+      if (head === undefined) continue;
+      const proofs = send.flatMap((i) => i.msg.creatorProofs.proofs);
+      try {
+        await nutzap(
+          {
+            mint: head.msg.creatorProofs.mint,
+            unit: 'sat',
+            lockedTo: head.msg.creatorProofs.lockedTo,
+            proofs,
+          },
+          {
+            core: head.msg.range.core,
+            peers: [...new Set(send.map((i) => i.peer))],
+            pays: send.length,
+          },
+        );
+        nutzapped += sum(proofs);
+      } catch {
+        retry.push(...send);
+      }
+    }
+    return { nutzapped, failed };
   }
 
   /** F31: whether a "spent" seeder set was spent by this seeder itself (never throws). */
@@ -775,15 +933,20 @@ export class RealPaymentEngine implements PaymentEngine {
     }
   }
 
-  /** F12: hand the queue to the host's persistence hook (a failing hook never stops the engine). */
-  private persist(): void {
+  /**
+   * F12: hand the queue to the host's persistence hook (a failing hook never stops the engine).
+   * During a flush the queue is split between `pending` and the batch in hand, so the caller may
+   * pass the full list.
+   */
+  private persist(queue: readonly Pending[] = this.pending): void {
     const hook = this.deps.persistPending;
     if (hook === undefined) return;
-    const items: PendingPay[] = this.pending.map((p) => ({
+    const items: PendingPay[] = queue.map((p) => ({
       peer: p.peer,
       msg: p.msg,
       stage: p.stage,
       ...(p.creatorChecked === true ? { creatorChecked: true } : {}),
+      ...(p.redeemTried === true ? { redeemTried: true } : {}),
     }));
     safeCall(() => {
       hook(items);
@@ -807,6 +970,7 @@ export class RealPaymentEngine implements PaymentEngine {
         msg: it.msg,
         stage,
         ...(it.creatorChecked === true ? { creatorChecked: true } : {}),
+        ...(it.redeemTried === true ? { redeemTried: true } : {}),
       });
     }
   }
