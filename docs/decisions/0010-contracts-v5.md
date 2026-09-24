@@ -27,7 +27,7 @@ carries a red tip.
 | 1 | `BlockRange.core` and `recordUpload`'s `core` required (ADR 0004) | **Accepted**, and `recordUpload` also carries the block index (item 7). §2 |
 | 2 | `PRICE` carries a core (L3) | **Accepted**: `PriceMessage.core`. The seeder sends one PRICE per core on the default policy; `UpstreamPayer` applies a PRICE to its core only |
 | 3 | Per-PAY split as contract text (ADR 0007) | **Accepted with one amendment** (§3.3): carry normative, minimum PAY a batching target |
-| 4 | BUD-09 reports reach `BlossomAuth` as a synthetic header under verb `report` | **Deferred to PART A step 5** (`gateway/src/auth/` is not a core contract); decided there |
+| 4 | BUD-09 reports reach `BlossomAuth` as a synthetic header under verb `report` | **Accepted in PART A step 5** (`gateway/src/auth/` is not a core contract): no second method; `report` verifies the NIP-56 event itself. §8 |
 | 5 | L5 screen requests (signer surface, `autoTopUp` clearing, `unreact`, `seederAnnouncement`, `searchChannels`, upload abort, `chooseThumbnail`, thumbnail hashes, progress error code, `studio.ffmpeg()`, `firstPaidAt`, `pendingMintQuotes`, resume lookup, `nostr:` resolution, throughput, session-closed flag) | **Signer surface accepted core-side** (`SignerConnectRequest`, `SignerControl`; the `NetworkAdapter`/IPC bridge is Stage 3 because the L6-0 wire table is exhaustive and frozen). **`autoTopUp` semantics made normative** (`belowSats <= 0` = disabled; compared with the balance at the paying mint, funded from `fromMint`). `unreact` was v4. **Everything else deferred to Stage 3** — none is money-path, each has a working screen-side workaround, and each needs adapter + IPC work that belongs with integration |
 | 6 | L6-B: `NostrKind.Deletion`, `seedersOnline` "unknown", `SignerStatus` "none", which balance `autoTopUp` compares, `satsByRendition` source, `studio.cancel` | **`Deletion = 5` accepted. `seedersOnline?` accepted** (absent = unknown; screens gate only on a known 0; Watch hides the count, Studio shows "Unknown"). **`autoTopUp` answered** (item 5). **`SignerStatus` "none" deferred** — `pubkey: null` already means "no signer" and a new kind widens every Settings switch; it lands with the Stage 3 signer bridge. `satsByRendition`, `studio.cancel`, the L1 items: **deferred** |
 | 7 | L6-C: mock bugs; `recordUpload` block index; `core` in ACK/PRICE; `windowBlocks` in HELLO; worker `shutdown`; seeder swarm hooks; runtime disk cap; boot module | **Mock fixed** (§4). **Index accepted** (§2). **`AckMessage.core`, `PriceMessage.core`, `HelloMessage.windowBlocks` accepted.** `shutdown` (L6-0 IPC), swarm hooks and disk cap (L2), boot module (packaging): **deferred to Stage 3** — not contracts |
@@ -196,6 +196,38 @@ connection) or whose key is not the remote's (a HELLO reflected back to its send
 HELLO signed an arbitrary random challenge the receiver had no way to check. Implemented in
 PART A step 4; until then the gateway and the dev worker send placeholders, as in Stage 1.
 
+## 8. Blossom authorisation (item 4, PART A step 5)
+
+`BlossomAuthImpl` (`packages/gateway/src/auth/blossom-auth.ts`) verifies through core's T9
+boundary (`nostr.classifyIncoming`), then applies policy to the authentic event:
+
+- **`report` (item 4).** The handler keeps passing the BUD-09 body as `Nostr <base64 event>`
+  under verb `report`; no second interface method. For that verb the event must be kind 1984
+  (NIP-56), carry the reported hash in an `x` tag, have `created_at` no more than 60 s ahead and
+  within `maxAgeSec`, and honour a NIP-40 `expiration` if present. It needs no `t` tag and no
+  `expiration`. A report is accepted once (replay by id), a denied pubkey cannot report, and
+  allow-list mode does not gate reports — anyone not denied may report a blob.
+- **Allow list.** `allow()` on any pubkey switches to allow-list mode: only allowed pubkeys pass
+  (403 `denied`). The gateway config names the field `allowPubkeys`, and an allow list that
+  restricted nothing would be a silent open door. `allow()` lifts a deny and `deny()` drops an
+  allow; the later call wins.
+- **Time.** `created_at` may be at most 60 s in the future (clock skew). A token is honoured for
+  at most `maxAgeSec` (default 3600 s, nostr-tools' default lifetime) whatever its `expiration`
+  says. `expiration` must be exactly one canonical decimal tag, and `expiration <= now` is
+  expired.
+- **Ambiguity is malformed.** Two `expiration` or two `t` tags are refused rather than read
+  first-or-last, and `1e10`, hex, padded or signed numbers are refused rather than coerced.
+- **`server` tags.** A token that names servers must name this gateway's host when one is
+  configured (new reason `wrong-server`). BUD-11 is not vendored: this follows nostr-tools'
+  Blossom client (`createAuthEvent` writes lower-cased hostnames as `server` tags) and is
+  **unverified against the spec text**.
+- **Bounded replay memory.** Accepted ids are kept until the token could no longer pass the
+  time checks (plus 300 s). When the memory is full of live tokens the answer is 503 `busy`
+  (new reason); evicting a live token would re-open it to replay.
+
+`BlossomAuthResult`'s failure `status` widens to `401 | 403 | 503`, and the reason set gains
+`wrong-server` and `busy`. The handler already forwards whatever status and reason it gets.
+
 ## Consequences
 
 - `CONTRACTS_VERSION = 5`. Consumers adapted: seeder (`PeerSession.onUpload` records indexes
@@ -207,6 +239,10 @@ PART A step 4; until then the gateway and the dev worker send placeholders, as i
   verifies every PAY against the current policy, so a price change makes honest PAYs
   `wrong-amount`); persisting the seen-secret set; the `NetworkAdapter`/IPC signer bridge and
   `SignerStatus` "none"; the deferred L5/L6-B/L6-C items above; a regtest-mint check of the
-  `pay1` tag.
+  `pay1` tag; wiring the gateway's runtime providers (`cli/providers.ts`: `BlossomAuthImpl`
+  with `serverHost` from `blossom.publicUrl`, the real engines, the HELLO signer). The report
+  store's `signatureVerified: false` also goes stale: the signature is now verified at the
+  auth boundary, but the handler sits outside the locked directories, so the change is filed
+  for Stage 3.
 - The manifest parser does not read the NIP-71 `minpay` tag yet, so every video uses the default
   minimum until it does.

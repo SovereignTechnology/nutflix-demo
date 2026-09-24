@@ -49,9 +49,12 @@ export type {
   WsLimits,
 } from './config.js';
 
-// Auth boundary (interface only — LOCKED until Stage 2)
+// Auth boundary (Blossom kind 24242 / BUD-09 report verification, Stage 2)
+export { BlossomAuthImpl } from './auth/index.js';
 export type {
   BlossomAuth,
+  BlossomAuthOptions,
+  BlossomAuthReason,
   BlossomAuthRequest,
   BlossomAuthResult,
   BlossomVerb,
