@@ -16,6 +16,7 @@ import {
   bool,
   int,
   isAbsolutePath,
+  isCashuP2pk,
   isCoreKey,
   isCount,
   isEventId,
@@ -33,6 +34,7 @@ import {
   isSeederStatusWire,
   isSessionId,
   isSha256,
+  isUnixSeconds,
   isUploadId,
   isVideoManifest,
   isWireError,
@@ -77,14 +79,29 @@ const isDev = safe(
     (x.bootstrap === undefined || x.mocks),
 );
 
-const isInit = obj(
-  {
-    v: literal(WORKER_V),
-    storage: isAbsolutePath,
-    seeding: isSeeding,
-    prefetchSeconds: isPrefetch,
-  },
-  { ffmpeg: obj({ ffmpeg: isAbsolutePath, ffprobe: isAbsolutePath }), dev: isDev },
+const isPayments = obj({
+  pubkey: isPubkey,
+  p2pk: isCashuP2pk,
+  mints: arrayOf(isMintUrl, 16, 1),
+});
+
+const isInit = safe(
+  (x: unknown): x is WorkerMethodTable['init'][0] =>
+    obj(
+      {
+        v: literal(WORKER_V),
+        storage: isAbsolutePath,
+        seeding: isSeeding,
+        prefetchSeconds: isPrefetch,
+      },
+      {
+        ffmpeg: obj({ ffmpeg: isAbsolutePath, ffprobe: isAbsolutePath }),
+        dev: isDev,
+        payments: isPayments,
+      },
+    )(x) &&
+    // Real payments and mock payments never run together.
+    !(x.payments !== undefined && x.dev?.mocks === true),
 );
 
 const isPlayOpen = obj(
@@ -198,9 +215,93 @@ const publishDraftShape = obj(
 
 const isPublishDraft: Guard<PublishDraft> = publishDraftShape;
 
+// ---- money (ADR 0012): shapes only; the host's money plane authorises every call ----------
+
+/** Most proofs one set may carry on the hop (the engine's own cap is lower). */
+const MAX_PROOFS = 128;
+const HEX = /^[0-9a-f]+$/;
+const isKeysetId = matches(/^(?:[0-9a-f]{16}|[0-9a-f]{66})$/, 66);
+const isProof = obj(
+  {
+    id: isKeysetId,
+    amount: int(1, LIMITS.maxSats),
+    secret: text(1, 4096),
+    C: matches(/^0[23][0-9a-f]{64}$/, 66),
+  },
+  {
+    dleq: obj({ e: matches(HEX, 64), s: matches(HEX, 64) }, { r: matches(HEX, 64) }),
+    witness: text(1, 8192),
+  },
+);
+const isProofs = arrayOf(isProof, MAX_PROOFS, 1);
+const isProofSet = obj({ mint: isMintUrl, proofs: isProofs });
+const isLockedSet = obj({
+  mint: isMintUrl,
+  unit: literal('sat'),
+  lockedTo: isCashuP2pk,
+  proofs: isProofs,
+});
+const MAX_BLOCK = 2 ** 40;
+const isRange = safe(
+  (x: unknown): x is HostMethodTable['pay.build'][0]['range'] =>
+    obj({ core: isCoreKey, fromBlock: int(0, MAX_BLOCK), toBlock: int(0, MAX_BLOCK) })(x) &&
+    x.toBlock >= x.fromBlock,
+);
+const isPayBuild = obj({
+  sid: isSessionId,
+  range: isRange,
+  seeder: obj({ pubkey: isPubkey, p2pk: isCashuP2pk, mint: isMintUrl }),
+  policy: isPricePolicy,
+  carryIn: int(0, 99),
+});
+const isPayMessage = obj({
+  range: isRange,
+  carryIn: int(0, 99),
+  seederProofs: isLockedSet,
+  creatorProofs: isLockedSet,
+});
+/** A keyset from the host: amount → compressed public key, at most 64 denominations. */
+const isKeys = safe((x: unknown): x is Readonly<Record<string, string>> => {
+  if (typeof x !== 'object' || x === null || Array.isArray(x)) return false;
+  const entries = Object.entries(x);
+  return (
+    entries.length > 0 &&
+    entries.length <= 64 &&
+    entries.every(
+      ([k, v]) =>
+        /^[1-9][0-9]{0,18}$/.test(k) && typeof v === 'string' && /^0[23][0-9a-f]{64}$/.test(v),
+    )
+  );
+});
+const isMintKeyset = obj(
+  {
+    mint: isMintUrl,
+    id: isKeysetId,
+    unit: literal('sat'),
+    active: bool,
+    keys: isKeys,
+    fetchedAt: isUnixSeconds,
+  },
+  { inputFeePpk: int(0, 100_000) },
+);
+const isHelloChallenge = matches(/^pay\/1:(?:[0-9a-f]{2}){32,64}:[0-9a-f]{64}$/, 256);
+const isRedeemResult = union(
+  obj({ ok: literal(true), sats: isSats }),
+  obj({ ok: literal(false), spent: bool }),
+);
+
 /** Arguments of every worker → host request (checked by the host). */
 export const validateHostArgs: { readonly [M in HostMethod]: Guard<HostMethodTable[M][0]> } = {
   'studio.publish': safe(isPublishDraft),
+  'pay.build': safe(isPayBuild),
+  // `helloChallenge()`: `<pay/1 name>:<handshake hash hex>:<sender Noise key hex>` — the host
+  // signs a HELLO over exactly this and nothing else (ADR 0012).
+  'pay.hello': safe(obj({ challenge: isHelloChallenge })),
+  'seller.keyset': safe(obj({ mint: isMintUrl, id: isKeysetId })),
+  'seller.redeem': safe(isProofSet),
+  'seller.checkSpent': safe(isProofSet),
+  'seller.spentByUs': safe(isProofSet),
+  'seller.nutzap': safe(obj({ set: isLockedSet, core: isCoreKey })),
 };
 
 /** Results of every worker → host request (checked by the worker). */
@@ -208,6 +309,15 @@ export const validateHostResult: {
   readonly [M in HostMethod]: Guard<HostMethodTable[M][1]>;
 } = {
   'studio.publish': safe(isVideoManifest),
+  'pay.build': safe(isPayMessage),
+  'pay.hello': safe(
+    obj({ pubkey: isPubkey, createdAt: isUnixSeconds, signature: matches(/^[0-9a-f]{128}$/, 128) }),
+  ),
+  'seller.keyset': safe(union(isMintKeyset, literal(null))),
+  'seller.redeem': safe(isRedeemResult),
+  'seller.checkSpent': safe(arrayOf(bool, MAX_PROOFS, 1)),
+  'seller.spentByUs': safe(bool),
+  'seller.nutzap': isVoid,
 };
 
 const isPercent = num(0, 100);

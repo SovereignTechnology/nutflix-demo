@@ -140,6 +140,13 @@ export class Seeder {
       // v5: the engine's effective window needs the core's price. A core with no policy
       // (no default either) is served unpriced — its PAYs cannot be verified anyway.
       pricing: (core) => this.pricingFor(core),
+      ...(config.announceCorePrices
+        ? {
+            onFirstUpload: (session: PeerSession, core: CoreKeyHex) => {
+              this.announceFirstUpload(session, core);
+            },
+          }
+        : {}),
     });
     this.blobs = new BlobStore({
       storageDir: config.storageDir,
@@ -404,6 +411,23 @@ export class Seeder {
       byCore.set(core, list);
       protocol.sendPrice({ core, satsPerBlock: next.satsPerBlock, effectiveFromBlock: fromBlock });
     }
+  }
+
+  /**
+   * `announceCorePrices`: the first block of `core` is about to go to this peer — tell it the
+   * core's price from block 0 (runs before the block is written, so it precedes it on the wire).
+   */
+  private announceFirstUpload(session: PeerSession, core: CoreKeyHex): void {
+    const protocol = this.protocols.get(session);
+    const policy = this.corePolicies.get(core) ?? this.policyOverride;
+    if (protocol === undefined || policy === null) return;
+    let byCore = this.priceHistory.get(session);
+    if (byCore === undefined) {
+      byCore = new Map();
+      this.priceHistory.set(session, byCore);
+    }
+    byCore.set(core, [{ fromBlock: 0, policy }]);
+    protocol.sendPrice({ core, satsPerBlock: policy.satsPerBlock, effectiveFromBlock: 0 });
   }
 
   /** v5: `policyFor` for the effective window, never throwing (unpriced when none). */

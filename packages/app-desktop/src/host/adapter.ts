@@ -57,6 +57,7 @@ import type {
   ThumbnailHex,
   UploadMeta,
   WorkerEvent,
+  WorkerMethodTable,
 } from '../ipc/worker-protocol.js';
 import type { CatalogSource, SearchQuery } from './catalog/catalog.js';
 import { NostrCatalog } from './catalog/catalog.js';
@@ -71,6 +72,7 @@ import { autoTopUpDue } from './settings/settings.js';
 import type { WorkerCall } from './sessions.js';
 import { HostPlaySession, SessionRegistry } from './sessions.js';
 import { buildUnreactDeletion, fetchReactionSummary, ownReactionIds } from './social/reactions.js';
+import type { MoneyPlane } from './money.js';
 import type { WalletProvider } from './wallet.js';
 import { DEV_BALANCE_SATS } from './wallet.js';
 
@@ -88,6 +90,12 @@ export interface DesktopAdapterOptions {
   readonly pool: nostr.PoolLike;
   readonly identity: IdentityProvider;
   readonly wallet: WalletProvider;
+  /**
+   * Stage 3 (ADR 0012): the money plane, when a signer is connected. Every play session is
+   * authorised with it BEFORE the worker opens the core — the worker's PAYs are paid only for
+   * registered sessions — and revoked when the session closes.
+   */
+  readonly money?: MoneyPlane;
   readonly images: ImageService;
   /** `WorkerSupervisor.request`, bound. */
   readonly worker: WorkerCall;
@@ -463,19 +471,30 @@ export class DesktopNetworkAdapter implements NetworkAdapter {
     const token = this.hex(32);
     await this.sessions.pauseOthers({ owner, sid });
     const prefetchSeconds = carry?.prefetchSeconds ?? this.o.settings.get().prefetchSeconds;
-    const res = await this.o.worker('play.open', {
+    this.o.money?.authorizeSession(
       sid,
-      videoId: video.id,
-      rendition: {
-        label: r.label,
-        hyper: r.hyper,
-        size: r.size,
-        ...(r.bitrateKbps === undefined ? {} : { bitrateKbps: r.bitrateKbps }),
-      },
-      ...(video.durationSec === undefined ? {} : { durationSec: video.durationSec }),
-      policy: video.price,
-      prefetchSeconds,
-    });
+      { core: r.hyper.core, blob: r.hyper.blob, policy: video.price },
+      video.author,
+    );
+    let res: WorkerMethodTable['play.open'][1];
+    try {
+      res = await this.o.worker('play.open', {
+        sid,
+        videoId: video.id,
+        rendition: {
+          label: r.label,
+          hyper: r.hyper,
+          size: r.size,
+          ...(r.bitrateKbps === undefined ? {} : { bitrateKbps: r.bitrateKbps }),
+        },
+        ...(video.durationSec === undefined ? {} : { durationSec: video.durationSec }),
+        policy: video.price,
+        prefetchSeconds,
+      });
+    } catch (err) {
+      this.o.money?.revokeSession(sid);
+      throw err;
+    }
     const session = new HostPlaySession(
       {
         sid,
@@ -500,6 +519,9 @@ export class DesktopNetworkAdapter implements NetworkAdapter {
       },
     );
     this.sessions.add(session);
+    session.onClose(() => {
+      this.o.money?.revokeSession(sid);
+    });
     // Main learns the link BEFORE anyone learns the token (HostOut ordering, protocol.ts).
     this.o.mediaLink(token, res.link);
     await this.sessions.pauseOthers(session);

@@ -35,6 +35,9 @@ import type { Logger } from './log.js';
 import { SettingsStore, loadDesktopConfig } from './settings/settings.js';
 import type { RestartPolicy, SpawnWorker, Timers, WorkerState } from './worker/supervisor.js';
 import { WorkerSupervisor } from './worker/supervisor.js';
+import { MoneyPlane } from './money.js';
+import type { MoneyPlaneOptions } from './money.js';
+import type { WalletProvider } from './wallet.js';
 import { createWalletProvider } from './wallet.js';
 import { TopicRegistry } from './topics.js';
 
@@ -53,6 +56,8 @@ export interface HostOptions {
   readonly imageTransport?: ImageTransport;
   /** Signer seam; default `NoIdentity` (`DevViewerIdentity` with `--dev-mocks`). */
   readonly identity?: IdentityProvider;
+  /** Tests: the mint transport of the money plane (the in-process `TestMint`). */
+  readonly mintRequest?: MoneyPlaneOptions['mintRequest'];
   readonly timers?: Timers;
   readonly restart?: RestartPolicy;
   readonly random?: (n: number) => Uint8Array;
@@ -247,6 +252,35 @@ export async function createHost(o: HostOptions): Promise<Host> {
     o.pool ?? (flags.devFixtures ? new nostr.FakeRelayPool() : new nostr.SimplePoolAdapter());
   const identity =
     o.identity ?? (flags.devMocks ? new DevViewerIdentity(mocks.ME) : new NoIdentity());
+  // Stage 3 (ADR 0012): with a connected signer (and never with --dev-mocks), the money plane —
+  // the user's NIP-60 wallet and the viewer engine; the worker then runs the real engines.
+  const signer = flags.devMocks ? undefined : identity.signer();
+  let money: MoneyPlane | undefined;
+  if (signer !== undefined)
+    try {
+      money = await MoneyPlane.open({
+        signer,
+        pool,
+        relays: () => settings.get().relays,
+        defaultMints: () => settings.get().defaultMints,
+        log: log.child('money'),
+        ...(o.mintRequest === undefined ? {} : { mintRequest: o.mintRequest }),
+        ...(o.now === undefined ? {} : { now: o.now }),
+      });
+    } catch (err) {
+      // The code prefix only (`wallet-unreadable`, `relay-down`, …): never a key or a proof.
+      const reason =
+        err instanceof Error ? (/^[a-z-]+(?=:)/.exec(err.message)?.[0] ?? err.name) : 'unknown';
+      log.error('the wallet could not be opened: payments stay unavailable', { reason });
+    }
+  if (money?.mints.length === 0)
+    log.warn(
+      'the wallet lists no mints: streaming payments stay off until one is added in Settings',
+    );
+  const walletProvider: WalletProvider =
+    money === undefined
+      ? createWalletProvider(flags.devMocks)
+      : { kind: 'real', wallet: money.wallet };
   const images = new ImageService({
     transport: o.imageTransport ?? httpsTransport(),
     log,
@@ -268,6 +302,8 @@ export async function createHost(o: HostOptions): Promise<Host> {
         seeding: s.seeding,
         prefetchSeconds: s.prefetchSeconds,
         ...(desktop.ffmpeg === undefined ? {} : { ffmpeg: desktop.ffmpeg }),
+        // Payments need at least one mint to pay at and be paid at (Settings → mints).
+        ...(money === undefined || money.mints.length === 0 ? {} : { payments: money.payments() }),
         ...(flags.devMocks || flags.devFixtures
           ? {
               dev: {
@@ -288,6 +324,7 @@ export async function createHost(o: HostOptions): Promise<Host> {
       if (s === 'failed' || s === 'stopped') fixtures?.workerGone();
     },
     handlers: {
+      ...(money === undefined ? {} : money.handlers()),
       'studio.publish': (draft) => {
         if (late.adapter === undefined) return Promise.reject(new Error('host not ready'));
         return late.adapter.publishUpload(draft);
@@ -303,7 +340,8 @@ export async function createHost(o: HostOptions): Promise<Host> {
     desktop,
     pool,
     identity,
-    wallet: createWalletProvider(flags.devMocks),
+    wallet: walletProvider,
+    ...(money === undefined ? {} : { money }),
     images,
     worker: (m, a) => worker.request(m, a),
     mediaLink: (token, url) => {

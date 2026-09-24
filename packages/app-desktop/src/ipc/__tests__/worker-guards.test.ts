@@ -1,7 +1,7 @@
 import * as fc from 'fast-check';
 import { describe, expect, it } from 'vitest';
 
-import { mocks } from '@sovit/core';
+import { mocks, payProtocol } from '@sovit/core';
 
 import { toHex } from '../codec.js';
 import { FrameDecoder, encodeFrame } from '../framing.js';
@@ -131,11 +131,44 @@ const draft: PublishDraft = {
   },
   codec: 'h264',
 };
+const P2PK = `02${'5e'.repeat(32)}` as never;
+const PROOF = {
+  id: `00${'ab'.repeat(7)}`,
+  amount: 2,
+  secret: '["P2PK",{"nonce":"ab","data":"02"}]',
+  C: `03${'cd'.repeat(32)}`,
+  dleq: { e: 'e1'.repeat(32), s: '5a'.repeat(32), r: 'f0'.repeat(32) },
+};
+const LOCKED = { mint: MINT, unit: 'sat' as const, lockedTo: P2PK, proofs: [PROOF] };
+const RANGE = { core: R.hyper.core, fromBlock: 0, toBlock: 3 };
+/** Exactly what `buildHello` asks the signer to sign (a 64-byte Noise handshake hash). */
+const CHALLENGE = payProtocol.helloChallenge(
+  new Uint8Array(64).fill(7),
+  new Uint8Array(32).fill(9),
+);
 const HOST_ARGS: { readonly [M in HostMethod]: readonly HostMethodTable[M][0][] } = {
   'studio.publish': [
     draft,
     { ...draft, thumbnail: { kind: 'custom', sha256: R.sha256, type: 'image/png' } },
   ],
+  'pay.build': [
+    {
+      sid: SID,
+      range: RANGE,
+      seeder: { pubkey: PUBKEY, p2pk: P2PK, mint: MINT },
+      policy: VIDEO.price,
+      carryIn: 0,
+    },
+  ],
+  'pay.hello': [{ challenge: CHALLENGE }],
+  'seller.keyset': [
+    { mint: MINT, id: `00${'ab'.repeat(7)}` },
+    { mint: MINT, id: `01${'ab'.repeat(32)}` },
+  ],
+  'seller.redeem': [{ mint: MINT, proofs: [PROOF] }],
+  'seller.checkSpent': [{ mint: MINT, proofs: [PROOF, { ...PROOF, secret: 's2' }] }],
+  'seller.spentByUs': [{ mint: MINT, proofs: [PROOF] }],
+  'seller.nutzap': [{ set: LOCKED, core: R.hyper.core }],
 };
 
 const EVENTS: { readonly [E in WorkerEventName]: readonly Extract<WorkerEvent, { e: E }>[] } = {
@@ -286,6 +319,78 @@ describe('worker → host', () => {
     expect(isWorkerToHost({ op: 'req', id: 9, m: 'play.open', a: ARGS['play.open'][0] })).toBe(
       false,
     );
+  });
+
+  it.each(Object.keys(HOST_ARGS) as HostMethod[])('host method %s: valid samples pass', (m) => {
+    for (const a of HOST_ARGS[m] as readonly unknown[]) {
+      expect((validateHostArgs[m] as Guard<unknown>)(viaJson(a)), m).toBe(true);
+      expect(isWorkerToHost({ op: 'req', id: 3, m, a: viaJson(a) })).toBe(true);
+    }
+  });
+
+  it('money calls (ADR 0012): malformed args and results are refused', () => {
+    const build = HOST_ARGS['pay.build'][0]!;
+    expect(validateHostArgs['pay.build']({ ...build, range: { ...RANGE, toBlock: -1 } })).toBe(
+      false,
+    );
+    expect(validateHostArgs['pay.build']({ ...build, range: { ...RANGE, fromBlock: 5 } })).toBe(
+      false,
+    ); // to < from
+    expect(validateHostArgs['pay.build']({ ...build, carryIn: 100 })).toBe(false);
+    expect(validateHostArgs['pay.build']({ ...build, sid: 'nope' })).toBe(false);
+    expect(validateHostArgs['pay.hello']({ challenge: 'ab'.repeat(32) })).toBe(false); // not a HELLO challenge
+    expect(validateHostArgs['pay.hello']({ challenge: CHALLENGE.toUpperCase() })).toBe(false);
+    expect(validateHostArgs['pay.hello']({ challenge: `${CHALLENGE}\n` })).toBe(false);
+    expect(validateHostArgs['pay.hello']({ challenge: CHALLENGE, kind: 1 })).toBe(false);
+    expect(validateHostArgs['seller.redeem']({ mint: MINT, proofs: [] })).toBe(false);
+    expect(
+      validateHostArgs['seller.redeem']({
+        mint: MINT,
+        proofs: Array.from({ length: 129 }, () => PROOF),
+      }),
+    ).toBe(false);
+    expect(
+      validateHostArgs['seller.redeem']({ mint: MINT, proofs: [{ ...PROOF, amount: 0 }] }),
+    ).toBe(false);
+    expect(
+      validateHostArgs['seller.nutzap']({ set: { ...LOCKED, unit: 'usd' }, core: R.hyper.core }),
+    ).toBe(false);
+    // Results the worker checks.
+    expect(validateHostResult['seller.redeem']({ ok: true, sats: 5 })).toBe(true);
+    expect(validateHostResult['seller.redeem']({ ok: false, spent: true })).toBe(true);
+    expect(validateHostResult['seller.redeem']({ ok: true })).toBe(false);
+    expect(
+      validateHostResult['pay.hello']({ pubkey: PUBKEY, createdAt: 1, signature: 'ab'.repeat(64) }),
+    ).toBe(true);
+    expect(validateHostResult['pay.hello']({ pubkey: PUBKEY, createdAt: 1, signature: 'ab' })).toBe(
+      false,
+    );
+    expect(
+      validateHostResult['pay.build']({
+        range: RANGE,
+        carryIn: 0,
+        seederProofs: LOCKED,
+        creatorProofs: LOCKED,
+      }),
+    ).toBe(true);
+    expect(validateHostResult['seller.keyset'](null)).toBe(true);
+    expect(
+      validateHostResult['seller.keyset']({
+        mint: MINT,
+        id: `00${'ab'.repeat(7)}`,
+        unit: 'sat',
+        active: true,
+        keys: { '1': P2PK, abc: P2PK },
+        fetchedAt: 0,
+      }),
+    ).toBe(false);
+    // Real payments and dev mocks never together.
+    const init = ARGS.init[0]!;
+    const payments = { pubkey: PUBKEY, p2pk: P2PK, mints: [MINT] };
+    expect(validateWorkerArgs.init({ ...init, payments })).toBe(true);
+    expect(
+      validateWorkerArgs.init({ ...init, payments, dev: { mocks: true, fixtures: false } }),
+    ).toBe(false);
   });
 
   it.each(Object.keys(EVENTS) as WorkerEventName[])('event %s: valid samples pass', (e) => {

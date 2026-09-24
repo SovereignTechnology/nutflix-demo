@@ -72,6 +72,12 @@ export interface PeerSessionOptions {
    * reconnect while the old connection lingers — found by the real-mint lane).
    */
   readonly onBind?: (session: PeerSession, pubkey: NostrPubkey) => void;
+  /**
+   * Called synchronously the first time a block of `core` is uploaded on this session, BEFORE it
+   * is written to the wire — where a multi-price seeder announces the core's price (a `PRICE`
+   * sent here precedes the block, so the payer never prices it at the HELLO's ceiling).
+   */
+  readonly onFirstUpload?: (session: PeerSession, core: CoreKeyHex) => void;
 }
 
 export class PeerSession {
@@ -95,6 +101,7 @@ export class PeerSession {
   private readonly log: Logger;
   private readonly peerInfo: PeerInfo | null;
   private readonly onBind: ((session: PeerSession, pubkey: NostrPubkey) => void) | undefined;
+  private readonly onFirstUpload: PeerSessionOptions['onFirstUpload'];
 
   constructor(opts: PeerSessionOptions) {
     this.noiseKey = opts.noiseKey;
@@ -107,6 +114,7 @@ export class PeerSession {
     this.openedAt = (opts.now ?? Date.now)();
     this.log = opts.logger.child({ noiseKey: this.noiseKeyHex });
     this.onBind = opts.onBind;
+    this.onFirstUpload = opts.onFirstUpload;
     this.stream.once('close', () => {
       this.isClosed = true;
       opts.onClose?.(this);
@@ -184,7 +192,14 @@ export class PeerSession {
     if (this.cutWith !== null || this.isClosed) return null;
     this.uploaded++;
     this.uploadedBytesTotal += byteLength;
+    const first = !this.coresUploaded.has(coreKeyHex);
     this.coresUploaded.add(coreKeyHex);
+    if (first && this.onFirstUpload !== undefined)
+      try {
+        this.onFirstUpload(this, coreKeyHex as CoreKeyHex);
+      } catch (err) {
+        this.log.error('first-upload hook threw', { error: err });
+      }
     this.nextIndex.set(coreKeyHex, Math.max(this.nextIndexFor(coreKeyHex), index + 1));
     if (this.pubkeyBound === null) this.provisionalUploads++;
     // v5 (ADR 0010): the block INDEX travels, so `range-not-uploaded` is exact per block

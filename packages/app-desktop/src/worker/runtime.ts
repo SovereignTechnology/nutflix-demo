@@ -10,6 +10,21 @@ import type { SeederFs } from '@sovit/seeder';
 
 import type { OsName } from './ffmpeg.js';
 
+/**
+ * Small durable state files, SYNCHRONOUS — the payment engine's pending PAYs are written before
+ * the ACK goes out (its `persistPending` hook is synchronous) and its seen secrets as they are
+ * accepted (ADR 0012). Every write is 0600.
+ */
+export interface StateFs {
+  /** The file's text, or `null` when it does not exist (other errors throw). */
+  readText(path: string): string | null;
+  /** `<path>.tmp` (created exclusively, a leftover removed first) + fsync + rename. */
+  writeAtomic(path: string, data: string): void;
+  append(path: string, data: string): void;
+  rename(from: string, to: string): void;
+  mkdirp(path: string): void;
+}
+
 export interface WorkerRuntime {
   /** `@sovit/seeder`'s filesystem (Corestore dir, CAS index, ban list, fixture dirs). */
   readonly seederFs: SeederFs;
@@ -22,4 +37,5 @@ export interface WorkerRuntime {
   /** Exists, is a regular file, and is executable by us. */
   isExecutable(path: string): Promise<boolean>;
   readonly os: OsName;
+  readonly stateFs: StateFs;
 }

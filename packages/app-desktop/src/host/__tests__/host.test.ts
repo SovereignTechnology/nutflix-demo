@@ -140,6 +140,24 @@ describe('HostIn → HostOut', () => {
     }
   });
 
+  it('ADR 0012: without a money plane (no signer, or --dev-mocks) every worker money call is answered payments-unavailable', async () => {
+    for (const flags of [{}, { devMocks: true }]) {
+      r = await rig({ flags });
+      await r.ready();
+      const challenge = `pay/1:${'ab'.repeat(64)}:${'cd'.repeat(32)}`;
+      await expect(r.worker().request('pay.hello', { challenge })).rejects.toMatchObject({
+        code: 'payments-unavailable',
+      });
+      await expect(
+        r.worker().request('seller.keyset', {
+          mint: 'https://mint.test' as never,
+          id: `00${'ab'.repeat(7)}`,
+        }),
+      ).rejects.toMatchObject({ code: 'payments-unavailable' });
+      await r.close();
+    }
+  });
+
   it('SE-1: studio.upload needs main’s file resolution; a file on any other call is refused', async () => {
     const viewer = new kit.TestSigner();
     r = await rig({

@@ -16,6 +16,7 @@
  * seeder's SwarmManager can neither bind the DHT to loopback (the `--dev-mocks` fence) nor
  * hand out the connection for `pay/1`. `loopbackOnly` binds the DHT node to 127.0.0.1.
  */
+import { payProtocol } from '@sovit/core';
 import type { HelloMessage, PayProtocol } from '@sovit/core';
 import type { ReplicationStream } from 'hypercore';
 import DHT from 'hyperdht';
@@ -43,8 +44,13 @@ export interface PayLink {
 export interface PayWiring {
   /** One `pay/1` instance per connection; `null` runs that connection without payments. */
   readonly protocol: (link: PayLink) => PayProtocol | null;
-  /** What we announce on every connection (seeder terms + our identity). */
-  readonly hello: () => Omit<HelloMessage, 'type'>;
+  /**
+   * What we announce on a connection (seeder terms + our identity). Stage 3 (ADR 0012): signed by
+   * the host over THIS connection's handshake (`binding`, `null` without one), so it may be async.
+   */
+  readonly hello: (
+    binding: payProtocol.ConnectionBinding | null,
+  ) => Omit<HelloMessage, 'type'> | Promise<Omit<HelloMessage, 'type'>>;
 }
 
 export interface PeerNodeOptions {
@@ -174,6 +180,16 @@ export class PeerNode {
       detachSeeder();
       detachPayer?.();
     });
-    protocol.sendHello(pay.hello());
+    const binding = mux === null ? null : payProtocol.bindingFromMux(mux);
+    void Promise.resolve()
+      .then(() => pay.hello(binding))
+      .then(
+        (hello) => {
+          if (protocol.state !== 'closed') protocol.sendHello(hello);
+        },
+        (err: unknown) => {
+          this.log.warn('HELLO could not be built — this connection runs unpaid', { error: err });
+        },
+      );
   }
 }

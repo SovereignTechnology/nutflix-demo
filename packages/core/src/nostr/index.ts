@@ -153,4 +153,9 @@ export {
   fetchRelayList,
 } from './relay-list.js';
 export { REPORT_TYPES, buildReportEvent, report } from './report.js';
+export {
+  announceNutzapInfo,
+  nutzapPublisher,
+  type NutzapPublisherOptions,
+} from './nutzap-publish.js';
 export type { ReportType, ReportInput } from './report.js';

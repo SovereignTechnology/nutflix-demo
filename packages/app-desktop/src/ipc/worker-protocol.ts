@@ -14,17 +14,24 @@
  * Runtime-neutral like the rest of `src/ipc/`: type-only imports from `@sovit/core`.
  */
 import type {
+  BlockRange,
+  CashuP2pkPubkey,
+  CashuProof,
   CoreKeyHex,
   HyperblobRef,
+  LockedProofSet,
+  MintKeyset,
   MintUrl,
   NostrEventId,
   NostrPubkey,
+  PayMessage,
   PeerSpend,
   PricePolicy,
   RenditionSpec,
   Sats,
   Settings,
   Sha256Hex,
+  UnixSeconds,
   UploadInput,
   UploadProgress,
   VideoManifest,
@@ -67,6 +74,19 @@ export interface WorkerInit {
     readonly mocks: boolean;
     readonly fixtures: boolean;
     readonly bootstrap?: readonly { readonly host: '127.0.0.1'; readonly port: number }[];
+  };
+  /**
+   * Stage 3 (ADR 0012): the user's PUBLIC payment identity, present when the host's money plane
+   * is live (a signer connected, the NIP-60 wallet open). With it the worker runs the real
+   * engines and asks the host for every PAY, HELLO signature, redeem and nutzap (`pay.*`,
+   * `seller.*`); without it (and without `dev.mocks`) it runs no swarm. Never with `dev.mocks`.
+   */
+  readonly payments?: {
+    readonly pubkey: NostrPubkey;
+    /** The NIP-60 wallet's P2PK key: HELLO `p2pk`, what peers lock the seeder share to. */
+    readonly p2pk: CashuP2pkPubkey;
+    /** Mints the wallet takes payment at and pays from. */
+    readonly mints: readonly MintUrl[];
   };
 }
 
@@ -162,9 +182,59 @@ export interface PublishDraft {
   readonly codec: RenditionSpec['codec'];
 }
 
+/** A proof set on the worker → host hop (ADR 0012: the host redeems / checks it). */
+export interface ProofSetWire {
+  readonly mint: MintUrl;
+  readonly proofs: readonly CashuProof[];
+}
+
+/** `seller.redeem`'s answer: a spent proof is data, not an error (IPC error codes are closed). */
+export type RedeemResult =
+  { readonly ok: true; readonly sats: Sats } | { readonly ok: false; readonly spent: boolean };
+
 /** Requests the worker makes: `[args, result]`. */
 export interface HostMethodTable {
   'studio.publish': [args: PublishDraft, result: VideoManifest];
+  /**
+   * Build OUR PAY (viewer side) with the host's wallet — authorised only for an open play
+   * session `sid`, the session's own core and price terms, within its block budget (ADR 0012).
+   */
+  'pay.build': [
+    args: {
+      readonly sid: SessionId;
+      readonly range: BlockRange;
+      readonly seeder: {
+        readonly pubkey: NostrPubkey;
+        readonly p2pk: CashuP2pkPubkey;
+        readonly mint: MintUrl;
+      };
+      readonly policy: PricePolicy;
+      readonly carryIn: number;
+    },
+    result: PayMessage,
+  ];
+  /** Sign OUR HELLO for a connection (the host signs nothing else for the worker). */
+  'pay.hello': [
+    args: { readonly challenge: string },
+    result: {
+      readonly pubkey: NostrPubkey;
+      readonly createdAt: UnixSeconds;
+      readonly signature: string;
+    },
+  ];
+  /** Seeder side (the worker's engine hooks). */
+  'seller.keyset': [
+    args: { readonly mint: MintUrl; readonly id: string },
+    result: MintKeyset | null,
+  ];
+  'seller.redeem': [args: ProofSetWire, result: RedeemResult];
+  'seller.checkSpent': [args: ProofSetWire, result: readonly boolean[]];
+  'seller.spentByUs': [args: ProofSetWire, result: boolean];
+  /** Publish the creator's share of a flush as one NIP-61 nutzap. */
+  'seller.nutzap': [
+    args: { readonly set: LockedProofSet; readonly core: CoreKeyHex },
+    result: undefined,
+  ];
 }
 export type HostMethod = keyof HostMethodTable;
 

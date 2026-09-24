@@ -53,9 +53,17 @@ export type SpawnWorker = (entry: string, args: readonly string[]) => WorkerProc
 
 export type WorkerState = 'idle' | 'starting' | 'ready' | 'down' | 'failed' | 'stopped';
 
-/** Handlers for requests the worker makes of the host (`studio.publish`). */
-export type HostRequestHandlers = {
-  readonly [M in HostMethod]: (a: HostMethodTable[M][0]) => Promise<HostMethodTable[M][1]>;
+type HostHandler<M extends HostMethod> = (
+  a: HostMethodTable[M][0],
+) => Promise<HostMethodTable[M][1]>;
+
+/**
+ * Handlers for requests the worker makes of the host. `studio.publish` always; the money calls
+ * (`pay.*`, `seller.*`, ADR 0012) only while the money plane is live — a request without a
+ * handler is answered `payments-unavailable`, never dropped.
+ */
+export type HostRequestHandlers = { readonly 'studio.publish': HostHandler<'studio.publish'> } & {
+  readonly [M in Exclude<HostMethod, 'studio.publish'>]?: HostHandler<M>;
 };
 
 export interface Timers {
@@ -500,7 +508,9 @@ export class WorkerSupervisor {
   private async onRequest(id: number, m: HostMethod, a: unknown): Promise<void> {
     const gen = this.gen;
     try {
-      const handler = this.o.handlers[m] as (x: unknown) => Promise<unknown>;
+      const handler = this.o.handlers[m] as ((x: unknown) => Promise<unknown>) | undefined;
+      if (handler === undefined)
+        throw hostError('payments-unavailable', 'no money plane: connect a signer first');
       const r = await handler(a);
       if (gen === this.gen) this.reply(id, true, r);
     } catch (e) {

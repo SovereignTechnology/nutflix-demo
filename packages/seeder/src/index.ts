@@ -51,6 +51,10 @@ export {
 } from './runtime/identity.js';
 export type { NodeIdentity } from './runtime/identity.js';
 export { nodeMintRequest, nodeRawHttp } from './runtime/mint-http.js';
+export { guardedKeyset } from './runtime/keysets.js';
+export type { KeysetGuardOptions } from './runtime/keysets.js';
+export { announceNutzapInfo, createRelayPool, nutzapPublisher } from './runtime/nostr-publish.js';
+export type { NutzapPublisherOptions } from './runtime/nostr-publish.js';
 export { Payout } from './runtime/payout.js';
 export type { OwnerCheck, PayoutResult } from './runtime/payout.js';
 

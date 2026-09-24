@@ -25,6 +25,7 @@ async function make(
     diskCapBytes?: number;
     dataDir?: string;
     mode?: mocks.MockPaymentMode;
+    announceCorePrices?: boolean;
   } = {},
 ) {
   const t = opts.dataDir ? null : await tmpDir();
@@ -48,6 +49,7 @@ async function make(
       },
       flushEveryBlocks: 1000,
       flushEveryMs: 60_000,
+      ...(opts.announceCorePrices === true ? { announceCorePrices: true } : {}),
     },
     { engine, logger: log.logger, ...adapters },
   );
@@ -212,6 +214,48 @@ describe('Seeder façade', () => {
       { type: 'PRICE', core: 'c', satsPerBlock: 2, effectiveFromBlock: 3 },
     ]);
     expect(s.seeder.policy().satsPerBlock).toBe(2);
+  });
+
+  it("announceCorePrices (ADR 0012): the first block of each core sent to a pay/1 peer is preceded by PRICE from block 0 at that core's price, and PAYs are verified at it", async () => {
+    const s = await make({ announceCorePrices: true, windowBlocks: 16 });
+    const policy = (sats: number, who: string): PricePolicy => ({
+      satsPerBlock: sats as never,
+      blockSize: BLOCK,
+      mints: s.engine.config.acceptedMints,
+      split: { seeder: 50, creator: 50 },
+      creatorP2pk: mocks.asP2pk(who),
+    });
+    s.seeder.setCorePolicy('a'.repeat(64) as never, policy(3, 'creator-A'), { announce: false });
+    s.seeder.setCorePolicy('b'.repeat(64) as never, policy(5, 'creator-B'), { announce: false });
+    const st = new FakeStream(noiseKey(9));
+    const session = s.seeder.sessions.admit(st)!;
+    const protocol = new FakePayProtocol();
+    s.seeder.attachPayProtocol(session, protocol);
+    session.onUpload('a'.repeat(64), 0, BLOCK);
+    session.onUpload('a'.repeat(64), 1, BLOCK); // not the first: no second PRICE
+    session.onUpload('b'.repeat(64), 7, BLOCK);
+    session.onUpload('c'.repeat(64), 0, BLOCK); // no policy for it: nothing to announce
+    expect(protocol.prices).toEqual([
+      { type: 'PRICE', core: 'a'.repeat(64), satsPerBlock: 3, effectiveFromBlock: 0 },
+      { type: 'PRICE', core: 'b'.repeat(64), satsPerBlock: 5, effectiveFromBlock: 0 },
+    ]);
+    expect(
+      s.seeder.policyForRange(session, 'b'.repeat(64) as never, {
+        core: 'b'.repeat(64) as never,
+        fromBlock: 7,
+        toBlock: 7,
+      }).satsPerBlock,
+    ).toBe(5);
+    // Off by default: a one-price seeder sends none.
+    const plain = await make({ windowBlocks: 16 });
+    plain.seeder.setCorePolicy('a'.repeat(64) as never, policy(3, 'creator-A'), {
+      announce: false,
+    });
+    const ps = plain.seeder.sessions.admit(new FakeStream(noiseKey(10)))!;
+    const pp = new FakePayProtocol();
+    plain.seeder.attachPayProtocol(ps, pp);
+    ps.onUpload('a'.repeat(64), 0, BLOCK);
+    expect(pp.prices).toEqual([]);
   });
 
   // Security review F9: the seeder used to verify every PAY at its CURRENT price, so after a

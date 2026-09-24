@@ -25,6 +25,14 @@ export interface SeederConfig {
   /** Swap batch triggers; default from the engine's `config` when it has one, else 64 / 60 s. */
   readonly flushEveryBlocks?: number;
   readonly flushEveryMs?: number;
+  /**
+   * A seeder of several videos at different prices (the desktop): on the first block of a core
+   * sent to a `pay/1` peer, send `PRICE { core, satsPerBlock, effectiveFromBlock: 0 }` with that
+   * core's price. Its HELLO then states a ceiling (the highest price it serves); a payer pays
+   * nothing above a manifest price and keeps blocks owed until the PRICE arrives, so no block is
+   * ever paid at the wrong price (ADR 0012). Default false: a one-price seeder's HELLO is exact.
+   */
+  readonly announceCorePrices?: boolean;
 }
 
 export interface ResolvedSeederConfig {
@@ -37,6 +45,7 @@ export interface ResolvedSeederConfig {
   readonly policy: PricePolicy | null;
   readonly flushEveryBlocks: number;
   readonly flushEveryMs: number;
+  readonly announceCorePrices: boolean;
 }
 
 export function resolveConfig(
@@ -54,5 +63,6 @@ export function resolveConfig(
     policy: c.policy ?? null,
     flushEveryBlocks: c.flushEveryBlocks ?? engineDefaults?.flushEveryBlocks ?? 64,
     flushEveryMs: c.flushEveryMs ?? engineDefaults?.flushEveryMs ?? 60_000,
+    announceCorePrices: c.announceCorePrices ?? false,
   };
 }

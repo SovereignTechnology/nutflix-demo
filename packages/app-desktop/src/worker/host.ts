@@ -95,6 +95,11 @@ export interface WorkerHostOptions {
   readonly clock?: GateClock;
   /** x264 preset for Studio transcodes (tests: `ultrafast`). */
   readonly uploadPreset?: string;
+  /**
+   * TESTS ONLY: a local DHT for a worker with REAL payments (`init.dev.bootstrap` is fenced to
+   * mock payments). Programmatic only — never reachable over IPC, never set by `entry.ts`.
+   */
+  readonly testBootstrap?: readonly BootstrapNode[];
   readonly now?: () => number;
 }
 
@@ -285,6 +290,34 @@ export class WorkerHost {
       this.hub = this.o.hub ?? new LoopbackPayHub();
       providers = devMockProviders({ hub: this.hub, label: randomHex(8) });
       log.warn('DEV MOCKS: MockPaymentEngine + in-process pay/1; swarm fenced to loopback');
+    } else if (a.payments !== undefined) {
+      // Stage 3 (ADR 0012): the host's money plane is live — real engines, every money step
+      // asked of the host.
+      const { realProviders } = await import('./pay/real-providers.js');
+      try {
+        providers = realProviders({
+          payments: a.payments,
+          dir: fs.join(a.storage, 'payments'),
+          join: (...p) => fs.join(...p),
+          state: runtime.stateFs,
+          request: this.o.request,
+          sidFor: (core) => {
+            let sid: SessionId | undefined;
+            for (const [id, s] of this.sessions) if (s.core === core) sid = id as SessionId;
+            return sid;
+          },
+          priceCeiling: () => {
+            let max = 0;
+            for (const p of this.net?.seeder.corePolicyMap().values() ?? [])
+              max = Math.max(max, p.satsPerBlock);
+            return max as Sats;
+          },
+          logger: log,
+        });
+      } catch (err) {
+        log.error('payments could not start', { error: err });
+        providers = undefined;
+      }
     } else {
       providers = (this.o.providers ?? getWorkerProviders)(ctx);
     }
@@ -293,7 +326,7 @@ export class WorkerHost {
       return;
     }
 
-    let bootstrap: readonly BootstrapNode[] | null = dev?.bootstrap ?? null;
+    let bootstrap: readonly BootstrapNode[] | null = dev?.bootstrap ?? this.o.testBootstrap ?? null;
     if (dev?.fixtures === true && bootstrap === null) {
       const { startDevTestnet } = await import('./dev/fixtures-net.js');
       this.testnet = await startDevTestnet();
@@ -307,6 +340,8 @@ export class WorkerHost {
         dataDir: fs.join(a.storage, 'seeder'),
         diskCapBytes: a.seeding.diskCapBytes,
         swarm: null,
+        // Several videos at their own manifest prices: each core's PRICE precedes its first block.
+        announceCorePrices: a.payments !== undefined,
       },
       { engine: providers.seederEngine, fs, crypto: sodiumCrypto, logger: log },
     );

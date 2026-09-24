@@ -13,7 +13,8 @@ import path from 'bare-path';
 import { spawn } from 'bare-subprocess';
 
 import type { OsName } from '../ffmpeg.js';
-import type { WorkerRuntime } from '../runtime.js';
+import { utf8 } from '../../ipc/codec.js';
+import type { StateFs, WorkerRuntime } from '../runtime.js';
 import type { BareSpawn } from '../transcode/index.js';
 import { createBareProcessRunner } from '../transcode/index.js';
 
@@ -79,8 +80,49 @@ async function isExecutable(p: string): Promise<boolean> {
   }
 }
 
+/** `StateFs` on bare-fs's synchronous calls (see `../runtime.ts`). */
+export const bareStateFs: StateFs = {
+  readText: (p) => {
+    try {
+      return fs.readFileSync(p, 'utf8');
+    } catch (err) {
+      if (errno(err) === 'ENOENT') return null;
+      throw err;
+    }
+  },
+  writeAtomic: (p, data) => {
+    const tmp = `${p}.tmp`;
+    try {
+      fs.unlinkSync(tmp);
+    } catch {
+      // none left over
+    }
+    const fd = fs.openSync(tmp, 'wx', 0o600);
+    try {
+      // No global Buffer in Bare: the shared codec (TextEncoder under Bare, see bare-globals).
+      const bytes = utf8.encode(data);
+      let off = 0;
+      while (off < bytes.byteLength) off += fs.writeSync(fd, bytes, off, bytes.byteLength - off);
+      fs.fsyncSync(fd);
+    } finally {
+      fs.closeSync(fd);
+    }
+    fs.renameSync(tmp, p);
+  },
+  append: (p, data) => {
+    fs.appendFileSync(p, data, { mode: 0o600 });
+  },
+  rename: (from, to) => {
+    fs.renameSync(from, to);
+  },
+  mkdirp: (p) => {
+    fs.mkdirSync(p, { recursive: true, mode: 0o700 });
+  },
+};
+
 export function bareRuntime(): WorkerRuntime {
   return {
+    stateFs: bareStateFs,
     seederFs: bareSeederFs,
     mediaFs: bareMediaFs,
     runner: createBareProcessRunner(spawn as unknown as BareSpawn),

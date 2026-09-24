@@ -75,7 +75,9 @@ export const DEV_BALANCE_SATS = 21_000;
 
 export type WalletProvider =
   | { readonly kind: 'unavailable'; readonly wallet: Wallet }
-  | { readonly kind: 'mock'; readonly wallet: mocks.MockWallet };
+  | { readonly kind: 'mock'; readonly wallet: mocks.MockWallet }
+  /** Stage 3 (ADR 0012): the user's NIP-60 wallet, opened by the host's money plane. */
+  | { readonly kind: 'real'; readonly wallet: Wallet };
 
 export function createWalletProvider(devMocks: boolean): WalletProvider {
   if (!devMocks) return { kind: 'unavailable', wallet: new UnavailableWallet() };

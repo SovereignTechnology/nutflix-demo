@@ -3,6 +3,17 @@
  * `WorkerRpc` fed framed bytes and a host-side `FrameDecoder` + `isWorkerToHost`, exactly
  * what L6-B's host does — plus a Node `WorkerRuntime` and small HTTP / wait helpers.
  */
+import {
+  appendFileSync,
+  closeSync,
+  fsyncSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  renameSync,
+  unlinkSync,
+  writeSync,
+} from 'node:fs';
 import { mkdtemp, rm, access, stat, constants } from 'node:fs/promises';
 import http from 'node:http';
 import { tmpdir } from 'node:os';
@@ -25,11 +36,51 @@ import type {
 import type { LoopbackPayHub } from '../../dev/loopback-pay.js';
 import type { WorkerHostOptions } from '../../host.js';
 import { WorkerHost } from '../../host.js';
-import type { WorkerRuntime } from '../../runtime.js';
+import type { StateFs, WorkerRuntime } from '../../runtime.js';
 import { WorkerRpc } from '../../rpc.js';
+
+/** `StateFs` on node:fs (tests; production is `adapters/bare.ts`). */
+export const nodeStateFs: StateFs = {
+  readText: (p) => {
+    try {
+      return readFileSync(p, 'utf8');
+    } catch (err) {
+      if ((err as { code?: unknown }).code === 'ENOENT') return null;
+      throw err;
+    }
+  },
+  writeAtomic: (p, data) => {
+    const tmp = `${p}.tmp`;
+    try {
+      unlinkSync(tmp);
+    } catch {
+      // none left over
+    }
+    const fd = openSync(tmp, 'wx', 0o600);
+    try {
+      const bytes = Buffer.from(data, 'utf8');
+      let off = 0;
+      while (off < bytes.byteLength) off += writeSync(fd, bytes, off, bytes.byteLength - off);
+      fsyncSync(fd);
+    } finally {
+      closeSync(fd);
+    }
+    renameSync(tmp, p);
+  },
+  append: (p, data) => {
+    appendFileSync(p, data, { mode: 0o600 });
+  },
+  rename: (from, to) => {
+    renameSync(from, to);
+  },
+  mkdirp: (p) => {
+    mkdirSync(p, { recursive: true, mode: 0o700 });
+  },
+};
 
 export function nodeRuntime(): WorkerRuntime {
   return {
+    stateFs: nodeStateFs,
     seederFs: nodeFs,
     mediaFs: (tmpDir) => nodeFsAdapter({ tmpDir }),
     runner: nodeProcessRunner(),
@@ -92,7 +143,9 @@ export function startWorker(
     readonly hub?: LoopbackPayHub;
     readonly handlers?: HostHandlers;
     readonly runtime?: WorkerRuntime;
-  } & Partial<Pick<WorkerHostOptions, 'uploadPreset' | 'logLevel' | 'providers'>> = {},
+  } & Partial<
+    Pick<WorkerHostOptions, 'uploadPreset' | 'logLevel' | 'providers' | 'testBootstrap'>
+  > = {},
 ): WorkerClient {
   const events: WorkerEvent[] = [];
   const invalid: unknown[] = [];
@@ -122,7 +175,7 @@ export function startWorker(
       return;
     }
     if (m.op === 'req') {
-      const h = opts.handlers?.[m.m];
+      const h = opts.handlers?.[m.m] as ((a: unknown) => Promise<unknown>) | undefined;
       const reply = (x: object): void => {
         rpc.push(encodeFrame(x));
       };
@@ -169,6 +222,7 @@ export function startWorker(
     ...(opts.uploadPreset !== undefined ? { uploadPreset: opts.uploadPreset } : {}),
     ...(opts.logLevel !== undefined ? { logLevel: opts.logLevel } : {}),
     ...(opts.providers !== undefined ? { providers: opts.providers } : {}),
+    ...(opts.testBootstrap !== undefined ? { testBootstrap: opts.testBootstrap } : {}),
   });
   rpc = new WorkerRpc({
     write: (bytes) => {

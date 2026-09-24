@@ -33,6 +33,8 @@ export interface SessionRegistryOptions {
    * unpriced (`{ satsPerBlock: 0 }` → the configured window).
    */
   readonly pricing?: (core: CoreKeyHex) => UploadPricing;
+  /** Forwarded to every session (`PeerSessionOptions.onFirstUpload`). */
+  readonly onFirstUpload?: (session: PeerSession, core: CoreKeyHex) => void;
 }
 
 export class SessionRegistry {
@@ -46,6 +48,7 @@ export class SessionRegistry {
   private readonly log: Logger;
   private readonly now: (() => number) | undefined;
   private readonly pricing: ((core: CoreKeyHex) => UploadPricing) | undefined;
+  private readonly onFirstUpload: SessionRegistryOptions['onFirstUpload'];
 
   constructor(opts: SessionRegistryOptions) {
     this.engine = opts.engine;
@@ -53,6 +56,7 @@ export class SessionRegistry {
     this.rateLimiter = opts.rateLimiter;
     this.log = opts.logger;
     this.now = opts.now;
+    this.onFirstUpload = opts.onFirstUpload;
     this.pricing = opts.pricing;
   }
 
@@ -116,6 +120,7 @@ export class SessionRegistry {
       peerInfo,
       ...(this.now ? { now: this.now } : {}),
       ...(this.pricing ? { pricing: this.pricing } : {}),
+      ...(this.onFirstUpload ? { onFirstUpload: this.onFirstUpload } : {}),
       onClose: (s) => {
         admitted.release();
         this.live.delete(s);

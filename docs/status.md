@@ -391,7 +391,7 @@ bump: reactions (`likes`/`dislikes`/`myReaction`, `unreact`). The list as record
 **0006 = NFX suite** (on the unmerged `spec/nfx-suite-m0`), **0008 = nfx master plan** (written in
 `~/Projects/nfx`, forked from `spec/nfx-suite-m0`). This repo never uses either number, so a later
 merge between the two histories cannot produce two ADRs with one number. **The next ADR here is
-0012.** Taken so far: 0001–0005, 0007, 0009, 0010, 0011.
+0013.** Taken so far: 0001–0005, 0007, 0009, 0010, 0011, 0012.
 
 ### Inputs from Cameron — ANSWERED 2026-09-23 (ADR 0007)
 
@@ -449,12 +449,13 @@ Wallet QR (pass = decodes to text starting `lnbc5000n1pj9x7`).
 | Seeder daemon runtime (build plan Phase 3) | `stage-3/seeder-runtime` (on `stage-3/real-mint`) | **done** — `nutflix-seeder.service` runs for real (ADR 0011): key file + `seeder-key-passphrase` systemd credential (`--keygen` from stdin), 0600 wallet file, the real engine with every hook (pending PAYs and seen secrets on disk, rate-limited keysets, NUT-07), NIP-61 nutzaps + kind 10019 over a `ws` relay pool, `pay/1` + HELLO on swarm sessions (`Seeder.onSessionReady`), one daemon per data dir. F10, F12, F24 (daemon) done; F11/F31 wired. Found and fixed **F36**: Node 22's global `fetch` crashes a `--jitless` daemon at the first mint request — mint requests now go over `node:http(s)` (`wallet.cashuRequestFn`), verified under the unit flags against Nutshell. |
 | Seeder payout + wallet encryption (ADR 0011 §2, §7) | `stage-3/seeder-payout` (on `stage-3/seeder-runtime`) | **done** — Cameron's answers 2026-09-24 (ADR 0011 §8): the wallet file is NIP-44 sealed to the node key (chunked, tamper-evident; plaintext files resealed at open); earnings leave as a NIP-61 nutzap locked to the owner's wallet key above `payout.thresholdSats`, only after the owner's own kind 10019 confirms the key; failed publishes retried from `payouts.jsonl`. Melt on the server dropped (the owner melts from their wallet); no NIP-60 on the server; paid views → sats per video (UI polish lane) |
 | Gateway runtime (ADR 0011 §9) | `stage-3/gateway-runtime` (on `stage-3/seeder-payout`) | **done** — the gateway runs on the seeder's runtime (`createNodeRuntime`): key file + `gateway-key-passphrase` credential, identity checked against the key file (`--keygen` prints it), sealed wallet shared by the seeder-side and upstream engines, `BlossomAuthImpl` on the public host, nutzaps, payout. Fixed **F38**: the gateway never paid upstream swarm peers (pay/1 attached before the Protomux existed). Open F37 (latent: nothing in the gateway fetches upstream on its own yet): `openUpstreamCore` does not pace to the unpaid window — required before upstream fetching is wired |
+| Desktop money plane (ADR 0012) | `stage-3/desktop-runtime` (on `stage-3/gateway-runtime`) | **done** — the host spends, the worker asks: the host's money plane holds the user's NIP-60 wallet (kind 17375 key, never created by accident — fixed a startup path that would have replaced it on a relay outage) and the viewer engine, and authorises every worker request (a PAY only for a host-registered session's core, range, manifest terms and budget; HELLO signatures only over a pay/1 challenge; seller hooks only at own mints); the worker runs the seeder engine with host-backed hooks and per-core `PRICE` announcements. Tested end to end over hyperswarm against a seeder daemon. Next: the signer connect flow (trusted prompt, key file, Settings bridge, create-wallet, worker restart on signer change) |
 
 Owed from Stage 2 (ADR 0010 Consequences, `docs/security-review.md` §0 and §6). The F1–F4 and
 F30 blockers were fixed on `stage-2/review-fixes` (2026-09-24); F6 verified on two real mints
 (`stage-3/real-mint`); the seeder daemon's runtime is done (`stage-3/seeder-runtime`, ADR 0011).
-Still owed: the desktop worker's runtime (next); gateway upstream pacing before any upstream
-fetching is wired (F37); (real engines via
+Still owed: the desktop signer connect flow (next; ADR 0012 Consequences); gateway upstream pacing
+before any upstream fetching is wired (F37); (real engines via
 the same pattern, the IPC signer bridge, the desktop's key-file `KeyStore` at 0600); "paid views" → sats per video (ADR 0011 §8.4, UI polish); DLEQ off the
 event loop and explicit `minPaySats` batching (F5);
 executing auto top-ups with caps (F4); NUT-20 quotes (F17); NUT-13 outputs (F31); packaging

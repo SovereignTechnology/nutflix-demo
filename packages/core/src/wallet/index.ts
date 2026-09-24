@@ -15,6 +15,13 @@ export {
 } from './spend.js';
 export { MemoryProofStore, proofTotal, type ProofStore, type WalletTx } from './store.js';
 export { Nip60ProofStore, type Nip60Relays } from './nip60.js';
+export { guardedKeyset, type KeysetGuardOptions } from './keyset-guard.js';
+export {
+  openNip60Wallet,
+  publishNutzapInfo,
+  type Nip60Wallet,
+  type OpenNip60WalletOptions,
+} from './nip60-wallet.js';
 export {
   cashuRequestFn,
   type CashuRequestOptions,

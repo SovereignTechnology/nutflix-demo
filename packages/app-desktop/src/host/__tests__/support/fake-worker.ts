@@ -13,9 +13,10 @@ import { FrameDecoder, encodeFrame } from '../../../ipc/framing.js';
 import type { SeederStatusWire, SessionId, UploadId, WireError } from '../../../ipc/protocol.js';
 import { isHostToWorker } from '../../../ipc/worker-guards.js';
 import type {
+  HostMethod,
+  HostMethodTable,
   HostToWorker,
   PlayOpenArgs,
-  PublishDraft,
   WorkerMethod,
   WorkerMethodTable,
 } from '../../../ipc/worker-protocol.js';
@@ -145,8 +146,8 @@ export class FakeWorker extends EventEmitter implements WorkerProcess {
     this.event({ e: 'upload.progress', uploadId, progress });
   }
 
-  /** Worker → host request (`studio.publish`). */
-  request(m: 'studio.publish', a: PublishDraft): Promise<unknown> {
+  /** Worker → host request (`studio.publish`, and the ADR 0012 money calls). */
+  request<M extends HostMethod>(m: M, a: HostMethodTable[M][0]): Promise<unknown> {
     const id = this.nextId++;
     return new Promise((resolve, reject) => {
       this.pending.set(id, { resolve, reject });
