@@ -101,15 +101,35 @@ describe('redact (structured)', () => {
     expect(s).not.toContain('mock:');
   });
 
-  it('keeps full 64-hex in public-identifier fields but truncates elsewhere', () => {
-    const out = redact({ pubkey: HEX64, peer: HEX64, noiseKey: HEX64, note: HEX64 }) as Record<
-      string,
-      string
-    >;
-    expect(out['pubkey']).toBe(HEX64);
-    expect(out['peer']).toBe(HEX64);
-    expect(out['noiseKey']).toBe(HEX64);
+  // Security review F13 changed this: peer identifiers used to be kept whole, which left a
+  // durable record in journald of which Nostr identities fetched or uploaded what.
+  it('replaces peer identifiers with a stable per-process alias, keeps content ids whole, truncates elsewhere', () => {
+    const OTHER = 'cd'.repeat(32);
+    const out = redact({
+      pubkey: HEX64,
+      peer: HEX64,
+      noiseKey: HEX64,
+      bound: OTHER,
+      reporter: OTHER,
+      coreKey: HEX64,
+      sha256: HEX64,
+      note: HEX64,
+    }) as Record<string, string>;
+    expect(out['pubkey']).toMatch(/^peer#\d+$/);
+    // The same peer keeps the same alias (the run's log still correlates) …
+    expect(out['peer']).toBe(out['pubkey']);
+    expect(out['noiseKey']).toBe(out['pubkey']);
+    expect((redact({ pubkey: HEX64.toUpperCase() }) as Record<string, string>)['pubkey']).toBe(
+      out['pubkey'],
+    );
+    // … and another peer gets another one.
+    expect(out['bound']).toMatch(/^peer#\d+$/);
+    expect(out['bound']).not.toBe(out['pubkey']);
+    expect(out['reporter']).toBe(out['bound']);
+    expect(out['coreKey']).toBe(HEX64);
+    expect(out['sha256']).toBe(HEX64);
     expect(out['note']).toBe('abababab…');
+    expect(JSON.stringify(out)).not.toContain(OTHER);
   });
 
   it('handles errors, bytes, maps, sets, bigint, cycles-by-depth and never throws', () => {

@@ -11,7 +11,15 @@ import { afterEach, describe, expect, it } from 'vitest';
 
 import type { Sha256Hex } from '@sovit/core';
 
-import { UPLOAD_SPOOL_DIR, sha256FromUrlPath } from '../blossom/handler.js';
+import { finalizeEvent, generateSecretKey, getPublicKey } from 'nostr-tools/pure';
+
+import { BlossomAuthImpl } from '../auth/blossom-auth.js';
+import {
+  MAX_UNHASHED_UPLOAD_BYTES,
+  UPLOAD_SPOOL_DIR,
+  servedAs,
+  sha256FromUrlPath,
+} from '../blossom/handler.js';
 import { OWNERS_FILE, REPORTS_FILE } from '../blossom/store.js';
 import { FakeBlossomAuth } from './fake-blossom-auth.js';
 import { BLOCK, cleanupRigs, fixtureBytes, pubkey, request, rig } from './helpers.js';
@@ -586,7 +594,7 @@ describe('BUD-09 PUT /report', () => {
     ...extra,
   });
 
-  it('a structurally valid signed report goes through the auth boundary as verb `report` and is stored (signature unverified)', async () => {
+  it('a structurally valid signed report goes through the auth boundary as verb `report` and is stored (signature verified there — F20)', async () => {
     const auth = new FakeBlossomAuth({ ok: true, pubkey: pubkey('reporter') });
     const r = await rig({ auth });
     const h = sha(fixtureBytes(1));
@@ -601,10 +609,46 @@ describe('BUD-09 PUT /report', () => {
     const stored = JSON.parse(
       (await readFile(path.join(r.config.dataDir, REPORTS_FILE), 'utf8')).trim(),
     ) as Record<string, unknown>;
+    // `signatureVerified` records the BlossomAuth contract's verdict (the fake stands in for it).
     expect(stored).toMatchObject({
       reporter: pubkey('reporter'),
       hashes: [h],
-      signatureVerified: false,
+      signatureVerified: true,
+    });
+  });
+
+  // Security review F20: with the REAL BlossomAuth a genuine signed report is stored as verified
+  // and a forged one never reaches the store.
+  it('with the real BlossomAuthImpl: a signed NIP-56 report is stored verified, a forged one is 401', async () => {
+    // The rig types `auth` as the fake (other tests read its call log); this one never does.
+    const r = await rig({ auth: new BlossomAuthImpl() as unknown as FakeBlossomAuth });
+    const h = sha(fixtureBytes(1));
+    const sk = generateSecretKey();
+    const ev = finalizeEvent(
+      {
+        kind: 1984,
+        created_at: Math.floor(Date.now() / 1000) - 5,
+        tags: [['x', h, 'spam']],
+        content: 'spam',
+      },
+      sk,
+    );
+    const forged = await request(`${r.url}/report`, {
+      method: 'PUT',
+      body: JSON.stringify({ ...ev, content: 'edited after signing' }),
+    });
+    expect(forged.status).toBe(401);
+    const ok = await request(`${r.url}/report`, { method: 'PUT', body: JSON.stringify(ev) });
+    expect(ok.status).toBe(200);
+    await r.gateway.reports.flushed();
+    const lines = (await readFile(path.join(r.config.dataDir, REPORTS_FILE), 'utf8'))
+      .trim()
+      .split('\n');
+    expect(lines).toHaveLength(1);
+    expect(JSON.parse(lines[0]!)).toMatchObject({
+      reporter: getPublicKey(sk),
+      hashes: [h],
+      signatureVerified: true,
     });
   });
 
@@ -648,5 +692,112 @@ describe('T11 HTTP limits', () => {
     const r = await rig({ raw: { http: { maxJsonBodyBytes: 100 } } });
     const res = await request(`${r.url}/report`, { method: 'PUT', body: 'x'.repeat(200) });
     expect(res.status).toBe(413);
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// Security review (docs/security-review.md) — the gateway's web-facing responses.
+
+describe('security review F3: bytes on the gateway origin are never a live document', () => {
+  it('servedAs: inert types inline, everything else (HTML, SVG, XHTML, PDF, scripts, unknown) as an octet-stream attachment', () => {
+    for (const m of [
+      'video/mp4',
+      'video/webm',
+      'image/png',
+      'text/vtt',
+      'text/plain',
+      'application/json',
+    ])
+      expect(servedAs(m), m).toEqual({ contentType: m, attachment: false });
+    for (const m of [
+      'text/html',
+      'image/svg+xml',
+      'application/xhtml+xml',
+      'application/pdf',
+      'text/javascript',
+      'application/x-anything',
+    ])
+      expect(servedAs(m), m).toEqual({ contentType: 'application/octet-stream', attachment: true });
+    expect(servedAs(undefined)).toEqual({
+      contentType: 'application/octet-stream',
+      attachment: false,
+    });
+  });
+
+  it('a blob stored as text/html or image/svg+xml is served as a download; every response carries nosniff + a sandboxing CSP', async () => {
+    const r = await rig();
+    // Distinct bytes per type: the CAS dedups by hash and keeps the first MIME it saw.
+    for (const [blocks, mime] of [
+      [1, 'text/html'],
+      [3, 'image/svg+xml'],
+    ] as const) {
+      const { sha: s } = await putFixture(r, blocks, mime);
+      const res = await request(`${r.url}/${s}`);
+      expect(res.status, mime).toBe(200);
+      expect(res.headers['content-type']).toBe('application/octet-stream');
+      expect(res.headers['content-disposition']).toBe(`attachment; filename="${s}.bin"`);
+      expect(res.headers['x-content-type-options']).toBe('nosniff');
+      expect(res.headers['content-security-policy']).toBe("sandbox; default-src 'none'");
+    }
+    const { sha: v } = await putFixture(r, 2, 'video/webm');
+    const video = await request(`${r.url}/${v}`);
+    expect(video.headers['content-type']).toBe('video/webm');
+    expect(video.headers['content-disposition']).toBeUndefined();
+    expect(video.headers['x-content-type-options']).toBe('nosniff');
+    // Errors and JSON too.
+    const missing = await request(`${r.url}/${'ab'.repeat(32)}`);
+    expect(missing.headers['x-content-type-options']).toBe('nosniff');
+    expect(missing.headers['content-security-policy']).toBe("sandbox; default-src 'none'");
+  });
+
+  it('the default upload allowlist refuses text/html (415) before any body byte is stored', async () => {
+    const auth = new FakeBlossomAuth({ ok: true, pubkey: UPLOADER });
+    const r = await rig({ auth });
+    const body = fixtureBytes(1);
+    const res = await request(`${r.url}/upload`, {
+      method: 'PUT',
+      headers: uploadHeaders(body, { 'Content-Type': 'text/html' }),
+      body: Buffer.from(body),
+    });
+    expect(res.status).toBe(415);
+    expect(await readdir(path.join(r.config.dataDir, UPLOAD_SPOOL_DIR))).toEqual([]);
+    expect(auth.calls).toHaveLength(0);
+  });
+});
+
+describe('security review F15: no unauthenticated spooling of large bodies', () => {
+  it(`an upload over ${String(MAX_UNHASHED_UPLOAD_BYTES)} bytes without X-SHA-256 is refused before the body is read or the token checked`, async () => {
+    const auth = new FakeBlossomAuth({ ok: true, pubkey: UPLOADER });
+    const r = await rig({ auth, raw: { http: { maxUploadBytes: 64 * 1024 * 1024 } } });
+    const res = await request(`${r.url}/upload`, {
+      method: 'PUT',
+      headers: {
+        'Content-Length': String(MAX_UNHASHED_UPLOAD_BYTES + 1),
+        'Content-Type': 'video/mp4',
+        Authorization: 'Nostr x',
+      },
+    }).catch(() => null);
+    expect(res?.status).toBe(400);
+    expect(res?.headers['x-reason']).toMatch(/X-SHA-256 is required/);
+    expect(auth.calls).toHaveLength(0);
+    expect(await readdir(path.join(r.config.dataDir, UPLOAD_SPOOL_DIR))).toEqual([]);
+  });
+});
+
+describe('security review F14: X-Forwarded-For is read from the right', () => {
+  it('with trustProxy, a client cannot pick its rate-limit bucket by prepending addresses', async () => {
+    const r = await rig({
+      raw: { http: { requestsPerWindow: 2, windowMs: 60_000, trustProxy: true } },
+    });
+    const statuses: number[] = [];
+    for (let i = 0; i < 4; i++)
+      statuses.push(
+        (
+          await request(`${r.url}/${'ab'.repeat(32)}`, {
+            headers: { 'X-Forwarded-For': `10.0.0.${String(i)}, 203.0.113.7` },
+          })
+        ).status,
+      );
+    expect(statuses).toEqual([404, 404, 429, 429]);
   });
 });

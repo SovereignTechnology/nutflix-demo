@@ -26,10 +26,14 @@ export {
 } from './split.js';
 export { PAY1_TAG, checkPayLock, type LockVerdict } from './lock.js';
 export {
+  MAX_KEYSETS_PER_SET,
   MAX_PROOFS_PER_SET,
+  MAX_REUSED_PROOFS,
   RealPaymentEngine,
   isPayMessageV5,
+  maxProofsFor,
   type PaymentEngineDeps,
+  type PendingPay,
 } from './engine.js';
 export { RangeSet } from './range-set.js';
 export { SeenSecrets, type SeenSecretsOptions } from './seen.js';

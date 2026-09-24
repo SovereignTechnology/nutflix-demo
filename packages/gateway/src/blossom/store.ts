@@ -120,9 +120,10 @@ export interface StoredReport {
   readonly at: UnixSeconds;
   readonly reporter: NostrPubkey;
   readonly hashes: readonly Sha256Hex[];
-  /** The kind-1984 event as received. Its signature is NOT verified here (Stage 2). */
+  /** The kind-1984 event as received (the auth boundary verified it before it was stored). */
   readonly event: unknown;
-  readonly signatureVerified: false;
+  /** `true` when a `BlossomAuth` verified the report's signature (`report` verb, ADR 0010 §8). */
+  readonly signatureVerified: boolean;
 }
 
 export class ReportStore {

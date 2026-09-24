@@ -18,6 +18,12 @@ import type {
 type Listeners = { [K in keyof PayProtocolEvents]: Set<PayProtocolEvents[K]> };
 
 export class FakePayProtocol implements PayProtocol {
+  /**
+   * `autoAck`: the remote side ACKs every PAY `ok` on a microtask, like an honest seeder. Off by
+   * default — a test that counts ACKs injects them with `remoteAck`.
+   */
+  constructor(private readonly opts: { readonly autoAck?: boolean } = {}) {}
+
   state: PayProtocolState = 'idle';
   peer: HelloMessage | null = null;
   attachedTo: MuxLike | null = null;
@@ -43,6 +49,10 @@ export class FakePayProtocol implements PayProtocol {
   }
   sendPay(msg: PayMessage): void {
     this.sentPays.push(msg);
+    if (this.opts.autoAck === true)
+      queueMicrotask(() => {
+        this.remoteAck({ type: 'ACK', ...msg.range, ok: true });
+      });
   }
   sendAck(ack: Omit<AckMessage, 'type'>): void {
     this.acks.push({ type: 'ACK', ...ack });

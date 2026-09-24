@@ -225,10 +225,11 @@ export function httpsTransport(opts: HttpsTransportOptions = {}): ImageTransport
         method: 'GET',
         agent: false,
         lookup: lookup,
+        // No `user-agent`: any thumbnail host a Nostr event names sees this request, and a
+        // distinctive one marked every fetch as "a Nutflix viewer" (security review F18).
         headers: {
           accept: 'image/jpeg,image/png,image/webp',
           'accept-encoding': 'identity',
-          'user-agent': 'nutflix-desktop',
         },
         timeout: timeoutMs,
       });

@@ -10,7 +10,10 @@
  *      live subscriptions, a small grant concurrency cap (`rate-limited` beyond);
  *   4. SE-1 — `studio.upload`'s `FileToken` is swapped for `{ path, name, size }` (single use,
  *      same webContents, unexpired) or the call is answered `file-token-invalid`;
- *   5. the money gate — `wallet.melt`, `seeder.melt`, `nutzap` (Stage 2 dialog; stub now).
+ *   5. the confirm gate (`money-gate.ts`, a native dialog in main) — `wallet.melt`,
+ *      `seeder.melt`, `nutzap`; an `updateSettings` patch that adds trusted mints or turns an
+ *      auto top-up on; and `studio.upload`, naming the file the token resolved to (security
+ *      review F7/F8).
  *
  * Only then is a `HostIn` posted to the host `utilityProcess`, which re-validates it. Handlers
  * never throw across `ipcMain.handle`: every path resolves a `ReplyMsg` (L6-0 rule). Replies
@@ -24,6 +27,8 @@ import type {
   EventMsg,
   HostIn,
   HostOut,
+  Method,
+  MethodTable,
   ReplyMsg,
   WireError,
 } from '../ipc/protocol.js';
@@ -33,7 +38,7 @@ import { wireError } from '../ipc/errors.js';
 import type { FileTokenRegistry } from './file-tokens.js';
 import type { Logger } from './log.js';
 import { silentLogger } from './log.js';
-import type { MoneyGate, MoneyRequest } from './money-gate.js';
+import type { ConfirmRequest, MoneyGate, MoneyRequest } from './money-gate.js';
 import { isMoneyMethod } from './money-gate.js';
 import { isAppUrl } from './schemes.js';
 
@@ -76,6 +81,10 @@ interface WcState {
   readonly subs: Set<number>;
   /** `sub`/`unsub` awaiting the host's ack: subId → resolver. */
   readonly acks: Map<number, (r: ReplyMsg) => void>;
+  /** Method of each call in flight (to learn the settings from their replies). */
+  readonly methods: Map<number, Method>;
+  /** The settings the host last returned to this page (`settings` / `updateSettings`). */
+  knownSettings: MethodTable['settings'][1] | undefined;
   grants: number;
 }
 
@@ -121,6 +130,7 @@ export class IpcGate {
       }
       return await new Promise<ReplyMsg>((resolve) => {
         st.calls.set(msg.id, resolve);
+        st.methods.set(msg.id, msg.method);
         void this.relay(st, msg).catch(() => {
           this.settle(st, msg.id, fail(msg.id, wireError('internal', 'relay failed')));
         });
@@ -227,6 +237,7 @@ export class IpcGate {
     for (const [id, r] of st.acks) r(fail(id, gone));
     // Cleared, so a relay still waiting on the money gate never posts for a gone page.
     st.calls.clear();
+    st.methods.clear();
     st.acks.clear();
     st.subs.clear();
     this.deps.post({ kind: 'wc-gone', wc });
@@ -239,6 +250,7 @@ export class IpcGate {
       for (const [id, r] of st.calls) r(fail(id, down));
       for (const [id, r] of st.acks) r(fail(id, down));
       st.calls.clear();
+      st.methods.clear();
       st.acks.clear();
       st.subs.clear();
     }
@@ -261,7 +273,15 @@ export class IpcGate {
     if (!this.deps.isAppWebContents(wc.id) || wc.isDestroyed()) return undefined;
     let st = this.states.get(wc.id);
     if (st === undefined) {
-      st = { wc, calls: new Map(), subs: new Set(), acks: new Map(), grants: 0 };
+      st = {
+        wc,
+        calls: new Map(),
+        subs: new Set(),
+        acks: new Map(),
+        methods: new Map(),
+        knownSettings: undefined,
+        grants: 0,
+      };
       this.states.set(wc.id, st);
     }
     return st;
@@ -286,10 +306,24 @@ export class IpcGate {
         return;
       }
     }
-    if (isMoneyMethod(msg.method)) {
-      const ok = await this.deps.moneyGate
-        .confirm({ wc: st.wc.id, method: msg.method, args: msg.args } as MoneyRequest)
-        .catch(() => false);
+    let question: ConfirmRequest | undefined;
+    if (file !== undefined)
+      question = {
+        wc: st.wc.id,
+        method: 'studio.upload',
+        file: { name: file.name, size: file.size },
+      };
+    else if (msg.method === 'updateSettings')
+      question = {
+        wc: st.wc.id,
+        method: 'updateSettings',
+        args: msg.args,
+        known: st.knownSettings,
+      };
+    else if (isMoneyMethod(msg.method))
+      question = { wc: st.wc.id, method: msg.method, args: msg.args } as MoneyRequest;
+    if (question !== undefined) {
+      const ok = await this.deps.moneyGate.confirm(question).catch(() => false);
       if (!ok) {
         this.settle(st, msg.id, fail(msg.id, wireError('forbidden', 'not confirmed')));
         return;
@@ -314,6 +348,10 @@ export class IpcGate {
     const r = st.calls.get(id);
     if (r === undefined) return;
     st.calls.delete(id);
+    const method = st.methods.get(id);
+    st.methods.delete(id);
+    if (reply.ok && (method === 'settings' || method === 'updateSettings'))
+      st.knownSettings = reply.result as MethodTable['settings'][1];
     r(reply);
   }
 

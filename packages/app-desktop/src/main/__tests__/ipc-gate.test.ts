@@ -330,6 +330,54 @@ describe('IPC gate — money gate (Stage 2 hook)', () => {
     expect(h.host.received.filter((m) => m.kind === 'call')).toHaveLength(0);
   });
 
+  // Security review F7: a compromised renderer PROCESS can mint a token for any path it knows,
+  // so main names the file it resolved — never renderer text — and a refusal uploads nothing.
+  it('studio.upload asks about the file main resolved from the token; a refusal never reaches the host', async () => {
+    const h = createHarness();
+    const seen: unknown[] = [];
+    const gate = h.gate as unknown as {
+      deps: { moneyGate: { confirm: (r: unknown) => Promise<boolean> } };
+    };
+    gate.deps.moneyGate.confirm = (r) => {
+      seen.push(r);
+      return Promise.resolve(false);
+    };
+    h.files.set('/home/u/.ssh/id_ed25519', fileStat('file', 411));
+    const g = await h.gate.grant(h.ev(), { v: 1, path: '/home/u/.ssh/id_ed25519' });
+    const token = g.ok ? (g.result as string) : '';
+    expectError(
+      await h.gate.call(h.ev(), callMsg('studio.upload', uploadArgs(token))),
+      'forbidden',
+    );
+    expect(seen).toEqual([
+      { wc: 1, method: 'studio.upload', file: { name: 'id_ed25519', size: 411 } },
+    ]);
+    await h.host.settled();
+    expect(h.host.received.filter((m) => m.kind === 'call')).toHaveLength(0);
+  });
+
+  // Security review F4/F8: settings that decide where sats may go are asked about, with the
+  // settings main last saw for the page so only real additions are named.
+  it('updateSettings goes through the gate with the settings main learned from the last settings reply', async () => {
+    const h = createHarness();
+    const seen: { method: string; known?: unknown }[] = [];
+    const gate = h.gate as unknown as {
+      deps: {
+        moneyGate: { confirm: (r: { method: string; known?: unknown }) => Promise<boolean> };
+      };
+    };
+    gate.deps.moneyGate.confirm = (r) => {
+      seen.push(r);
+      return Promise.resolve(true);
+    };
+    const current = await h.gate.call(h.ev(), callMsg('settings', []));
+    expect(current.ok).toBe(true);
+    await h.gate.call(h.ev(), callMsg('updateSettings', [{ theme: 'light' }]));
+    expect(seen).toHaveLength(1);
+    expect(seen[0]?.method).toBe('updateSettings');
+    expect(seen[0]?.known).toEqual(current.ok ? current.result : undefined);
+  });
+
   it('never asks for anything else', async () => {
     const h = createHarness();
     await h.gate.call(h.ev(), callMsg('wallet.balances', []));

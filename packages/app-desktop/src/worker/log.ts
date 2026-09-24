@@ -3,11 +3,11 @@
  * redacting logger whose sink turns every record into a `log` event for the host.
  *
  * Redaction is layered. The seeder's `redact()` already scrubs Cashu tokens, `nsec`s, proof
- * objects and secret-named fields, but deliberately keeps FULL 64-hex values in fields named
- * `pubkey` / `peer` / `noiseKey` / `core` … so an operator can grep a daemon's journal. The
- * desktop worker's logs leave the process (host → Electron log), so the sink re-applies
- * `redactString` to the finished line: every 32-byte value — peer Noise keys, Nostr pubkeys,
- * core keys — is cut to its first 8 hex chars. Nothing peer-identifying leaves whole.
+ * objects and secret-named fields, and replaces peer identifiers (`pubkey` / `peer` /
+ * `noiseKey` …) with a per-process alias (security review F13); it keeps content ids (`core`,
+ * `sha256`) whole. The desktop worker's logs leave the process (host → Electron log), so the
+ * sink re-applies `redactString` to the finished line: every remaining 32-byte value is cut to
+ * its first 8 hex chars. Nothing peer-identifying leaves whole.
  *
  * Lines are clamped to the protocol's `LIMITS.maxString` so the host guard accepts them.
  */

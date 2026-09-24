@@ -87,6 +87,9 @@ export class TestMint {
   private readonly feeReserve: number;
   /** hex(Y) of every spent proof. */
   private readonly spent = new Set<string>();
+  /** hex(Y) → the witness the proof was spent with (NUT-07 returns it). */
+  private readonly witnesses = new Map<string, string>();
+  private dropped = 0;
   private readonly quotes = new Map<string, Quote>();
   private readonly melts = new Map<string, MeltQuote>();
   private seq = 0;
@@ -140,6 +143,14 @@ export class TestMint {
   }
 
   /**
+   * The next `n` state-changing requests (POST) are EXECUTED — proofs spent, quotes paid — but
+   * their response is lost, as with a timeout after the mint committed.
+   */
+  dropNextResponse(n = 1): void {
+    this.dropped += n;
+  }
+
+  /**
    * Mint proofs directly (a test's starting balance), in power-of-two denominations, each with
    * DLEQ including the blinding factor `r` (NUT-12, what a wallet stores). `p2pk` locks them;
    * `tags` are extra NUT-10 tags committed into the secret.
@@ -190,8 +201,13 @@ export class TestMint {
       const method = (args.method ?? 'GET').toUpperCase();
       this.calls.push(`${method} ${path}`);
       const body: Record<string, unknown> = args.requestBody ?? {};
+      const result = this.route(method, path, body);
+      if (method === 'POST' && this.dropped > 0) {
+        this.dropped--;
+        throw new Error('test mint: the response was lost after the mint committed');
+      }
       // Round-trip through JSON like the wire does (Amount → string → number).
-      return Promise.resolve(JSON.parse(JSON.stringify(this.route(method, path, body))) as T);
+      return Promise.resolve(JSON.parse(JSON.stringify(result)) as T);
     } catch (e) {
       return Promise.reject(e instanceof Error ? e : new Error(String(e)));
     }
@@ -256,11 +272,16 @@ export class TestMint {
   }
 
   /** Verify inputs (signature, not spent, spending conditions); returns their total. */
-  private checkInputs(inputs: unknown): { total: number; ys: string[] } {
+  private checkInputs(inputs: unknown): {
+    total: number;
+    ys: string[];
+    witnesses: (string | undefined)[];
+  } {
     if (!Array.isArray(inputs) || inputs.length === 0)
       throw new MintOperationError(11002, 'no inputs');
     let total = 0;
     const ys: string[] = [];
+    const witnesses: (string | undefined)[] = [];
     for (const raw of inputs) {
       const p = wireProof(raw);
       const amount = num(p.amount);
@@ -289,9 +310,19 @@ export class TestMint {
       if (this.spent.has(y) || ys.includes(y))
         throw new MintOperationError(11001, 'Token already spent');
       ys.push(y);
+      witnesses.push(typeof p.witness === 'string' ? p.witness : undefined);
       total += amount;
     }
-    return { total, ys };
+    return { total, ys, witnesses };
+  }
+
+  /** Spend checked inputs, remembering each one's witness. */
+  private spend(inputs: { ys: string[]; witnesses: (string | undefined)[] }): void {
+    inputs.ys.forEach((y, i) => {
+      this.spent.add(y);
+      const w = inputs.witnesses[i];
+      if (w !== undefined) this.witnesses.set(y, w);
+    });
   }
 
   private sign(outputs: unknown): { signatures: SerializedBlindedSignature[]; total: number } {
@@ -330,7 +361,7 @@ export class TestMint {
     if (outTotal + this.fee((body['inputs'] as unknown[]).length) !== inputs.total)
       throw new MintOperationError(11002, 'Transaction is not balanced');
     const { signatures } = this.sign(outputs);
-    for (const y of inputs.ys) this.spent.add(y);
+    this.spend(inputs);
     return { signatures };
   }
 
@@ -341,7 +372,7 @@ export class TestMint {
       states: (ys as string[]).map((Y) => ({
         Y,
         state: this.spent.has(Y) ? 'SPENT' : 'UNSPENT',
-        witness: null,
+        witness: this.witnesses.get(Y) ?? null,
       })),
     };
   }
@@ -420,7 +451,7 @@ export class TestMint {
     const inputs = this.checkInputs(body['inputs']);
     const need = q.amount + this.feeReserve + this.fee((body['inputs'] as unknown[]).length);
     if (inputs.total < need) throw new MintOperationError(11002, 'Transaction is not balanced');
-    for (const y of inputs.ys) this.spent.add(y);
+    this.spend(inputs);
     q.state = 'PAID';
     // NUT-08: the unused fee reserve comes back as change on the blank outputs, if any.
     const blanks = Array.isArray(body['outputs'])

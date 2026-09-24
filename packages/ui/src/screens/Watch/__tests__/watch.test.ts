@@ -1026,6 +1026,35 @@ describe('Watch — price shown is price charged', () => {
     );
   });
 
+  // Security review F19: Shorts refused a session whose POLICY charges more than the quote;
+  // Watch only compared the rendition. Same guard now.
+  it('refuses a session whose policy charges more than the price shown (closed, nothing played)', async () => {
+    const base = new MockNetworkAdapter();
+    const closes: ReturnType<typeof vi.fn>[] = [];
+    const adapter = override(base, {
+      play: (id: NostrEventId, label?: string) =>
+        base.play(id, label).then((s) => {
+          const close = vi.fn(() => s.close());
+          closes.push(close);
+          return {
+            ...s,
+            policy: { ...s.policy, satsPerBlock: mocks.sats(s.policy.satsPerBlock * 3) },
+            close,
+          };
+        }),
+    });
+    const { r } = mount(adapter);
+    keep(r);
+    await flush();
+    await pressPlay(r);
+    expect(closes).toHaveLength(1);
+    expect(closes[0]).toHaveBeenCalledTimes(1);
+    expect(r.all('video')).toHaveLength(0);
+    expect(r.get('.nf-watch__stage--gate [role="alert"]').textContent).toContain(
+      'nothing was played',
+    );
+  });
+
   it('never prefetches related videos: one play() for the video on screen only', async () => {
     const adapter = new MockNetworkAdapter();
     const play = vi.spyOn(adapter, 'play');

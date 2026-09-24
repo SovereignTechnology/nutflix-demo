@@ -25,8 +25,12 @@ Type=simple
 User=nutflix-gateway
 Group=nutflix-gateway
 WorkingDirectory=/opt/nutflix
-# --jitless: see MDWE-RESULTS.md. Entry point / flags are lane L3's to confirm.
-ExecStart=/usr/bin/node --jitless /opt/nutflix/packages/gateway/dist/index.js --config /etc/nutflix/gateway.json
+# --jitless: see MDWE-RESULTS.md. --no-experimental-websocket: as in the seeder unit, --jitless
+# also removes WebAssembly, and on Node 22 the first touch of the global WebSocket (nostr-tools,
+# via @sovit/core) loads undici, which needs it; the gateway loads node:http through require()
+# for the same reason (MDWE-RESULTS.md §6). Guarded by packages/gateway/src/__tests__/cli.test.ts,
+# which runs the built entry with the flags read from this line.
+ExecStart=/usr/bin/node --jitless --no-experimental-websocket /opt/nutflix/packages/gateway/dist/index.js --config /etc/nutflix/gateway.json
 Environment=NODE_ENV=production
 Environment=NODE_OPTIONS=
 UnsetEnvironment=NODE_EXTRA_CA_CERTS NODE_PATH NODE_DEBUG NODE_PENDING_DEPRECATION

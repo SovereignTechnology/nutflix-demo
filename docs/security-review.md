@@ -7,15 +7,52 @@ gateway auth). There is no web portal; only the gateway's web-facing responses w
 
 Method: every claim below was checked against the source at `f398f9f` (file:line references are
 to that tree), and against measurements where a number is given. Findings are ranked by what an
-attacker gains and how cheaply. **None is fixed here** unless it sat inside the five Stage 2
-directories. PART B forbids fixes elsewhere, so each finding carries a concrete fix and a
-test, to be filed as a `stage-3` issue (§6).
+attacker gains and how cheaply. Each finding carries a concrete fix and a test. PART B forbade
+fixes outside the five Stage 2 directories; on 2026-09-24 Cameron asked for the fixes, and **§0
+records what was fixed and what is still open** (filed as `stage-3` issues, §6).
 
 **Exposure today is nil for the money findings.** No runtime provider is wired: the desktop
 worker, the seeder and the gateway CLIs all refuse to start without `--dev-mocks`
 (`*/providers.ts` return `undefined`), so no real ecash moves until Stage 3 wires the Stage 2
-modules in. That makes F1–F4 and F30 **Stage 3 blockers**: each must be fixed before a real wallet is
-connected.
+modules in. F1–F4 and F30 were the **Stage 3 blockers**; all five are fixed (§0).
+
+## 0. Status after the review fixes (2026-09-24, branch `stage-2/review-fixes`)
+
+Cameron asked for the fixes on 2026-09-24, which lifts PART B's "do not fix outside the five
+directories" for this list. Each fix carries a test that fails without it, except where noted.
+
+| ID | Status | What changed |
+|---|---|---|
+| F1 | **Fixed** | `UpstreamPayer`: the seeder's asking price (HELLO or `PRICE`) may only lower the manifest price; above it nothing is paid (`skippedOverpriced`) |
+| F2 | **Fixed** | `manifestPolicyResolver` replaces `helloPolicyResolver`: per-core manifest policy or no payment; split from the manifest; mint ∈ seeder ∩ wallet ∩ manifest |
+| F3 | **Fixed** | Every Blossom response: `nosniff` + `CSP: sandbox`; only inert types inline (`servedAs`), everything else an `octet-stream` attachment; upload MIME allowlist by default (explicit `null` = any) |
+| F4 | **Fixed (policy)** | `autoTopUpDue` tops up only mints in `defaultMints`, and now follows the v5 direction (it had it backwards); contract text says so. Executing top-ups (with caps) is Stage 3 |
+| F5 | **Partly fixed** | Proofs per set capped at `bitLength(amount) + 6` (`maxProofsFor`); one unacknowledged PAY per core batches PAYs naturally (F30). Open: DLEQ off the event loop, explicit `minPaySats` batching tied to the credit pool |
+| F6 | **Open** | Needs a real mint (nutshell/cdk) — Stage 3 regtest |
+| F7 | **Fixed** | `studio.upload` asks with a native dialog naming the file main resolved from the token |
+| F8 | **Fixed** | The money gate is a native dialog (`dialog.showMessageBox`, Cancel default) built from guarded args; `seeder.melt` cross-checks the invoice amount; settings patches that add mints or turn on auto top-up are asked about too |
+| F9 | **Fixed** | The seeder records each `PRICE` boundary per session × core and verifies a PAY at the price in force for its blocks; `setCorePolicy` now announces per-core `PRICE` |
+| F10 | **Mitigated** | F12's `restorePending` puts the unflushed secrets back in the seen set; the `persist` hook for the rest is wired with the runtime providers (Stage 3) |
+| F11 | **Fixed (engine)** | `checkSpent` dep: a spent creator set is a double-spend (ban, no nutzap) — checked once, before the first nutzap; `CashuWallet.checkSpent` provides it |
+| F12 | **Fixed (engine)** | `persistPending` (synchronous, before the ACK) + `restorePending`; the host wires the store in Stage 3 |
+| F13 | **Fixed** | Peer identifiers in log fields become a per-process alias (`peer#17`) |
+| F14 | **Fixed** | `trustProxy` reads the rightmost `X-Forwarded-For` entry |
+| F15 | **Fixed** | Uploads over 8 MiB must send `X-SHA-256` (no unauthenticated spooling of large bodies); default MIME allowlist (F3). Open: per-pubkey quota; whether uploads should default to allow-list-only (decision) |
+| F16 | **Fixed** | The gateway loads `node:http` via `createRequire`; the unit gains `--no-experimental-websocket`; a spawn test runs the built entry with the unit's flags (verified on Node 22.22.0) |
+| F17 | **Open** | NUT-20 locked quotes need a signer method for mint requests — Stage 3 |
+| F18 | **Partly fixed** | The distinctive user agent is gone. Open: hash-addressed images only by default (decision) |
+| F19 | **Fixed** | Watch refuses a session whose policy charges more than the quote (play and quality switch) |
+| F20 | **Fixed** | `StoredReport.signatureVerified` is `true` after the auth boundary verified the report |
+| F21 | **Open** | Packaging (dev flags compiled out, Electron fuses) |
+| F22 | **Fixed** | `app.requestSingleInstanceLock()`; a second launch focuses the first window |
+| F23 | **Fixed** | `Nip60ProofStore` verifies every event itself |
+| F24 | **Open** | The `KeyStore` adapter and headless unlock come with the runtime providers |
+| F25 | **Open** | Only matters once Stage 3 opens external links |
+| F26 | **Partly fixed** | Natural batching (F30) cuts dust PAYs; explicit batching open (F5) |
+| F27 | **Open** | Concurrent channels from one pubkey (seeder carry is per pubkey) — Low |
+| F28, F29, F32 | Info | Recorded, no change |
+| F30 | **Fixed** | `UpstreamPayer` keeps the carry per channel, commits it on `ACK ok`, one PAY per core in flight |
+| F31 | **Fixed (engine)** | `spentByUs` dep: a "spent" redeem whose witness is our own signature is our lost swap — no ban, creator still paid. Open: NUT-13 deterministic outputs to recover the swapped proofs |
 
 ## 1. Summary
 
@@ -465,33 +502,24 @@ is ACKed, then cut, with the ban persisted.
 
 ## 6. Stage 3 issues
 
-To be filed on GitLab as one issue per finding, labelled `stage-3` and `security`, severity in
-the title, body = the finding's section above. **Filing waits for Cameron's go-ahead**
-(outward-facing). F1–F4 and F30 are blockers for wiring any real wallet.
+To be filed on GitLab, labelled `stage-3` and `security`, severity in the title, body = the
+finding's section above plus its row in §0. **Filing waits for Cameron's go-ahead**
+(outward-facing). Only what §0 leaves open:
 
 | Issue title |
 |---|
-| [Critical] F1: clamp PRICE to the manifest price in UpstreamPayer / ViewerPayer |
-| [High] F2: gateway pays upstream on the manifest policy, never HELLO terms |
-| [High] F3: Blossom GET — nosniff, CSP sandbox, media allowlist, attachment for active types |
-| [High] F4: auto top-up only into trusted mints, capped, confirmed first time |
-| [High] F5: batch PAYs, cap proofs per set, DLEQ off the event loop |
 | [High] F6: regtest-verify the pay1 NUT-10 tag on nutshell and cdk |
-| [High] F30: UpstreamPayer scopes the carry per channel and commits it on ACK |
-| [Medium] F7: main-owned file choice / confirm before studio.upload |
-| [Medium] F8: native money-gate dialog; gate money-relevant settings |
-| [Medium] F9: price blocks by the policy in force when uploaded |
-| [Medium] F10: persist the seen-secret set |
-| [Medium] F11: NUT-07 checkstate the creator set at flush |
-| [Medium] F12: persist the pending redeem/nutzap queue |
-| [Medium] F31: witness-checked recovery from a lost redeem response; NUT-13 outputs |
-| [Medium] F13: hash peer identifiers in info logs |
-| [Medium] F14: rightmost trusted X-Forwarded-For hop |
-| [Medium] F15: gateway upload defaults, per-pubkey quota, no pre-auth spooling |
-| [Medium] F16: gateway unit on Node 22 (Node ≥ 24 + --no-experimental-websocket) |
+| [High] F5: DLEQ verification off the event loop; explicit minPaySats batching tied to the credit pool |
+| [Medium] F10: wire the seen-secret persistence (the `persist` hook exists) |
+| [Medium] F11/F12/F31: wire `checkSpent`, `persistPending`/`restorePending`, `spentByUs` in the seeder runtime providers |
+| [Medium] F31: NUT-13 deterministic outputs + NUT-09 restore |
+| [Medium] F15: per-pubkey upload quota |
 | [Medium] F17: NUT-20 locked mint quotes; opaque quote handles over IPC |
-| [Medium] F18: hash-addressed images by default; drop the distinctive user agent |
-| [Low] F19–F27: one issue each; F28, F29, F32 recorded, no issue |
+| [Medium] F4: execute auto top-ups with per-top-up and per-day caps |
+| [Low] F21: packaging — compile out dev flags, set Electron fuses |
+| [Low] F24: file `KeyStore` (0600, atomic) + headless unlock via systemd credentials |
+| [Low] F25: external-link confirm shows the real host |
+| [Low] F27: concurrent channels from one pubkey |
 
 ## 7. Not verified
 

@@ -13,7 +13,7 @@ import { mocks } from '@sovit/core';
 import type { CoreKeyHex, PayMessage, PricePolicy, Sats } from '@sovit/core';
 import { Seeder, nodeCrypto, nodeFs, toHex } from '@sovit/seeder';
 
-import { UpstreamPayer, helloPolicyResolver } from '../upstream/payer.js';
+import { UpstreamPayer, manifestPolicyResolver } from '../upstream/payer.js';
 import { FakePayProtocol, helloFrom } from './fake-pay-protocol.js';
 import {
   BLOCK,
@@ -39,10 +39,16 @@ const UP_PUBKEY = pubkey('upstream');
 const UP_P2PK = ('02' + '11'.repeat(32)) as PricePolicy['creatorP2pk'];
 const NOISE = 'ee'.repeat(32);
 
-function unit(payEveryBlocks = 2, opts: { policy?: PricePolicy | null } = {}) {
+/** The manifest price of CORE_A / CORE_B in the unit rig (the seeder's HELLO asks 3). */
+const MANIFEST_PRICE = 5;
+
+function unit(payEveryBlocks = 2, opts: { policy?: PricePolicy | null; autoAck?: boolean } = {}) {
   const engine = new mocks.MockPaymentEngine({ mode: 'honest' });
   const log = capturedLogger();
-  const perCore = new Map<CoreKeyHex, PricePolicy>();
+  const perCore = new Map<CoreKeyHex, PricePolicy>([
+    [CORE_A, basePolicy(MANIFEST_PRICE)],
+    [CORE_B, basePolicy(MANIFEST_PRICE)],
+  ]);
   const payer = new UpstreamPayer({
     engine,
     logger: log.logger,
@@ -53,9 +59,9 @@ function unit(payEveryBlocks = 2, opts: { policy?: PricePolicy | null } = {}) {
         ? () => null
         : opts.policy
           ? () => opts.policy!
-          : helloPolicyResolver(basePolicy(), () => perCore),
+          : manifestPolicyResolver(() => perCore),
   });
-  const protocol = new FakePayProtocol();
+  const protocol = new FakePayProtocol({ autoAck: opts.autoAck ?? true });
   const detach = payer.attachPeer(NOISE, protocol);
   return { engine, payer, protocol, detach, log, perCore };
 }
@@ -64,7 +70,7 @@ const hello = () =>
   helloFrom(UP_PUBKEY, { acceptedMints: [MINT_B, MINT_A], satsPerBlock: 3 as Sats, p2pk: UP_P2PK });
 
 describe('UpstreamPayer (unit)', () => {
-  it('pays every N contiguous verified blocks with range.core set, at the HELLO price, to the HELLO pubkey/p2pk/common mint', async () => {
+  it('pays every N contiguous verified blocks with range.core set, at the seeder’s price (≤ the manifest’s), to the HELLO pubkey/p2pk/common mint', async () => {
     const { engine, payer, protocol } = unit(2);
     protocol.remoteHello(hello());
     for (let i = 0; i < 5; i++) payer.onDownload(CORE_A, i, NOISE);
@@ -178,7 +184,7 @@ describe('UpstreamPayer (unit)', () => {
     expect(noMint.protocol.sentPays).toHaveLength(0);
     expect(noMint.log.records.some((r) => r.msg.includes('no common mint'))).toBe(true);
 
-    const u = unit(1);
+    const u = unit(1, { autoAck: false });
     u.protocol.remoteHello(hello());
     u.payer.onDownload(CORE_A, 0, NOISE);
     await u.payer.flush();
@@ -196,6 +202,125 @@ describe('UpstreamPayer (unit)', () => {
     u.payer.onDownload(CORE_A, 1, NOISE);
     await u.payer.flush();
     expect(u.protocol.sentPays).toHaveLength(1);
+  });
+
+  // ---- security review (docs/security-review.md) -------------------------------------
+
+  it('F1: a seeder that asks more than the manifest price — in its HELLO or in a later PRICE — is not paid above it', async () => {
+    // HELLO above the manifest: nothing is paid at all.
+    const greedy = unit(1);
+    greedy.protocol.remoteHello(
+      helloFrom(UP_PUBKEY, { acceptedMints: [MINT_A], satsPerBlock: 50 as Sats, p2pk: UP_P2PK }),
+    );
+    for (let i = 0; i < 3; i++) greedy.payer.onDownload(CORE_A, i, NOISE);
+    await greedy.payer.flush();
+    expect(greedy.protocol.sentPays).toHaveLength(0);
+    expect(greedy.payer.stats().skippedOverpriced).toBeGreaterThanOrEqual(1);
+    expect(greedy.engine.spent().total).toBe(0);
+
+    // An honest HELLO, then a PRICE above the manifest from block 4: blocks 0..3 are paid at the
+    // HELLO price, blocks from 4 on are not paid at all — never at the raised price.
+    const { engine, payer, protocol } = unit(10);
+    protocol.remoteHello(hello());
+    protocol.remotePrice({
+      type: 'PRICE',
+      core: CORE_A,
+      satsPerBlock: 1_000_000 as Sats,
+      effectiveFromBlock: 4,
+    });
+    for (let i = 0; i < 8; i++) payer.onDownload(CORE_A, i, NOISE);
+    await payer.flush();
+    expect(protocol.sentPays.map((p) => [p.range.fromBlock, p.range.toBlock])).toEqual([[0, 3]]);
+    expect(engine.spent().total).toBe(4 * 3);
+    expect(payer.stats().skippedOverpriced).toBeGreaterThanOrEqual(1);
+
+    // A PRICE that LOWERS it is honoured.
+    const cheaper = unit(10);
+    cheaper.protocol.remoteHello(hello());
+    cheaper.protocol.remotePrice({
+      type: 'PRICE',
+      core: CORE_A,
+      satsPerBlock: 1 as Sats,
+      effectiveFromBlock: 0,
+    });
+    for (let i = 0; i < 4; i++) cheaper.payer.onDownload(CORE_A, i, NOISE);
+    await cheaper.payer.flush();
+    expect(cheaper.engine.spent().total).toBe(4);
+  });
+
+  it('F2: the seeder’s HELLO split and mint list are not trusted — the split is the manifest’s, the mint one the manifest accepts', async () => {
+    const { payer, protocol, perCore } = unit(1);
+    perCore.set(CORE_A, { ...basePolicy(MANIFEST_PRICE), mints: [MINT_A] });
+    // The seeder claims 100/0 (the whole creator share) and lists MINT_B first.
+    protocol.remoteHello(
+      helloFrom(UP_PUBKEY, {
+        acceptedMints: [MINT_B, MINT_A],
+        satsPerBlock: 4 as Sats,
+        split: { seeder: 100, creator: 0 },
+        p2pk: UP_P2PK,
+      }),
+    );
+    for (let i = 0; i < 2; i++) payer.onDownload(CORE_A, i, NOISE);
+    await payer.flush();
+    expect(protocol.sentPays).toHaveLength(1);
+    const pay = protocol.sentPays[0]!;
+    const total = (xs: readonly { amount: number }[]): number =>
+      xs.reduce((a, p) => a + p.amount, 0);
+    // 2 blocks × 4 sat at the manifest's 50/50: 4 to the seeder, 4 to the creator.
+    expect(total(pay.seederProofs.proofs)).toBe(4);
+    expect(total(pay.creatorProofs.proofs)).toBe(4);
+    expect(pay.creatorProofs.lockedTo).toBe(CREATOR_P2PK);
+    expect(pay.seederProofs.mint).toBe(MINT_A); // the manifest does not accept MINT_B
+  });
+
+  it('F30: the carry is per channel and moves only on ACK ok; one PAY per core waits for its ACK, and blocks that land meanwhile batch into the next', async () => {
+    const policy70 = {
+      ...basePolicy(MANIFEST_PRICE),
+      satsPerBlock: 3 as Sats,
+      split: { seeder: 70, creator: 30 },
+    };
+    const { payer, protocol, perCore, engine } = unit(1, { autoAck: false });
+    perCore.set(CORE_A, policy70);
+    protocol.remoteHello(hello());
+    payer.onDownload(CORE_A, 0, NOISE);
+    await settle(5);
+    payer.onDownload(CORE_A, 1, NOISE);
+    payer.onDownload(CORE_A, 2, NOISE);
+    await settle(5);
+    // Only the first PAY is out: the next waits for its ACK.
+    expect(protocol.sentPays.map((p) => [p.range.fromBlock, p.range.toBlock, p.carryIn])).toEqual([
+      [0, 0, 0],
+    ]);
+    // 1 block × 3 sat at 30 % → 90 units → carry 90 after an accepted PAY.
+    protocol.remoteAck({ type: 'ACK', core: CORE_A, fromBlock: 0, toBlock: 0, ok: true });
+    await settle(5);
+    expect(protocol.sentPays.map((p) => [p.range.fromBlock, p.range.toBlock, p.carryIn])).toEqual([
+      [0, 0, 0],
+      [1, 2, 90], // batched: both blocks that landed while waiting
+    ]);
+    // Rejected: the seeder did not move its carry, so neither do we.
+    protocol.remoteAck({
+      type: 'ACK',
+      core: CORE_A,
+      fromBlock: 1,
+      toBlock: 2,
+      ok: false,
+      reason: 'wrong-amount',
+    });
+    payer.onDownload(CORE_A, 3, NOISE);
+    await settle(5);
+    expect(protocol.sentPays[2]).toMatchObject({
+      carryIn: 90,
+      range: { fromBlock: 3, toBlock: 3 },
+    });
+    // A new channel to the same seeder starts from 0, like the seeder's rebind.
+    const second = new FakePayProtocol({ autoAck: false });
+    payer.attachPeer('dd'.repeat(32), second);
+    second.remoteHello(hello());
+    payer.onDownload(CORE_A, 9, 'dd'.repeat(32));
+    await settle(5);
+    expect(second.sentPays.map((p) => p.carryIn)).toEqual([0]);
+    expect(engine.spent().total).toBeGreaterThan(0);
   });
 
   it('logs never carry proofs (redaction layer in front of the payer)', async () => {
@@ -297,6 +422,8 @@ describe('UpstreamPayer (integration): gateway pulls from a real upstream seeder
       }),
     );
 
+    // The gateway pays only under the core's manifest policy (security review F2).
+    r.gateway.setUpstreamPolicy(coreKey, basePolicy(3));
     const sc = await r.gateway.openUpstreamCore(coreKey);
     const got = await sc.blobs.get(put.entry.blob, { wait: true, timeout: 8000 });
     expect(got).not.toBeNull();
@@ -338,16 +465,18 @@ describe('UpstreamPayer (integration): gateway pulls from a real upstream seeder
     expect(r.gateway.seeder.blobs.coreByKey(coreKey)).toBeDefined();
   });
 
-  it('pays with a per-core policy override when one is set (creator P2PK from the manifest)', async () => {
+  it('pays each core under its MANIFEST policy (creator P2PK from the manifest); a core without one is not paid (F2)', async () => {
     const { payer, protocol, perCore } = unit(1);
     const creator = ('03' + '77'.repeat(32)) as PricePolicy['creatorP2pk'];
-    perCore.set(CORE_A, { ...basePolicy(), creatorP2pk: creator });
+    perCore.set(CORE_A, { ...basePolicy(MANIFEST_PRICE), creatorP2pk: creator });
+    perCore.delete(CORE_B);
     protocol.remoteHello(hello());
     payer.onDownload(CORE_A, 0, NOISE);
     payer.onDownload(CORE_B, 0, NOISE);
     await payer.flush();
     const byCore = new Map(protocol.sentPays.map((p) => [p.range.core, p.creatorProofs.lockedTo]));
     expect(byCore.get(CORE_A)).toBe(creator);
-    expect(byCore.get(CORE_B)).toBe(CREATOR_P2PK);
+    expect(byCore.has(CORE_B)).toBe(false);
+    expect(payer.stats().skippedNoPolicy).toBeGreaterThanOrEqual(1);
   });
 });

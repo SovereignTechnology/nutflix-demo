@@ -188,7 +188,9 @@ export interface Settings {
    * v5 (L5-Settings/Wallet, L6-B, SE-4) — normative: `belowSats <= 0` means DISABLED (a patch
    * cannot remove the key, so "off" is written as 0). `belowSats` is compared with the balance
    * at the mint a payment is about to draw from, and the top-up is funded from `fromMint`
-   * (melt there, mint at the target); it never fires for `fromMint` itself.
+   * (melt there, mint at the target); it never fires for `fromMint` itself. The target must be
+   * one of `defaultMints` — never a mint first seen in a video's manifest (security review F4:
+   * a creator's own mint would otherwise receive the user's sats unattended).
    */
   readonly autoTopUp?: { readonly belowSats: Sats; readonly fromMint: MintUrl };
 }

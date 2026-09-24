@@ -1,24 +1,32 @@
 /**
- * UpstreamPayer — the gateway as a VIEWER toward the seeders it pulls from (build-plan §5
- * "pays upstream"; SECURITY.md invariant 1 "pay after verify").
+ * UpstreamPayer — the gateway (and the desktop worker, via `ViewerPayer`) as a VIEWER toward the
+ * seeders it pulls from (build-plan §5 "pays upstream"; SECURITY.md invariant 1 "pay after
+ * verify").
  *
- * Per (upstream peer, core) it counts Hypercore `download` events — each one is a block
- * whose Merkle proof already verified — and, every `payEveryBlocks` contiguous verified
- * blocks, asks `PaymentEngineViewer.pay(range, seeder, policy)` for a `PayMessage` and puts
- * it on the wire through the peer's `PayProtocol` (contract interface; Stage 2 implements
- * the codec/state machine, tests use a structural fake).
+ * Per (upstream peer, core) it counts Hypercore `download` events — each one is a block whose
+ * Merkle proof already verified — and asks `PaymentEngineViewer.pay(range, seeder, policy)` for
+ * a `PayMessage`, which it puts on the wire through the peer's `PayProtocol`.
  *
- * CONTRACTS v3 (ADR 0004): every `BlockRange` built here carries `core`. The gateway
- * replicates many cores over one stream, so a core-less `PAY` would be `malformed` at any
- * v3 seeder — and `range-not-uploaded` is per core.
+ * Rules (security review, docs/security-review.md):
  *
- * Only peers that sent a verified `HELLO` (protocol `open`) are paid: without it there is
- * no pubkey / P2PK / mint to lock proofs to. Blocks downloaded from such a peer are still
- * counted and paid the moment its HELLO arrives.
+ *   - **The price is the manifest's (F1, F2).** `policyFor` returns the policy the user was
+ *     shown — for the gateway, the per-core MANIFEST policy (`manifestPolicyResolver`); a core
+ *     without one is not paid. The seeder's asking price (its HELLO, or a later `PRICE` from
+ *     `effectiveFromBlock` on) may only LOWER it: a seeder that asks more than the manifest is
+ *     not paid at all, and neither its split nor its mint list is taken on trust (the split is
+ *     the manifest's; the mint must be one the seeder, our wallet and the manifest all accept).
+ *   - **One unacknowledged PAY per peer × core, carry per channel (F30).** The creator's carry
+ *     (ADR 0010 §3.1) is scoped to this `pay/1` channel: it starts at 0, travels as
+ *     `opts.carryIn`, and advances only on the matching `ACK ok`. A rejected PAY leaves it where
+ *     the seeder left it, so the next PAY is accepted; a new channel starts from 0 like the
+ *     seeder's rebind does. Waiting for the ACK also batches: blocks that land meanwhile go
+ *     into the next PAY (fewer PAYs, fewer DLEQ checks at the seeder — F5).
+ *   - A rejected PAY is never re-sent: the seeder set is locked to the seeder, so a seeder that
+ *     "rejects" and keeps the proofs must not be paid twice for the same blocks.
  *
- * `PRICE` (seeder → viewer): `effectiveFromBlock` is honoured by splitting a run at the
- * boundary; blocks below it are paid at the old price. v5 (ADR 0010): the message names its
- * core, and the new price applies to that core only.
+ * Only peers that sent a verified `HELLO` (protocol `open`) are paid; blocks downloaded before
+ * it are counted and become payable the moment it arrives. Every `BlockRange` carries `core`
+ * (v3/v5).
  */
 import type {
   BlockRange,
@@ -30,6 +38,7 @@ import type {
   PricePolicy,
   Sats,
 } from '@sovit/core';
+import { payment } from '@sovit/core';
 import type Hypercore from 'hypercore';
 import type { Logger } from '@sovit/seeder';
 import { toHex } from '@sovit/seeder';
@@ -55,6 +64,13 @@ interface PriceOverride {
   readonly effectiveFromBlock: number;
 }
 
+interface InFlight {
+  readonly fromBlock: number;
+  readonly toBlock: number;
+  /** The creator carry after this PAY — committed only if the seeder ACKs it ok. */
+  readonly carryOut: number;
+}
+
 interface PeerState {
   readonly noiseHex: string;
   readonly protocol: PayProtocol;
@@ -65,6 +81,12 @@ interface PeerState {
   readonly pending: Map<CoreKeyHex, Set<number>>;
   /** core → indexes already paid (replay guard). */
   readonly paid: Map<CoreKeyHex, Set<number>>;
+  /** core → the creator carry the seeder holds for this channel (ADR 0010 §3.1). */
+  readonly carry: Map<CoreKeyHex, number>;
+  /** core → the PAY awaiting its ACK (at most one per core). */
+  readonly inflight: Map<CoreKeyHex, InFlight>;
+  /** `flush()` is draining: runs unlocked by an ACK are paid however short. */
+  draining: boolean;
   chain: Promise<void>;
   closed: boolean;
 }
@@ -75,6 +97,8 @@ export interface UpstreamPayerStats {
   readonly acksOk: number;
   readonly acksRejected: number;
   readonly skippedNoPolicy: number;
+  /** PAYs not sent because the seeder asked more than the manifest price. */
+  readonly skippedOverpriced: number;
 }
 
 /** Read through a function so TS's property narrowing does not survive the `await`s. */
@@ -112,6 +136,7 @@ export class UpstreamPayer {
     acksOk: 0,
     acksRejected: 0,
     skippedNoPolicy: 0,
+    skippedOverpriced: 0,
   };
 
   constructor(o: UpstreamPayerOptions) {
@@ -135,6 +160,9 @@ export class UpstreamPayer {
       price: new Map(),
       pending: new Map(),
       paid: new Map(),
+      carry: new Map(),
+      inflight: new Map(),
+      draining: false,
       chain: Promise.resolve(),
       closed: false,
     };
@@ -174,6 +202,12 @@ export class UpstreamPayer {
             reason: ack.reason,
           });
         }
+        const f = state.inflight.get(ack.core);
+        if (f?.fromBlock !== ack.fromBlock || f.toBlock !== ack.toBlock) return;
+        state.inflight.delete(ack.core);
+        // The carry moves only when the seeder accepted the PAY that moved it.
+        if (ack.ok) state.carry.set(ack.core, f.carryOut);
+        this.schedule(state, state.draining);
       }),
       protocol.on('close', () => {
         state.closed = true;
@@ -216,16 +250,28 @@ export class UpstreamPayer {
     if (set.size >= this.payEvery) this.schedule(state, false);
   }
 
-  /** Pay every pending run for every peer (or one peer). Used at close and by tests. */
-  flush(noiseHex?: string): Promise<void> {
+  /**
+   * Pay every pending run for every peer (or one peer), shorter ones included. Used at close and
+   * by tests. A core with a PAY awaiting its ACK pays its next run when the ACK arrives; this
+   * resolves once no more work is queued (it does not wait for ACKs that never come).
+   */
+  async flush(noiseHex?: string): Promise<void> {
     const targets = noiseHex === undefined ? [...this.peers.values()] : [this.peers.get(noiseHex)];
-    const waits: Promise<void>[] = [];
     for (const s of targets) {
       if (!s) continue;
-      this.schedule(s, true);
-      waits.push(s.chain);
+      s.draining = true;
+      try {
+        this.schedule(s, true);
+        // ACKs that arrive while we wait schedule more work on the same chain: follow it.
+        let seen: Promise<void> | null = null;
+        while (seen !== s.chain) {
+          seen = s.chain;
+          await seen;
+        }
+      } finally {
+        s.draining = false;
+      }
     }
-    return Promise.all(waits).then(() => undefined);
   }
 
   private schedule(state: PeerState, force: boolean): void {
@@ -240,53 +286,58 @@ export class UpstreamPayer {
     if (state.closed || state.hello === null) return;
     const hello = state.hello;
     for (const [core, set] of state.pending) {
-      if (set.size === 0) continue;
+      if (set.size === 0 || state.inflight.has(core)) continue;
       const sorted = [...set].sort((a, b) => a - b);
-      for (const [from, to] of contiguousRuns(sorted)) {
-        const n = to - from + 1;
-        if (!force && n < this.payEvery) continue;
-        const ranges = this.splitAtPrice(state, { core, fromBlock: from, toBlock: to });
-        for (const range of ranges) {
-          const policy = this.resolvePolicy(state, core, hello, range);
-          if (policy === null) {
-            this.counters.skippedNoPolicy++;
-            continue;
-          }
-          const mint = hello.acceptedMints.find((m) => this.ownMints.includes(m));
-          if (mint === undefined) {
-            this.counters.skippedNoPolicy++;
-            this.log.warn('no common mint with upstream — not paying', {
-              peer: state.noiseHex,
-              core,
-            });
-            continue;
-          }
-          const msg = await this.engine.pay(
-            range,
-            { pubkey: hello.pubkey, p2pk: hello.p2pk, mint },
-            policy,
-          );
-          if (isClosed(state)) return;
-          state.protocol.sendPay(msg);
-          this.counters.pays++;
-          this.counters.blocksPaid += range.toBlock - range.fromBlock + 1;
-          let paidSet = state.paid.get(core);
-          if (!paidSet) {
-            paidSet = new Set();
-            state.paid.set(core, paidSet);
-          }
-          for (let i = range.fromBlock; i <= range.toBlock; i++) {
-            paidSet.add(i);
-            set.delete(i);
-          }
-          this.log.debug('PAY sent upstream', {
-            peer: state.noiseHex,
-            core,
-            fromBlock: range.fromBlock,
-            toBlock: range.toBlock,
-          });
-        }
+      const run = contiguousRuns(sorted).find(
+        ([from, to]) => force || to - from + 1 >= this.payEvery,
+      );
+      if (run === undefined) continue;
+      // One PAY per core in flight: the first price segment of the first payable run now, the
+      // rest when its ACK arrives.
+      const [range] = this.splitAtPrice(state, { core, fromBlock: run[0], toBlock: run[1] });
+      if (range === undefined) continue;
+      const policy = this.resolvePolicy(state, core, hello, range);
+      if (policy === null) continue;
+      const mint = hello.acceptedMints.find(
+        (m) => this.ownMints.includes(m) && policy.mints.includes(m),
+      );
+      if (mint === undefined) {
+        this.counters.skippedNoPolicy++;
+        this.log.warn('no common mint with upstream — not paying', {
+          peer: state.noiseHex,
+          core,
+        });
+        continue;
       }
+      const carryIn = state.carry.get(core) ?? 0;
+      const amount = (range.toBlock - range.fromBlock + 1) * policy.satsPerBlock;
+      const carryOut = payment.splitPay(amount, policy.split, carryIn).carryOut;
+      const msg = await this.engine.pay(
+        range,
+        { pubkey: hello.pubkey, p2pk: hello.p2pk, mint },
+        policy,
+        { carryIn },
+      );
+      if (isClosed(state)) return;
+      state.inflight.set(core, { fromBlock: range.fromBlock, toBlock: range.toBlock, carryOut });
+      state.protocol.sendPay(msg);
+      this.counters.pays++;
+      this.counters.blocksPaid += range.toBlock - range.fromBlock + 1;
+      let paidSet = state.paid.get(core);
+      if (!paidSet) {
+        paidSet = new Set();
+        state.paid.set(core, paidSet);
+      }
+      for (let i = range.fromBlock; i <= range.toBlock; i++) {
+        paidSet.add(i);
+        set.delete(i);
+      }
+      this.log.debug('PAY sent upstream', {
+        peer: state.noiseHex,
+        core,
+        fromBlock: range.fromBlock,
+        toBlock: range.toBlock,
+      });
     }
   }
 
@@ -300,6 +351,10 @@ export class UpstreamPayer {
     ];
   }
 
+  /**
+   * The policy to pay `range` under: the manifest's (`policyFor`), at the seeder's asking price
+   * for that range when it is not above the manifest price. `null` = do not pay (counted).
+   */
   private resolvePolicy(
     state: PeerState,
     core: CoreKeyHex,
@@ -308,33 +363,36 @@ export class UpstreamPayer {
   ): PricePolicy | null {
     const base = this.policyFor(core, hello, state.noiseHex);
     if (base === null) {
+      this.counters.skippedNoPolicy++;
       this.log.warn('no policy for upstream core — not paying', { peer: state.noiseHex, core });
       return null;
     }
     const p = state.price.get(core);
-    if (p !== undefined && range.fromBlock >= p.effectiveFromBlock)
-      return { ...base, satsPerBlock: p.satsPerBlock };
-    return base;
+    const asked =
+      p !== undefined && range.fromBlock >= p.effectiveFromBlock
+        ? p.satsPerBlock
+        : hello.satsPerBlock;
+    if (asked > base.satsPerBlock) {
+      this.counters.skippedOverpriced++;
+      this.log.warn('upstream asks more than the manifest price — not paying', {
+        peer: state.noiseHex,
+        core,
+        asked,
+        manifest: base.satsPerBlock,
+      });
+      return null;
+    }
+    return asked === base.satsPerBlock ? base : { ...base, satsPerBlock: asked };
   }
 }
 
 /**
- * Default resolver: price/split/mints from the seeder's HELLO, `creatorP2pk` + block size
- * from a per-core map (manifest-derived, `config.upstream.policies` / `setUpstreamPolicy`)
- * falling back to the gateway's base policy.
+ * The gateway's resolver: the per-core MANIFEST policy (`config.upstream.policies` /
+ * `setUpstreamPolicy`), or `null` — never the seeder's HELLO terms (security review F2). Without
+ * the manifest there is no trustworthy price, split or creator key, so nothing is paid.
  */
-export function helloPolicyResolver(
-  base: PricePolicy,
+export function manifestPolicyResolver(
   perCore: () => ReadonlyMap<CoreKeyHex, PricePolicy>,
 ): UpstreamPolicyResolver {
-  return (core, hello) => {
-    const override = perCore().get(core);
-    return {
-      satsPerBlock: hello.satsPerBlock,
-      blockSize: override?.blockSize ?? base.blockSize,
-      mints: hello.acceptedMints,
-      split: hello.split,
-      creatorP2pk: override?.creatorP2pk ?? base.creatorP2pk,
-    };
-  };
+  return (core) => perCore().get(core) ?? null;
 }

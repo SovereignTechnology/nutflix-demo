@@ -75,7 +75,7 @@ export { WsBridge } from './ws/bridge.js';
 export type { UpgradeRefusal, WsBridgeOptions } from './ws/bridge.js';
 
 // Upstream paying
-export { UpstreamPayer, helloPolicyResolver } from './upstream/payer.js';
+export { UpstreamPayer, manifestPolicyResolver } from './upstream/payer.js';
 export type {
   UpstreamPayerOptions,
   UpstreamPayerStats,

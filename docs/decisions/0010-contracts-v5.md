@@ -234,15 +234,17 @@ boundary (`nostr.classifyIncoming`), then applies policy to the authentic event:
   with the core's pricing; `PRICE` per core; the pay bridge ACKs with the core and cuts on
   `double-spend`), gateway (`UpstreamPayer` per-core PRICE, v5 HELLO fields), desktop worker
   (plain mock, ACKs matched by core, v5 HELLO fields), Studio/Watch (`seedersOnline` unknown).
-- **Owed to Stage 3** (recorded in `docs/status.md`): payers batching to `minPaySats`; the
-  seeder honouring the OLD price for blocks below a PRICE's `effectiveFromBlock` (today it
-  verifies every PAY against the current policy, so a price change makes honest PAYs
-  `wrong-amount`); persisting the seen-secret set; the `NetworkAdapter`/IPC signer bridge and
-  `SignerStatus` "none"; the deferred L5/L6-B/L6-C items above; a regtest-mint check of the
-  `pay1` tag; wiring the gateway's runtime providers (`cli/providers.ts`: `BlossomAuthImpl`
-  with `serverHost` from `blossom.publicUrl`, the real engines, the HELLO signer). The report
-  store's `signatureVerified: false` also goes stale: the signature is now verified at the
-  auth boundary, but the handler sits outside the locked directories, so the change is filed
-  for Stage 3.
+- **Owed to Stage 3** (recorded in `docs/status.md`): payers batching to `minPaySats`;
+  persisting the seen-secret set (the `persist` hook exists); the `NetworkAdapter`/IPC signer
+  bridge and `SignerStatus` "none"; the deferred L5/L6-B/L6-C items above; a regtest-mint check
+  of the `pay1` tag; wiring the runtime providers (`cli/providers.ts`: `BlossomAuthImpl` with
+  `serverHost` from `blossom.publicUrl`, the real engines with `checkSpent` / `spentByUs` /
+  `persistPending`, the HELLO signer).
+- **Done in the review fixes (2026-09-24, `docs/security-review.md` §0):** the seeder honours
+  the OLD price for blocks below a `PRICE`'s `effectiveFromBlock` (per session × core), and
+  per-core policy changes announce a per-core `PRICE`; the report store records
+  `signatureVerified: true`; the viewer transport (`UpstreamPayer`) keeps the carry per channel
+  and advances it only on `ACK ok`, as `PaymentEngineViewer.pay` requires; a seeder's price may
+  only lower the manifest's; auto top-up targets only the user's own mints (contract text).
 - The manifest parser does not read the NIP-71 `minpay` tag yet, so every video uses the default
   minimum until it does.

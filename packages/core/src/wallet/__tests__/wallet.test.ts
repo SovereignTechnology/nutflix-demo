@@ -183,6 +183,24 @@ describe('CashuWallet (NUT-04 / NUT-11 / NUT-03 / NUT-05 over a real mint)', () 
     });
   });
 
+  // Security review F8 follow-up: the native confirm dialog shows the quote's fee reserve, so the
+  // wallet must not pay under a larger one than the quote it was handed (a compromised renderer
+  // could otherwise show 1 sat while the mint reserves more).
+  it('melt refuses when the mint asks a larger fee reserve than the quote that was shown; nothing leaves', async () => {
+    const mint = new TestMint({ url: MINT, seed: new Uint8Array(32).fill(1), feeReserve: 4 });
+    const wallet = new CashuWallet({
+      mints: new CashuMintConnections({ request: () => mint.request }),
+      store: new MemoryProofStore(),
+    });
+    await fund(wallet, mint, 64);
+    const q = await wallet.meltQuote(MINT, 'lnbc200n1testinvoice');
+    await expect(wallet.melt({ ...q, feeReserve: 1 })).rejects.toMatchObject({
+      code: 'bad-mint-response',
+    });
+    expect(await wallet.balance(MINT)).toBe(64);
+    expect((await wallet.melt(q)).paid).toBe(true);
+  });
+
   it('a mint outage before the swap reaches it leaves the inputs in the wallet (reconciled as unspent)', async () => {
     const { mint, wallet } = rig();
     await fund(wallet, mint, 16);

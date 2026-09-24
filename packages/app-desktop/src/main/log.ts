@@ -15,6 +15,7 @@ export type Logger = (level: LogLevel, event: LogEvent, fields?: LogFields) => v
 /** Every event main can log. A literal union so nothing dynamic becomes a log line. */
 export type LogEvent =
   | 'app.start'
+  | 'app.already-running'
   | 'app.sandbox-bypass-refused'
   | 'window.created'
   | 'window.load-failed'

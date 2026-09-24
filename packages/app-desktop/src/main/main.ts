@@ -19,11 +19,14 @@ import {
   BrowserWindow,
   Menu,
   app,
+  dialog,
   ipcMain,
   net,
   protocol,
   session,
   utilityProcess,
+  webContents as allWebContents,
+  type MessageBoxOptions,
   type WebContents,
 } from 'electron';
 import type { HostOut } from '../ipc/protocol.js';
@@ -35,7 +38,7 @@ import { HostLink } from './host-link.js';
 import { IpcGate } from './ipc-gate.js';
 import { createLogger } from './log.js';
 import { ImageRequests, MediaLinks, createMediaProtocolHandler } from './media.js';
-import { createMoneyGate } from './money-gate.js';
+import { createMoneyGate, type ConfirmPrompt } from './money-gate.js';
 import { APP_URL, MEDIA_SCHEME, APP_SCHEME, privilegedSchemes } from './schemes.js';
 import { hardenWebContents, installSessionPolicy, sandboxBypassSwitch } from './security.js';
 import { createMainWindow } from './window.js';
@@ -56,6 +59,14 @@ if (sandboxBypassSwitch(app.commandLine) !== undefined) {
 }
 app.enableSandbox();
 if (opts.userDataDir !== undefined) app.setPath('userData', opts.userDataDir);
+// One instance per userData (security review F22): two would share the settings file and race
+// on the worker's storage. The lock is keyed on userData, so it is taken after setPath. A second
+// launch focuses the first window and quits without starting anything.
+const primary = app.requestSingleInstanceLock();
+if (!primary) {
+  log('info', 'app.already-running');
+  app.quit();
+}
 protocol.registerSchemesAsPrivileged(privilegedSchemes());
 
 /** webContents ids that show the app (the gate refuses everything else). */
@@ -71,10 +82,31 @@ const links = new MediaLinks(log);
 let host: HostLink | undefined;
 const post = (msg: Parameters<HostLink['post']>[0]): boolean => host?.post(msg) ?? false;
 const images = new ImageRequests(post, 30_000, log);
+/**
+ * The confirm gate's native dialog (security review F7/F8): modal to the asking window, Cancel
+ * the default and the Escape answer, the text built by `money-gate.ts` from guarded arguments.
+ */
+async function askUser(wcId: number, p: ConfirmPrompt): Promise<boolean> {
+  const wc = allWebContents.fromId(wcId);
+  const win = wc === undefined ? null : BrowserWindow.fromWebContents(wc);
+  const box: MessageBoxOptions = {
+    type: 'question',
+    buttons: ['Cancel', p.confirmLabel],
+    defaultId: 0,
+    cancelId: 0,
+    noLink: true,
+    title: p.title,
+    message: p.message,
+    detail: p.detail,
+  };
+  const r = win === null ? await dialog.showMessageBox(box) : await dialog.showMessageBox(win, box);
+  return r.response === 1;
+}
+
 const gate = new IpcGate({
   post,
   tokens,
-  moneyGate: createMoneyGate({ devMocks: opts.devMocks }),
+  moneyGate: createMoneyGate({ devMocks: opts.devMocks, ask: askUser }),
   isAppWebContents: (id) => appWebContents.has(id),
   log,
 });
@@ -201,12 +233,19 @@ function start(): void {
   log('info', 'app.start', { devMocks: opts.devMocks, devFixtures: opts.devFixtures });
 }
 
+app.on('second-instance', () => {
+  const w = BrowserWindow.getAllWindows()[0];
+  if (w === undefined) return;
+  if (w.isMinimized()) w.restore();
+  w.focus();
+});
 app.on('window-all-closed', () => {
   app.quit();
 });
 app.on('before-quit', () => {
   host?.stop();
 });
-app.whenReady().then(start, () => {
-  app.exit(1);
-});
+if (primary)
+  app.whenReady().then(start, () => {
+    app.exit(1);
+  });

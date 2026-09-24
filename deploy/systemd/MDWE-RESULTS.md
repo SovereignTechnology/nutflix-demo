@@ -84,7 +84,7 @@ Tested alongside, because it is the other §7 directive that can silently kill t
 ```
 MemoryDenyWriteExecute=yes
 ExecStart=/usr/bin/node --jitless --no-experimental-websocket …   # seeder, since 2026-09-23 (§6)
-ExecStart=/usr/bin/node --jitless …                               # gateway: BROKEN on Node 22, §6
+ExecStart=/usr/bin/node --jitless --no-experimental-websocket …   # gateway, since 2026-09-24 (§6)
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
 ```
 
@@ -145,10 +145,10 @@ Who triggers it:
   flags READ FROM `nutflix-seeder.service` (fails with this exact `ReferenceError` if the flag
   is dropped).
 - **gateway** (`packages/gateway/dist/index.js`): the same `nostr-tools` access, **plus** its
-  ESM `import … from 'node:http'`, which no flag fixes. `node --jitless
-  --no-experimental-websocket packages/gateway/dist/index.js --check --config <valid>` still
-  dies on Node 22. **Open, not fixed here** (gateway code is lane L3's; its `cli.test.ts` pins
-  the current ExecStart): load `http` via `createRequire` in the gateway, or require Node ≥ 24
-  on the host, or drop the MDWE + `--jitless` pair for the gateway (§4 escape hatch). The
-  gateway unit also needs `--no-experimental-websocket` in any Node 22 fix.
+  ESM `import … from 'node:http'`, which no flag fixes. **Fixed 2026-09-24** (security review
+  F16): the unit adds `--no-experimental-websocket`, and `gateway.ts` loads `node:http` through
+  `createRequire` (a CJS require builds no facade). `node --jitless --no-experimental-websocket
+  packages/gateway/dist/index.js --check --config <valid>` now prints `config ok` and exits 0 on
+  Node 22.22.0; without the flag it still dies. Guarded by `packages/gateway/src/__tests__/cli.test.ts`
+  (runs the built entry with the flags read from the unit).
 

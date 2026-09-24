@@ -5,8 +5,12 @@
  *   - Cashu tokens (`cashuA…` / `cashuB…`) anywhere in a string
  *   - Nostr secret keys (`nsec1…`) anywhere in a string
  *   - 64-hex strings inside free text → truncated to 8 chars (a 32-byte value never leaves
- *     whole; pubkeys stay recognisable). Structured fields carrying a *public* identifier
- *     (`pubkey`, `peer`, `noiseKey`, `coreKey`, `sha256`, …) keep the full value.
+ *     whole). Structured fields carrying a CONTENT or own identifier (`coreKey`, `sha256`,
+ *     `publicKey`, …) keep the full value.
+ *   - structured fields naming a PEER (`pubkey`, `peer`, `noiseKey`, `bound`, `reporter`, …) are
+ *     replaced by a per-process alias (`peer#17`): the same peer keeps the same alias for the
+ *     life of the process, so a run's log still correlates, but journald no longer keeps a
+ *     durable record of which Nostr identities fetched or uploaded what (security review F13).
  *   - structured fields whose NAME denotes a secret (`secret`, `C`, `dleq`, `witness`,
  *     `proofs`, `token`, `nsec`, `privateKey`, `seed`, `preimage`, …)
  *   - anything SHAPED like a Cashu proof (`{ amount, secret, C }`), a proof set
@@ -47,14 +51,21 @@ const SECRET_FIELD_NAMES: ReadonlySet<string> = new Set([
   'keypair',
 ]);
 
-/** Field names that legitimately hold a full 32-byte public identifier. */
-const PUBLIC_ID_FIELD_NAMES: ReadonlySet<string> = new Set([
+/** Field names that hold ANOTHER node's identity: logged as a per-process alias (F13). */
+const PEER_ID_FIELD_NAMES: ReadonlySet<string> = new Set([
   'pubkey',
   'peer',
   'nostrpubkey',
   'noisekey',
   'noisekeyhex',
   'remotepublickey',
+  'bound',
+  'reporter',
+  'uploader',
+]);
+
+/** Field names that legitimately hold a full 32-byte public identifier (content or own key). */
+const PUBLIC_ID_FIELD_NAMES: ReadonlySet<string> = new Set([
   'publickey',
   'corekey',
   'core',
@@ -65,6 +76,22 @@ const PUBLIC_ID_FIELD_NAMES: ReadonlySet<string> = new Set([
   'eventid',
   'topic',
 ]);
+
+/** Peer hex → alias, for this process only (never persisted, never logged in the clear). */
+const peerAliases = new Map<string, string>();
+const MAX_PEER_ALIASES = 50_000;
+let nextPeerAlias = 1;
+
+function peerAlias(hex: string): string {
+  const key = hex.toLowerCase();
+  let alias = peerAliases.get(key);
+  if (alias === undefined) {
+    if (peerAliases.size >= MAX_PEER_ALIASES) return 'peer#?';
+    alias = `peer#${String(nextPeerAlias++)}`;
+    peerAliases.set(key, alias);
+  }
+  return alias;
+}
 
 const CASHU_TOKEN_RE = /cashu[A-Z][A-Za-z0-9_\-+/=]{4,}/g;
 const NSEC_RE = /nsec1[a-z0-9]{6,}/g;
@@ -102,8 +129,10 @@ function looksLikeProofSet(o: Record<string, unknown>): boolean {
 function redactValue(v: unknown, keyHint: string | null, depth: number): unknown {
   if (depth > MAX_DEPTH) return '[REDACTED:depth]';
   if (typeof v === 'string') {
-    if (keyHint !== null && PUBLIC_ID_FIELD_NAMES.has(keyHint) && /^[0-9a-f]{64}$/i.test(v))
-      return v;
+    if (keyHint !== null && /^[0-9a-f]{64}$/i.test(v)) {
+      if (PEER_ID_FIELD_NAMES.has(keyHint)) return peerAlias(v);
+      if (PUBLIC_ID_FIELD_NAMES.has(keyHint)) return v;
+    }
     return redactString(v);
   }
   if (typeof v === 'number' || typeof v === 'boolean' || v === null || v === undefined) return v;

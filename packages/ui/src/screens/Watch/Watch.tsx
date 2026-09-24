@@ -466,6 +466,21 @@ export function Watch({
             );
             return;
           }
+          // The session's own policy must not charge more than the quote either (security
+          // review F19 — Shorts already checked this; the same guard, same wording).
+          const charged = quoteFor({ ...latest.video, price: session.policy }, quote.label);
+          if (charged === undefined || charged.sats > quote.sats) {
+            session.pause();
+            closeQuietly(session, spentRef.current);
+            connectingRef.current = false;
+            setConnecting(false);
+            setPlayError(
+              new Error(
+                `The network asked ${formatInteger(charged?.sats ?? 0)} sats instead of the ${formatInteger(quote.sats)} you were shown, so nothing was played.`,
+              ),
+            );
+            return;
+          }
           attachSession(session, latest);
         },
         (err: unknown) => {
@@ -1095,7 +1110,8 @@ export function Watch({
             closeQuietly(next, spentRef.current);
             return;
           }
-          if (next.rendition !== label) {
+          const nextCharged = quoteFor({ ...data.video, price: next.policy }, label);
+          if (next.rendition !== label || nextCharged === undefined || nextCharged.sats > to.sats) {
             // Never pay a price that was not shown: keep the current session.
             closeQuietly(next, spentRef.current);
             pushToast('error', 'Could not switch quality', 'The current quality keeps playing.');

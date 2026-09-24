@@ -15,7 +15,7 @@
  * The seeder never calls `protocol.cut()`: the session owns the ban+destroy so the ban
  * list and the swarm `PeerInfo` are always updated together.
  */
-import type { CoreKeyHex, PayProtocol, PricePolicy } from '@sovit/core';
+import type { BlockRange, CoreKeyHex, PayProtocol, PricePolicy } from '@sovit/core';
 
 import type { Logger } from '../log/logger.js';
 import type { PeerSession } from '../net/peer-session.js';
@@ -26,9 +26,11 @@ export interface PayBridgeOptions {
   readonly protocol: PayProtocol;
   /**
    * Price policy to verify this peer's `PAY` messages against, resolved per `range.core`.
-   * A `() => PricePolicy` (the v2 shape) is still accepted and simply ignores the core.
+   * A `() => PricePolicy` (the v2 shape) is still accepted and simply ignores the core. The
+   * PAY's range is passed too: blocks sent before a `PRICE` change are priced at the policy in
+   * force when they were sent (security review F9).
    */
-  readonly policy: (core: CoreKeyHex) => PricePolicy;
+  readonly policy: (core: CoreKeyHex, range: BlockRange) => PricePolicy;
   readonly scheduler: Pick<FlushScheduler, 'notePaidBlocks'>;
   readonly logger: Logger;
 }
@@ -48,7 +50,7 @@ export function attachPayBridge(opts: PayBridgeOptions): () => void {
     protocol.on('pay', (msg) => {
       void (async () => {
         const core = msg.range.core;
-        const r = await session.verifyPay(msg, opts.policy(core));
+        const r = await session.verifyPay(msg, opts.policy(core, msg.range));
         if (session.closed) return;
         const at = { core, fromBlock: msg.range.fromBlock, toBlock: msg.range.toBlock };
         protocol.sendAck(r.ok ? { ...at, ok: true } : { ...at, ok: false, reason: r.reason });

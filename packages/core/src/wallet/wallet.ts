@@ -211,6 +211,22 @@ export class CashuWallet implements Wallet {
     return got;
   }
 
+  /** NUT-07 spent flags for a proof set (the seeder's creator-set check, security review F11). */
+  checkSpent(set: {
+    readonly mint: MintUrl;
+    readonly proofs: readonly CashuProof[];
+  }): Promise<readonly boolean[]> {
+    return this.spender.checkSpent(set);
+  }
+
+  /** Whether every proof was spent with this wallet's own signature (a lost swap, F31). */
+  spentByUs(set: {
+    readonly mint: MintUrl;
+    readonly proofs: readonly CashuProof[];
+  }): Promise<boolean> {
+    return this.spender.spentByUs(set);
+  }
+
   async meltQuote(mint: MintUrl, bolt11: string): Promise<MeltQuote> {
     if (typeof bolt11 !== 'string' || !/^ln[a-z0-9]+$/i.test(bolt11.trim()))
       throw new WalletError('invalid-argument', 'expected a bolt11 invoice');

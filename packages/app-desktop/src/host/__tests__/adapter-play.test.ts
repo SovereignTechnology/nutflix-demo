@@ -288,8 +288,13 @@ describe('SE-4: nothing executes an auto top-up in Stage 1', () => {
       const a = r.host.adapter;
       const w = a.wallet as mocks.MockWallet;
       const mintQuote = vi.spyOn(w, 'mintQuote');
+      // v5 (ADR 0010 item 5): the PAYING mint (a) is compared, the top-up is funded from
+      // `fromMint` (b), and only mints on the user's own list are topped up (security review F4).
+      // Before the review fixes this test funded from — and drained — the same mint, which the
+      // contract says never fires.
       await a.updateSettings({
-        autoTopUp: { belowSats: below as Sats, fromMint: mocks.MINTS.a },
+        defaultMints: [mocks.MINTS.a, mocks.MINTS.b],
+        autoTopUp: { belowSats: below as Sats, fromMint: mocks.MINTS.b },
       });
       const s = await a.openSession(1, videos[0]!.video.id);
       const bal = Number(await w.balance(mocks.MINTS.a));

@@ -5,7 +5,10 @@
  * a real start via the test seam, SIGTERM → graceful close, and the canonical unit's
  * ExecStart contract (read-only assertion against deploy/).
  */
-import { readFile, writeFile } from 'node:fs/promises';
+import { spawn } from 'node:child_process';
+import { existsSync } from 'node:fs';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -335,7 +338,7 @@ describe('canonical systemd unit (deploy/systemd/nutflix-gateway.service, read-o
     const unit = await readFile(path.join(root, 'deploy/systemd/nutflix-gateway.service'), 'utf8');
     const exec = unit.split('\n').find((l) => l.startsWith('ExecStart='));
     expect(exec).toBe(
-      'ExecStart=/usr/bin/node --jitless /opt/nutflix/packages/gateway/dist/index.js --config /etc/nutflix/gateway.json',
+      'ExecStart=/usr/bin/node --jitless --no-experimental-websocket /opt/nutflix/packages/gateway/dist/index.js --config /etc/nutflix/gateway.json',
     );
     expect(unit).toContain('Type=simple');
     const pkg = JSON.parse(
@@ -350,4 +353,77 @@ describe('canonical systemd unit (deploy/systemd/nutflix-gateway.service, read-o
     expect(isMainModule(import.meta.url, undefined)).toBe(false);
     expect(isMainModule(import.meta.url, fileURLToPath(import.meta.url))).toBe(true);
   });
+});
+
+// Security review F16 (deploy/systemd/MDWE-RESULTS.md §6): the gateway died one tick after start
+// on Node 22 under the unit's `--jitless` (undici needs WebAssembly). Run the BUILT entry with the
+// node flags read from the unit, so dropping a flag or going back to an ESM `node:http` import
+// fails here, not on a host.
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../../..');
+const DIST_ENTRY = path.join(ROOT, 'packages/gateway/dist/index.js');
+const builtEntry = existsSync(DIST_ENTRY);
+
+describe.skipIf(!builtEntry)('built entry (dist/index.js) with the unit node flags', () => {
+  it('--check stays up and exits 0 (no WebAssembly crash)', async () => {
+    const unit = await readFile(path.join(ROOT, 'deploy/systemd/nutflix-gateway.service'), 'utf8');
+    const argv = (unit.split('\n').find((l) => l.startsWith('ExecStart=')) ?? '')
+      .slice('ExecStart='.length)
+      .split(/\s+/);
+    const nodeFlags = argv.slice(
+      1,
+      argv.findIndex((a) => a.endsWith('/dist/index.js')),
+    );
+    expect(nodeFlags).toEqual(['--jitless', '--no-experimental-websocket']);
+    const dir = await mkdtemp(path.join(os.tmpdir(), 'nutflix-gw-entry-'));
+    try {
+      const config = path.join(dir, 'gateway.json');
+      await writeFile(
+        config,
+        JSON.stringify({
+          listen: { host: '127.0.0.1', port: 0 },
+          dataDir: path.join(dir, 'data'),
+          identity: { pubkey: 'ab'.repeat(32), p2pk: `02${'cd'.repeat(32)}` },
+          policy: {
+            satsPerBlock: 2,
+            mints: ['https://mint.example'],
+            split: { seeder: 50, creator: 50 },
+            creatorP2pk: `02${'ef'.repeat(32)}`,
+          },
+          acceptedMints: ['https://mint.example'],
+          blossom: { publicUrl: 'http://gw.test' },
+        }),
+      );
+      const run = await new Promise<{ code: number | null; out: string }>((resolve, reject) => {
+        const child = spawn(
+          process.execPath,
+          [...nodeFlags, DIST_ENTRY, '--check', '--config', config],
+          {
+            cwd: ROOT,
+            env: {},
+            stdio: ['ignore', 'pipe', 'pipe'],
+          },
+        );
+        let out = '';
+        child.stdout.on('data', (b: Buffer) => (out += b.toString('utf8')));
+        child.stderr.on('data', (b: Buffer) => (out += b.toString('utf8')));
+        const timer = setTimeout(() => {
+          child.kill('SIGKILL');
+          reject(new Error(`gateway --check did not exit; output:\n${out}`));
+        }, 30_000);
+        child.once('error', (e) => {
+          clearTimeout(timer);
+          reject(e);
+        });
+        child.once('close', (code) => {
+          clearTimeout(timer);
+          resolve({ code, out });
+        });
+      });
+      expect(run.out).not.toContain('WebAssembly');
+      expect(run.out).toContain('"config ok"');
+      expect(run.code).toBe(0);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  }, 60_000);
 });

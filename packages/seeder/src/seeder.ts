@@ -11,6 +11,7 @@
  *   Logger (redacting; the only output path)
  */
 import type {
+  BlockRange,
   CoreKeyHex,
   MintUrl,
   NostrPubkey,
@@ -104,6 +105,15 @@ export class Seeder {
   private readonly unsubs: (() => void)[] = [];
   private policyOverride: PricePolicy | null;
   private readonly corePolicies = new Map<CoreKeyHex, PricePolicy>();
+  /**
+   * Per session × core, the price boundaries announced to that peer (security review F9): each
+   * entry applies from `fromBlock` on. A PAY is verified against the entry in force at its first
+   * block, so blocks sent before a `PRICE` stay at the old price, as the `PRICE` promised.
+   */
+  private readonly priceHistory = new WeakMap<
+    PeerSession,
+    Map<CoreKeyHex, { readonly fromBlock: number; readonly policy: PricePolicy }[]>
+  >();
   private started = false;
   private closed = false;
 
@@ -318,7 +328,7 @@ export class Seeder {
     const detach = attachPayBridge({
       session,
       protocol,
-      policy: (core) => this.policyFor(core),
+      policy: (core, range) => this.policyForRange(session, core, range),
       scheduler: this.scheduler,
       logger: this.log,
     });
@@ -352,6 +362,36 @@ export class Seeder {
     return this.policy();
   }
 
+  /**
+   * The policy a `PAY` for `range` on `session` is verified against: the one this peer was told
+   * applies from the range's first block (F9), else `policyFor(core)`. A range spanning a price
+   * boundary gets the policy of its first block — and fails the amount check, as it should: the
+   * payer splits PAYs at `effectiveFromBlock`.
+   */
+  policyForRange(session: PeerSession, core: CoreKeyHex, range: BlockRange): PricePolicy {
+    const history = this.priceHistory.get(session)?.get(core);
+    let hit: PricePolicy | undefined;
+    for (const e of history ?? []) if (e.fromBlock <= range.fromBlock) hit = e.policy;
+    return hit ?? this.policyFor(core);
+  }
+
+  /** Tell every live `pay/1` peer that has downloaded `core` its new price, and remember it. */
+  private announcePrice(core: CoreKeyHex, prev: PricePolicy, next: PricePolicy): void {
+    for (const [session, protocol] of this.protocols) {
+      if (session.closed || !session.uploadedCores.has(core)) continue;
+      const fromBlock = session.nextIndexFor(core);
+      let byCore = this.priceHistory.get(session);
+      if (byCore === undefined) {
+        byCore = new Map();
+        this.priceHistory.set(session, byCore);
+      }
+      const list = byCore.get(core) ?? [{ fromBlock: 0, policy: prev }];
+      list.push({ fromBlock, policy: next });
+      byCore.set(core, list);
+      protocol.sendPrice({ core, satsPerBlock: next.satsPerBlock, effectiveFromBlock: fromBlock });
+    }
+  }
+
   /** v5: `policyFor` for the effective window, never throwing (unpriced when none). */
   private pricingFor(core: CoreKeyHex): Pick<PricePolicy, 'satsPerBlock' | 'minPaySats'> {
     const p = this.corePolicies.get(core) ?? this.policyOverride;
@@ -359,15 +399,21 @@ export class Seeder {
   }
 
   /**
-   * Set (or with `null` clear) the policy for one core. No `PRICE` is announced (v5 `PRICE`
-   * names its core, so a per-core announcement is now expressible — owed to Stage 3 with the
-   * old-price honouring in `verify`, see docs/security-review.md). Peers learn the price for
-   * a core from the manifest / `HELLO` and their `PAY` is verified against this policy from
-   * now on.
+   * Set (or with `null` clear) the policy for one core. When that changes the core's price, every
+   * live `pay/1` peer that downloaded it gets a `PRICE` for the core (v5 `PRICE` names its core),
+   * and blocks it was already sent stay at the old price (F9). `announce: false` skips that.
    */
-  setCorePolicy(core: CoreKeyHex, policy: PricePolicy | null): void {
+  setCorePolicy(
+    core: CoreKeyHex,
+    policy: PricePolicy | null,
+    opts: { readonly announce?: boolean } = {},
+  ): void {
+    const prev = this.corePolicies.get(core) ?? this.policyOverride;
     if (policy === null) this.corePolicies.delete(core);
     else this.corePolicies.set(core, policy);
+    const next = this.corePolicies.get(core) ?? this.policyOverride;
+    if (!(opts.announce ?? true) || prev === null || next === null) return;
+    if (prev.satsPerBlock !== next.satsPerBlock) this.announcePrice(core, prev, next);
   }
 
   /** Per-core policies currently set (does not include the default). */
@@ -386,17 +432,12 @@ export class Seeder {
     const changed = prev !== null && prev.satsPerBlock !== policy.satsPerBlock;
     this.policyOverride = policy;
     if (!(opts.announce ?? true) || !changed) return;
-    for (const [session, protocol] of this.protocols) {
-      if (session.closed) continue;
-      for (const core of session.uploadedCores) {
-        if (this.corePolicies.has(core as CoreKeyHex)) continue;
-        protocol.sendPrice({
-          core: core as CoreKeyHex,
-          satsPerBlock: policy.satsPerBlock,
-          effectiveFromBlock: session.nextIndexFor(core),
-        });
-      }
-    }
+    const cores = new Set<CoreKeyHex>();
+    for (const session of this.protocols.keys())
+      if (!session.closed)
+        for (const core of session.uploadedCores)
+          if (!this.corePolicies.has(core as CoreKeyHex)) cores.add(core as CoreKeyHex);
+    for (const core of cores) this.announcePrice(core, prev, policy);
   }
 
   session(noiseKey: Uint8Array | string): PeerSession | undefined {

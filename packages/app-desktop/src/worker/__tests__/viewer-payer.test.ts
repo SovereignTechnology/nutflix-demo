@@ -160,20 +160,26 @@ describe('ViewerPayer', () => {
     await settle();
     r.download(1);
     await settle();
+    // Security review F30: one unacknowledged PAY per core — block 1 waits for [0,0]'s ACK
+    // (the creator carry chains PAYs; pipelining them would desynchronise it on a rejection).
+    expect(r.proto.sent.map((m) => [m.range.fromBlock, m.range.toBlock])).toEqual([[0, 0]]);
+    // Same range, another core: answers nothing we sent on this core.
+    r.proto.ack(0, 0, true, 'ee'.repeat(32) as CoreKeyHex);
+    expect(r.credit.holds(r.key, 0)).toBe(true);
+    expect(r.payer.stats().unmatchedAcks).toBe(1);
+    await settle();
+    expect(r.proto.sent).toHaveLength(1);
+    r.proto.ack(0, 0);
+    expect(r.credit.holds(r.key, 0)).toBe(false);
+    expect(r.credit.holds(r.key, 1)).toBe(true);
+    await settle();
     expect(r.proto.sent.map((m) => [m.range.fromBlock, m.range.toBlock])).toEqual([
       [0, 0],
       [1, 1],
     ]);
-    // Same range, another core: answers nothing we sent on this core.
-    r.proto.ack(1, 1, true, 'ee'.repeat(32) as CoreKeyHex);
-    expect(r.credit.holds(r.key, 1)).toBe(true);
-    expect(r.payer.stats().unmatchedAcks).toBe(1);
-    r.proto.ack(1, 1);
-    expect(r.credit.holds(r.key, 1)).toBe(false);
-    expect(r.credit.holds(r.key, 0)).toBe(true);
     r.proto.ack(7, 7); // answers nothing we sent
     expect(r.payer.stats().unmatchedAcks).toBe(2);
-    r.proto.ack(0, 0, false); // refused: still settled (the seeder decides what that means)
+    r.proto.ack(1, 1, false); // refused: still settled (the seeder decides what that means)
     expect(r.credit.size).toBe(0);
     expect(r.payer.stats()).toMatchObject({ acksRejected: 1, owed: 0 });
   });

@@ -28,6 +28,7 @@ import type {
   WalletHistoryEntry,
 } from '../contracts/index.js';
 import { NostrKind } from '../contracts/index.js';
+import { verifyIncoming } from '../nostr/event.js';
 import type { ProofStore, WalletTx } from './store.js';
 
 /** The two relay operations this store needs (the host's relay pool implements them). */
@@ -99,10 +100,17 @@ export class Nip60ProofStore implements ProofStore {
   }
 
   private async reload(): Promise<void> {
-    const events = await this.relays.query({
+    const raw = await this.relays.query({
       kinds: [NostrKind.WalletToken, NostrKind.Deletion, NostrKind.WalletHistory],
       authors: [this.me],
     });
+    // Re-verified here whatever the relay layer promised (security review F23): a forged
+    // kind-5 "from us" would otherwise hide proofs, and the check costs ~1 ms an event.
+    const events: NostrEvent[] = [];
+    for (const ev of raw) {
+      const ok = verifyIncoming(ev);
+      if (ok !== null) events.push(ok);
+    }
     const superseded = new Set<string>();
     const parsed: TokenEvent[] = [];
     for (const ev of events) {

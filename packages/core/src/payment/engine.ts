@@ -103,6 +103,42 @@ export interface PaymentEngineDeps {
   ) => Promise<void>;
   /** Seeder side: accepted proof secrets (restore from disk at start; persists new ones). */
   readonly seen?: SeenSecrets;
+  /**
+   * Seeder side: NUT-07 spent flags for a proof set (`CashuWallet.checkSpent`). Given, the
+   * creator set is checked before its first nutzap and a spent proof is a double-spend of the
+   * creator's share: ban, no nutzap (security review F11). A failed check does not block the nutzap.
+   */
+  readonly checkSpent?: (set: {
+    readonly mint: MintUrl;
+    readonly proofs: readonly CashuProof[];
+  }) => Promise<readonly boolean[]>;
+  /**
+   * Seeder side: whether every proof of a seeder set was spent with OUR key (`CashuWallet.
+   * spentByUs`). Given, a redeem the mint answers "spent" is first checked: our own swap whose
+   * response was lost is not a double-spend — no ban, and the creator set is still nutzapped
+   * (security review F31).
+   */
+  readonly spentByUs?: (set: {
+    readonly mint: MintUrl;
+    readonly proofs: readonly CashuProof[];
+  }) => Promise<boolean>;
+  /**
+   * Seeder side: called synchronously with a snapshot of every accepted-but-unflushed PAY
+   * whenever that queue changes — in the same tick as the acceptance, before `verify` resolves
+   * (so before the ACK). The proofs in it are spendable by this seeder (and the creator): store
+   * them like wallet proofs (0600, or the encrypted NIP-60 store). `restorePending` reloads them
+   * at start (security review F12).
+   */
+  readonly persistPending?: (items: readonly PendingPay[]) => void;
+}
+
+/** An accepted PAY not yet redeemed (`redeem`) or not yet forwarded to the creator (`nutzap`). */
+export interface PendingPay {
+  readonly peer: NostrPubkey;
+  readonly msg: PayMessage;
+  readonly stage: 'redeem' | 'nutzap';
+  /** The creator set was checked at the mint already (F11: never re-checked after a restart). */
+  readonly creatorChecked?: boolean;
 }
 
 // ---------------------------------------------------------------------------------------
@@ -127,6 +163,19 @@ export const MAX_PROOFS_PER_SET = 64;
  * may cost a keyset lookup (the host's policy), so a set naming dozens is refused unread.
  */
 export const MAX_KEYSETS_PER_SET = 3;
+/** Orphaned seeder proofs (see `pay`) one PAY may reuse — keeps honest sets under the cap below. */
+export const MAX_REUSED_PROOFS = 6;
+
+/**
+ * Most proofs a set worth `sats` may carry (security review F5). A P2PK send splits into
+ * distinct powers of two — at most `bitLength(sats)` proofs — and a reused orphan set adds up to
+ * `MAX_REUSED_PROOFS`. A set split finer is refused before any DLEQ runs: splitting 64 sats into
+ * 64 one-sat proofs would otherwise buy 64 curve checks for the price of 64 sats.
+ */
+export function maxProofsFor(sats: number): number {
+  const bits = sats > 0 ? sats.toString(2).length : 0;
+  return Math.min(MAX_PROOFS_PER_SET, bits + MAX_REUSED_PROOFS);
+}
 
 function isProofShape(x: unknown): x is CashuProof {
   if (typeof x !== 'object' || x === null) return false;
@@ -220,6 +269,8 @@ interface Pending {
   peer: NostrPubkey;
   readonly msg: PayMessage;
   stage: 'redeem' | 'nutzap';
+  /** The creator set was checked at the mint already (F11: only before its FIRST nutzap). */
+  creatorChecked?: boolean;
 }
 
 type Decision =
@@ -342,7 +393,7 @@ export class RealPaymentEngine implements PaymentEngine {
     const keep: CashuProof[] = [];
     let covered = 0;
     for (const p of [...orphans].sort((a, b) => b.amount - a.amount)) {
-      if (covered + p.amount <= share) {
+      if (use.length < MAX_REUSED_PROOFS && covered + p.amount <= share) {
         use.push(p);
         covered += p.amount;
       } else keep.push(p);
@@ -445,6 +496,11 @@ export class RealPaymentEngine implements PaymentEngine {
     const amount = blocks * policy.satsPerBlock;
     if (amount > MAX_PAY_SATS) return out('malformed', 'amount too large');
     const owed = splitPay(amount, policy.split, carryIn);
+    if (
+      seederProofs.proofs.length > maxProofsFor(owed.seederSats) ||
+      creatorProofs.proofs.length > maxProofsFor(owed.creatorSats)
+    )
+      return out('malformed', 'more proofs than the amount needs');
     if (seederProofs.proofs.length === 0 && owed.seederSats > 0) return out('missing-seeder-set');
     if (creatorProofs.proofs.length === 0 && owed.creatorSats > 0)
       return out('missing-creator-set');
@@ -518,6 +574,7 @@ export class RealPaymentEngine implements PaymentEngine {
     cs.carry = owed.carryOut;
     st.lastActivity = this.now();
     this.pending.push({ peer, msg, stage: 'redeem' });
+    this.persist();
     return { kind: 'result', result: { ok: true, credited: amount as Sats, blocks } };
   }
 
@@ -566,7 +623,13 @@ export class RealPaymentEngine implements PaymentEngine {
       this.banMap.delete(from);
       if (!this.banMap.has(to)) this.ban(to, srcBan.reason, srcBan.noiseKey);
     }
-    for (const p of this.pending) if (p.peer === from) p.peer = to;
+    let moved = false;
+    for (const p of this.pending)
+      if (p.peer === from) {
+        p.peer = to;
+        moved = true;
+      }
+    if (moved) this.persist();
     return this.enforceWindow(dst);
   }
 
@@ -637,15 +700,21 @@ export class RealPaymentEngine implements PaymentEngine {
         try {
           await redeem({ mint: seederProofs.mint, proofs: seederProofs.proofs });
         } catch (e) {
-          if ((e as { code?: unknown } | null)?.code === 'spent') {
+          if ((e as { code?: unknown } | null)?.code !== 'spent') {
+            retry.push(item);
+            continue;
+          }
+          // Spent. By a double-spender — or by us, in a swap whose response was lost (F31)?
+          const ours = await this.ownSpend(seederProofs);
+          if (!ours) {
             failed++;
             this.doubleSpend(
               item.peer,
               seederProofs.mint,
               sum(seederProofs.proofs) + sum(creatorProofs.proofs),
             );
-          } else retry.push(item);
-          continue;
+            continue;
+          }
         }
         swapped += sum(seederProofs.proofs);
       }
@@ -655,6 +724,26 @@ export class RealPaymentEngine implements PaymentEngine {
         if (nutzap === undefined) {
           retry.push(item);
           continue;
+        }
+        // F11: a creator set spent before we forwarded it is a double-spend of the creator's
+        // share. Checked once — a retry after a nutzap that may have reached a relay (and been
+        // redeemed by the creator) must not read the creator's own spend as fraud.
+        if (item.creatorChecked !== true && this.deps.checkSpent !== undefined) {
+          item.creatorChecked = true;
+          let spent: readonly boolean[] | null;
+          try {
+            spent = await this.deps.checkSpent({
+              mint: creatorProofs.mint,
+              proofs: creatorProofs.proofs,
+            });
+          } catch {
+            spent = null;
+          }
+          if (spent?.some(Boolean) === true) {
+            failed++;
+            this.doubleSpend(item.peer, creatorProofs.mint, sum(creatorProofs.proofs));
+            continue;
+          }
         }
         try {
           await nutzap(creatorProofs, {
@@ -671,7 +760,55 @@ export class RealPaymentEngine implements PaymentEngine {
       }
     }
     this.pending.unshift(...retry);
+    this.persist();
     return { swapped: swapped as Sats, nutzapped: nutzapped as Sats, failed };
+  }
+
+  /** F31: whether a "spent" seeder set was spent by this seeder itself (never throws). */
+  private async ownSpend(set: LockedProofSet): Promise<boolean> {
+    const check = this.deps.spentByUs;
+    if (check === undefined) return false;
+    try {
+      return await check({ mint: set.mint, proofs: set.proofs });
+    } catch {
+      return false;
+    }
+  }
+
+  /** F12: hand the queue to the host's persistence hook (a failing hook never stops the engine). */
+  private persist(): void {
+    const hook = this.deps.persistPending;
+    if (hook === undefined) return;
+    const items: PendingPay[] = this.pending.map((p) => ({
+      peer: p.peer,
+      msg: p.msg,
+      stage: p.stage,
+      ...(p.creatorChecked === true ? { creatorChecked: true } : {}),
+    }));
+    safeCall(() => {
+      hook(items);
+    });
+  }
+
+  /**
+   * F12: reload accepted-but-unflushed PAYs saved by `persistPending` (at start, before any PAY
+   * arrives). Their secrets join the seen set, so a replay of them is still a double-spend.
+   */
+  restorePending(items: readonly PendingPay[]): void {
+    for (const it of items) {
+      // Read back from the host's storage: checked like any untrusted input.
+      const stage: unknown = it.stage;
+      if (!isPayMessageV5(it.msg) || (stage !== 'redeem' && stage !== 'nutzap')) continue;
+      this.seen.restore(
+        [...it.msg.seederProofs.proofs, ...it.msg.creatorProofs.proofs].map((p) => p.secret),
+      );
+      this.pending.push({
+        peer: it.peer,
+        msg: it.msg,
+        stage,
+        ...(it.creatorChecked === true ? { creatorChecked: true } : {}),
+      });
+    }
   }
 
   /** Accepted PAYs whose redemption or nutzap has not completed yet. */

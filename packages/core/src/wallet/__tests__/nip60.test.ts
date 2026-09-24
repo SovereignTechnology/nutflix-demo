@@ -153,6 +153,41 @@ describe('Nip60ProofStore', () => {
     expect([...(await store.mints())].sort()).toEqual([MINT, OTHER_MINT].sort());
   });
 
+  // Security review F23: the store trusted its relay layer to have verified signatures. A layer
+  // that did not (a raw pool) let a forged kind-5 "from us" hide proofs.
+  it('an event whose signature does not verify is ignored even when the relay layer hands it over', async () => {
+    const s = await signer();
+    const me = await s.getPublicKey();
+    const r = relay();
+    const t = await s.signEvent({
+      kind: NostrKind.WalletToken,
+      created_at: 1,
+      tags: [],
+      content: await s.nip44Encrypt(me, JSON.stringify({ mint: MINT, proofs: [proof(1, 4)] })),
+    });
+    r.events.push(t);
+    // Right author, right tags — and a signature that belongs to another event.
+    const real = await s.signEvent({
+      kind: 5,
+      created_at: 9,
+      tags: [
+        ['e', 'ff'.repeat(32)],
+        ['k', '7375'],
+      ],
+      content: '',
+    });
+    r.events.push({
+      ...real,
+      tags: [
+        ['e', t.id],
+        ['k', '7375'],
+      ],
+    });
+    expect(await (await Nip60ProofStore.load({ signer: s, relays: r })).proofs(MINT)).toHaveLength(
+      1,
+    );
+  });
+
   it('a kind-5 deletion (k=7375) by the author supersedes a token; one by anyone else does not', async () => {
     const s = await signer();
     const other = await signer();

@@ -92,9 +92,12 @@ describe('SettingsStore (atomic JSON in userData)', () => {
   });
 });
 
-describe('autoTopUpDue (SE-4)', () => {
-  const withTopUp = (belowSats: number, fromMint = MINT): Settings => ({
+describe('autoTopUpDue (SE-4, v5, security review F4)', () => {
+  const FUNDING = 'https://funding.example' as MintUrl;
+  /** The user's own mints are MINT and FUNDING; top-ups are funded from FUNDING. */
+  const withTopUp = (belowSats: number, fromMint = FUNDING): Settings => ({
     ...DEFAULT_SETTINGS,
+    defaultMints: [MINT, FUNDING],
     autoTopUp: { belowSats: belowSats as Sats, fromMint },
   });
 
@@ -110,12 +113,23 @@ describe('autoTopUpDue (SE-4)', () => {
     expect(autoTopUpDue(DEFAULT_SETTINGS, MINT, 0 as Sats)).toBe(false);
   });
 
-  it('triggers strictly below the threshold (never <=), only for fromMint', () => {
+  // Corrected in the Stage 2 review fixes: this test used to assert "only for fromMint", which
+  // is the opposite of the v5 contract text (network-adapter.ts `Settings.autoTopUp`, ADR 0010
+  // item 5): the balance compared is the PAYING mint's, the top-up is funded FROM `fromMint`,
+  // and it never fires for `fromMint` itself.
+  it('triggers strictly below the threshold (never <=) for the paying mint, never for fromMint itself', () => {
     expect(autoTopUpDue(withTopUp(100), MINT, 99 as Sats)).toBe(true);
     expect(autoTopUpDue(withTopUp(100), MINT, 0 as Sats)).toBe(true);
     expect(autoTopUpDue(withTopUp(100), MINT, 100 as Sats)).toBe(false);
     expect(autoTopUpDue(withTopUp(100), MINT, 101 as Sats)).toBe(false);
+    expect(autoTopUpDue(withTopUp(100), FUNDING, 0 as Sats)).toBe(false);
+  });
+
+  it('F4: never tops up a mint that is not on the user’s own list (e.g. one a manifest named)', () => {
     expect(autoTopUpDue(withTopUp(100), OTHER, 0 as Sats)).toBe(false);
+    expect(
+      autoTopUpDue({ ...withTopUp(100), defaultMints: [MINT, FUNDING, OTHER] }, OTHER, 0 as Sats),
+    ).toBe(true);
   });
 });
 

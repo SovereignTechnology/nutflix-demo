@@ -74,16 +74,24 @@ export interface StoredSettings {
 }
 
 /**
- * SE-4 (docs/reviews/2026-09-23-pre-push-l5-v4.md): auto top-up is "off" when absent or when
- * `belowSats <= 0` — v4 cannot clear the optional key, so Settings/Wallet write `belowSats: 0`.
- * The trigger is strictly `balance < belowSats`. Stage 1 never EXECUTES a top-up; this only
- * answers whether one would be due.
+ * Whether a top-up of `mint` (whose balance is `balance`) would be due. Nothing EXECUTES a
+ * top-up yet (Stage 3); this answers the question the contract defines:
+ *
+ *   - SE-4 (docs/reviews/2026-09-23-pre-push-l5-v4.md): "off" when absent or `belowSats <= 0`
+ *     (a patch cannot clear the optional key, so Settings/Wallet write `belowSats: 0`); the
+ *     trigger is strictly `balance < belowSats`;
+ *   - v5 (ADR 0010 item 5): `mint` is the mint a payment is about to draw from, the top-up is
+ *     funded from `fromMint`, and it never fires for `fromMint` itself;
+ *   - security review F4: only a mint on the user's own list (`defaultMints`) is ever topped up —
+ *     never a mint first seen in a video's manifest, which a creator can run to siphon
+ *     unattended top-ups.
  */
 export function autoTopUpDue(settings: Settings, mint: MintUrl, balance: Sats): boolean {
   const a = settings.autoTopUp;
   if (a === undefined) return false;
   if (!(Number.isFinite(a.belowSats) && a.belowSats > 0)) return false;
-  if (a.fromMint !== mint) return false;
+  if (mint === a.fromMint) return false;
+  if (!settings.defaultMints.includes(mint)) return false;
   return balance < a.belowSats;
 }
 

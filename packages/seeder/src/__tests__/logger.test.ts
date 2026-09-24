@@ -18,7 +18,9 @@ describe('Logger', () => {
     expect(rec.level).toBe('info');
     expect(rec.msg).toBe('peer [REDACTED:nsec] paid');
     expect(rec.fields['proofs']).toBe('[REDACTED:1 proofs]');
-    expect(rec.fields['peer']).toBe('ab'.repeat(32));
+    // F13: a peer identifier is a per-process alias, never the key itself.
+    expect(rec.fields['peer']).toMatch(/^peer#\d+$/);
+    expect(lines[0]).not.toContain('ab'.repeat(32));
     expect(rec.fields['n']).toBe(3);
     expect(lines[0]).not.toContain('mock:9');
     expect(records[0]?.fields['proofs']).toBe('[REDACTED:1 proofs]');
@@ -40,11 +42,9 @@ describe('Logger', () => {
       .child({ noiseKey: 'cd'.repeat(32) });
     child.info('hi');
     const rec = JSON.parse(lines[0]!) as { fields: Record<string, unknown> };
-    expect(rec.fields).toMatchObject({
-      component: 'x',
-      secret: '[REDACTED]',
-      noiseKey: 'cd'.repeat(32),
-    });
+    expect(rec.fields).toMatchObject({ component: 'x', secret: '[REDACTED]' });
+    expect(rec.fields['noiseKey']).toMatch(/^peer#\d+$/); // F13
+    expect(lines[0]).not.toContain('cd'.repeat(32));
   });
 
   it('survives a throwing sink and unserialisable fields', () => {

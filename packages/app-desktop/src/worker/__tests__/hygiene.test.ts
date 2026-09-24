@@ -66,10 +66,14 @@ describe('worker log redaction', () => {
     expect(validateWorkerEvent.log(ev)).toBe(true);
   });
 
-  it('the seeder logger alone keeps full public ids (the worker layer is what cuts them)', () => {
+  // Changed by security review F13: the seeder logger itself now replaces PEER identifiers with a
+  // per-process alias; content ids (`core`, `sha256`) stay whole there and the worker layer cuts
+  // them to 8 hex before the line leaves the process.
+  it('the seeder logger aliases peer ids itself; content ids stay whole until the worker layer cuts them', () => {
     const lines: string[] = [];
-    createLogger({ sink: (l) => lines.push(l) }).info('x', { pubkey: pk });
-    expect(lines[0]).toContain(pk);
+    createLogger({ sink: (l) => lines.push(l) }).info('x', { pubkey: pk, core: pk });
+    expect(lines[0]).toMatch(/"pubkey":"peer#\d+"/);
+    expect(lines[0]).toContain(`"core":"${pk}"`);
   });
 });
 

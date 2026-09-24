@@ -27,7 +27,13 @@ import type {
 import { TestMint } from '../../mocks/test-mint.js';
 import { MemoryProofStore } from '../../wallet/store.js';
 import { CashuMintConnections, CashuWallet, memoryWalletKey } from '../../wallet/wallet.js';
-import { MAX_KEYSETS_PER_SET, MAX_PROOFS_PER_SET, RealPaymentEngine } from '../engine.js';
+import {
+  MAX_KEYSETS_PER_SET,
+  MAX_PROOFS_PER_SET,
+  RealPaymentEngine,
+  maxProofsFor,
+  type PendingPay,
+} from '../engine.js';
 import { PAY1_TAG } from '../lock.js';
 import { SeenSecrets } from '../seen.js';
 import {
@@ -59,6 +65,12 @@ vi.setConfig({ testTimeout: 120_000 });
 /** A PAY whose seeder set is issued with `secret`-level options the honest viewer never uses. */
 function hex(b: Uint8Array): string {
   return Array.from(b, (x) => x.toString(16).padStart(2, '0')).join('');
+}
+
+/** A deterministic test key pair (the scalar is a test fixture, never a real key). */
+function keyOf(fill: number): { sk: Uint8Array; pub: CashuP2pkPubkey } {
+  const sk = new Uint8Array(32).fill(fill);
+  return { sk, pub: hex(getPubKeyFromPrivKey(sk)) as CashuP2pkPubkey };
 }
 
 function relock(
@@ -236,6 +248,51 @@ describe('real engine — keysets (T7)', () => {
     );
     expect(res).toMatchObject({ ok: false, reason: 'malformed' });
     expect(lookups).toEqual([]);
+  });
+});
+
+describe('real engine — proof count vs amount (security review F5)', () => {
+  // Missed before: every fixture paid with the wallet's powers of two. Each proof costs the
+  // seeder a DLEQ check (~11 ms, ~20 ms under --jitless), so a payer that splits its sats into
+  // one-sat proofs buys CPU at a sat a check.
+  it('a set carrying more proofs than its amount needs is malformed before any keyset lookup; the honest split passes', async () => {
+    const lookups: string[] = [];
+    const base = getSeederEngine(WIDE_WINDOW);
+    const seeder = new RealPaymentEngine({
+      config: base.config,
+      seen: new SeenSecrets(),
+      keyset: (mint, id) => {
+        lookups.push(id);
+        const m = testMint(mint);
+        return Promise.resolve(m.keysetId === id ? m.keyset() : undefined);
+      },
+    });
+    // 4 blocks × 8 sat at 50/50 → 16 + 16.
+    const p = policyWith({ satsPerBlock: sats(8) });
+    upload(seeder, VIEWER, 4, { policy: p });
+    const { viewer } = getPair('honest');
+    const honest = await viewer.pay(range(0, 3), SEEDER_INFO, p);
+    expect(maxProofsFor(16)).toBe(11);
+    const dust = Array.from({ length: 16 }, () =>
+      testMint(MINT_A).issue(1, { p2pk: SEEDER_P2PK }),
+    ).flat();
+    expect(dust).toHaveLength(16);
+    const res = await seeder.verify(
+      VIEWER,
+      { ...honest, seederProofs: { ...honest.seederProofs, proofs: dust } },
+      p,
+    );
+    expect(res).toMatchObject({ ok: false, reason: 'malformed' });
+    expect(lookups).toEqual([]);
+    // The honest PAY for the same range is accepted.
+    expect(await seeder.verify(VIEWER, honest, p)).toMatchObject({ ok: true, blocks: 4 });
+  });
+
+  it('maxProofsFor: bit length plus the reuse allowance, never above MAX_PROOFS_PER_SET', () => {
+    expect(maxProofsFor(0)).toBe(6);
+    expect(maxProofsFor(1)).toBe(7);
+    expect(maxProofsFor(255)).toBe(14);
+    expect(maxProofsFor(2 ** 40)).toBe(Math.min(MAX_PROOFS_PER_SET, 41 + 6));
   });
 });
 
@@ -441,11 +498,6 @@ describe('real engine — the viewer side', () => {
 });
 
 describe('real engine — end to end with real wallets on both sides', () => {
-  function keyOf(fill: number): { sk: Uint8Array; pub: CashuP2pkPubkey } {
-    const sk = new Uint8Array(32).fill(fill);
-    return { sk, pub: hex(getPubKeyFromPrivKey(sk)) as CashuP2pkPubkey };
-  }
-
   it('viewer wallet pays → seeder verifies → flush redeems the seeder set with its own key; the creator redeems its nutzap; a replay is caught; the seeder cannot redeem the creator set', async () => {
     const MINT = 'https://mint.e2e.example' as MintUrl;
     const mint = new TestMint({ url: MINT, seed: new Uint8Array(32).fill(9), inputFeePpk: 0 });
@@ -529,5 +581,161 @@ describe('real engine — end to end with real wallets on both sides', () => {
       reason: 'double-spend',
     });
     expect(seeder.isBanned(VIEWER)).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// Security review F11, F12, F31: flush robustness, with real wallets on both sides.
+
+describe('real engine — flush robustness (security review F11, F12, F31)', () => {
+  const MINT = 'https://mint.flush.example' as MintUrl;
+
+  async function world(
+    deps: {
+      check?: boolean;
+      own?: boolean;
+      persist?: (items: readonly PendingPay[]) => void;
+      nutzap?: (set: LockedProofSet) => Promise<void>;
+    } = {},
+  ) {
+    const mint = new TestMint({ url: MINT, seed: new Uint8Array(32).fill(41), inputFeePpk: 0 });
+    const conns = (): CashuMintConnections =>
+      new CashuMintConnections({ request: () => mint.request });
+    const seederKey = keyOf(51);
+    const creatorKey = keyOf(52);
+    const viewerWallet = new CashuWallet({ mints: conns(), store: new MemoryProofStore() });
+    const q = await viewerWallet.mintQuote(MINT, sats(200));
+    mint.payQuote(q.quoteId);
+    await viewerWallet.pollQuote(q);
+    const seederWallet = new CashuWallet({
+      mints: conns(),
+      store: new MemoryProofStore(),
+      key: memoryWalletKey(seederKey.sk),
+    });
+    const zaps: LockedProofSet[] = [];
+    const config = {
+      windowBlocks: 16,
+      acceptedMints: [MINT],
+      ownP2pk: seederKey.pub,
+      ownPubkey: SEEDER,
+      flushEveryBlocks: 64,
+      flushEveryMs: 60_000,
+    };
+    const seederDeps = {
+      config,
+      keyset: (m: MintUrl, id: string) => seederWallet.keyset(m, id),
+      redeem: (set: { mint: MintUrl; proofs: readonly CashuProof[] }) => seederWallet.receive(set),
+      nutzap:
+        deps.nutzap ??
+        ((set: LockedProofSet) => {
+          zaps.push(set);
+          return Promise.resolve();
+        }),
+      ...(deps.check === true
+        ? {
+            checkSpent: (s: { mint: MintUrl; proofs: readonly CashuProof[] }) =>
+              seederWallet.checkSpent(s),
+          }
+        : {}),
+      ...(deps.own === true
+        ? {
+            spentByUs: (s: { mint: MintUrl; proofs: readonly CashuProof[] }) =>
+              seederWallet.spentByUs(s),
+          }
+        : {}),
+      ...(deps.persist ? { persistPending: deps.persist } : {}),
+    };
+    const seeder = new RealPaymentEngine({ ...seederDeps, seen: new SeenSecrets() });
+    const viewer = new RealPaymentEngine({
+      config: { ...config, acceptedMints: [], ownPubkey: VIEWER },
+      wallet: viewerWallet,
+    });
+    const policy: PricePolicy = {
+      satsPerBlock: sats(5),
+      blockSize: 65_536,
+      mints: [MINT],
+      split: { seeder: 60, creator: 40 },
+      creatorP2pk: creatorKey.pub,
+      minPaySats: sats(1),
+    };
+    const who = { pubkey: SEEDER, p2pk: seederKey.pub, mint: MINT };
+    upload(seeder, VIEWER, 8, { core: CORE_B, policy });
+    const msg = await viewer.pay(range(0, 3, CORE_B), who, policy);
+    expect(await seeder.verify(VIEWER, msg, policy)).toMatchObject({ ok: true });
+    return { mint, seeder, seederWallet, seederDeps, msg, policy, zaps };
+  }
+
+  it('F31: a redeem whose response was lost is recognised as OUR spend — no ban, the creator is still paid', async () => {
+    const w = await world({ own: true });
+    w.mint.dropNextResponse();
+    expect(await w.seeder.flush()).toEqual({ swapped: 0, nutzapped: 0, failed: 0 }); // ambiguous: kept
+    expect(w.seeder.pendingCount()).toBe(1);
+    const r = await w.seeder.flush(); // the mint now answers "already spent" — by us
+    expect(r).toEqual({ swapped: 12, nutzapped: 8, failed: 0 });
+    expect(w.seeder.isBanned(VIEWER)).toBe(false);
+    expect(w.zaps).toHaveLength(1);
+  });
+
+  it('F31: without the check (or when someone else spent it) the same "spent" is a double-spend ban', async () => {
+    const w = await world({ own: true });
+    // Someone else — the viewer, elsewhere — spent the seeder set first: no witness of ours.
+    w.mint.markSpent(w.msg.seederProofs.proofs);
+    expect(await w.seeder.flush()).toMatchObject({ failed: 1 });
+    expect(w.seeder.isBanned(VIEWER)).toBe(true);
+    expect(w.zaps).toHaveLength(0);
+    const legacy = await world();
+    legacy.mint.dropNextResponse();
+    await legacy.seeder.flush();
+    expect(await legacy.seeder.flush()).toMatchObject({ failed: 1 });
+    expect(legacy.seeder.isBanned(VIEWER)).toBe(true);
+  });
+
+  it('F11: a creator set spent before it is forwarded is a double-spend of the creator share — ban, no nutzap', async () => {
+    const w = await world({ check: true });
+    w.mint.markSpent(w.msg.creatorProofs.proofs);
+    const r = await w.seeder.flush();
+    expect(r).toEqual({ swapped: 12, nutzapped: 0, failed: 1 });
+    expect(w.seeder.isBanned(VIEWER)).toBe(true);
+    expect(w.zaps).toHaveLength(0);
+  });
+
+  it('F11: the creator set is checked only before its FIRST nutzap — a retry never reads the creator’s own redemption as fraud', async () => {
+    let fail = true;
+    const zaps: LockedProofSet[] = [];
+    const w = await world({
+      check: true,
+      nutzap: (set) => {
+        if (fail) return Promise.reject(new Error('relay down (but the event may have landed)'));
+        zaps.push(set);
+        return Promise.resolve();
+      },
+    });
+    expect(await w.seeder.flush()).toMatchObject({ swapped: 12, nutzapped: 0, failed: 0 });
+    // The nutzap reached a relay after all and the creator redeemed it.
+    w.mint.markSpent(w.msg.creatorProofs.proofs);
+    fail = false;
+    expect(await w.seeder.flush()).toEqual({ swapped: 0, nutzapped: 8, failed: 0 });
+    expect(w.seeder.isBanned(VIEWER)).toBe(false);
+    expect(zaps).toHaveLength(1);
+  });
+
+  it('F12: accepted PAYs are handed to persistPending before verify resolves, and restorePending brings them back after a crash', async () => {
+    const snapshots: (readonly PendingPay[])[] = [];
+    const w = await world({ persist: (items) => snapshots.push(items) });
+    expect(snapshots.at(-1)).toHaveLength(1);
+    expect(snapshots.at(-1)?.[0]).toMatchObject({ peer: VIEWER, stage: 'redeem' });
+    // "Crash": a new engine on the same wallet, restored from the last snapshot.
+    const after = new RealPaymentEngine({ ...w.seederDeps, seen: new SeenSecrets() });
+    after.restorePending(snapshots.at(-1)!);
+    expect(after.pendingCount()).toBe(1);
+    expect(await after.flush()).toEqual({ swapped: 12, nutzapped: 8, failed: 0 });
+    expect(await w.seederWallet.balance(MINT)).toBe(12);
+    // The restored secrets are still "seen": replaying them is a double-spend.
+    upload(after, VIEWER, 8, { core: CORE_B, policy: w.policy });
+    const replay = { ...w.msg, range: { ...w.msg.range, fromBlock: 4, toBlock: 7 } };
+    expect(await after.verify(VIEWER, replay, w.policy)).toMatchObject({
+      ok: false,
+      reason: 'double-spend',
+    });
   });
 });

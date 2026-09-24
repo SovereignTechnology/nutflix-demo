@@ -214,6 +214,69 @@ describe('Seeder façade', () => {
     expect(s.seeder.policy().satsPerBlock).toBe(2);
   });
 
+  // Security review F9: the seeder used to verify every PAY at its CURRENT price, so after a
+  // price change an honest viewer's PAY for blocks sent earlier (at the old price, as the PRICE
+  // promised) was `wrong-amount` — and enough of those window-cut the viewer.
+  it('F9: blocks sent before a PRICE are verified at the old price, blocks after it at the new one; setCorePolicy announces per core', async () => {
+    const s = await make({ windowBlocks: 16 });
+    const viewer = new mocks.MockPaymentEngine({ mode: 'honest' });
+    const oldP: PricePolicy = {
+      satsPerBlock: 2 as never,
+      blockSize: BLOCK,
+      mints: s.engine.config.acceptedMints,
+      split: { seeder: 50, creator: 50 },
+      creatorP2pk: mocks.asP2pk('creator'),
+    };
+    const newP: PricePolicy = { ...oldP, satsPerBlock: 4 as never };
+    const core = mocks.asCoreKey('F9');
+    s.seeder.setPolicy(oldP);
+    const session = s.seeder.sessions.admit(new FakeStream(noiseKey(9)))!;
+    const protocol = new FakePayProtocol();
+    s.seeder.attachPayProtocol(session, protocol);
+    protocol.remoteHello(hello(pubkey('f9')));
+    for (let i = 0; i < 3; i++) session.onUpload(core, i, BLOCK);
+    s.seeder.setPolicy(newP);
+    expect(protocol.prices).toEqual([
+      { type: 'PRICE', core, satsPerBlock: 4, effectiveFromBlock: 3 },
+    ]);
+    for (let i = 3; i < 6; i++) session.onUpload(core, i, BLOCK);
+    const ref = {
+      pubkey: s.engine.config.ownPubkey,
+      p2pk: s.engine.config.ownP2pk,
+      mint: oldP.mints[0]!,
+    };
+    const tick = (): Promise<void> => new Promise((r) => setTimeout(r, 0));
+    // Old blocks at the NEW price: refused (the promise was the old price).
+    protocol.remotePay(
+      await viewer.pay({ core, fromBlock: 0, toBlock: 2 }, ref, newP, { carryIn: 0 }),
+    );
+    await tick();
+    // Old blocks at the old price, new blocks at the new price: both accepted.
+    protocol.remotePay(
+      await viewer.pay({ core, fromBlock: 0, toBlock: 2 }, ref, oldP, { carryIn: 0 }),
+    );
+    await tick();
+    protocol.remotePay(
+      await viewer.pay({ core, fromBlock: 3, toBlock: 5 }, ref, newP, { carryIn: 0 }),
+    );
+    await tick();
+    expect(protocol.acks.map((a) => (a.ok ? 'ok' : a.reason))).toEqual(['overpay', 'ok', 'ok']);
+    expect(s.seeder.policyForRange(session, core, { core, fromBlock: 0, toBlock: 2 })).toBe(oldP);
+    expect(s.seeder.policyForRange(session, core, { core, fromBlock: 3, toBlock: 5 })).toBe(newP);
+
+    // A per-core policy change announces a PRICE for that core only.
+    const other = mocks.asCoreKey('F9-other');
+    session.onUpload(other, 0, BLOCK);
+    s.seeder.setCorePolicy(core, { ...newP, satsPerBlock: 6 as never });
+    expect(protocol.prices.at(-1)).toEqual({
+      type: 'PRICE',
+      core,
+      satsPerBlock: 6,
+      effectiveFromBlock: 6,
+    });
+    expect(protocol.prices.filter((p) => p.core === other)).toEqual([]);
+  });
+
   it('v3 (c): setCorePolicy adds a per-core policy the pay bridge resolves by range.core; setPolicy stays the default', async () => {
     const s = await make({ windowBlocks: 16 });
     const viewer = new mocks.MockPaymentEngine({ mode: 'honest' });

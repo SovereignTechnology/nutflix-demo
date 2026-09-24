@@ -7,7 +7,8 @@ first** — it is the resume point. **Stage 2 is DONE on branch `stage-2/2026-09
 awaiting Cameron's review before anything is pushed or merged:** contracts v5 (ADR 0010), the
 five audit-surface modules implemented over cashu-ts / nostr-tools / sodium, all 27
 Stage-2-gated tests running, and the PART B review (`docs/security-review.md`, 32 findings —
-F1–F4 and F30 block wiring a real wallet in Stage 3). `LOCKED_DIRS_UNLOCKED=1 npm run ci` on the A.5
+F1–F4 and F30, the blockers for wiring a real wallet, were fixed on `stage-2/review-fixes`
+2026-09-24 with most of the rest — §0 of the review). `LOCKED_DIRS_UNLOCKED=1 npm run ci` on the A.5
 commit: **143 files, 2298 passed / 0 skipped**; since the Stage 2 wrap-up commit, plain
 `npm run ci` (the guard is now a standing audit-surface check). Stage 1 (DONE 2026-09-23): all
 L5 screens, the L6 desktop app, e2e 13/13 with the Chromium sandbox on.
@@ -427,7 +428,8 @@ worktree (`.worktrees/stage-2`), no subagents. One branch per deliverable, all s
 | A.4 pay/1 | `39cdaeb` | `stage-2/a4-pay-protocol` | Codec, connection-bound HELLO, `PayChannel` on protomux; real replication integration test |
 | A.5 gateway auth | `f398f9f` | `stage-2/a5-gateway-auth` | `BlossomAuthImpl` (kind 24242 + BUD-09 report), ADR 0010 §8 |
 | PART B | `bc12485` | `stage-2/part-b-security-review` | `docs/security-review.md` (F30–F32 and the review fixes added in the wrap-up) |
-| Wrap-up | (this commit) | `stage-2/2026-09-23` | Pre-push differential + sharp-edges review and its fixes, standing audit-surface guard, status, handoff |
+| Wrap-up | `26b7a8c` | `stage-2/2026-09-23` | Pre-push differential + sharp-edges review and its fixes, standing audit-surface guard, status, handoff |
+| Review fixes | (this commit) | `stage-2/review-fixes` | Cameron asked for the fixes (2026-09-24): F1–F4, F7–F9, F11–F16, F19, F20, F22, F23, F30, F31 fixed, F5/F18/F26 partly — `docs/security-review.md` §0 |
 
 Test counts: all 27 Stage-2-gated tests run (13 BlossomAuth, 10 pay/1 codec fuzz, 4
 `skipIf(usingMock())`); adversary cases added after every module, each with why it was missed.
@@ -441,10 +443,12 @@ Wallet QR (pass = decodes to text starting `lnbc5000n1pj9x7`).
 
 ## Stage 3 — integration and polish: NOT STARTED
 
-Owed from Stage 2 (ADR 0010 Consequences, `docs/security-review.md`): **F1–F4 and F30 before
-any real wallet is wired**; runtime providers (desktop worker, seeder, gateway `cli/providers.ts`: real
-engines, `BlossomAuthImpl` with `serverHost`, HELLO signer, key-file `KeyStore` at 0600);
-payers batching to `minPaySats` (F5/F26); pricing blocks by the policy in force (F9);
-persisting the seen set and the pending flush queue (F10, F12); the `NetworkAdapter`/IPC
-signer bridge + `SignerStatus` "none"; the deferred L5/L6-B/L6-C requests; the NIP-71 `minpay`
-tag in the manifest parser; the native money-gate dialog (F8).
+Owed from Stage 2 (ADR 0010 Consequences, `docs/security-review.md` §0 and §6). The F1–F4 and
+F30 blockers were fixed on `stage-2/review-fixes` (2026-09-24). Still owed: the runtime
+providers (desktop worker, seeder, gateway `cli/providers.ts`: real engines wired with
+`checkSpent` / `spentByUs` / `persistPending` + seen-set persistence, `BlossomAuthImpl` with
+`serverHost`, HELLO signer, key-file `KeyStore` at 0600 — F10, F11, F12, F24, F31); a regtest
+check of the `pay1` tag (F6); DLEQ off the event loop and explicit `minPaySats` batching (F5);
+executing auto top-ups with caps (F4); NUT-20 quotes (F17); NUT-13 outputs (F31); packaging
+(F21); the `NetworkAdapter`/IPC signer bridge + `SignerStatus` "none"; the deferred
+L5/L6-B/L6-C requests; the NIP-71 `minpay` tag in the manifest parser.

@@ -15,8 +15,9 @@
  * engine behind the same interfaces.
  */
 import { mkdir } from 'node:fs/promises';
+import type * as NodeHttp from 'node:http';
 import type { IncomingMessage, Server, ServerResponse } from 'node:http';
-import { createServer } from 'node:http';
+import { createRequire } from 'node:module';
 import type { Duplex as NodeDuplex } from 'node:stream';
 import type { AddressInfo } from 'node:net';
 import path from 'node:path';
@@ -49,9 +50,18 @@ import type { MirrorFetch } from './blossom/handler.js';
 import { OwnerIndex, ReportStore } from './blossom/store.js';
 import type { GatewayConfig } from './config.js';
 import { gatewayPolicy, gatewayPrice } from './config.js';
-import { UpstreamPayer, helloPolicyResolver } from './upstream/payer.js';
+import { UpstreamPayer, manifestPolicyResolver } from './upstream/payer.js';
 import type { UpstreamPolicyResolver } from './upstream/payer.js';
 import { WsBridge } from './ws/bridge.js';
+
+/**
+ * `node:http` through CommonJS, on purpose (security review F16; deploy/systemd/MDWE-RESULTS.md
+ * §6): an ESM `import … from 'node:http'` builds the builtin's facade by reading EVERY export,
+ * Node 22's lazy `http.WebSocket` getter included, which loads undici and so WebAssembly — absent
+ * under `--jitless`, the flag the systemd unit pairs with MemoryDenyWriteExecute. The process then
+ * died one tick after start. `require` builds no facade.
+ */
+const { createServer } = createRequire(import.meta.url)('node:http') as typeof NodeHttp;
 
 /**
  * The gateway's `pay/1` identity. Signing is NOT this package's — inject the node's `Signer`
@@ -153,8 +163,7 @@ export class Gateway {
       logger: this.log,
       payEveryBlocks: config.upstream.payEveryBlocks,
       ownMints: config.acceptedMints,
-      policyFor:
-        deps.upstreamPolicy ?? helloPolicyResolver(config.policy, () => this.upstreamPolicies),
+      policyFor: deps.upstreamPolicy ?? manifestPolicyResolver(() => this.upstreamPolicies),
     });
     this.bridge = new WsBridge({ seeder, limits: config.ws, logger: this.log });
     this.blossom = new BlossomHandler({
@@ -446,9 +455,12 @@ export class Gateway {
 
   private clientKey(req: IncomingMessage): string {
     if (this.config.http.trustProxy) {
+      // The proxy APPENDS the address it saw: the last entry is the proxy's, the earlier ones the
+      // client's own claims (F14). Several headers are joined in order.
       const xff = req.headers['x-forwarded-for'];
-      const first = (Array.isArray(xff) ? xff[0] : xff)?.split(',')[0]?.trim();
-      if (first) return first;
+      const joined = Array.isArray(xff) ? xff.join(',') : xff;
+      const last = joined?.split(',').pop()?.trim();
+      if (last) return last;
     }
     return req.socket.remoteAddress ?? 'unknown';
   }

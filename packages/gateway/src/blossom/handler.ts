@@ -87,9 +87,60 @@ export interface BlossomHandlerOptions {
 
 type Res = ServerResponse;
 
+/**
+ * Every Blossom response is CORS-open (BUD-01) — and, because anyone can make the gateway serve
+ * bytes on its own origin, it is also never a live document there (security review F3): no MIME
+ * sniffing, and a sandboxing CSP should a browser ever render one of these responses directly.
+ * `<video>`, `<img>` and `fetch()` from other origins are unaffected by either header.
+ */
 function cors(res: Res): void {
   res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('Content-Security-Policy', "sandbox; default-src 'none'");
 }
+
+/**
+ * Types a browser renders inertly (media, images without script, plain text, JSON). Anything else
+ * a blob was stored as — `text/html`, `image/svg+xml`, `application/xhtml+xml`, PDF, scripts,
+ * unknown types — is served as an `application/octet-stream` attachment, whatever the uploader
+ * claimed (F3).
+ */
+const INLINE_SAFE_MIME: ReadonlySet<string> = new Set([
+  'video/mp4',
+  'video/webm',
+  'video/quicktime',
+  'audio/mpeg',
+  'audio/ogg',
+  'audio/mp4',
+  'image/png',
+  'image/jpeg',
+  'image/webp',
+  'image/gif',
+  'image/avif',
+  'text/vtt',
+  'text/plain',
+  'application/json',
+  'application/octet-stream',
+]);
+
+/** What `GET /<sha256>` serves a stored MIME type as. */
+export function servedAs(mime: string | undefined): {
+  readonly contentType: string;
+  readonly attachment: boolean;
+} {
+  const m = mime ?? OCTET;
+  return INLINE_SAFE_MIME.has(m)
+    ? { contentType: m, attachment: false }
+    : { contentType: OCTET, attachment: true };
+}
+
+/**
+ * Largest body `PUT /upload` spools BEFORE the token is checked, i.e. when the client sent no
+ * `X-SHA-256` (the token then has to be checked against the hash of the body). Bigger bodies must
+ * name their hash up front, so an unauthenticated client cannot make the gateway write gigabytes
+ * to disk (F15). nostr-tools' Blossom client always sends the header.
+ */
+export const MAX_UNHASHED_UPLOAD_BYTES = 8 * 1024 * 1024;
 
 function fail(
   res: Res,
@@ -288,7 +339,10 @@ export class BlossomHandler {
     }
     cors(res);
     res.setHeader('Accept-Ranges', 'bytes');
-    res.setHeader('Content-Type', entry.mime ?? OCTET);
+    const served = servedAs(entry.mime);
+    res.setHeader('Content-Type', served.contentType);
+    if (served.attachment)
+      res.setHeader('Content-Disposition', `attachment; filename="${entry.sha256}.bin"`);
     res.setHeader('ETag', `"${entry.sha256}"`);
     res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
 
@@ -452,6 +506,14 @@ export class BlossomHandler {
     const claimed = header(req, 'x-sha-256');
     if (claimed !== undefined && !HEX64.test(claimed)) {
       fail(res, 400, 'X-SHA-256 must be 64 lower-case hex chars');
+      return;
+    }
+    if (claimed === undefined && declared > MAX_UNHASHED_UPLOAD_BYTES) {
+      fail(
+        res,
+        400,
+        `X-SHA-256 is required for uploads over ${String(MAX_UNHASHED_UPLOAD_BYTES)} bytes`,
+      );
       return;
     }
     const mime = mimeOf(header(req, 'content-type'), this.cfg.allowedMimeTypes);
@@ -709,7 +771,8 @@ export class BlossomHandler {
       reporter,
       hashes,
       event,
-      signatureVerified: false,
+      // `authorize(…, 'report', …)` verified the report's signature (ADR 0010 §8) — F20.
+      signatureVerified: true,
     };
     if (!this.reports.append(stored)) {
       fail(res, 429, 'report store full');

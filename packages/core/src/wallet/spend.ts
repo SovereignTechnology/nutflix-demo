@@ -27,6 +27,7 @@ import {
   Amount,
   getP2PKExpectedWitnessPubkeys,
   hasValidDleq,
+  schnorrVerifyMessage,
   type MeltQuoteBolt11Response,
   type P2PKTag,
   type Proof,
@@ -335,6 +336,13 @@ export class Spender {
           'bad-mint-response',
           'the mint changed the melt amount since the quote was shown',
         );
+      // The confirm dialog (security review F8) shows `quote.feeReserve`; never let the mint's
+      // reserve exceed what the user agreed to.
+      if (q.fee_reserve.toNumber() > quote.feeReserve)
+        throw new WalletError(
+          'bad-mint-response',
+          'the mint asks a larger fee reserve than the quote that was shown',
+        );
       const need = q.amount.add(q.fee_reserve);
       const held = (await this.ctx.store.proofs(quote.mint)).map(toCashu);
       let selected: Proof[];
@@ -398,6 +406,67 @@ export class Spender {
       });
       return proofTotal(added) as Sats;
     });
+  }
+
+  /**
+   * NUT-07: which of `set`'s proofs the mint reports SPENT, in order. Needs no ownership — the
+   * seeder uses it on the creator set it forwards (security review F11). Rejects if the mint
+   * cannot be asked.
+   */
+  checkSpent(set: {
+    readonly mint: MintUrl;
+    readonly proofs: readonly CashuProof[];
+  }): Promise<readonly boolean[]> {
+    return this.exclusive(set.mint, async () => {
+      const w = await this.ctx.mints.wallet(set.mint);
+      const states = await w.checkProofsStates(
+        set.proofs.map((p) => ({ secret: p.secret, id: p.id })),
+      );
+      if (states.length !== set.proofs.length)
+        throw new WalletError('bad-mint-response', 'checkstate answered for the wrong proofs');
+      return states.map((st) => st.state === 'SPENT');
+    });
+  }
+
+  /**
+   * Whether EVERY proof of `set` was spent with a witness signed by this wallet's key — i.e. by
+   * us, in a swap whose response was lost (security review F31), not by a double-spender, who
+   * cannot sign with our key. `false` when any proof is unspent, lacks a witness, or the mint
+   * cannot be asked.
+   */
+  async spentByUs(set: {
+    readonly mint: MintUrl;
+    readonly proofs: readonly CashuProof[];
+  }): Promise<boolean> {
+    const key = this.ctx.key;
+    if (key === undefined || set.proofs.length === 0) return false;
+    try {
+      return await this.exclusive(set.mint, async () => {
+        const w = await this.ctx.mints.wallet(set.mint);
+        const states = await w.checkProofsStates(
+          set.proofs.map((p) => ({ secret: p.secret, id: p.id })),
+        );
+        if (states.length !== set.proofs.length) return false;
+        return set.proofs.every((p, i) => {
+          const st = states[i];
+          if (st?.state !== 'SPENT' || typeof st.witness !== 'string') return false;
+          let sigs: unknown;
+          try {
+            sigs = (JSON.parse(st.witness) as { signatures?: unknown }).signatures;
+          } catch {
+            return false;
+          }
+          return (
+            Array.isArray(sigs) &&
+            sigs.some(
+              (sig) => typeof sig === 'string' && schnorrVerifyMessage(sig, p.secret, key.pubkey),
+            )
+          );
+        });
+      });
+    } catch {
+      return false;
+    }
   }
 
   /**

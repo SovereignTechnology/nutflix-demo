@@ -45,9 +45,10 @@ export interface HttpLimits {
   readonly requestsPerWindow: number;
   readonly windowMs: number;
   /**
-   * Trust `X-Forwarded-For` (first hop) for the client address. ONLY behind the TLS proxy
-   * the deploy unit assumes; on a directly exposed listener it lets anyone pick their
-   * rate-limit bucket.
+   * Take the client address from `X-Forwarded-For`: its LAST entry, the one the (single) trusted
+   * proxy appended — the entries before it are whatever the client sent (security review F14).
+   * ONLY behind the TLS proxy the deploy unit assumes; on a directly exposed listener it lets
+   * anyone pick their rate-limit bucket.
    */
   readonly trustProxy: boolean;
 }
@@ -73,7 +74,11 @@ export interface BlossomConfig {
   /** Hosts `PUT /mirror` may fetch from (exact host[:port] match). Empty = none. */
   readonly mirrorAllowedHosts: readonly string[];
   readonly allowReport: boolean;
-  /** `null` = any MIME type; otherwise an exact allowlist (415 otherwise). */
+  /**
+   * Upload MIME allowlist (415 otherwise); `null` = any type. Default: media, images without
+   * script, captions and `application/octet-stream` (security review F3). Whatever is allowed,
+   * `GET` serves only inert types inline (`servedAs` in blossom/handler.ts).
+   */
   readonly allowedMimeTypes: readonly string[] | null;
   /** Pubkeys passed to `BlossomAuth.allow()` / `.deny()` at start. */
   readonly allowPubkeys: readonly NostrPubkey[];
@@ -86,8 +91,9 @@ export interface UpstreamConfig {
   /** Pay after every N verified blocks from a peer (contiguous run). Must be ≤ the window. */
   readonly payEveryBlocks: number;
   /**
-   * Per-core `PricePolicy` overrides for paying upstream (creator P2PK etc. from the
-   * manifest). Keys are core keys (hex). Missing cores fall back to `policy` + HELLO.
+   * Per-core MANIFEST `PricePolicy` for paying upstream (price, split, mints, creator P2PK).
+   * Keys are core keys (hex). A core without one is NOT paid: a seeder's HELLO is never trusted
+   * for terms (security review F2), and it may only lower the price, never raise it (F1).
    */
   readonly policies: Readonly<Record<string, PricePolicy>>;
 }
@@ -147,7 +153,21 @@ export const DEFAULT_BLOSSOM: BlossomConfig = {
   allowMirror: false,
   mirrorAllowedHosts: [],
   allowReport: true,
-  allowedMimeTypes: null,
+  allowedMimeTypes: [
+    'video/mp4',
+    'video/webm',
+    'video/quicktime',
+    'audio/mpeg',
+    'audio/ogg',
+    'audio/mp4',
+    'image/png',
+    'image/jpeg',
+    'image/webp',
+    'image/gif',
+    'image/avif',
+    'text/vtt',
+    'application/octet-stream',
+  ],
   allowPubkeys: [],
   denyPubkeys: [],
   authHeadUpload: false,
@@ -417,8 +437,10 @@ export function validateConfig(raw: unknown): ConfigResult {
   const publicUrl = str(e, b, 'publicUrl', `${P}.blossom`, B.publicUrl);
   if (!/^https?:\/\/[^\s]+$/.test(publicUrl) || publicUrl.endsWith('/'))
     e.add(`${P}.blossom.publicUrl`, 'expected http(s) URL without trailing slash');
+  // Absent = the default allowlist; an explicit `null` = any type (the operator's choice).
   let allowedMimeTypes: readonly string[] | null = B.allowedMimeTypes;
-  if (b['allowedMimeTypes'] !== undefined && b['allowedMimeTypes'] !== null)
+  if (b['allowedMimeTypes'] === null) allowedMimeTypes = null;
+  else if (b['allowedMimeTypes'] !== undefined)
     allowedMimeTypes = strList(e, b, 'allowedMimeTypes', `${P}.blossom`, []);
   const isHex64 = (s: string): boolean => HEX64.test(s);
   const blossom: BlossomConfig = {

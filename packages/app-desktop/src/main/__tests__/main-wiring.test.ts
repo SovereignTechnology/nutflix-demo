@@ -29,6 +29,10 @@ const fx = vi.hoisted(() => {
     fetches: [] as { url: string; init: unknown }[],
     paths: new Map<string, string>(),
     ready: undefined as undefined | (() => void),
+    /** `app.requestSingleInstanceLock()`'s answer. */
+    primary: true,
+    dialogs: [] as unknown[],
+    dialogAnswer: 0,
   };
   return state;
 });
@@ -87,7 +91,10 @@ vi.mock('electron', () => {
       exit: (code: number) => {
         fx.exitCode = code;
       },
-      quit: () => undefined,
+      quit: () => {
+        fx.order.push('quit');
+      },
+      requestSingleInstanceLock: () => fx.primary,
       whenReady: () =>
         new Promise<void>((r) => {
           fx.ready = () => {
@@ -97,6 +104,13 @@ vi.mock('electron', () => {
         }),
     },
     BrowserWindow,
+    dialog: {
+      showMessageBox: (...a: unknown[]) => {
+        fx.dialogs.push(a.at(-1));
+        return Promise.resolve({ response: fx.dialogAnswer });
+      },
+    },
+    webContents: { fromId: () => undefined },
     Menu: { setApplicationMenu: () => undefined, buildFromTemplate: () => ({}) },
     ipcMain: {
       handle: (channel: string, fn: (e: unknown, raw: unknown) => Promise<unknown>) => {
@@ -166,6 +180,9 @@ beforeEach(() => {
   fx.switches.clear();
   fx.appended.length = 0;
   fx.exitCode = undefined;
+  fx.primary = true;
+  fx.dialogs.length = 0;
+  fx.dialogAnswer = 0;
   fx.appListeners.clear();
   fx.protocols.clear();
   fx.ipc.clear();
@@ -286,6 +303,54 @@ describe('main.ts wiring (fake electron)', () => {
       'will-navigate',
       'will-redirect',
     ]);
+  });
+
+  // Security review F22.
+  it('a second instance on the same userData quits without a window, a host or IPC handlers', async () => {
+    fx.primary = false;
+    await boot(['--user-data-dir=/tmp/nf-one']);
+    expect(fx.order).toContain('quit');
+    expect(fx.order).not.toContain('ready');
+    expect(fx.windows).toHaveLength(0);
+    expect(fx.forks).toHaveLength(0);
+    expect(fx.ipc.size).toBe(0);
+  });
+
+  // Security review F8: the money gate is a native dialog in main, not a stub.
+  it('a nutzap from the window asks with a native dialog: Cancel is forbidden and never reaches the host, confirm relays', async () => {
+    await boot();
+    const call = fx.ipc.get('nf:call');
+    const child = fx.children[0];
+    const event = {
+      sender: { id: 1, isDestroyed: () => false, send: () => undefined },
+      senderFrame: { url: 'app://nutflix/index.html', parent: null },
+    };
+    const nutzap = (id: number): unknown => ({
+      v: 1,
+      id,
+      method: 'nutzap',
+      args: [mocks.VIDEOS[0]!.id, 21, mocks.MINTS.a],
+    });
+    fx.dialogAnswer = 0; // Cancel
+    await expect(call?.(event, nutzap(1))).resolves.toMatchObject({
+      ok: false,
+      error: { code: 'forbidden' },
+    });
+    expect(fx.dialogs).toHaveLength(1);
+    expect(fx.dialogs[0]).toMatchObject({
+      type: 'question',
+      buttons: ['Cancel', 'Send 21 sats'],
+      defaultId: 0,
+      cancelId: 0,
+      message: 'Send 21 sats to the creator of this video?',
+    });
+    expect(child?.posted.filter((m) => (m as { kind?: string }).kind === 'call')).toHaveLength(0);
+    fx.dialogAnswer = 1; // confirm
+    void call?.(event, nutzap(2));
+    await new Promise<void>((r) => {
+      setTimeout(r, 0);
+    });
+    expect(child?.posted.filter((m) => (m as { kind?: string }).kind === 'call')).toHaveLength(1);
   });
 
   it('a renderer call from the window reaches the host; a host media-link feeds nf-media', async () => {

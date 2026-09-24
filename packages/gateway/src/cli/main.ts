@@ -1,6 +1,6 @@
 /**
  * Entry point behind the canonical unit's
- *   `ExecStart=/usr/bin/node --jitless /opt/nutflix/packages/gateway/dist/index.js --config /etc/nutflix/gateway.json`
+ *   `ExecStart=/usr/bin/node --jitless --no-experimental-websocket /opt/nutflix/packages/gateway/dist/index.js --config /etc/nutflix/gateway.json`
  * (deploy/systemd/nutflix-gateway.service, `Type=simple`).
  *
  *   --config <path>   JSON config (`config.ts`); `NUTFLIX_GATEWAY_CONFIG` is the fallback
