@@ -17,7 +17,7 @@ import type {
   RelayUrl,
   Sats,
 } from '@sovit/core';
-import { DEFAULT_BLOCK_SIZE, nostr } from '@sovit/core';
+import { DEFAULT_BLOCK_SIZE, DEFAULT_WINDOW_BLOCKS, nostr } from '@sovit/core';
 import type { LogLevel, PayoutConfig, RateLimitConfig, SwarmConfig } from '@sovit/seeder';
 import { DEFAULT_PAYOUT_THRESHOLD_SATS, DEFAULT_RATE_LIMITS, MAX_RELAYS } from '@sovit/seeder';
 
@@ -92,6 +92,12 @@ export interface BlossomConfig {
 export interface UpstreamConfig {
   /** Pay after every N verified blocks from a peer (contiguous run). Must be ≤ the window. */
   readonly payEveryBlocks: number;
+  /**
+   * Upstream blocks requested or downloaded and not yet paid-and-acknowledged, across every
+   * upstream seeder (security review F37): at most the smallest unpaid window the gateway's
+   * upstream seeders allow. Default `DEFAULT_WINDOW_BLOCKS`, every seeder's minimum.
+   */
+  readonly creditBlocks: number;
   /**
    * Per-core MANIFEST `PricePolicy` for paying upstream (price, split, mints, creator P2PK).
    * Keys are core keys (hex). A core without one is NOT paid: a seeder's HELLO is never trusted
@@ -189,7 +195,11 @@ export const DEFAULT_BLOSSOM: BlossomConfig = {
   authHeadUpload: false,
 };
 
-export const DEFAULT_UPSTREAM: UpstreamConfig = { payEveryBlocks: 2, policies: {} };
+export const DEFAULT_UPSTREAM: UpstreamConfig = {
+  payEveryBlocks: 2,
+  creditBlocks: DEFAULT_WINDOW_BLOCKS,
+  policies: {},
+};
 
 /** Environment variable names honoured by `loadConfig` (override the file). */
 export const ENV = {
@@ -614,6 +624,15 @@ export function validateConfig(raw: unknown, opts: ValidateOptions = {}): Config
       `${P}.upstream`,
       DEFAULT_UPSTREAM.payEveryBlocks,
       1,
+    ),
+    creditBlocks: int(
+      e,
+      u,
+      'creditBlocks',
+      `${P}.upstream`,
+      DEFAULT_UPSTREAM.creditBlocks,
+      1,
+      1024,
     ),
     policies,
   };

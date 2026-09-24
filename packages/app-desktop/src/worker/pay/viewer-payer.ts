@@ -24,7 +24,6 @@
  *     the video lists (the host's wallet is debited there).
  */
 import type {
-  AckMessage,
   CoreKeyHex,
   HelloMessage,
   MintUrl,
@@ -32,15 +31,12 @@ import type {
   PayMessage,
   PaymentEngineViewer,
   PayProtocol,
-  PayProtocolEvents,
   PricePolicy,
   Sats,
 } from '@sovit/core';
 import type Hypercore from 'hypercore';
-import type { ReplicationPeer } from 'hypercore';
-import { UpstreamPayer } from '@sovit/gateway/upstream';
+import { CreditSettler, UpstreamPayer } from '@sovit/gateway/upstream';
 import type { Logger } from '@sovit/seeder';
-import { toHex } from '@sovit/seeder';
 
 import type { CreditPool } from '../playback/credit.js';
 
@@ -66,15 +62,6 @@ export interface ViewerPayerOptions {
   readonly onPaid?: (e: PaidEvent) => void;
 }
 
-interface Link {
-  readonly noiseHex: string;
-  /** PAYs on the wire awaiting their ACK, oldest first. */
-  readonly sent: PayMessage[];
-  /** core → blocks downloaded from this peer and not yet settled. */
-  readonly owed: Map<string, Set<number>>;
-  closed: boolean;
-}
-
 function proofSum(msg: PayMessage): number {
   let n = 0;
   for (const p of msg.seederProofs.proofs) n += p.amount;
@@ -86,9 +73,7 @@ export class ViewerPayer {
   private readonly o: ViewerPayerOptions;
   private readonly log: Logger;
   private readonly upstream: UpstreamPayer;
-  private readonly links = new Map<string, Link>();
-  private acksRejected = 0;
-  private unmatchedAcks = 0;
+  private readonly settler: CreditSettler;
 
   constructor(o: ViewerPayerOptions) {
     this.o = o;
@@ -109,12 +94,18 @@ export class ViewerPayer {
       },
       spent: () => ({ total: 0 as Sats, perPeer: new Map() }),
     };
+    this.settler = new CreditSettler({
+      credit: o.credit,
+      logger: o.logger,
+      payable: (core) => o.policyFor(core) !== null,
+    });
     this.upstream = new UpstreamPayer({
       engine,
       logger: o.logger,
-      // Pay every verified block as it lands (runs landing in one tick still batch into one
-      // PAY): the credit window is small, so a tail must never wait for more blocks.
+      // Batch to half the credit window, and pay everything the moment the pool is under
+      // pressure — so a tail never waits on blocks that credit keeps from coming (F5 batching).
       payEveryBlocks: 1,
+      credit: o.credit,
       ownMints: o.ownMints,
       policyFor: (core, hello) => this.resolvePolicy(core, hello),
     });
@@ -125,87 +116,25 @@ export class ViewerPayer {
     readonly unmatchedAcks: number;
     readonly owed: number;
   } {
-    let owed = 0;
-    for (const l of this.links.values()) for (const s of l.owed.values()) owed += s.size;
-    return {
-      ...this.upstream.stats(),
-      acksRejected: this.acksRejected,
-      unmatchedAcks: this.unmatchedAcks,
-      owed,
-    };
+    return { ...this.upstream.stats(), ...this.settler.stats() };
   }
 
   /** A peer's `pay/1` instance (one per connection). Returns a detach function. */
   attachPeer(noiseHex: string, protocol: PayProtocol): () => void {
-    const link: Link = { noiseHex, sent: [], owed: new Map(), closed: false };
-    const previous = this.links.get(noiseHex);
-    if (previous !== undefined) this.release(previous);
-    this.links.set(noiseHex, link);
-    const decorated: PayProtocol = {
-      get state() {
-        return protocol.state;
-      },
-      get peer() {
-        return protocol.peer;
-      },
-      attach: (mux) => {
-        protocol.attach(mux);
-      },
-      sendHello: (h) => {
-        protocol.sendHello(h);
-      },
-      sendPay: (msg) => {
-        if (!link.closed) link.sent.push(msg);
-        protocol.sendPay(msg);
-      },
-      sendAck: (a) => {
-        protocol.sendAck(a);
-      },
-      sendPrice: (p) => {
-        protocol.sendPrice(p);
-      },
-      cut: (reason) => {
-        protocol.cut(reason);
-      },
-      on: <K extends keyof PayProtocolEvents>(event: K, cb: PayProtocolEvents[K]) =>
-        protocol.on(event, cb),
-    };
-    const offAck = protocol.on('ack', (ack) => {
-      this.onAck(link, ack);
-    });
-    const offClose = protocol.on('close', () => {
-      this.release(link);
-    });
-    const detachUpstream = this.upstream.attachPeer(noiseHex, decorated);
+    const settled = this.settler.attachPeer(noiseHex, protocol);
+    const detachUpstream = this.upstream.attachPeer(noiseHex, settled.protocol);
     return () => {
-      offAck();
-      offClose();
       detachUpstream();
-      this.release(link);
-      if (this.links.get(noiseHex) === link) this.links.delete(noiseHex);
+      settled.detach();
     };
   }
 
   /** Watch a core's verified downloads. Returns a detach function. */
   attachCore(core: Hypercore): () => void {
-    const keyHex = toHex(core.key);
-    const onDownload = (index: number, _bytes: number, peer: ReplicationPeer): void => {
-      const link = this.links.get(toHex(peer.remotePublicKey));
-      if (link === undefined || link.closed || this.o.policyFor(keyHex as CoreKeyHex) === null) {
-        this.o.credit.settle(keyHex, index);
-        return;
-      }
-      let set = link.owed.get(keyHex);
-      if (set === undefined) {
-        set = new Set();
-        link.owed.set(keyHex, set);
-      }
-      set.add(index);
-    };
-    core.on('download', onDownload);
+    const detachSettler = this.settler.attachCore(core);
     const detachUpstream = this.upstream.attachCore(core);
     return () => {
-      core.off('download', onDownload);
+      detachSettler();
       detachUpstream();
     };
   }
@@ -235,40 +164,5 @@ export class ViewerPayer {
       return null;
     }
     return policy;
-  }
-
-  private onAck(link: Link, ack: AckMessage): void {
-    const i = link.sent.findIndex(
-      (m) =>
-        m.range.core === ack.core &&
-        m.range.fromBlock === ack.fromBlock &&
-        m.range.toBlock === ack.toBlock,
-    );
-    if (i === -1) {
-      this.unmatchedAcks++;
-      this.log.warn('ACK for no outstanding PAY', { from: ack.fromBlock, to: ack.toBlock });
-      return;
-    }
-    const [msg] = link.sent.splice(i, 1);
-    if (!ack.ok) {
-      this.acksRejected++;
-      this.log.warn('seeder rejected our PAY', { reason: ack.reason ?? 'unknown' });
-    }
-    if (msg === undefined) return;
-    const core = msg.range.core;
-    const owed = link.owed.get(core);
-    for (let b = msg.range.fromBlock; b <= msg.range.toBlock; b++) {
-      owed?.delete(b);
-      this.o.credit.settle(core, b);
-    }
-  }
-
-  /** The peer is gone: nothing it is owed will ever be acknowledged. */
-  private release(link: Link): void {
-    if (link.closed) return;
-    link.closed = true;
-    link.sent.splice(0);
-    for (const [core, set] of link.owed) for (const b of set) this.o.credit.settle(core, b);
-    link.owed.clear();
   }
 }

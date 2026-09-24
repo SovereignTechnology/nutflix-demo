@@ -9,8 +9,9 @@
  * and the gateway could never pay an upstream swarm peer; the upstream seeder binds the gateway's
  * key-file identity, is paid for every block, and redeems into its own wallet.
  *
- * The reader here is PACED (two blocks, then wait for the payment): the gateway does not yet gate
- * upstream requests on its unpaid window, so a fast reader gets it cut and banned (F37).
+ * The reader reads at FULL SPEED through `Gateway.readUpstreamBlob`, which paces upstream requests
+ * on the gateway's credit pool (security review F37): before it, an unpaced reader outran its PAYs
+ * and the upstream cut and banned the gateway (6 outstanding against a window of 5, every run).
  */
 import { mkdir, writeFile } from 'node:fs/promises';
 import path from 'node:path';
@@ -123,6 +124,7 @@ describe('gateway runtime over hyperswarm', () => {
     const put = await upSeeder.putBytes(data, { mime: 'video/mp4' });
     if (!put.ok) throw new Error('put failed');
     const core = put.entry.coreKey;
+    const blob = put.entry.blob;
     upRt.attach(upSeeder);
     upSeeder.start();
     await upSeeder.swarm!.flushedAll();
@@ -162,7 +164,7 @@ describe('gateway runtime over hyperswarm', () => {
       await deps.close?.();
     });
 
-    const vcore = await gateway.openUpstreamCore(core);
+    await gateway.openUpstreamCore(core);
     await gateway.seeder.swarm!.flush();
     cleanups.push(async () => {
       const out = process.env['GW_SWARM_DUMP'];
@@ -173,26 +175,43 @@ describe('gateway runtime over hyperswarm', () => {
         [...upLog.lines.map((l) => `UP ${l}`), ...gwLog.lines.map((l) => `GW ${l}`)].join('\n'),
       );
     });
-    // A PACED reader: two blocks, then wait until the upstream counts them paid. The gateway does
-    // not pace upstream fetches itself yet — an unpaced reader outruns its PAYs and the upstream
-    // cuts and bans it for exceeding the unpaid window (security review F37; the next lane).
-    const paid = (n: number) => (): boolean => {
-      const win = upRt.engine.window(gw.pubkey as never);
-      return win !== undefined && win.paid >= n && win.outstanding === 0;
-    };
-    for (let i = 0; i < BLOCKS; i += 2) {
-      for (const j of [i, i + 1])
-        expect(
-          await vcore.core.get(j, { wait: true, timeout: 10_000 }),
-          `block ${String(j)}`,
-        ).not.toBeNull();
-      await until(paid(i + 2), 20_000);
+    // F37: read the whole blob as fast as the gateway will go. It never holds more unpaid upstream
+    // blocks than its credit, so the upstream never counts more outstanding than its window.
+    let worst = 0;
+    let exceeded = false;
+    const offExceeded = upRt.engine.onWindowExceeded((w) => {
+      if (w.peer === gw.pubkey) exceeded = true;
+    });
+    const sample = setInterval(() => {
+      const w = upRt.engine.window(gw.pubkey as never);
+      if (w !== undefined) worst = Math.max(worst, w.outstanding);
+    }, 2);
+    const chunks: Uint8Array[] = [];
+    try {
+      for await (const b of gateway.readUpstreamBlob(core, blob)) chunks.push(b);
+    } finally {
+      clearInterval(sample);
+      offExceeded();
     }
+    expect(exceeded).toBe(false);
+    const got = Buffer.concat(chunks);
+    expect(Buffer.compare(got, Buffer.from(data))).toBe(0);
+    // Paid upstream, and every ACK back at the gateway (its credit drains as they arrive).
+    await until(() => {
+      const win = upRt.engine.window(gw.pubkey as never);
+      return (
+        win !== undefined &&
+        win.paid >= BLOCKS &&
+        win.outstanding === 0 &&
+        gateway.credit.size === 0
+      );
+    }, 20_000);
+    expect(worst).toBeLessThanOrEqual(gwCfg.config.upstream.creditBlocks);
 
     // The upstream seeder bound the gateway's key-file identity on the swarm session…
     const session = upSeeder.sessionInfos().find((s) => s.pubkey === gw.pubkey);
     expect(session, 'a swarm session bound to the gateway pubkey').toBeDefined();
-    // …and every block it uploaded was paid (the gateway pays every 2 blocks, one PAY in flight).
+    // …and every block it uploaded was paid, the gateway never cut.
     const w = upRt.engine.window(gw.pubkey as never)!;
     expect(w.uploaded).toBeGreaterThanOrEqual(BLOCKS);
     expect(w.paid).toBe(w.uploaded);

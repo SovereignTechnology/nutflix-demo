@@ -160,6 +160,17 @@ describe('validateConfig', () => {
     });
     expect(r.config.upstream.payEveryBlocks).toBe(3);
     expect(r.config.upstream.policies[core]?.creatorP2pk).toBe(CREATOR_P2PK);
+    // F37: upstream credit defaults to every seeder's minimum window.
+    expect(r.config.upstream.creditBlocks).toBe(4);
+  });
+
+  it('F37: upstream.creditBlocks is an integer in [1, 1024]', () => {
+    const ok = validateConfig({ ...MINIMAL, upstream: { creditBlocks: 16 } });
+    expect(ok.ok && ok.config.upstream.creditBlocks).toBe(16);
+    for (const bad of [0, -1, 1.5, 1025, '8'])
+      expect(validateConfig({ ...MINIMAL, upstream: { creditBlocks: bad } }).ok, String(bad)).toBe(
+        false,
+      );
   });
 
   it('gatewayPrice / gatewayPolicy: markupPercent default 0 leaves the base price unchanged', () => {

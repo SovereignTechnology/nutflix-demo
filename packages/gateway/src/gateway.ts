@@ -24,6 +24,7 @@ import path from 'node:path';
 
 import type {
   CoreKeyHex,
+  HyperblobId,
   MuxLike,
   PaymentEngineSeeder,
   PaymentEngineViewer,
@@ -51,8 +52,10 @@ import type { MirrorFetch } from './blossom/handler.js';
 import { OwnerIndex, ReportStore } from './blossom/store.js';
 import type { GatewayConfig } from './config.js';
 import { gatewayPolicy, gatewayPrice } from './config.js';
+import { CreditPool } from './upstream/credit.js';
 import { UpstreamPayer, manifestPolicyResolver } from './upstream/payer.js';
 import type { UpstreamPolicyResolver } from './upstream/payer.js';
+import { CreditSettler } from './upstream/settle.js';
 import { WsBridge } from './ws/bridge.js';
 
 /**
@@ -130,6 +133,9 @@ export class Gateway {
   readonly seeder: Seeder;
   readonly log: Logger;
   readonly payer: UpstreamPayer;
+  /** Upstream blocks requested or unpaid, across every upstream seeder (F37). */
+  readonly credit: CreditPool;
+  private readonly settler: CreditSettler;
   readonly bridge: WsBridge;
   readonly blossom: BlossomHandler;
   readonly owners: OwnerIndex;
@@ -159,10 +165,19 @@ export class Gateway {
     for (const [k, v] of Object.entries(config.upstream.policies))
       this.upstreamPolicies.set(k as CoreKeyHex, v);
 
+    // F37: upstream blocks travel only on credit, which comes back when their PAY is ACKed —
+    // so no upstream seeder ever holds more of our unpaid blocks than its window.
+    this.credit = new CreditPool(config.upstream.creditBlocks);
+    this.settler = new CreditSettler({
+      credit: this.credit,
+      logger: this.log,
+      payable: (core) => deps.upstreamPolicy !== undefined || this.upstreamPolicies.has(core),
+    });
     this.payer = new UpstreamPayer({
       engine: deps.viewerEngine,
       logger: this.log,
       payEveryBlocks: config.upstream.payEveryBlocks,
+      credit: this.credit,
       ownMints: config.acceptedMints,
       policyFor: deps.upstreamPolicy ?? manifestPolicyResolver(() => this.upstreamPolicies),
     });
@@ -292,6 +307,7 @@ export class Gateway {
     this.closed = true;
     for (const off of this.unsubs) off();
     await this.payer.flush().catch(() => undefined);
+    this.payer.dispose();
     await this.bridge.close();
     this.server.closeAllConnections();
     await new Promise<void>((resolve) => {
@@ -329,13 +345,70 @@ export class Gateway {
 
   /**
    * Replicate a remote core (read-only replica) and pay for what is downloaded from it.
-   * Hex or raw key. Idempotent.
+   * Hex or raw key. Idempotent. READ IT THROUGH `readUpstreamBlob`: a plain `core.get()` loop is
+   * not paced, outruns its PAYs, and the upstream cuts and bans the gateway (security review F37).
    */
   async openUpstreamCore(key: CoreKeyHex | string | Uint8Array): Promise<SeedCore> {
     const raw = typeof key === 'string' ? fromHex(key) : key;
     const sc = await this.seeder.blobs.openCoreByKey(raw);
     this.watchCore(sc);
     return sc;
+  }
+
+  /**
+   * A blob from an upstream core, block by block, PACED to the upstream seeders' unpaid window
+   * (security review F37): a block that must travel first takes a unit of `credit` (waiting when
+   * none is free), and the unit comes back when the PAY covering it is acknowledged. Local blocks
+   * cost nothing. Up to `lookahead` blocks are fetched ahead, but only on credit that is free NOW.
+   */
+  async *readUpstreamBlob(
+    key: CoreKeyHex | string | Uint8Array,
+    blob: HyperblobId,
+    opts: { readonly lookahead?: number; readonly timeoutMs?: number } = {},
+  ): AsyncGenerator<Uint8Array, void, undefined> {
+    const sc = await this.openUpstreamCore(key);
+    const core = sc.core;
+    const hex = sc.keyHex;
+    const timeout = opts.timeoutMs ?? 30_000;
+    const lookahead = Math.max(0, opts.lookahead ?? this.credit.limit - 1);
+    const first = blob.blockOffset;
+    const last = blob.blockOffset + blob.blockLength - 1;
+    /** `held`: a unit was taken for this block already (lookahead's `tryAcquire`). */
+    const fetchBlock = async (i: number, held: boolean): Promise<Uint8Array> => {
+      if (await core.has(i)) {
+        if (held) this.credit.settle(hex, i);
+        const local = await core.get(i);
+        if (local === null) throw new Error(`upstream block ${String(i)} vanished`);
+        return local;
+      }
+      if (!held) await this.credit.acquire(hex, i).promise;
+      try {
+        const b = await core.get(i, { wait: true, timeout });
+        if (b === null) throw new Error(`upstream block ${String(i)} did not arrive`);
+        return b;
+      } catch (e) {
+        this.credit.settle(hex, i);
+        throw e;
+      } finally {
+        // Owed → settles on its ACK. Not owed (a peer without pay/1, or it was local after all):
+        // nothing will ever settle it, so now.
+        if (!this.settler.owes(hex, i)) this.credit.settle(hex, i);
+      }
+    };
+    const ahead = new Map<number, Promise<Uint8Array>>();
+    for (let i = first; i <= last; i++) {
+      let p = ahead.get(i);
+      ahead.delete(i);
+      p ??= fetchBlock(i, false);
+      for (let j = i + 1; j <= last && ahead.size < lookahead; j++) {
+        if (ahead.has(j)) continue;
+        if (!this.credit.tryAcquire(hex, j)) break;
+        const q = fetchBlock(j, true);
+        q.catch(() => undefined); // surfaced when the reader reaches it
+        ahead.set(j, q);
+      }
+      yield await p;
+    }
   }
 
   stats(): GatewayStats {
@@ -353,7 +426,12 @@ export class Gateway {
 
   private watchCore(sc: SeedCore): void {
     if (this.coreDetachers.has(sc.keyHex)) return;
-    this.coreDetachers.set(sc.keyHex, this.payer.attachCore(sc.core));
+    const offSettler = this.settler.attachCore(sc.core);
+    const offPayer = this.payer.attachCore(sc.core);
+    this.coreDetachers.set(sc.keyHex, () => {
+      offSettler();
+      offPayer();
+    });
   }
 
   private wireSeeder(): void {
@@ -411,10 +489,13 @@ export class Gateway {
     const protocol = this.deps.payProtocol(info);
     protocol.attach(mux);
     const detachBridge = this.seeder.attachPayProtocol(session, protocol);
-    const detachPayer = this.payer.attachPeer(info.noiseKeyHex, protocol);
+    // Upstream: the payer's PAYs go through the settler, which gives credit back on their ACKs.
+    const settled = this.settler.attachPeer(info.noiseKeyHex, protocol);
+    const detachPayer = this.payer.attachPeer(info.noiseKeyHex, settled.protocol);
     this.detachers.set(info.noiseKeyHex, () => {
       detachBridge();
       detachPayer();
+      settled.detach();
     });
     void this.sendHello(session.noiseKeyHex, protocol, mux);
   }

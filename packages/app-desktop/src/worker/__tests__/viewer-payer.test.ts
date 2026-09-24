@@ -110,9 +110,11 @@ const settle = async (): Promise<void> => {
   for (let i = 0; i < 20; i++) await Promise.resolve();
 };
 
-function rig(policyFor?: (c: CoreKeyHex) => PricePolicy | null) {
+function rig(policyFor?: (c: CoreKeyHex) => PricePolicy | null, creditBlocks = 2) {
   const engine = new mocks.MockPaymentEngine();
-  const credit = new CreditPool(8);
+  // A pool of 2 batches ONE block per PAY (half the pool): these tests are about settlement,
+  // matching and policy, one PAY at a time. Batching has its own tests below (F5).
+  const credit = new CreditPool(creditBlocks);
   const paid: PaidEvent[] = [];
   const payer = new ViewerPayer({
     pay: (r, s, p) => engine.pay(r, s, p),
@@ -243,5 +245,58 @@ describe('ViewerPayer', () => {
     r.download(0);
     await r.payer.flush();
     expect(r.proto.sent).toHaveLength(1);
+  });
+
+  it('F5 batching: PAYs cover half the credit pool, not one block each', async () => {
+    const r = rig(undefined, 8);
+    r.proto.hello();
+    for (const i of [0, 1, 2]) r.download(i);
+    await settle();
+    expect(r.proto.sent).toHaveLength(0); // 3 < ⌊8 / 2⌋: waiting for a batch
+    r.download(3);
+    await settle();
+    expect(r.proto.sent.map((m) => [m.range.fromBlock, m.range.toBlock])).toEqual([[0, 3]]);
+    r.proto.ack(0, 3);
+    expect(r.credit.size).toBe(0);
+  });
+
+  it('F5 batching never stalls a download: under pressure every held block is paid', async () => {
+    const r = rig(undefined, 8);
+    r.proto.hello();
+    r.download(0);
+    await settle();
+    expect(r.proto.sent).toHaveLength(0);
+    // The player needs a block and the pool has none free (six units held elsewhere).
+    for (let i = 100; i < 107; i++) r.credit.tryAcquire('ff'.repeat(32), i);
+    const w = r.credit.acquire(r.key, 1); // queues: pressure
+    await settle();
+    expect(r.proto.sent.map((m) => [m.range.fromBlock, m.range.toBlock])).toEqual([[0, 0]]);
+    r.proto.ack(0, 0);
+    await w.promise; // block 0's unit came back and went to the waiter
+    expect(r.credit.holds(r.key, 1)).toBe(true);
+  });
+
+  it("F5 batching counts a seeder's blocks across cores (its window does)", async () => {
+    const r = rig(undefined, 8);
+    const other = fakeCore(2);
+    r.payer.attachCore(other);
+    const otherKey = toHex(other.key);
+    r.proto.hello();
+    r.download(0);
+    r.download(1);
+    r.credit.tryAcquire(otherKey, 0);
+    other.emit('download', 0, 65_536, { remotePublicKey: peerKey });
+    await settle();
+    expect(r.proto.sent).toHaveLength(0); // 3 held across two cores
+    r.credit.tryAcquire(otherKey, 1);
+    other.emit('download', 1, 65_536, { remotePublicKey: peerKey });
+    await settle();
+    // 4 across cores: both cores' short runs are paid.
+    expect(
+      r.proto.sent.map((m) => [m.range.core === r.key, m.range.fromBlock, m.range.toBlock]).sort(),
+    ).toEqual([
+      [false, 0, 1],
+      [true, 0, 1],
+    ]);
   });
 });

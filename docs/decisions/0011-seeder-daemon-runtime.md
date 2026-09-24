@@ -222,11 +222,8 @@ What differs for the gateway:
 - **Swarm sessions (security review F38, fixed).** The gateway attached pay/1 on `session-open`,
   when a swarm connection has no Protomux yet, so it never paid an upstream swarm peer; it now
   uses `Seeder.onSessionReady`, like the daemon (a swarm integration test fails without it).
-- **Open: upstream pacing (F37).** The gateway does not hold upstream requests to the seeders'
-  unpaid window; a fast reader outruns its PAYs and gets it cut and banned. Latent: nothing in the
-  shipped gateway fetches upstream on its own (`openUpstreamCore` is API-only). The desktop solved this
-  with a credit pool settled by ACKs (`app-desktop/src/worker/playback/credit.ts`); the next lane
-  moves that into the shared `UpstreamPayer` so the gateway and the desktop use one implementation.
+- **Upstream pacing (F37) — fixed in §11.** The gateway did not hold upstream requests to the
+  seeders' unpaid window; a fast reader outran its PAYs and got it cut and banned.
 
 ## 10. DLEQ checks off the event loop (`stage-3/dleq-batching`, security review F5)
 
@@ -253,6 +250,38 @@ batching threshold can deadlock (several seeders each holding a short unpaid run
 and the fix is the same mechanism F37 needs — the credit pool inside the shared `UpstreamPayer`,
 aware of each seeder's window, paying short runs under pressure. The desktop's Bare worker (a
 light, single-user seeder) still checks inline (`bare-worker` would be a new native dependency).
+
+## 11. Upstream credit and batching (`stage-3/upstream-credit`, security review F37 + F5)
+
+One mechanism for both findings, shared by the gateway and the desktop (`@sovit/gateway/upstream`):
+
+- **`CreditPool`** (moved from the desktop worker). Every upstream block that must travel first
+  takes a unit, and gets it back when it is SETTLED: its PAY was ACKed (ok or not), it came from
+  a peer without `pay/1` or of a core nobody pays for, or its peer went away. The pool now also
+  reports PRESSURE (`pressured`, `onPressure`): an acquire had to queue, or a `tryAcquire` was
+  refused.
+- **`CreditSettler`** (extracted from the desktop's `ViewerPayer`): tracks the PAYs put on the wire
+  per peer and settles by ACK — one implementation for both downloaders.
+- **Batching in `UpstreamPayer`** (F5 (1)):
+  - with a pool, a PAY covers `max(payEveryBlocks, ⌊limit / 2⌋)` blocks, counted per SEEDER
+    across cores (its window is per peer);
+  - under pressure, every pending block is paid, so batching can never keep back the credit a
+    download needs (tested: several seeders each holding a short run cannot fill the pool into a
+    stall);
+  - a run shorter than a batch is paid after `tailMs` (2 s) without new blocks from that peer, so
+    the end of a video is not left unpaid until the session closes.
+- **The gateway's reads (F37).**
+  - `Gateway.readUpstreamBlob(key, blob)` fetches block by block on credit (`upstream.creditBlocks`,
+    default the minimum window, 4), prefetching only on credit that is free now. Local blocks cost
+    nothing.
+  - The swarm integration test reads a blob at full speed from an upstream seeder daemon. No
+    window is exceeded, every block is paid, and the gateway ends with no credit held. With
+    pacing disabled (an unlimited pool) the same test fails.
+  - `openUpstreamCore` stays, documented as unpaced.
+- **The desktop:**
+  - its `ViewerPayer` is now `CreditSettler` + a batching `UpstreamPayer` on its playback pool;
+  - with the default pool of 4, PAYs cover 2 blocks unless the pool is under pressure (the pool's
+    size stays the minimum window).
 
 ## Consequences
 

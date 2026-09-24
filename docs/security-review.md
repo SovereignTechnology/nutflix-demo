@@ -27,7 +27,7 @@ directories" for this list. Each fix carries a test that fails without it, excep
 | F2 | **Fixed** | `manifestPolicyResolver` replaces `helloPolicyResolver`: per-core manifest policy or no payment; split from the manifest; mint ∈ seeder ∩ wallet ∩ manifest |
 | F3 | **Fixed** | Every Blossom response: `nosniff` + `CSP: sandbox`; only inert types inline (`servedAs`), everything else an `octet-stream` attachment; upload MIME allowlist by default (explicit `null` = any) |
 | F4 | **Fixed (policy)** | `autoTopUpDue` tops up only mints in `defaultMints`, and now follows the v5 direction (it had it backwards); contract text says so. Executing top-ups (with caps) is Stage 3 |
-| F5 | **Partly fixed** | Proofs per set capped at `bitLength(amount) + 6` (`maxProofsFor`); one unacknowledged PAY per core batches PAYs naturally (F30); DLEQ checks off the event loop for the seeder daemon and the gateway — a `worker_threads` pool behind `PaymentEngineDeps.dleq`, failure falls back to the synchronous check (`stage-3/dleq-batching`, ADR 0011 §10). Open: explicit `minPaySats` batching tied to the credit pool (with F37); the desktop's Bare worker still checks inline |
+| F5 | **Partly fixed** | Proofs per set capped at `bitLength(amount) + 6` (`maxProofsFor`); one unacknowledged PAY per core batches PAYs naturally (F30); DLEQ checks off the event loop for the seeder daemon and the gateway — a `worker_threads` pool behind `PaymentEngineDeps.dleq`, failure falls back to the synchronous check (`stage-3/dleq-batching`, ADR 0011 §10). Explicit batching tied to the credit pool: PAYs cover half the pool per seeder, all pending paid under pressure, short tails after 2 s (`stage-3/upstream-credit`, ADR 0011 §11). Open: the desktop's Bare worker still checks DLEQ inline; the credit pool stays at the minimum window (a per-seeder window would batch more) |
 | F6 | **Verified on Nutshell 0.21.0 and cdk-mintd 0.18.1** (2026-09-24, `stage-3/real-mint`) | Both mints accept the `pay1` tag and still refuse the set without the creator's witness; the whole pay/1 path, three seeders, double-spends and a network drop pass against both (§0a) |
 | F7 | **Fixed** | `studio.upload` asks with a native dialog naming the file main resolved from the token |
 | F8 | **Fixed** | The money gate is a native dialog (`dialog.showMessageBox`, Cancel default) built from guarded args; `seeder.melt` cross-checks the invoice amount; settings patches that add mints or turn on auto top-up are asked about too |
@@ -55,7 +55,7 @@ directories" for this list. Each fix carries a test that fails without it, excep
 | F34 | **Fixed (new)** | See §0a |
 | F35 | **Fixed (new)** | See §0a |
 | F36 | **Fixed (new)** — seeder daemon and gateway | See §0b |
-| F37 | **Open (new) — latent: no production path fetches upstream yet** | See §0b |
+| F37 | **Fixed** (`stage-3/upstream-credit`) | `Gateway.readUpstreamBlob` fetches upstream blocks on a shared `CreditPool` settled by ACKs (`CreditSettler`); the full-speed swarm test stays inside the window, and fails with pacing disabled (ADR 0011 §11) |
 | F38 | **Fixed (new)** | See §0b |
 | F39 | **Fixed (new)** — desktop signer lane | See §0c |
 | F30 | **Fixed** | `UpstreamPayer` keeps the carry per channel, commits it on `ACK ok`, one PAY per core in flight |
@@ -593,9 +593,9 @@ finding's section above plus its row in §0. **Filing waits for Cameron's go-ahe
 | Issue title |
 |---|
 | [Medium] F33: duplicate block deliveries — cap at the quoted price or single-peer ranges (decision) |
-| [High] F5: explicit minPaySats batching tied to the credit pool — with F37 (DLEQ off the event loop: done for Node, ADR 0011 §10) |
+| [Done] F5: DLEQ off the event loop (Node) and batching on the credit pool (ADR 0011 §10–§11). Residual [Low]: DLEQ in the desktop's Bare worker; a credit pool sized per seeder window |
 | [Medium] Seeder: the pending-PAY queue is unbounded while a mint is down, and `pending.json` is rewritten whole per change (quadratic) — an append-only journal plus an engine cap on queued PAYs (docs/reviews/2026-09-24-pre-push-seeder-runtime.md) |
-| [High, before upstream fetching is wired] F37: pace the gateway's upstream fetches — credit pool + ACK settlement in the shared `UpstreamPayer` |
+| [Done] F37: the gateway's upstream fetches are paced (ADR 0011 §11) |
 | [Done] F10/F11/F12/F31 hooks in the desktop runtime — the worker's seeder engine persists seen secrets and pending PAYs and asks the host for `checkSpent` / `spentByUs` (ADR 0012) |
 | [Medium] F31: NUT-13 deterministic outputs + NUT-09 restore |
 | [Medium] F15: per-pubkey upload quota |

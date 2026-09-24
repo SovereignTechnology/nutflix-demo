@@ -7,7 +7,7 @@
  * engine VERIFIES and ACKs every `PAY` the gateway built — with `range.core` set on all
  * of them (contracts v3, ADR 0004).
  */
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { mocks } from '@sovit/core';
 import type { CoreKeyHex, PayMessage, PricePolicy, Sats } from '@sovit/core';
@@ -42,7 +42,10 @@ const NOISE = 'ee'.repeat(32);
 /** The manifest price of CORE_A / CORE_B in the unit rig (the seeder's HELLO asks 3). */
 const MANIFEST_PRICE = 5;
 
-function unit(payEveryBlocks = 2, opts: { policy?: PricePolicy | null; autoAck?: boolean } = {}) {
+function unit(
+  payEveryBlocks = 2,
+  opts: { policy?: PricePolicy | null; autoAck?: boolean; tailMs?: number } = {},
+) {
   const engine = new mocks.MockPaymentEngine({ mode: 'honest' });
   const log = capturedLogger();
   const perCore = new Map<CoreKeyHex, PricePolicy>([
@@ -53,6 +56,7 @@ function unit(payEveryBlocks = 2, opts: { policy?: PricePolicy | null; autoAck?:
     engine,
     logger: log.logger,
     payEveryBlocks,
+    ...(opts.tailMs === undefined ? {} : { tailMs: opts.tailMs }),
     ownMints: [MINT_A, MINT_B],
     policyFor:
       opts.policy === null
@@ -68,6 +72,41 @@ function unit(payEveryBlocks = 2, opts: { policy?: PricePolicy | null; autoAck?:
 
 const hello = () =>
   helloFrom(UP_PUBKEY, { acceptedMints: [MINT_B, MINT_A], satsPerBlock: 3 as Sats, p2pk: UP_P2PK });
+
+describe('UpstreamPayer — the short tail (F5 batching)', () => {
+  it('a run shorter than a batch is paid once the peer has been quiet for tailMs', async () => {
+    vi.useFakeTimers();
+    try {
+      const { payer, protocol } = unit(4, { tailMs: 2000 });
+      protocol.remoteHello(hello());
+      payer.onDownload(CORE_A, 0, NOISE);
+      payer.onDownload(CORE_A, 1, NOISE);
+      await vi.advanceTimersByTimeAsync(1500);
+      payer.onDownload(CORE_A, 2, NOISE); // resets the quiet period
+      await vi.advanceTimersByTimeAsync(1500);
+      expect(protocol.sentPays).toHaveLength(0);
+      await vi.advanceTimersByTimeAsync(600);
+      expect(protocol.sentPays.map((p) => [p.range.fromBlock, p.range.toBlock])).toEqual([[0, 2]]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('tailMs 0 leaves a short tail for flush()', async () => {
+    vi.useFakeTimers();
+    try {
+      const { payer, protocol } = unit(4, { tailMs: 0 });
+      protocol.remoteHello(hello());
+      payer.onDownload(CORE_A, 0, NOISE);
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(protocol.sentPays).toHaveLength(0);
+      await payer.flush();
+      expect(protocol.sentPays).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
 
 describe('UpstreamPayer (unit)', () => {
   it('pays every N contiguous verified blocks with range.core set, at the seeder’s price (≤ the manifest’s), to the HELLO pubkey/p2pk/common mint', async () => {

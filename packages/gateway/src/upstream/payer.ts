@@ -43,6 +43,8 @@ import type Hypercore from 'hypercore';
 import type { Logger } from '@sovit/seeder';
 import { toHex } from '@sovit/seeder';
 
+import type { CreditPool } from './credit.js';
+
 /** Policy to pay `core` blocks from this peer under; `null` = do not pay (log + skip). */
 export type UpstreamPolicyResolver = (
   core: CoreKeyHex,
@@ -50,10 +52,27 @@ export type UpstreamPolicyResolver = (
   peer: string,
 ) => PricePolicy | null;
 
+/** How long a short tail waits for more blocks before it is paid anyway. */
+export const DEFAULT_TAIL_MS = 2000;
+
 export interface UpstreamPayerOptions {
   readonly engine: PaymentEngineViewer;
   readonly logger: Logger;
+  /** The shortest run paid on its own (without `credit`, the batch size). */
   readonly payEveryBlocks: number;
+  /**
+   * The downloader's `CreditPool` (security review F5 batching, F37). Given, PAYs batch to half
+   * the pool (`max(payEveryBlocks, ⌊limit / 2⌋)` blocks per peer) — fewer PAYs, fewer DLEQ checks
+   * at the seeder — and the moment the pool is under pressure (full, or an acquirer waiting)
+   * every pending block is paid, so batching can never stall a download that needs credit.
+   */
+  readonly credit?: Pick<CreditPool, 'limit' | 'pressured' | 'onPressure'>;
+  /**
+   * A run shorter than a batch is paid once this many ms pass without a new block from that peer
+   * (default `DEFAULT_TAIL_MS`): the end of a video is not left unpaid until the session closes
+   * (a crash meanwhile would never pay it). `0` = only at `flush()`.
+   */
+  readonly tailMs?: number;
   /** Mints the gateway can pay with; the first one the seeder also accepts is used. */
   readonly ownMints: readonly MintUrl[];
   readonly policyFor: UpstreamPolicyResolver;
@@ -87,6 +106,8 @@ interface PeerState {
   readonly inflight: Map<CoreKeyHex, InFlight>;
   /** `flush()` is draining: runs unlocked by an ACK are paid however short. */
   draining: boolean;
+  /** Pays the short tail after `tailMs` without a new block (reset per block). */
+  tailTimer: ReturnType<typeof setTimeout> | null;
   chain: Promise<void>;
   closed: boolean;
 }
@@ -129,6 +150,9 @@ export class UpstreamPayer {
   private readonly payEvery: number;
   private readonly ownMints: readonly MintUrl[];
   private readonly policyFor: UpstreamPolicyResolver;
+  private readonly credit: UpstreamPayerOptions['credit'];
+  private readonly tailMs: number;
+  private readonly offPressure: () => void;
   private readonly peers = new Map<string, PeerState>();
   private readonly counters = {
     pays: 0,
@@ -145,6 +169,27 @@ export class UpstreamPayer {
     this.payEvery = Math.max(1, o.payEveryBlocks);
     this.ownMints = o.ownMints;
     this.policyFor = o.policyFor;
+    this.credit = o.credit;
+    this.tailMs = o.tailMs ?? DEFAULT_TAIL_MS;
+    // Pressure: pay whatever is held so the pool can refill.
+    this.offPressure =
+      o.credit?.onPressure(() => {
+        for (const s of this.peers.values()) this.schedule(s, s.draining);
+      }) ?? ((): void => undefined);
+  }
+
+  /** Stop listening to the credit pool (the payer is being discarded). */
+  dispose(): void {
+    this.offPressure();
+    for (const s of this.peers.values()) this.clearTail(s);
+  }
+
+  /** Blocks per PAY right now: `payEveryBlocks`, or with a pool half of it — 1 under pressure. */
+  private batchBlocks(): number {
+    const c = this.credit;
+    if (c === undefined) return this.payEvery;
+    if (c.pressured) return 1;
+    return Math.max(this.payEvery, Math.floor(c.limit / 2));
   }
 
   stats(): UpstreamPayerStats {
@@ -163,6 +208,7 @@ export class UpstreamPayer {
       carry: new Map(),
       inflight: new Map(),
       draining: false,
+      tailTimer: null,
       chain: Promise.resolve(),
       closed: false,
     };
@@ -215,6 +261,7 @@ export class UpstreamPayer {
     ];
     return () => {
       state.closed = true;
+      this.clearTail(state);
       for (const off of offs) off();
       if (this.peers.get(noiseHex) === state) this.peers.delete(noiseHex);
     };
@@ -248,6 +295,25 @@ export class UpstreamPayer {
     }
     set.add(index);
     if (set.size >= this.payEvery) this.schedule(state, false);
+    this.armTail(state);
+  }
+
+  /** (Re)start the peer's tail timer: a quiet peer's short runs get paid. */
+  private armTail(state: PeerState): void {
+    const ms = this.tailMs;
+    if (ms <= 0) return;
+    this.clearTail(state);
+    const t = setTimeout(() => {
+      state.tailTimer = null;
+      if (!state.closed) this.schedule(state, true);
+    }, ms);
+    (t as { unref?: () => void }).unref?.();
+    state.tailTimer = t;
+  }
+
+  private clearTail(state: PeerState): void {
+    if (state.tailTimer !== null) clearTimeout(state.tailTimer);
+    state.tailTimer = null;
   }
 
   /**
@@ -285,12 +351,16 @@ export class UpstreamPayer {
   private async payPending(state: PeerState, force: boolean): Promise<void> {
     if (state.closed || state.hello === null) return;
     const hello = state.hello;
+    const batch = this.batchBlocks();
+    // The seeder's window counts this peer's blocks across cores: once the peer's pending total
+    // reaches a batch, its runs are paid however short (per-core runs could otherwise each wait).
+    let peerPending = 0;
+    for (const set of state.pending.values()) peerPending += set.size;
+    const due = force || (this.credit !== undefined && peerPending >= batch);
     for (const [core, set] of state.pending) {
       if (set.size === 0 || state.inflight.has(core)) continue;
       const sorted = [...set].sort((a, b) => a - b);
-      const run = contiguousRuns(sorted).find(
-        ([from, to]) => force || to - from + 1 >= this.payEvery,
-      );
+      const run = contiguousRuns(sorted).find(([from, to]) => due || to - from + 1 >= batch);
       if (run === undefined) continue;
       // One PAY per core in flight: the first price segment of the first payable run now, the
       // rest when its ACK arrives.
@@ -396,3 +466,5 @@ export function manifestPolicyResolver(
 ): UpstreamPolicyResolver {
   return (core) => perCore().get(core) ?? null;
 }
+export { CreditCancelled, CreditPool, type CreditWaiter } from './credit.js';
+export { CreditSettler, type CreditSettlerOptions, type CreditSettlerStats } from './settle.js';
