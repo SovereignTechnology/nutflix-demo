@@ -59,7 +59,7 @@ directories" for this list. Each fix carries a test that fails without it, excep
 | F38 | **Fixed (new)** | See §0b |
 | F39 | **Fixed (new)** — desktop signer lane | See §0c |
 | F30 | **Fixed** | `UpstreamPayer` keeps the carry per channel, commits it on `ACK ok`, one PAY per core in flight |
-| F31 | **Fixed (engine)**; wired in the seeder daemon | `spentByUs` dep: a "spent" answer to a RETRIED redeem whose witness is our own signature is our lost swap — no ban, creator still paid. A first attempt answered "spent" is a double-spend even with our witness (a set we redeemed before a restart carries it too — found by the real-mint lane); the attempt is persisted before it is made. Open: NUT-13 deterministic outputs to recover the swapped proofs |
+| F31 | **Fixed** (`stage-3/wallet-journal`, ADR 0014) | `spentByUs` dep: a "spent" answer to a RETRIED redeem whose witness is our own signature is our lost swap — no ban, creator still paid. A first attempt answered "spent" is a double-spend even with our witness (a set we redeemed before a restart carries it too — found by the real-mint lane); the attempt is persisted before it is made. The swapped proofs are now recovered too: a send / receive / mint journals its outputs in the store before the request, and a lost answer is restored with NUT-09 (instead of NUT-13 deterministic secrets — ADR 0014 says why). Verified on Nutshell 0.21.0 and cdk-mintd 0.18.1. Residual: the desktop's journal is in memory (a crash mid-recovery), melt change is not journaled |
 
 ## 0a. Found by the real-mint lane (2026-09-24, `stage-3/real-mint`)
 
@@ -566,7 +566,8 @@ hash-addressed images).
 - **Payment engine.** Pay-after-verify, exact amounts, both sets P2PK-checked
   (`checkPayLock`: no locktime/refund/extra keys), DLEQ offline against the cached keyset
   (forged → ban), window accounting on distinct blocks, local double-spend check at verify, ban
-  on a mint-reported double-spend. Residual: F5, F6, F9, F10, F11, F12, F27, F30 (consumer), F31, F32.
+  on a mint-reported double-spend. Residual: F5, F6, F9, F10, F11, F12, F27, F30 (consumer), F32.
+  (F31 fixed: a lost mint answer is restored by NUT-09 from a write-ahead journal, ADR 0014.)
 - **pay/1.** Strict codec (exact consumption, caps on every length), and the HELLO is bound to
   the Noise handshake hash and sender key. PAY/ACK/PRICE are delivered as they arrive, even
   before the HELLO, on purpose (ADR 0004 d: a PAY may race its sender's HELLO). The seeder
@@ -597,7 +598,7 @@ finding's section above plus its row in §0. **Filing waits for Cameron's go-ahe
 | [Done] Seeder: an append-only pending-PAY journal and a cap that stops serving at `maxPendingPays` (daemon + gateway, ADR 0011 §12). Residual [Low]: the desktop worker's queue (one user) is still snapshotted whole, uncapped |
 | [Done] F37: the gateway's upstream fetches are paced (ADR 0011 §11) |
 | [Done] F10/F11/F12/F31 hooks in the desktop runtime — the worker's seeder engine persists seen secrets and pending PAYs and asks the host for `checkSpent` / `spentByUs` (ADR 0012) |
-| [Medium] F31: NUT-13 deterministic outputs + NUT-09 restore |
+| [Done] F31: a lost mint answer is restored (write-ahead journal + NUT-09, ADR 0014 — not NUT-13). Residual [Low]: the desktop's journal is in memory; melt change is not journaled. Open (decision): NUT-13 seed backup |
 | [Done] F15: per-pubkey upload quota (`blossom.maxBytesPerPubkey`) |
 | [Done] F17: NUT-20 locked mint quotes; opaque quote handles over IPC. Residual [Low]: a signer-held wallet key (the seeder daemon) takes unlocked quotes — cashu-ts signs NUT-20 itself and needs the key as a string |
 | [Medium] F4: execute auto top-ups with per-top-up and per-day caps |

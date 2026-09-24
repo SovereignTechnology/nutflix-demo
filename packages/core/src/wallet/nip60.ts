@@ -29,7 +29,7 @@ import type {
 } from '../contracts/index.js';
 import { NostrKind } from '../contracts/index.js';
 import { verifyIncoming } from '../nostr/event.js';
-import type { ProofStore, WalletTx } from './store.js';
+import type { PendingOp, ProofStore, WalletTx } from './store.js';
 
 /** The two relay operations this store needs (the host's relay pool implements them). */
 export interface Nip60Relays {
@@ -74,6 +74,12 @@ export class Nip60ProofStore implements ProofStore {
   private readonly tokens = new Map<NostrEventId, TokenEvent>();
   private readonly hist: WalletHistoryEntry[] = [];
   private readonly outbox: NostrEvent[] = [];
+  /**
+   * The journal (ADR 0014), in memory: NIP-60 has no event for it, and a relay round trip before
+   * every payment is too slow. It recovers a lost mint answer within this session; a crash in
+   * between loses the operation's outputs, as it did before the journal.
+   */
+  private readonly ops = new Map<string, PendingOp>();
 
   private constructor(
     private readonly signer: Signer,
@@ -213,7 +219,27 @@ export class Nip60ProofStore implements ProofStore {
   }
 
   mints(): Promise<readonly MintUrl[]> {
-    return Promise.resolve([...new Set([...this.tokens.values()].map((t) => t.mint))]);
+    return Promise.resolve([
+      ...new Set([
+        ...[...this.tokens.values()].map((t) => t.mint),
+        ...[...this.ops.values()].map((o) => o.mint),
+      ]),
+    ]);
+  }
+
+  pending(mint: MintUrl): Promise<readonly PendingOp[]> {
+    return Promise.resolve(
+      [...this.ops.values()]
+        .filter((o) => o.mint === mint)
+        .map((o) => JSON.parse(JSON.stringify(o)) as PendingOp),
+    );
+  }
+
+  /** Apply a transition's journal half (in memory). */
+  private journal(tx: WalletTx): void {
+    for (const id of tx.settle ?? []) this.ops.delete(id);
+    if (tx.begin !== undefined)
+      this.ops.set(tx.begin.id, JSON.parse(JSON.stringify(tx.begin)) as PendingOp);
   }
 
   proofs(mint: MintUrl): Promise<readonly CashuProof[]> {
@@ -229,6 +255,11 @@ export class Nip60ProofStore implements ProofStore {
   }
 
   async commit(tx: WalletTx): Promise<WalletHistoryEntry | null> {
+    // Journal only: nothing for the relays.
+    if (tx.spent.length === 0 && tx.added.length === 0 && tx.history === undefined) {
+      this.journal(tx);
+      return null;
+    }
     const spent = new Set(tx.spent.map((p) => p.secret));
     const affected = [...this.tokens.values()].filter(
       (t) => t.mint === tx.mint && t.proofs.some((p) => spent.has(p.secret)),
@@ -303,6 +334,7 @@ export class Nip60ProofStore implements ProofStore {
     }
 
     // Local state first: this process never forgets proofs it holds.
+    this.journal(tx);
     for (const t of affected) this.tokens.delete(t.id);
     if (created !== undefined)
       this.tokens.set(created, { id: created, mint: tx.mint, proofs: [...keep.values()] });

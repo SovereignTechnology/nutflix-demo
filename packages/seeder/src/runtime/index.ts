@@ -260,6 +260,16 @@ export async function createNodeRuntime(o: NodeRuntimeOptions): Promise<SeederRu
       key: walletMod.signerWalletKey(identity.signer, identity.p2pk),
       configuredMints: o.acceptedMints,
     });
+    // ADR 0014: an operation whose mint answer was lost before a crash is restored now (in the
+    // background: every operation at a mint settles its journal first anyway).
+    void wallet.recoverPending().then(
+      ({ recovered, left }) => {
+        if (recovered > 0)
+          log.info('wallet: restored operations whose mint answer was lost', { recovered });
+        if (left > 0) log.warn('wallet: operations still unresolved at their mint', { left });
+      },
+      () => undefined,
+    );
 
     const seenLog = new SeenLog(join(walletDir, 'seen.jsonl'), SEEN_CAPACITY, (err) => {
       log.error('seen-secrets append failed (a cache: replays are still caught at the mint)', {

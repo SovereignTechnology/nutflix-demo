@@ -73,6 +73,8 @@ export interface TestMintOptions {
    * cashu-ts does with older mints — the amended form is exercised against real mints.
    */
   readonly nut20?: boolean;
+  /** NUT-09 restore (default on, like Nutshell and cdk): signatures are remembered by `B_`. */
+  readonly nut09?: boolean;
 }
 
 interface Quote {
@@ -96,6 +98,9 @@ export class TestMint {
   private readonly inputFeePpk: number;
   private readonly feeReserve: number;
   private readonly nut20: boolean;
+  private readonly nut09: boolean;
+  /** B_ → the signature the mint gave it (NUT-09 restore; an output is never signed twice). */
+  private readonly promises = new Map<string, SerializedBlindedSignature>();
   /** hex(Y) of every spent proof. */
   private readonly spent = new Set<string>();
   /** hex(Y) → the witness the proof was spent with (NUT-07 returns it). */
@@ -113,6 +118,7 @@ export class TestMint {
     this.inputFeePpk = o.inputFeePpk ?? 0;
     this.feeReserve = o.feeReserve ?? 0;
     this.nut20 = o.nut20 ?? true;
+    this.nut09 = o.nut09 ?? true;
     const pair = createNewMintKeys(16, o.seed, { unit: 'sat', input_fee_ppk: this.inputFeePpk });
     this.keysetId = pair.keysetId;
     this.pub = pair.pubKeys;
@@ -247,6 +253,7 @@ export class TestMint {
     if (method === 'GET' && path.startsWith('/v1/melt/quote/bolt11/'))
       return this.meltQuoteState(path.slice('/v1/melt/quote/bolt11/'.length));
     if (method === 'POST' && path === '/v1/melt/bolt11') return this.meltBolt11(body);
+    if (method === 'POST' && path === '/v1/restore' && this.nut09) return this.restore(body);
     throw new MintOperationError(404, `test mint: no route ${method} ${path}`);
   }
 
@@ -265,6 +272,7 @@ export class TestMint {
         '10': { supported: true },
         '11': { supported: true },
         '12': { supported: true },
+        ...(this.nut09 ? { '9': { supported: true } } : {}),
         ...(this.nut20 ? { '20': { supported: true } } : {}),
       },
     };
@@ -349,6 +357,8 @@ export class TestMint {
       if (raw.id !== this.keysetId) throw new MintOperationError(12001, 'Keyset is not known');
       if (!priv) throw new MintOperationError(11005, 'amount has no key');
       if (seen.has(raw.B_)) throw new MintOperationError(10002, 'duplicate output');
+      if (this.promises.has(raw.B_))
+        throw new MintOperationError(10002, 'Blinded message of output already signed');
       seen.add(raw.B_);
       const B_ = pointFromHex(raw.B_);
       const sig = createBlindSignature(B_, priv, this.keysetId);
@@ -378,7 +388,34 @@ export class TestMint {
       throw new MintOperationError(11002, 'Transaction is not balanced');
     const { signatures } = this.sign(outputs);
     this.spend(inputs);
+    this.remember(outputs as SerializedBlindedMessage[], signatures);
     return { signatures };
+  }
+
+  /** Keep what was signed, once the operation that signed it has committed. */
+  private remember(
+    outputs: readonly SerializedBlindedMessage[],
+    signatures: readonly SerializedBlindedSignature[],
+  ): void {
+    outputs.forEach((o, i) => {
+      const sig = signatures[i];
+      if (sig !== undefined) this.promises.set(o.B_, sig);
+    });
+  }
+
+  /** NUT-09: the signatures of those `outputs` this mint has signed (the others are left out). */
+  private restore(body: Record<string, unknown>): unknown {
+    const outputs = body['outputs'];
+    if (!Array.isArray(outputs)) throw new MintOperationError(11002, 'outputs must be a list');
+    const outs: SerializedBlindedMessage[] = [];
+    const signatures: SerializedBlindedSignature[] = [];
+    for (const o of outputs as SerializedBlindedMessage[]) {
+      const sig = this.promises.get(o.B_);
+      if (sig === undefined) continue;
+      outs.push(o);
+      signatures.push(sig);
+    }
+    return { outputs: outs, signatures };
   }
 
   private checkState(body: Record<string, unknown>): unknown {
@@ -456,6 +493,7 @@ export class TestMint {
     }
     const { signatures } = this.sign(outputs);
     q.state = 'ISSUED';
+    this.remember(outputs as SerializedBlindedMessage[], signatures);
     return { signatures };
   }
 
@@ -505,7 +543,10 @@ export class TestMint {
     for (const a of denominations(refund).reverse()) {
       const slot = blanks[change.length];
       if (slot === undefined || left <= 0) break;
-      change.push(...this.sign([{ ...slot, amount: a as unknown as Amount }]).signatures);
+      const out = { ...slot, amount: a as unknown as Amount };
+      const signed = this.sign([out]).signatures;
+      this.remember([out], signed);
+      change.push(...signed);
       left -= a;
     }
     return this.meltQuoteState(quote, change);

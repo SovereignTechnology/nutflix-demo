@@ -145,6 +145,76 @@ describe.skipIf(MINT_URL === undefined)(
       expect(await w.balance(mint)).toBe(16);
     });
 
+    it('F31 (ADR 0014): answers lost after the mint executed — the top-up is minted, the send completes, the receive is restored (NUT-09)', async () => {
+      const info = (await (await fetch(`${mint}/v1/info`)).json()) as {
+        nuts: Record<string, { supported?: boolean }>;
+      };
+      expect(info.nuts['9']?.supported, 'NUT-09').toBe(true);
+      /** Real HTTP that runs the request, then loses the answer to the next POST on `drop`. */
+      let drop: string | null = null;
+      const http: RawHttp = async (req) => {
+        const res = await fetch(req.url, {
+          method: req.method,
+          headers: req.headers,
+          ...(req.body === undefined ? {} : { body: req.body }),
+        });
+        const body = await res.text();
+        if (drop !== null && req.method === 'POST' && req.url.endsWith(drop)) {
+          drop = null;
+          throw new Error('socket hang up');
+        }
+        const headers: Record<string, string> = {};
+        res.headers.forEach((v, k) => {
+          headers[k] = v;
+        });
+        return { status: res.status, headers, body };
+      };
+      const lossyWallet = (key: Uint8Array): { w: CashuWallet; store: MemoryProofStore } => {
+        const store = new MemoryProofStore();
+        return {
+          store,
+          w: new CashuWallet({
+            mints: new CashuMintConnections({ request: () => cashuRequestFn(http) }),
+            store,
+            key: memoryWalletKey(key),
+          }),
+        };
+      };
+      const a = lossyWallet(keyOf(0x51).sk);
+      const q = await a.w.mintQuote(mint, 32 as Sats);
+      for (let i = 0; i < 50; i++) {
+        const st = (await (await fetch(`${mint}/v1/mint/quote/bolt11/${q.quoteId}`)).json()) as {
+          state: string;
+        };
+        if (st.state === 'PAID') break;
+        await new Promise((r) => setTimeout(r, 100));
+      }
+      drop = '/v1/mint/bolt11';
+      expect(await a.w.pollQuote(q)).toEqual({ state: 'ISSUED', minted: 32 });
+      expect(drop).toBeNull(); // the answer really was lost
+      expect(await a.w.balance(mint)).toBe(32);
+
+      const b = keyOf(0x52);
+      drop = '/v1/swap';
+      const set = await a.w.send(5 as Sats, { p2pk: b.pub, mint });
+      expect(drop).toBeNull();
+      expect(total(set)).toBe(5);
+      const [sent] = await a.w.history({ limit: 1 });
+      expect(await a.w.balance(mint)).toBe(32 - (sent?.amount ?? 0));
+
+      const bob = lossyWallet(b.sk);
+      drop = '/v1/swap';
+      expect(await bob.w.receive(set)).toBe(5 - (await inputFee(mint, set.proofs.length)));
+      expect(drop).toBeNull();
+      expect(await a.store.pending(mint)).toEqual([]);
+      expect(await bob.store.pending(mint)).toEqual([]);
+      // Nothing was double-counted: bob's proofs are unspent at the mint, the set is spent.
+      expect(await bob.w.checkSpent({ mint, proofs: await bob.store.proofs(mint) })).not.toContain(
+        true,
+      );
+      expect(await bob.w.checkSpent(set)).not.toContain(false);
+    });
+
     it('F6: a pay1-tagged creator set is redeemable by the creator — the mint accepts the NUT-10 tag — and still enforces the lock', async () => {
       const viewer = wallet();
       await fund(viewer, mint, 64);

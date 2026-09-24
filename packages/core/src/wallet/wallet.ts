@@ -124,6 +124,7 @@ export class CashuWallet implements Wallet {
       mints: o.mints,
       store: o.store,
       ...(o.key ? { key: o.key } : {}),
+      ...(o.now ? { now: o.now } : {}),
     });
     this.now = o.now ?? ((): UnixSeconds => Math.floor(Date.now() / 1000) as UnixSeconds);
   }
@@ -183,8 +184,13 @@ export class CashuWallet implements Wallet {
     const q = await w.checkMintQuoteBolt11(quote.quoteId);
     if (q.state === 'UNPAID') return { state: 'UNPAID' };
     if (q.state === 'ISSUED') {
+      // ADR 0014: issued by a mint request of ours whose answer was lost — restored, not gone.
+      const minted = await this.spender.recoverMint(quote);
       this.pending.delete(quote.quoteId);
-      return { state: 'ISSUED' };
+      if (minted === null) return { state: 'ISSUED' };
+      this.emit({ type: 'quote', quote: { ...quote, state: 'ISSUED' } });
+      await this.emitBalance(quote.mint);
+      return { state: 'ISSUED', minted };
     }
     const minted = await this.spender.mint(quote, q.pubkey !== undefined ? q : undefined);
     this.pending.delete(quote.quoteId);
@@ -236,6 +242,28 @@ export class CashuWallet implements Wallet {
     readonly proofs: readonly CashuProof[];
   }): Promise<boolean> {
     return this.spender.spentByUs(set);
+  }
+
+  /**
+   * ADR 0014: settle the journal at every mint this wallet holds proofs or journaled operations
+   * at — recover what a mint signed for an operation whose answer was lost. Run once at startup.
+   * A mint that cannot be asked keeps its journal for the next operation there. Returns counts
+   * of operations recovered and still journaled.
+   */
+  async recoverPending(): Promise<{ recovered: number; left: number }> {
+    let recovered = 0;
+    let left = 0;
+    for (const mint of await this.o.store.mints()) {
+      try {
+        const r = await this.spender.recover(mint);
+        recovered += r.recovered;
+        left += r.left;
+        if (r.recovered > 0) await this.emitBalance(mint);
+      } catch {
+        // unreachable now; every operation at this mint settles it first
+      }
+    }
+    return { recovered, left };
   }
 
   async meltQuote(mint: MintUrl, bolt11: string): Promise<MeltQuote> {

@@ -4,6 +4,7 @@
  */
 export type { Wallet, WalletHistoryEntry, WalletChangeEvent } from '../contracts/wallet.js';
 export {
+  PENDING_SETTLE_AFTER_S,
   Spender,
   WalletError,
   fromCashu,
@@ -13,7 +14,14 @@ export {
   type WalletErrorCode,
   type WalletKey,
 } from './spend.js';
-export { MemoryProofStore, proofTotal, type ProofStore, type WalletTx } from './store.js';
+export {
+  MemoryProofStore,
+  proofTotal,
+  type PendingOp,
+  type PendingOutput,
+  type ProofStore,
+  type WalletTx,
+} from './store.js';
 export { Nip60ProofStore, type Nip60Relays } from './nip60.js';
 export { guardedKeyset, type KeysetGuardOptions } from './keyset-guard.js';
 export {

@@ -13,7 +13,7 @@
  *     redeeming its nutzap): the model had no wallet.
  */
 import { describe, expect, it, vi } from 'vitest';
-import { getPubKeyFromPrivKey } from '@cashu/cashu-ts';
+import { getPubKeyFromPrivKey, type RequestFn } from '@cashu/cashu-ts';
 
 import type {
   CashuP2pkPubkey,
@@ -639,12 +639,16 @@ describe('real engine — flush robustness (security review F11, F12, F31)', () 
       nutzap?: (set: LockedProofSet) => Promise<void>;
       feePpk?: number;
       onRedeem?: (n: number) => void;
+      /** NUT-09 at the mint (default on): the seeder's wallet journals its redeems (ADR 0014). */
+      nut09?: boolean;
+      wrap?: (r: RequestFn) => RequestFn;
     } = {},
   ) {
     const mint = new TestMint({
       url: MINT,
       seed: new Uint8Array(32).fill(41),
       inputFeePpk: deps.feePpk ?? 0,
+      ...(deps.nut09 === undefined ? {} : { nut09: deps.nut09 }),
     });
     const conns = (): CashuMintConnections =>
       new CashuMintConnections({ request: () => mint.request });
@@ -654,8 +658,9 @@ describe('real engine — flush robustness (security review F11, F12, F31)', () 
     const q = await viewerWallet.mintQuote(MINT, sats(200));
     mint.payQuote(q.quoteId);
     await viewerWallet.pollQuote(q);
+    const wrap = deps.wrap ?? ((r: RequestFn) => r);
     const seederWallet = new CashuWallet({
-      mints: conns(),
+      mints: new CashuMintConnections({ request: () => wrap(mint.request) }),
       store: new MemoryProofStore(),
       key: memoryWalletKey(seederKey.sk),
     });
@@ -728,8 +733,11 @@ describe('real engine — flush robustness (security review F11, F12, F31)', () 
     return { mint, seeder, seederWallet, seederDeps, msg, policy, zaps, otherViewer };
   }
 
+  // These three run on a mint without NUT-09: no journal, so the lost redeem's proofs are gone
+  // and `spentByUs` is what keeps the viewer from a false ban. With NUT-09 the redeem is recovered
+  // outright (ADR 0014): see "F31 with NUT-09".
   it('F31: a redeem whose response was lost is recognised as OUR spend — no ban, the creator is still paid', async () => {
-    const w = await world({ own: true });
+    const w = await world({ own: true, nut09: false });
     w.mint.dropNextResponse();
     expect(await w.seeder.flush()).toEqual({ swapped: 0, nutzapped: 0, failed: 0 }); // ambiguous: kept
     expect(w.seeder.pendingCount()).toBe(1);
@@ -740,17 +748,83 @@ describe('real engine — flush robustness (security review F11, F12, F31)', () 
   });
 
   it('F31: without the check (or when someone else spent it) the same "spent" is a double-spend ban', async () => {
-    const w = await world({ own: true });
+    const w = await world({ own: true, nut09: false });
     // Someone else — the viewer, elsewhere — spent the seeder set first: no witness of ours.
     w.mint.markSpent(w.msg.seederProofs.proofs);
     expect(await w.seeder.flush()).toMatchObject({ failed: 1 });
     expect(w.seeder.isBanned(VIEWER)).toBe(true);
     expect(w.zaps).toHaveLength(0);
-    const legacy = await world();
+    const legacy = await world({ nut09: false });
     legacy.mint.dropNextResponse();
     await legacy.seeder.flush();
     expect(await legacy.seeder.flush()).toMatchObject({ failed: 1 });
     expect(legacy.seeder.isBanned(VIEWER)).toBe(true);
+  });
+
+  // Security review F31's test, with NUT-09 (ADR 0014): the seeder's wallet journals the redeem
+  // and restores what the mint signed — the viewer is not banned, the creator is paid, and the
+  // seeder keeps its earnings.
+  it('F31 with NUT-09: a lost redeem answer is recovered at once — swapped, creator nutzapped, no ban, balance restored', async () => {
+    const w = await world({ own: true });
+    w.mint.dropNextResponse();
+    expect(await w.seeder.flush()).toEqual({ swapped: 12, nutzapped: 8, failed: 0 });
+    expect(w.seeder.isBanned(VIEWER)).toBe(false);
+    expect(w.zaps).toHaveLength(1);
+    expect(await w.seederWallet.balance(MINT)).toBe(12);
+  });
+
+  it('F31 + F12 with NUT-09: a crash before the lost answer was recovered — the restarted engine recovers it', async () => {
+    const snapshots: (readonly PendingPay[])[] = [];
+    let restoreDown = 1;
+    const w = await world({
+      own: true,
+      persist: (items) => snapshots.push(items),
+      wrap:
+        (inner) =>
+        <T>(args: Parameters<RequestFn>[0]): Promise<T> => {
+          if (args.endpoint.endsWith('/v1/restore') && restoreDown > 0) {
+            restoreDown--;
+            return Promise.reject(new Error('connect ETIMEDOUT'));
+          }
+          return inner<T>(args);
+        },
+    });
+    w.mint.dropNextResponse();
+    expect(await w.seeder.flush()).toMatchObject({ swapped: 0, failed: 0 }); // kept, journaled
+    const last = snapshots.at(-1)!;
+    expect(last[0]).toMatchObject({ stage: 'redeem', redeemTried: true });
+    const after = new RealPaymentEngine({ ...w.seederDeps, seen: new SeenSecrets() });
+    after.restorePending(last);
+    expect(await after.flush()).toEqual({ swapped: 12, nutzapped: 8, failed: 0 });
+    expect(after.isBanned(VIEWER)).toBe(false);
+    expect(await w.seederWallet.balance(MINT)).toBe(12);
+  });
+
+  it('F31 + F12 with NUT-09, the daemon’s startup order: the journal sweep recovers first, the retried redeem is then read as our own spend', async () => {
+    const snapshots: (readonly PendingPay[])[] = [];
+    let restoreDown = 1;
+    const w = await world({
+      own: true,
+      persist: (items) => snapshots.push(items),
+      wrap:
+        (inner) =>
+        <T>(args: Parameters<RequestFn>[0]): Promise<T> => {
+          if (args.endpoint.endsWith('/v1/restore') && restoreDown > 0) {
+            restoreDown--;
+            return Promise.reject(new Error('connect ETIMEDOUT'));
+          }
+          return inner<T>(args);
+        },
+    });
+    w.mint.dropNextResponse();
+    await w.seeder.flush();
+    expect(await w.seederWallet.recoverPending()).toEqual({ recovered: 1, left: 0 });
+    expect(await w.seederWallet.balance(MINT)).toBe(12);
+    const after = new RealPaymentEngine({ ...w.seederDeps, seen: new SeenSecrets() });
+    after.restorePending(snapshots.at(-1)!);
+    expect(await after.flush()).toEqual({ swapped: 12, nutzapped: 8, failed: 0 });
+    expect(after.isBanned(VIEWER)).toBe(false);
+    expect(await w.seederWallet.balance(MINT)).toBe(12); // counted once
   });
 
   // Found while planning the real-mint lane: a set we redeemed BEFORE a restart that lost the
@@ -770,7 +844,11 @@ describe('real engine — flush robustness (security review F11, F12, F31)', () 
 
   it('F31 + F12: a crash right after the redeem was sent restores as "tried", and the retry reads our own spend correctly', async () => {
     const snapshots: (readonly PendingPay[])[] = [];
-    const w = await world({ own: true, persist: (items) => snapshots.push(items) });
+    const w = await world({
+      own: true,
+      nut09: false,
+      persist: (items) => snapshots.push(items),
+    });
     w.mint.dropNextResponse();
     await w.seeder.flush(); // the swap happened at the mint; we never heard back
     const last = snapshots.at(-1)!;

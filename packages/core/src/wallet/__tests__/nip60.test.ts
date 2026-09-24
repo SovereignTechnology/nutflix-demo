@@ -6,11 +6,19 @@
  */
 import { describe, expect, it } from 'vitest';
 
-import type { CashuProof, MintUrl, NostrEvent, NostrFilter, Sats } from '../../contracts/index.js';
+import type {
+  CashuProof,
+  MintUrl,
+  NostrEvent,
+  NostrFilter,
+  Sats,
+  UnixSeconds,
+} from '../../contracts/index.js';
 import { NostrKind } from '../../contracts/index.js';
 import { minimumCost } from '../../signer/keyfile.js';
 import { LocalSigner } from '../../signer/local.js';
 import { Nip60ProofStore, type Nip60Relays } from '../nip60.js';
+import type { PendingOp } from '../store.js';
 
 const MINT = 'https://mint.test-a.example' as MintUrl;
 const OTHER_MINT = 'https://mint.test-b.example' as MintUrl;
@@ -97,6 +105,48 @@ describe('Nip60ProofStore', () => {
     ]);
     expect(h[0]!.destroyed).toEqual([r.events[0]!.id]);
     expect(h[0]!.created).toEqual([r.events[2]!.id]);
+  });
+
+  it('the journal (ADR 0014) stays in memory: a journal-only commit publishes nothing, settle drops it with the proofs', async () => {
+    const s = await signer();
+    const r = relay();
+    const store = await Nip60ProofStore.load({ signer: s, relays: r });
+    const op: PendingOp = {
+      id: `02${'aa'.repeat(32)}`,
+      kind: 'receive',
+      mint: MINT,
+      key: ['secret-x'],
+      keep: [
+        {
+          blindedMessage: { amount: '2', B_: `02${'aa'.repeat(32)}`, id: '00aa' },
+          blindingFactor: '7',
+          secret: 'ab'.repeat(32),
+        },
+      ],
+      send: [],
+      spends: [],
+      created: 1_900_000_000 as UnixSeconds,
+    };
+    await store.commit({
+      mint: OTHER_MINT,
+      spent: [],
+      added: [],
+      begin: { ...op, mint: OTHER_MINT },
+    });
+    expect(r.events).toHaveLength(0);
+    expect(store.unsynced()).toBe(0);
+    expect(await store.mints()).toEqual([OTHER_MINT]);
+    expect(await store.pending(OTHER_MINT)).toHaveLength(1);
+    expect(await store.pending(MINT)).toEqual([]);
+    await store.commit({
+      mint: OTHER_MINT,
+      spent: [],
+      added: [proof(1, 2)],
+      history: { direction: 'in', amount: 2 as Sats },
+      settle: [op.id],
+    });
+    expect(await store.pending(OTHER_MINT)).toEqual([]);
+    expect(r.events.length).toBeGreaterThan(0);
   });
 
   it('a relay outage keeps the transition locally (proofs never forgotten) and publishes it on the next sync', async () => {

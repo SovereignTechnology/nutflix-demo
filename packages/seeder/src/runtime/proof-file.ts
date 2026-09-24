@@ -13,6 +13,11 @@
  *
  * A file that exists but does not parse is NOT treated as empty: the first commit would overwrite
  * it and destroy whatever it still held. `load()` throws and the daemon refuses to start.
+ *
+ * It also holds the wallet's journal (ADR 0014): each send / receive / mint's outputs, written
+ * before the request goes out and dropped with the proofs it produced — so an operation whose
+ * answer was lost is restored from the mint (NUT-09), even across a crash. The outputs are bearer
+ * ecash once signed, and sealed like the proofs.
  */
 import type {
   CashuProof,
@@ -27,6 +32,8 @@ import { RuntimeSetupError, assertPrivate, readTextIfExists, writeFileAtomic } f
 
 type ProofStore = walletMod.ProofStore;
 type WalletTx = walletMod.WalletTx;
+type PendingOp = walletMod.PendingOp;
+type PendingOutput = walletMod.PendingOutput;
 
 const FORMAT = 'nutflix-seeder-wallet';
 const VERSION = 1;
@@ -107,6 +114,8 @@ interface WalletFile {
   readonly seq: number;
   readonly mints: Record<string, CashuProof[]>;
   readonly history: WalletHistoryEntry[];
+  /** The journal (ADR 0014); absent when empty. */
+  readonly pending?: PendingOp[];
 }
 
 const HEX = /^[0-9a-f]+$/;
@@ -124,6 +133,52 @@ function isProof(x: unknown): x is CashuProof {
     p['secret'].length > 0 &&
     typeof p['C'] === 'string' &&
     HEX.test(p['C'])
+  );
+}
+
+const DECIMAL = /^[0-9]+$/;
+
+function isPendingOutput(x: unknown): x is PendingOutput {
+  if (typeof x !== 'object' || x === null) return false;
+  const o = x as Record<string, unknown>;
+  const bm = o['blindedMessage'];
+  if (typeof bm !== 'object' || bm === null) return false;
+  const b = bm as Record<string, unknown>;
+  return (
+    typeof b['amount'] === 'string' &&
+    DECIMAL.test(b['amount']) &&
+    typeof b['B_'] === 'string' &&
+    HEX.test(b['B_']) &&
+    typeof b['id'] === 'string' &&
+    HEX.test(b['id']) &&
+    typeof o['blindingFactor'] === 'string' &&
+    DECIMAL.test(o['blindingFactor']) &&
+    typeof o['secret'] === 'string' &&
+    HEX.test(o['secret']) &&
+    (o['ephemeralE'] === undefined ||
+      (typeof o['ephemeralE'] === 'string' && HEX.test(o['ephemeralE'])))
+  );
+}
+
+function isPendingOp(x: unknown): x is PendingOp {
+  if (typeof x !== 'object' || x === null) return false;
+  const o = x as Record<string, unknown>;
+  return (
+    typeof o['id'] === 'string' &&
+    HEX.test(o['id']) &&
+    (o['kind'] === 'receive' || o['kind'] === 'send' || o['kind'] === 'mint') &&
+    typeof o['mint'] === 'string' &&
+    /^https?:\/\//.test(o['mint']) &&
+    Array.isArray(o['key']) &&
+    o['key'].every((k) => typeof k === 'string') &&
+    Array.isArray(o['keep']) &&
+    o['keep'].every(isPendingOutput) &&
+    Array.isArray(o['send']) &&
+    o['send'].every(isPendingOutput) &&
+    Array.isArray(o['spends']) &&
+    o['spends'].every(isProof) &&
+    typeof o['created'] === 'number' &&
+    Number.isSafeInteger(o['created'])
   );
 }
 
@@ -157,18 +212,29 @@ function parse(text: string): WalletFile | null {
   if (typeof seq !== 'number' || !Number.isSafeInteger(seq) || seq < 0) return null;
   if (typeof mints !== 'object' || mints === null || Array.isArray(mints)) return null;
   if (!Array.isArray(history) || !history.every(isEntry)) return null;
+  const pending = o['pending'];
+  if (pending !== undefined && (!Array.isArray(pending) || !pending.every(isPendingOp)))
+    return null;
   const out: Record<string, CashuProof[]> = {};
   for (const [mint, proofs] of Object.entries(mints as Record<string, unknown>)) {
     if (!/^https?:\/\//.test(mint) || !Array.isArray(proofs) || !proofs.every(isProof)) return null;
     out[mint] = proofs;
   }
-  return { format: FORMAT, v: VERSION, seq, mints: out, history };
+  return {
+    format: FORMAT,
+    v: VERSION,
+    seq,
+    mints: out,
+    history,
+    ...(pending === undefined ? {} : { pending }),
+  };
 }
 
 export class FileProofStore implements ProofStore {
   private byMint = new Map<MintUrl, Map<string, CashuProof>>();
   private hist: WalletHistoryEntry[] = [];
   private seq = 0;
+  private ops = new Map<string, PendingOp>();
   /** Commits run one at a time, in call order: each rewrites the whole file. */
   private chain: Promise<unknown> = Promise.resolve();
 
@@ -214,6 +280,7 @@ export class FileProofStore implements ProofStore {
       );
     store.seq = file.seq;
     store.hist = file.history;
+    store.ops = new Map((file.pending ?? []).map((op) => [op.id, op]));
     for (const [mint, proofs] of Object.entries(file.mints))
       store.byMint.set(mint as MintUrl, new Map(proofs.map((p) => [p.secret, p])));
     if (!sealed) {
@@ -224,7 +291,16 @@ export class FileProofStore implements ProofStore {
   }
 
   mints(): Promise<readonly MintUrl[]> {
-    return Promise.resolve([...this.byMint.keys()]);
+    const withOps = [...this.ops.values()].map((o) => o.mint);
+    return Promise.resolve([...new Set([...this.byMint.keys(), ...withOps])]);
+  }
+
+  pending(mint: MintUrl): Promise<readonly PendingOp[]> {
+    return Promise.resolve(
+      [...this.ops.values()]
+        .filter((o) => o.mint === mint)
+        .map((o) => JSON.parse(JSON.stringify(o)) as PendingOp),
+    );
   }
 
   proofs(mint: MintUrl): Promise<readonly CashuProof[]> {
@@ -255,6 +331,10 @@ export class FileProofStore implements ProofStore {
     for (const p of tx.added) m.set(p.secret, { ...p });
     if (m.size === 0) next.delete(tx.mint);
     else next.set(tx.mint, m);
+    const ops = new Map(this.ops);
+    for (const id of tx.settle ?? []) ops.delete(id);
+    if (tx.begin !== undefined)
+      ops.set(tx.begin.id, JSON.parse(JSON.stringify(tx.begin)) as PendingOp);
 
     let entry: WalletHistoryEntry | null = null;
     let seq = this.seq;
@@ -279,9 +359,11 @@ export class FileProofStore implements ProofStore {
       seq,
       mints: Object.fromEntries([...next].map(([mint, ps]) => [mint, [...ps.values()]])),
       history: hist,
+      ...(ops.size === 0 ? {} : { pending: [...ops.values()] }),
     };
     await writeFileAtomic(this.path, await seal(this.cipher, file));
     this.byMint = next;
+    this.ops = ops;
     this.hist = hist;
     this.seq = seq;
     return entry;

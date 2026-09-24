@@ -7,10 +7,10 @@
 import { describe, expect, it } from 'vitest';
 import { getPubKeyFromPrivKey, hasValidDleq, Amount, type RequestFn } from '@cashu/cashu-ts';
 
-import type { CashuP2pkPubkey, MintUrl, Sats } from '../../contracts/index.js';
+import type { CashuP2pkPubkey, MintUrl, Sats, UnixSeconds } from '../../contracts/index.js';
 import { TestMint } from '../../mocks/test-mint.js';
 import { checkPayLock } from '../../payment/lock.js';
-import { WalletError } from '../spend.js';
+import { PENDING_SETTLE_AFTER_S, WalletError } from '../spend.js';
 import { MemoryProofStore, proofTotal } from '../store.js';
 import { CashuMintConnections, CashuWallet, memoryWalletKey } from '../wallet.js';
 
@@ -32,7 +32,9 @@ function rig(
     readonly wrap?: (r: RequestFn) => RequestFn;
     readonly walletKey?: Uint8Array;
     readonly nut20?: boolean;
+    readonly nut09?: boolean;
     readonly mint?: TestMint;
+    readonly now?: () => UnixSeconds;
   } = {},
 ): { mint: TestMint; store: MemoryProofStore; wallet: CashuWallet } {
   const mint =
@@ -42,6 +44,7 @@ function rig(
       seed: new Uint8Array(32).fill(1),
       inputFeePpk: opts.fee ?? 0,
       ...(opts.nut20 === undefined ? {} : { nut20: opts.nut20 }),
+      ...(opts.nut09 === undefined ? {} : { nut09: opts.nut09 }),
     });
   const store = new MemoryProofStore();
   const request = opts.wrap ? opts.wrap(mint.request) : mint.request;
@@ -49,6 +52,7 @@ function rig(
     mints: new CashuMintConnections({ request: () => request }),
     store,
     ...(opts.walletKey ? { key: memoryWalletKey(opts.walletKey) } : {}),
+    ...(opts.now ? { now: opts.now } : {}),
   });
   return { mint, store, wallet };
 }
@@ -302,9 +306,12 @@ describe('CashuWallet (NUT-04 / NUT-11 / NUT-03 / NUT-05 over a real mint)', () 
     expect(await wallet.balance(MINT)).toBe(13);
   });
 
+  // Without NUT-09 (no restore, so no journal — ADR 0014) a lost answer is a reconciled loss. With
+  // it, the same loss is recovered: see "F31: a lost answer loses nothing".
   it('a response lost AFTER the mint spent the inputs is reconciled: the spent inputs are dropped and the loss is recorded (never silently kept)', async () => {
     let dropNextSwap = false;
     const { mint, wallet } = rig({
+      nut09: false,
       wrap: (inner) =>
         (async (args: Parameters<RequestFn>[0]) => {
           const res = await inner(args);
@@ -328,6 +335,7 @@ describe('CashuWallet (NUT-04 / NUT-11 / NUT-03 / NUT-05 over a real mint)', () 
 
   it('a mint that strips DLEQ from its signatures is refused (requireSigDleq); the spent inputs are reconciled, not kept', async () => {
     const { mint, wallet } = rig({
+      nut09: false,
       wrap: (inner) =>
         (async (args: Parameters<RequestFn>[0]) => {
           const res = await inner<{ signatures?: { dleq?: unknown }[] }>(args);
@@ -350,5 +358,176 @@ describe('CashuWallet (NUT-04 / NUT-11 / NUT-03 / NUT-05 over a real mint)', () 
     expect(ks.keys['1']).toMatch(/^0[23][0-9a-f]{64}$/);
     expect(await wallet.keyset(MINT, mint.keysetId)).toBe(ks);
     await expect(wallet.keyset(MINT, '00ffffffffffffff')).rejects.toThrow();
+  });
+});
+
+// ADR 0014 (security review F31): a send, receive or mint writes its outputs to the store before
+// the request; if the answer is lost, what the mint signed is restored (NUT-09), never gone.
+describe('F31: a lost answer loses nothing (journal + NUT-09 restore)', () => {
+  /** A transport that loses the answer to the next request on `path` (after the mint ran it). */
+  function lossy(path: string) {
+    let drop = 0;
+    let refuse = 0;
+    let noRestore = 0;
+    const bodies: unknown[] = [];
+    const wrap =
+      (inner: RequestFn): RequestFn =>
+      async <T>(args: Parameters<RequestFn>[0]): Promise<T> => {
+        if (args.endpoint.endsWith('/v1/restore') && noRestore > 0) {
+          noRestore--;
+          throw new Error('connect ETIMEDOUT');
+        }
+        if (args.endpoint.endsWith(path)) {
+          bodies.push(JSON.parse(JSON.stringify(args.requestBody ?? null)));
+          if (refuse > 0) {
+            refuse--; // never reached the mint
+            throw new Error('connect ECONNREFUSED');
+          }
+        }
+        const res = await inner<T>(args);
+        if (args.endpoint.endsWith(path) && drop > 0) {
+          drop--;
+          throw new Error('socket hang up');
+        }
+        return res;
+      };
+    return {
+      wrap,
+      bodies,
+      dropNext: () => {
+        drop++;
+      },
+      refuseNext: () => {
+        refuse++;
+      },
+      noRestoreNext: () => {
+        noRestore++;
+      },
+    };
+  }
+  const outputsOf = (body: unknown): string[] =>
+    ((body as { outputs?: { B_: string }[] }).outputs ?? []).map((o) => o.B_);
+
+  it('a send whose answer was lost completes: the locked set comes back, the change is kept', async () => {
+    const net = lossy('/v1/swap');
+    const { mint, store, wallet } = rig({ wrap: net.wrap });
+    await fund(wallet, mint, 16);
+    net.dropNext();
+    const recipient = keyOf(5).pub;
+    const set = await wallet.send(sats(3), { p2pk: recipient, mint: MINT });
+    expect(proofTotal(set.proofs)).toBe(3);
+    const keys = await wallet.keyset(MINT, mint.keysetId);
+    for (const p of set.proofs) {
+      expect(checkPayLock(p.secret, recipient).ok).toBe(true);
+      expect(hasValidDleq({ ...p, amount: Amount.from(p.amount) }, keys)).toBe(true);
+    }
+    expect(await wallet.balance(MINT)).toBe(13);
+    expect(await store.pending(MINT)).toEqual([]);
+    const [last] = await wallet.history({ limit: 1 });
+    expect(last).toMatchObject({ direction: 'out', amount: 3 });
+  });
+
+  it('a receive whose answer was lost is recovered in the same call', async () => {
+    const payer = rig();
+    await fund(payer.wallet, payer.mint, 16);
+    const me = keyOf(7);
+    const set = await payer.wallet.send(sats(5), { p2pk: me.pub, mint: MINT });
+    const net = lossy('/v1/swap');
+    const { store, wallet } = rig({ mint: payer.mint, wrap: net.wrap, walletKey: me.sk });
+    net.dropNext();
+    expect(await wallet.receive(set)).toBe(5);
+    expect(await wallet.balance(MINT)).toBe(5);
+    expect(await store.pending(MINT)).toEqual([]);
+  });
+
+  it('a top-up whose mint answer was lost is minted anyway; if the mint could not be asked, the next poll recovers it', async () => {
+    const net = lossy('/v1/mint/bolt11');
+    const { mint, store, wallet } = rig({ wrap: net.wrap });
+    const q = await wallet.mintQuote(MINT, sats(16));
+    mint.payQuote(q.quoteId);
+    net.dropNext();
+    expect(await wallet.pollQuote(q)).toEqual({ state: 'ISSUED', minted: 16 });
+    expect(await wallet.balance(MINT)).toBe(16);
+
+    const q2 = await wallet.mintQuote(MINT, sats(8));
+    mint.payQuote(q2.quoteId);
+    net.dropNext();
+    net.noRestoreNext();
+    await expect(wallet.pollQuote(q2)).rejects.toMatchObject({ code: 'mint-error' });
+    expect(await store.pending(MINT)).toHaveLength(1);
+    // The mint now says ISSUED — by the request whose answer we lost.
+    expect(await wallet.pollQuote(q2)).toEqual({ state: 'ISSUED', minted: 8 });
+    expect(await wallet.balance(MINT)).toBe(24);
+    expect(await store.pending(MINT)).toEqual([]);
+  });
+
+  it('a retried receive reuses the journaled outputs; a mint that already signed them answers once', async () => {
+    const payer = rig();
+    await fund(payer.wallet, payer.mint, 16);
+    const me = keyOf(8);
+    const set = await payer.wallet.send(sats(6), { p2pk: me.pub, mint: MINT });
+    const net = lossy('/v1/swap');
+    const { store, wallet } = rig({ mint: payer.mint, wrap: net.wrap, walletKey: me.sk });
+    net.refuseNext();
+    await expect(wallet.receive(set)).rejects.toMatchObject({ code: 'mint-error' });
+    expect(await store.pending(MINT)).toHaveLength(1);
+    expect(await wallet.receive(set)).toBe(6);
+    expect(net.bodies).toHaveLength(2);
+    expect(outputsOf(net.bodies[1])).toEqual(outputsOf(net.bodies[0]));
+    expect(await store.pending(MINT)).toEqual([]);
+  });
+
+  it('a send the mint never saw keeps its inputs out of selection until the wait is over, then frees them', async () => {
+    let now = 1_900_000_000;
+    const net = lossy('/v1/swap');
+    const { mint, store, wallet } = rig({ wrap: net.wrap, now: () => now as UnixSeconds });
+    await fund(wallet, mint, 16); // one 16-sat proof
+    net.refuseNext();
+    await expect(wallet.send(sats(3), { p2pk: keyOf(5).pub, mint: MINT })).rejects.toMatchObject({
+      code: 'mint-error',
+    });
+    expect(await wallet.balance(MINT)).toBe(16); // kept: maybe still in flight
+    await expect(wallet.send(sats(3), { p2pk: keyOf(5).pub, mint: MINT })).rejects.toMatchObject({
+      code: 'insufficient-funds',
+    });
+    now += PENDING_SETTLE_AFTER_S;
+    await wallet.send(sats(3), { p2pk: keyOf(5).pub, mint: MINT });
+    expect(await wallet.balance(MINT)).toBe(13);
+    expect(await store.pending(MINT)).toEqual([]);
+  });
+
+  it('a restored signature without its DLEQ (NUT-12 mint) is refused: nothing is committed, the journal stays', async () => {
+    let strip = false;
+    const { mint, store, wallet } = rig({
+      wrap: (inner) =>
+        (async (args: Parameters<RequestFn>[0]) => {
+          const res = await inner<{ signatures?: { dleq?: unknown }[] }>(args);
+          if (strip && /\/v1\/(swap|restore)$/.test(args.endpoint) && Array.isArray(res.signatures))
+            for (const sig of res.signatures) delete sig.dleq;
+          return res;
+        }) as RequestFn,
+    });
+    await fund(wallet, mint, 16);
+    strip = true;
+    await expect(wallet.send(sats(3), { p2pk: keyOf(5).pub, mint: MINT })).rejects.toBeInstanceOf(
+      WalletError,
+    );
+    expect(await store.pending(MINT)).toHaveLength(1);
+    expect(await wallet.balance(MINT)).toBe(16); // held, but out of selection while pending
+    strip = false;
+    await wallet.recoverPending(); // an honest answer now: the change is restored
+    expect(await wallet.balance(MINT)).toBe(13);
+    expect(await store.pending(MINT)).toEqual([]);
+  });
+
+  it('without NUT-09 at the mint nothing is journaled', async () => {
+    const net = lossy('/v1/swap');
+    const { mint, store, wallet } = rig({ wrap: net.wrap, nut09: false });
+    await fund(wallet, mint, 16);
+    net.refuseNext();
+    await expect(wallet.send(sats(3), { p2pk: keyOf(5).pub, mint: MINT })).rejects.toMatchObject({
+      code: 'mint-error',
+    });
+    expect(await store.pending(MINT)).toEqual([]);
   });
 });

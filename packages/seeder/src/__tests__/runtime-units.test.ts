@@ -10,7 +10,7 @@ import type { AddressInfo } from 'node:net';
 import { chmod, lstat, mkdir, readFile, stat, symlink, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 
-import { NostrKind, nostr, signer as signerMod } from '@sovit/core';
+import { NostrKind, mocks, nostr, signer as signerMod, wallet as walletMod } from '@sovit/core';
 import type {
   CashuP2pkPubkey,
   CashuProof,
@@ -257,6 +257,90 @@ describe('FileProofStore (the wallet file)', () => {
   });
 });
 
+// ------------------------------------------------------------------------ the journal (ADR 0014)
+
+describe('FileProofStore — the wallet journal (ADR 0014)', () => {
+  const op = (id: string, over: Partial<walletMod.PendingOp> = {}): walletMod.PendingOp => ({
+    id,
+    kind: 'receive',
+    mint: MINT,
+    key: ['secret-a'],
+    keep: [
+      {
+        blindedMessage: { amount: '2', B_: id, id: '00ab'.repeat(4) },
+        blindingFactor: '12345',
+        secret: 'ab'.repeat(32),
+      },
+    ],
+    send: [],
+    spends: [],
+    created: 1_900_000_000 as walletMod.PendingOp['created'],
+    ...over,
+  });
+
+  it('keeps journaled operations across a reopen, lists their mint, and drops them with the proofs they made', async () => {
+    const dir = await scratch();
+    const file = path.join(dir, 'proofs.json');
+    const a = await FileProofStore.open(file, CIPHER);
+    await a.commit({ mint: MINT, spent: [], added: [], begin: op(`02${'aa'.repeat(32)}`) });
+    const b = await FileProofStore.open(file, CIPHER);
+    expect(await b.mints()).toEqual([MINT]); // a mint with only a journal entry is listed
+    expect(await b.pending(MINT)).toEqual([op(`02${'aa'.repeat(32)}`)]);
+    await b.commit({
+      mint: MINT,
+      spent: [],
+      added: [proof(1)],
+      settle: [`02${'aa'.repeat(32)}`],
+    });
+    const c = await FileProofStore.open(file, CIPHER);
+    expect(await c.pending(MINT)).toEqual([]);
+    expect(await c.proofs(MINT)).toHaveLength(1);
+  });
+
+  it('refuses to start on a damaged journal entry rather than drop it', async () => {
+    const dir = await scratch();
+    const file = path.join(dir, 'proofs.json');
+    const a = await FileProofStore.open(file, CIPHER);
+    await a.commit({
+      mint: MINT,
+      spent: [],
+      added: [],
+      begin: op(`02${'bb'.repeat(32)}`, { keep: [{ blindedMessage: { amount: 'x' } } as never] }),
+    });
+    await expect(FileProofStore.open(file, CIPHER)).rejects.toBeInstanceOf(RuntimeSetupError);
+  });
+
+  it('a redeem whose answer was lost, then a crash before recovery: the next start restores it from the mint', async () => {
+    const dir = await scratch();
+    const file = path.join(dir, 'proofs.json');
+    const mint = new mocks.TestMint({ url: MINT, seed: new Uint8Array(32).fill(0x61) });
+    let restoreDown = true;
+    const conns = new walletMod.CashuMintConnections({
+      request:
+        () =>
+        <T>(args: Parameters<typeof mint.request>[0]): Promise<T> =>
+          restoreDown && args.endpoint.endsWith('/v1/restore')
+            ? Promise.reject(new Error('connect ETIMEDOUT'))
+            : mint.request<T>(args),
+    });
+    const set = { mint: MINT, proofs: mint.issue(8) };
+    const before = new walletMod.CashuWallet({
+      mints: conns,
+      store: await FileProofStore.open(file, CIPHER),
+    });
+    mint.dropNextResponse();
+    await expect(before.receive(set)).rejects.toThrow(/mint-error/);
+    // "Crash": a new process opens the same file; the mint is reachable again.
+    restoreDown = false;
+    const store = await FileProofStore.open(file, CIPHER);
+    expect(await store.pending(MINT)).toHaveLength(1);
+    const after = new walletMod.CashuWallet({ mints: conns, store });
+    expect(await after.recoverPending()).toEqual({ recovered: 1, left: 0 });
+    expect(await after.balance(MINT)).toBe(8);
+    expect(await (await FileProofStore.open(file, CIPHER)).pending(MINT)).toEqual([]);
+  });
+});
+
 // ------------------------------------------------------------------------ pending + seen
 
 describe('pending PAYs and seen secrets on disk', () => {
@@ -340,6 +424,8 @@ describe('pending PAYs and seen secrets on disk', () => {
     again.close();
   });
 
+  // 500 fsynced writes: ~0.4 s alone, but fsync contention under the full parallel CI run took
+  // it past the default 5 s once — the same allowance as the file's other fsync-heavy tests.
   it('the journal compacts itself: its size stays bounded by the live queue', async () => {
     const dir = await scratch();
     const file = path.join(dir, 'pending.jsonl');
@@ -357,7 +443,7 @@ describe('pending PAYs and seen secrets on disk', () => {
       500 * 4,
       501 * 4,
     ]);
-  });
+  }, 60_000);
 
   it('a torn last line is a crash mid-append; any other damage refuses to start', async () => {
     const dir = await scratch();
