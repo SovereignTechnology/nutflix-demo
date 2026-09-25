@@ -343,7 +343,13 @@ export class WorkerHost {
         // Several videos at their own manifest prices: each core's PRICE precedes its first block.
         announceCorePrices: a.payments !== undefined,
       },
-      { engine: providers.seederEngine, fs, crypto: sodiumCrypto, logger: log },
+      {
+        engine: providers.seederEngine,
+        fs,
+        crypto: sodiumCrypto,
+        logger: log,
+        ...(providers.accepting === undefined ? {} : { accepting: providers.accepting }),
+      },
     );
     const keyPair = await seeder.blobs.store.createKeyPair('nutflix-desktop-swarm');
     const credit = new CreditPool(providers.creditBlocks);

@@ -38,6 +38,11 @@ export interface WorkerProviders {
   readonly creditBlocks: number;
   /** Dev doubles only: the swarm must stay on loopback (the `--dev-mocks` fence). */
   readonly loopbackOnly: boolean;
+  /**
+   * `SeederDeps.accepting`: `false` while the accepted-but-unflushed PAY queue is full (a mint
+   * down) — serving stops (a local cut, no ban) until a flush drains it. Real providers only.
+   */
+  readonly accepting?: () => boolean;
 }
 
 export interface ProviderContext {

@@ -10,9 +10,12 @@
  *   seeder   `RealPaymentEngine` runs HERE (its upload accounting is synchronous), with every
  *            money step asked of the host: keysets, redeem (swap into the NIP-60 wallet), NUT-07
  *            checks, nutzaps. Accepted-but-unflushed PAYs are kept in `<storage>/payments/
- *            pending.json` (written before the ACK) and accepted secrets in `seen.jsonl`; the
- *            proofs in both are P2PK-locked to our wallet key or the creator's, so a copy of the
- *            files spends nothing.
+ *            pending.jsonl`, the daemon's append-only journal (`PendingJournalCore`, ADR 0011
+ *            §12: appended and fsynced before the ACK, compacted as it grows; an old
+ *            `pending.json` is migrated), and accepted secrets in `seen.jsonl`. The proofs in
+ *            both are P2PK-locked to our wallet key or the creator's, so a copy of the files
+ *            spends nothing. At `WORKER_MAX_PENDING_PAYS` queued PAYs (a mint down) the
+ *            worker stops serving until a flush drains the queue.
  */
 import type {
   CoreKeyHex,
@@ -24,6 +27,7 @@ import type {
   UnixSeconds,
 } from '@sovit/core';
 import { DEFAULT_WINDOW_BLOCKS, payProtocol, payment } from '@sovit/core';
+import { JournalReadError, PendingJournalCore, replayJournal } from '@sovit/seeder';
 import type { Logger } from '@sovit/seeder';
 
 import type { SessionId } from '../../ipc/protocol.js';
@@ -39,6 +43,13 @@ export type HostRequester = <M extends HostMethod>(
 /** Secrets kept in memory (~300 B each): older replays are caught at the mint. */
 export const WORKER_SEEN_CAPACITY = 100_000;
 
+/**
+ * Accepted-but-unflushed PAYs the worker holds before it stops serving (one user's node; the
+ * daemon's cap is 4096). Nothing redeems while a mint is down, and each PAY in the queue is
+ * proofs held in memory and on disk.
+ */
+export const WORKER_MAX_PENDING_PAYS = 1024;
+
 export interface RealProviderOptions {
   readonly payments: NonNullable<WorkerInit['payments']>;
   /** `<storage>/payments` (created 0700). */
@@ -51,6 +62,8 @@ export interface RealProviderOptions {
   /** The highest per-block price among the cores this node serves (HELLO's ceiling). */
   readonly priceCeiling: () => Sats;
   readonly logger: Logger;
+  /** The serving cap (default `WORKER_MAX_PENDING_PAYS`; 0 never serves — fails closed). */
+  readonly maxPendingPays?: number;
 }
 
 /** What a failed redeem looks like to the engine: `code: 'spent'` marks a double-spend. */
@@ -133,8 +146,35 @@ export interface RealProviders extends WorkerProviders {
 export function realProviders(o: RealProviderOptions): RealProviders {
   const log = o.logger.child({ component: 'payments' });
   o.state.mkdirp(o.dir);
-  const pendingPath = o.join(o.dir, 'pending.json');
-  const pending = loadPending(o.state, pendingPath);
+  const journalPath = o.join(o.dir, 'pending.jsonl');
+  const legacyPath = o.join(o.dir, 'pending.json');
+  const text = o.state.readText(journalPath);
+  let pending: payment.PendingPay[];
+  if (text !== null) {
+    try {
+      pending = replayJournal(text);
+    } catch (err) {
+      if (!(err instanceof JournalReadError)) throw err;
+      throw new Error(
+        'the pending-PAY journal is unreadable — payments stay off rather than drop them',
+        { cause: err },
+      );
+    }
+  } else pending = loadPending(o.state, legacyPath);
+  const journal = new PendingJournalCore(
+    {
+      append: (t) => {
+        o.state.appendDurable(journalPath, t);
+      },
+      rewrite: (t) => {
+        o.state.writeAtomic(journalPath, t);
+      },
+    },
+    pending,
+  );
+  // A fresh journal of what was loaded, before anything else is accepted; then the old file goes.
+  journal.compact();
+  o.state.remove(legacyPath);
   const seenFile = seenLog(o.state, o.join(o.dir, 'seen.jsonl'), WORKER_SEEN_CAPACITY, log);
   const seen = new payment.SeenSecrets({
     capacity: WORKER_SEEN_CAPACITY,
@@ -167,7 +207,7 @@ export function realProviders(o: RealProviderOptions): RealProviders {
     },
     persistPending: (items) => {
       try {
-        o.state.writeAtomic(pendingPath, JSON.stringify({ v: 1, items }));
+        journal.persist(items);
       } catch (err) {
         log.error('pending-PAY write failed: accepted payments are in memory only', {
           error: err,
@@ -203,6 +243,7 @@ export function realProviders(o: RealProviderOptions): RealProviders {
   return {
     engine,
     seederEngine: engine,
+    accepting: () => engine.pendingCount() < (o.maxPendingPays ?? WORKER_MAX_PENDING_PAYS),
     pay: (range, seeder, policy: PricePolicy, opts) => {
       const sid = o.sidFor(range.core);
       if (sid === undefined)

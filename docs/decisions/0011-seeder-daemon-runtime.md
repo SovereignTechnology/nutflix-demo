@@ -306,7 +306,13 @@ While a mint is down nothing redeems: the engine's queue of accepted PAYs grew w
   - it serves again once a flush drains the queue;
   - the transition is logged once each way.
 
-The desktop's worker (one user) still snapshots its smaller queue whole and has no cap.
+The desktop's worker (one user) got the same treatment the same day (`stage-3/worker-journal`).
+The journal's logic moved to a runtime-neutral module in the seeder's portable entry
+(`PendingJournalCore`, `replayJournal`), fed by an injected append and rewrite. The daemon wraps
+it with Node's fs and a kept-open, fsynced descriptor, so its behaviour is unchanged. The Bare
+worker wraps it with `StateFs.appendDurable` / `writeAtomic` in `<storage>/payments/pending.jsonl`,
+and migrates its old `pending.json`. The worker's cap is `WORKER_MAX_PENDING_PAYS` (1024), passed
+to its `Seeder` as `accepting`.
 
 ## Consequences
 

@@ -21,6 +21,10 @@ export interface StateFs {
   /** `<path>.tmp` (created exclusively, a leftover removed first) + fsync + rename. */
   writeAtomic(path: string, data: string): void;
   append(path: string, data: string): void;
+  /** Append, then fsync, before returning (the pending-PAY journal: written before the ACK). */
+  appendDurable(path: string, data: string): void;
+  /** Delete the file; a missing one is fine. */
+  remove(path: string): void;
   rename(from: string, to: string): void;
   mkdirp(path: string): void;
 }

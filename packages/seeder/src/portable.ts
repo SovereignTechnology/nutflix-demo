@@ -43,6 +43,16 @@ export { FlushScheduler } from './payment/flush-scheduler.js';
 export type { FlushResult, FlushTrigger } from './payment/flush-scheduler.js';
 export { attachPayBridge } from './payment/pay-bridge.js';
 export type { PayBridgeOptions } from './payment/pay-bridge.js';
+export {
+  JOURNAL_COMPACT_FACTOR,
+  JOURNAL_FORMAT,
+  JournalReadError,
+  PendingJournalCore,
+  journalKey,
+  journalText,
+  replayJournal,
+} from './payment/pending-journal.js';
+export type { JournalIo } from './payment/pending-journal.js';
 
 // Logging (the only output path)
 export { createLogger, silentLogger } from './log/logger.js';

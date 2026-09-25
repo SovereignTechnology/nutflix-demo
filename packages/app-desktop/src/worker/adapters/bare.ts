@@ -112,6 +112,24 @@ export const bareStateFs: StateFs = {
   append: (p, data) => {
     fs.appendFileSync(p, data, { mode: 0o600 });
   },
+  appendDurable: (p, data) => {
+    const fd = fs.openSync(p, 'a', 0o600);
+    try {
+      const bytes = utf8.encode(data);
+      let off = 0;
+      while (off < bytes.byteLength) off += fs.writeSync(fd, bytes, off, bytes.byteLength - off);
+      fs.fsyncSync(fd);
+    } finally {
+      fs.closeSync(fd);
+    }
+  },
+  remove: (p) => {
+    try {
+      fs.unlinkSync(p);
+    } catch (err) {
+      if (errno(err) !== 'ENOENT') throw err;
+    }
+  },
   rename: (from, to) => {
     fs.renameSync(from, to);
   },

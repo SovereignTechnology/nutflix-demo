@@ -70,6 +70,24 @@ export const nodeStateFs: StateFs = {
   append: (p, data) => {
     appendFileSync(p, data, { mode: 0o600 });
   },
+  appendDurable: (p, data) => {
+    const fd = openSync(p, 'a', 0o600);
+    try {
+      const bytes = Buffer.from(data, 'utf8');
+      let off = 0;
+      while (off < bytes.byteLength) off += writeSync(fd, bytes, off, bytes.byteLength - off);
+      fsyncSync(fd);
+    } finally {
+      closeSync(fd);
+    }
+  },
+  remove: (p) => {
+    try {
+      unlinkSync(p);
+    } catch (err) {
+      if ((err as { code?: unknown }).code !== 'ENOENT') throw err;
+    }
+  },
   rename: (from, to) => {
     renameSync(from, to);
   },
