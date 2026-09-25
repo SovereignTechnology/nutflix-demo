@@ -123,9 +123,7 @@ const isThumbnailHex = obj({
   type: isImageMime,
 });
 
-const isUploadMeta = obj(uploadMetaGuards, {
-  mirrorTo: arrayOf(matches(/^https:\/\/[\x21-\x7e]+$/, LIMITS.maxServerUrl), 16),
-});
+const isUploadMeta = obj(uploadMetaGuards);
 
 const isStudioUpload = obj(
   { uploadId: isUploadId, path: isAbsolutePath, name: text(1, 1024), meta: isUploadMeta },
@@ -332,11 +330,6 @@ export const isWorkerUploadProgress: Guard<UploadProgress> = safe(
       percent: isPercent,
     }),
     obj({ stage: literal('thumbnails'), candidates: arrayOf(isAbsolutePath, 64) }),
-    obj({
-      stage: literal('mirroring'),
-      server: matches(/^https:\/\/[\x21-\x7e]+$/, LIMITS.maxServerUrl),
-      ok: bool,
-    }),
     obj({ stage: literal('done'), video: isVideoManifest }),
     obj({ stage: literal('error'), message: text(0, LIMITS.maxErrorMessage, { multiline: true }) }),
   ),

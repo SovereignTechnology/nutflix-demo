@@ -1,6 +1,6 @@
 /**
  * Studio → Upload (build-plan §6.1 Studio "Upload", §6.4). Drop zone / file picker → details
- * form (title, Markdown description, tags, kind, mints, price, split, thumbnail, mirrors) →
+ * form (title, Markdown description, tags, kind, mints, price, split, thumbnail) →
  * `adapter.studio.upload` with a per-stage progress view → published / failed.
  *
  * The form state and the running upload live in `Studio` (so switching Studio tabs keeps
@@ -669,32 +669,6 @@ function DetailsForm(props: UploadPanelProps): ReactElement {
           ) : null}
           <FieldError id={id} field="thumbnail" errors={errors} />
         </fieldset>
-
-        <details className="nf-studio__fieldset nf-studio__details">
-          <summary className="nf-studio__legend">Mirrors (optional)</summary>
-          <div className="nf-studio__field">
-            <label htmlFor={`${id}-mirrors`} className="nf-studio__label">
-              Blossom servers to mirror to
-            </label>
-            <textarea
-              id={`${id}-mirrors`}
-              name="mirrors"
-              className="nf-studio__input nf-studio__textarea"
-              rows={2}
-              value={draft.mirrors}
-              placeholder="https://blossom.example"
-              onChange={(e) => {
-                onDraft({ mirrors: e.currentTarget.value });
-              }}
-              {...fieldProps(id, 'mirrors', errors, true)}
-            />
-            <p id={`${id}-mirrors-hint`} className="nf-studio__hint">
-              One https:// address per line. A copy there keeps the video available when no seeder
-              is online.
-            </p>
-            <FieldError id={id} field="mirrors" errors={errors} />
-          </div>
-        </details>
       </div>
 
       <aside className="nf-studio__preview" aria-label="Preview">
@@ -861,8 +835,6 @@ function liveText(run: ActiveRun): string {
     }
     case 'publishing':
       return 'Publishing';
-    case 'mirroring':
-      return 'Mirroring';
     case 'done':
       return 'Published';
     case 'error':
@@ -920,8 +892,7 @@ function UploadRunView(props: UploadPanelProps & { readonly run: ActiveRun }): R
   const { run, adapter } = props;
   const failed = run.phase === 'failed' || run.progress.stage === 'error';
   const done = !failed && run.phase === 'done';
-  const withMirrors = (run.input.mirrorTo?.length ?? 0) > 0;
-  const steps = uploadSteps(run.progress, withMirrors);
+  const steps = uploadSteps(run.progress);
   const failure =
     failed && run.error !== undefined
       ? describeStudioError(run.error, 'upload')
@@ -968,7 +939,6 @@ function UploadRunView(props: UploadPanelProps & { readonly run: ActiveRun }): R
           navigate={props.navigate}
           onReset={props.onReset}
           onShowVideos={props.onShowVideos}
-          mirrors={run.progress.mirrors}
           split={run.input.split}
           now={props.now}
         />
@@ -1033,17 +1003,6 @@ function UploadRunView(props: UploadPanelProps & { readonly run: ActiveRun }): R
                       </p>
                     </div>
                   ) : null}
-                  {s.id === 'mirror' && run.progress.mirrors.length > 0 ? (
-                    <ul className="nf-studio__mirrors">
-                      {run.progress.mirrors.map((m) => (
-                        <li key={m.server} data-ok={m.ok}>
-                          <Icon name={m.ok ? 'check' : 'error'} size={16} />
-                          <span>{m.server}</span>
-                          <span className="nf-studio__muted">{m.ok ? 'Mirrored' : 'Failed'}</span>
-                        </li>
-                      ))}
-                    </ul>
-                  ) : null}
                 </div>
               </li>
             ))}
@@ -1095,7 +1054,6 @@ function Published({
   navigate,
   onReset,
   onShowVideos,
-  mirrors,
   split,
   now,
 }: {
@@ -1104,7 +1062,6 @@ function Published({
   readonly navigate: (to: Route) => void;
   readonly onReset: () => void;
   readonly onShowVideos: () => void;
-  readonly mirrors: readonly { readonly server: string; readonly ok: boolean }[];
   readonly split: { readonly seeder: number; readonly creator: number };
   readonly now: number;
 }): ReactElement {
@@ -1116,7 +1073,6 @@ function Published({
         : { name: 'watch', videoId: video.id },
     );
   };
-  const failedMirrors = mirrors.filter((m) => !m.ok).length;
   const id = useId();
   return (
     <section className="nf-studio__card nf-studio__published" aria-labelledby={id}>
@@ -1130,9 +1086,6 @@ function Published({
           </h2>
           <p className="nf-studio__hint">
             Viewers pay per block as they watch: seeders {split.seeder}%, you {split.creator}%.
-            {failedMirrors > 0
-              ? ` ${failedMirrors} mirror${failedMirrors === 1 ? '' : 's'} failed; the video is still published.`
-              : ''}
           </p>
         </div>
       </div>

@@ -155,7 +155,6 @@ export const VALID: Samples = {
         satsPerBlock: sats(0),
         split: { seeder: 70, creator: 30 },
         thumbnailChoice: { bytes: new Uint8Array([0xff, 0xd8, 0xff]), type: 'image/jpeg' },
-        mirrorTo: ['https://blossom.example'],
       },
     ],
     [

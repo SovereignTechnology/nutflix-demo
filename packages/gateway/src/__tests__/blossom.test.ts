@@ -207,7 +207,7 @@ describe('F15: a per-pubkey upload quota', () => {
     expect([a.status, b.status].sort()).toEqual([201, 413]);
   });
 
-  it('`null` lifts the quota; the default is 8 GiB', async () => {
+  it('`null` lifts the quota; the default is 2 GiB', async () => {
     const auth = new FakeBlossomAuth({ ok: true, pubkey: UPLOADER });
     const off = await rig({
       auth,
@@ -215,7 +215,7 @@ describe('F15: a per-pubkey upload quota', () => {
     });
     expect(off.config.blossom.maxBytesPerPubkey).toBeNull();
     const dflt = await rig({ auth });
-    expect(dflt.config.blossom.maxBytesPerPubkey).toBe(8 * 1024 ** 3);
+    expect(dflt.config.blossom.maxBytesPerPubkey).toBe(2 * 1024 ** 3);
   });
 });
 

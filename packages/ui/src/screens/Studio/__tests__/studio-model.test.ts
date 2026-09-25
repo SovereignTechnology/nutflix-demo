@@ -19,7 +19,6 @@ import {
   looksLikeVideo,
   normalizeHttpsUrl,
   normalizeInvoice,
-  parseServers,
   parseSplit,
   parseTags,
   reduceUploadProgress,
@@ -98,10 +97,6 @@ describe('small parsers', () => {
     expect(normalizeHttpsUrl('http://mint.example')).toBeNull();
     expect(normalizeHttpsUrl('https://user:pw@mint.example')).toBeNull();
     expect(normalizeHttpsUrl('javascript:alert(1)')).toBeNull();
-    expect(parseServers('https://a.example\nnope\nhttps://a.example/')).toEqual({
-      servers: ['https://a.example'],
-      invalid: ['nope'],
-    });
     expect(normalizeInvoice(`lightning:LNBC10N1${'P'.repeat(30)}`)).toBe(
       `lnbc10n1${'p'.repeat(30)}`,
     );
@@ -131,7 +126,6 @@ describe('draft → UploadInput', () => {
     title: '  A title ',
     tags: 'a, b',
     mints: ['https://mint.example' as MintUrl],
-    mirrors: 'https://m.example/',
   };
 
   it('builds the exact contract input for a valid draft', () => {
@@ -145,8 +139,9 @@ describe('draft → UploadInput', () => {
       mints: ['https://mint.example'],
       satsPerBlock: 1,
       split: { seeder: 50, creator: 50 },
-      mirrorTo: ['https://m.example'],
     });
+    // v6: media on Pear only — the input never names a Blossom mirror.
+    expect(toUploadInput(draft)).not.toHaveProperty('mirrorTo');
   });
 
   it('refuses an invalid draft and names every problem', () => {
@@ -158,10 +153,9 @@ describe('draft → UploadInput', () => {
       seeder: '60',
       creator: '60',
       thumbnail: { mode: 'custom', image: undefined },
-      mirrors: 'ftp://nope',
     };
     expect(Object.keys(validateDraft(bad)).sort()).toEqual(
-      ['file', 'mints', 'mirrors', 'price', 'split', 'tags', 'thumbnail', 'title'].sort(),
+      ['file', 'mints', 'price', 'split', 'tags', 'thumbnail', 'title'].sort(),
     );
     expect(toUploadInput(bad)).toBeUndefined();
   });
@@ -179,8 +173,6 @@ describe('upload progress', () => {
       { stage: 'transcoding', rendition: '1080p', percent: 140 },
       { stage: 'thumbnails', candidates: ['a', 'b'] },
       { stage: 'writing', rendition: '1080p', percent: -5 },
-      { stage: 'mirroring', server: 's1', ok: false },
-      { stage: 'mirroring', server: 's1', ok: true },
     ]);
     expect(v.transcoding).toEqual([
       { label: '1080p', percent: 100 },
@@ -188,25 +180,23 @@ describe('upload progress', () => {
     ]);
     expect(v.writing).toEqual([{ label: '1080p', percent: 0 }]);
     expect(v.candidates).toEqual(['a', 'b']);
-    expect(v.mirrors).toEqual([{ server: 's1', ok: true }]);
   });
 
-  it('computes step statuses, with mirror only when asked', () => {
+  it('computes step statuses (v6: five steps, no mirroring)', () => {
     const mid = run([
       { stage: 'probing' },
       { stage: 'transcoding', rendition: '720p', percent: 3 },
     ]);
-    expect(uploadSteps(mid, false).map((s) => s.status)).toEqual([
+    expect(uploadSteps(mid).map((s) => s.status)).toEqual([
       'done',
       'active',
       'pending',
       'pending',
       'pending',
     ]);
-    expect(uploadSteps(mid, true)).toHaveLength(6);
-    expect(uploadSteps(INITIAL_PROGRESS, false)[0]?.status).toBe('pending');
+    expect(uploadSteps(INITIAL_PROGRESS)[0]?.status).toBe('pending');
     const done = run([{ stage: 'done', video: mocks.VIDEOS[0]! }]);
-    expect(uploadSteps(done, true).every((s) => s.status === 'done')).toBe(true);
+    expect(uploadSteps(done).every((s) => s.status === 'done')).toBe(true);
   });
 
   it('marks the running step failed, from an event or a rejection, once', () => {
@@ -216,7 +206,7 @@ describe('upload progress', () => {
     ]);
     expect(e.failedAt).toBe('write');
     expect(e.errorMessage).toBe('disk full');
-    expect(uploadSteps(e, false)[3]?.status).toBe('error');
+    expect(uploadSteps(e)[3]?.status).toBe('error');
     expect(failProgress(e, 'later')).toBe(e);
     const r = failProgress(run([{ stage: 'publishing' }]), 'relay-down');
     expect(r.failedAt).toBe('publish');

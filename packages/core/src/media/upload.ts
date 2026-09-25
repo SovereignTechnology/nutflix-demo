@@ -42,8 +42,6 @@ export interface StudioUploadDeps {
   readonly sink: BlobSink | ((spec: RenditionSpec) => BlobSink);
   /** L1/L2: build + sign the NIP-71 event, start seeding, return the verified manifest. */
   readonly publish: (draft: UploadDraft) => Promise<VideoManifest>;
-  /** Optional BUD-02 mirror per server; `false` = that server failed (reported, not fatal). */
-  readonly mirror?: (server: string, draft: UploadDraft, video: VideoManifest) => Promise<boolean>;
   readonly sha256: Sha256Factory;
   readonly fs: FsAdapter;
   readonly workDir?: string;
@@ -153,18 +151,6 @@ export async function runStudioUpload(
 
     onProgress({ stage: 'publishing' });
     const video = await deps.publish(draft);
-
-    if (deps.mirror && input.mirrorTo) {
-      for (const server of input.mirrorTo) {
-        let ok = false;
-        try {
-          ok = await deps.mirror(server, draft, video);
-        } catch {
-          ok = false;
-        }
-        onProgress({ stage: 'mirroring', server, ok });
-      }
-    }
 
     if (deps.removeWorkDir === true) await fs.rm(workDir, { recursive: true });
 

@@ -195,7 +195,6 @@ export function createBridge(t: Transport, deps: BridgeDeps): NutflixBridge {
       satsPerBlock: input.satsPerBlock,
       split: input.split,
       ...(thumb === undefined ? {} : { thumbnailChoice: thumb }),
-      ...(input.mirrorTo === undefined ? {} : { mirrorTo: input.mirrorTo }),
     };
     const unsubscribe = await t.subscribeAcked({ t: 'upload.progress', uploadId }, (p) => {
       onProgress(p);

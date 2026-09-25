@@ -77,7 +77,7 @@ const ARGS: { readonly [M in WorkerMethod]: readonly WorkerMethodTable[M][0][] }
       uploadId: UPLOAD_ID,
       path: 'C:\\Users\\u\\a.mp4',
       name: 'a.mp4',
-      meta: { ...meta, mirrorTo: ['https://blossom.example'] },
+      meta,
       thumbnailChoice: { hex: toHex(Uint8Array.of(0xff, 0xd8)), type: 'image/jpeg' },
     },
     { uploadId: UPLOAD_ID, path: '/a.mp4', name: 'a.mp4', meta, thumbnailChoice: 1 },
@@ -285,6 +285,8 @@ describe('host → worker', () => {
       ['studio.upload', { ...up, thumbnailChoice: { hex: 'abc', type: 'image/jpeg' } }],
       ['studio.upload', { ...up, thumbnailChoice: { hex: 'AB', type: 'image/jpeg' } }],
       ['studio.upload', { ...up, meta: { ...meta, mirrorTo: ['http://x'] } }],
+      // v6: media on Pear only — no Blossom mirror list crosses, not even a well-formed one.
+      ['studio.upload', { ...up, meta: { ...meta, mirrorTo: ['https://blossom.example'] } }],
       ['seeder.status', { extra: 1 }],
       ['studio.ffmpeg', { recheck: true, path: 'ffmpeg' }],
     ] as const)

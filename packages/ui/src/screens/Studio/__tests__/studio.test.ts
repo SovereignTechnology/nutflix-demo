@@ -341,9 +341,7 @@ describe('Studio — publishing', () => {
   it('sends exactly the form to studio.upload and lands on Published', async () => {
     const a = adapterWith();
     const upload = vi.spyOn(a.studio, 'upload');
-    const { r, navigate } = await withForm(a, {
-      mirrorServers: ['https://blossom.fixture.example'],
-    });
+    const { r, navigate } = await withForm(a);
     typeInto(r.get('input[name="title"]'), 'Hohmann, explained');
     typeInto(r.get('textarea[name="description"]'), 'With a *hose*.');
     typeInto(r.get('input[name="tags"]'), 'Space, #physics, orbital mechanics, space');
@@ -363,8 +361,9 @@ describe('Studio — publishing', () => {
       mints: [MINTS.a],
       satsPerBlock: 3,
       split: { seeder: 40, creator: 60 },
-      mirrorTo: ['https://blossom.fixture.example'],
     });
+    // v6: media on Pear only — no mirror field, no mirror list.
+    expect(r.all('textarea[name="mirrors"]')).toHaveLength(0);
     const done = r.get('.nf-studio__published');
     expect(done.textContent).toContain('Published');
     expect(done.textContent).toContain('seeders 40%, you 60%');
@@ -378,7 +377,7 @@ describe('Studio — publishing', () => {
       name: 'shorts',
       videoId: mocks.asEventId('upload:Hohmann, explained'),
     });
-    expect(r.all('.nf-studio__mirrors li[data-ok="true"]')).toHaveLength(1);
+    expect(r.all('.nf-studio__mirrors li')).toHaveLength(0); // v6: nothing is mirrored
     click(button(r, 'Upload another'));
     expect(r.get('.nf-studio__drop')).toBeTruthy();
   });

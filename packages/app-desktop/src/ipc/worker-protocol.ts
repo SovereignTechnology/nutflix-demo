@@ -159,7 +159,8 @@ export type RenditionDraftWire = media.RenditionDraft;
 
 /**
  * Everything the host needs to build + sign the NIP-71 event (`manifest.buildVideoEvent`) for
- * an upload: the host adds `creatorP2pk`, `publishedAt`, `blossomServers` and signs.
+ * an upload: the host adds `creatorP2pk` and `publishedAt` and signs (v6: no Blossom servers —
+ * media is on Pear only).
  */
 export interface PublishDraft {
   readonly uploadId: UploadId;

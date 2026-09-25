@@ -678,7 +678,8 @@ export class DesktopNetworkAdapter implements NetworkAdapter {
         split: draft.meta.split,
         creatorP2pk,
       },
-      blossomServers: draft.meta.mirrorTo ?? [],
+      // v6: media on Pear only — our manifests name no Blossom servers.
+      blossomServers: [],
     };
     return this.write(async (c) => {
       const { event } = await c.publish(manifest.buildVideoEvent(input));

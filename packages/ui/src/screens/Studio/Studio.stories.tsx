@@ -311,15 +311,7 @@ export const UploadWriting: Story = {
 
 export const UploadPublished: Story = {
   name: 'Upload — published',
-  render: () => (
-    <Screen
-      adapter={storyAdapter()}
-      tab="upload"
-      pendingFile={FILE}
-      mirrorServers={['https://blossom.fixture.example', 'https://gateway.fixture.example']}
-      steps={PUBLISH}
-    />
-  ),
+  render: () => <Screen adapter={storyAdapter()} tab="upload" pendingFile={FILE} steps={PUBLISH} />,
 };
 
 export const UploadFailed: Story = {

@@ -95,8 +95,8 @@ export interface BlossomConfig {
   readonly maxBytesPerPubkey: number | null;
 }
 
-/** Four full-size uploads (`maxUploadBytes` defaults to 2 GiB). */
-export const DEFAULT_MAX_BYTES_PER_PUBKEY = 8 * 1024 ** 3;
+/** One full-size upload (`maxUploadBytes` defaults to 2 GiB). Cameron, 2026-09-25 (was 8 GiB). */
+export const DEFAULT_MAX_BYTES_PER_PUBKEY = 2 * 1024 ** 3;
 
 export interface UpstreamConfig {
   /** Pay after every N verified blocks from a peer (contiguous run). Must be ≤ the window. */

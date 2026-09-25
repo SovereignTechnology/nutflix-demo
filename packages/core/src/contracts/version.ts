@@ -42,5 +42,11 @@
  *       Amended 2026-09-24 (Stage 3, no bump): the NIP-71 `minpay` tag is parsed (1 …
  *       `MAX_MIN_PAY_SATS`), and the part of the effective window a minimum PAY adds is capped
  *       at `MAX_MIN_PAY_WINDOW_BLOCKS` (64): a creator's tag must not open huge unpaid windows.
+ *   6 — 2026-09-25 Stage 3 (Cameron: media on Pear only). BREAKING for uploads only:
+ *       `UploadInput.mirrorTo` and the `mirroring` `UploadProgress` stage are removed — Studio
+ *       no longer names or mirrors to Blossom servers, so our manifests carry sha256 +
+ *       `hyper://` only. `blossom` / `fallback` tags in other publishers' events are still
+ *       parsed and never fetched. (The gateway's Blossom endpoints stay: they are an HTTP face
+ *       over its own Pear seeder.)
  */
-export const CONTRACTS_VERSION = 5 as const;
+export const CONTRACTS_VERSION = 6 as const;

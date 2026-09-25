@@ -134,23 +134,6 @@ export function normalizeMintUrl(text: string): MintUrl | null {
   return u === null ? null : (u as MintUrl);
 }
 
-/** One server per line (or comma separated); invalid lines are reported, not dropped. */
-export function parseServers(text: string): {
-  readonly servers: readonly string[];
-  readonly invalid: readonly string[];
-} {
-  const servers: string[] = [];
-  const invalid: string[] = [];
-  for (const raw of text.split(/[\n,]/)) {
-    const line = raw.trim();
-    if (!line) continue;
-    const u = normalizeHttpsUrl(line);
-    if (u === null) invalid.push(line);
-    else if (!servers.includes(u)) servers.push(u);
-  }
-  return { servers, invalid };
-}
-
 /**
  * Shape check for a pasted Lightning invoice (NOT a decoder: no amount, no checksum).
  * Strips a `lightning:` prefix and whitespace, lower-cases. The mint's melt quote is what
@@ -227,7 +210,6 @@ export interface StudioDraft {
   readonly seeder: string;
   readonly creator: string;
   readonly thumbnail: ThumbnailDraft;
-  readonly mirrors: string;
 }
 
 export const EMPTY_DRAFT: StudioDraft = {
@@ -241,11 +223,10 @@ export const EMPTY_DRAFT: StudioDraft = {
   seeder: String(DEFAULT_SPLIT.seeder),
   creator: String(DEFAULT_SPLIT.creator),
   thumbnail: { mode: 'auto' },
-  mirrors: '',
 };
 
 export type DraftField =
-  'file' | 'title' | 'description' | 'tags' | 'mints' | 'price' | 'split' | 'thumbnail' | 'mirrors';
+  'file' | 'title' | 'description' | 'tags' | 'mints' | 'price' | 'split' | 'thumbnail';
 
 export type DraftErrors = Partial<Record<DraftField, string>>;
 
@@ -294,9 +275,6 @@ export function validateDraft(d: StudioDraft): DraftErrors {
   if (d.thumbnail.mode === 'custom' && d.thumbnail.image === undefined) {
     e.thumbnail = 'Choose an image, or let Studio pick a frame.';
   }
-  if (parseServers(d.mirrors).invalid.length > 0) {
-    e.mirrors = 'Each mirror must be an https:// address.';
-  }
   return e;
 }
 
@@ -306,7 +284,6 @@ export function toUploadInput(d: StudioDraft): UploadInput | undefined {
   const split = parseSplit(d.seeder, d.creator);
   if (!d.file || price === undefined || split === undefined) return undefined;
   if (Object.keys(validateDraft(d)).length > 0) return undefined;
-  const mirrors = parseServers(d.mirrors).servers;
   return {
     file: d.file.source,
     title: d.title.trim(),
@@ -319,13 +296,12 @@ export function toUploadInput(d: StudioDraft): UploadInput | undefined {
     ...(d.thumbnail.mode === 'custom' && d.thumbnail.image !== undefined
       ? { thumbnailChoice: d.thumbnail.image }
       : {}),
-    ...(mirrors.length > 0 ? { mirrorTo: mirrors } : {}),
   };
 }
 
 // ---- upload progress -----------------------------------------------------------------------
 
-export type UploadStepId = 'probe' | 'transcode' | 'thumbnails' | 'write' | 'publish' | 'mirror';
+export type UploadStepId = 'probe' | 'transcode' | 'thumbnails' | 'write' | 'publish';
 export type UploadStepStatus = 'pending' | 'active' | 'done' | 'error';
 
 export interface RenditionProgress {
@@ -339,7 +315,6 @@ export interface UploadProgressView {
   readonly transcoding: readonly RenditionProgress[];
   readonly writing: readonly RenditionProgress[];
   readonly candidates: readonly string[] | undefined;
-  readonly mirrors: readonly { readonly server: string; readonly ok: boolean }[];
   readonly video: VideoManifest | undefined;
   readonly errorMessage: string | undefined;
   /** The step that was running when the error arrived. */
@@ -351,7 +326,6 @@ export const INITIAL_PROGRESS: UploadProgressView = {
   transcoding: [],
   writing: [],
   candidates: undefined,
-  mirrors: [],
   video: undefined,
   errorMessage: undefined,
   failedAt: undefined,
@@ -364,7 +338,6 @@ const STAGE_STEP: Readonly<Record<UploadProgressView['stage'], UploadStepId | un
   thumbnails: 'thumbnails',
   writing: 'write',
   publishing: 'publish',
-  mirroring: 'mirror',
   done: undefined,
   error: undefined,
 };
@@ -404,15 +377,6 @@ export function reduceUploadProgress(
       return { ...view, stage: 'writing', writing: upsert(view.writing, p.rendition, p.percent) };
     case 'publishing':
       return { ...view, stage: 'publishing' };
-    case 'mirroring':
-      return {
-        ...view,
-        stage: 'mirroring',
-        mirrors: [
-          ...view.mirrors.filter((m) => m.server !== p.server),
-          { server: p.server, ok: p.ok },
-        ],
-      };
     case 'done':
       return { ...view, stage: 'done', video: p.video };
     case 'error':
@@ -442,19 +406,15 @@ export const UPLOAD_STEPS: readonly { readonly id: UploadStepId; readonly label:
   { id: 'thumbnails', label: 'Thumbnails' },
   { id: 'write', label: 'Writing to your seeder' },
   { id: 'publish', label: 'Publishing' },
-  { id: 'mirror', label: 'Mirroring' },
 ];
 
-/** Step list with a status each; `mirror` only when the input asked for mirrors. */
-export function uploadSteps(
-  view: UploadProgressView,
-  withMirrors: boolean,
-): readonly {
+/** Step list with a status each. */
+export function uploadSteps(view: UploadProgressView): readonly {
   readonly id: UploadStepId;
   readonly label: string;
   readonly status: UploadStepStatus;
 }[] {
-  const steps = UPLOAD_STEPS.filter((s) => withMirrors || s.id !== 'mirror');
+  const steps = UPLOAD_STEPS;
   const ids = steps.map((s) => s.id);
   const current =
     view.stage === 'done'

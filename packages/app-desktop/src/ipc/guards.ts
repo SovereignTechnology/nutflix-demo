@@ -299,8 +299,6 @@ const AUTH_URL_RE = new RegExp(
 
 export const isRelayUrl = safe(branded<RelayUrl>(matches(RELAY_RE, LIMITS.maxServerUrl)));
 export const isMintUrl = safe(branded<MintUrl>(matches(HTTPS_SERVER_RE, LIMITS.maxServerUrl)));
-/** A Blossom server (Studio mirrors): same rule as a mint. */
-export const isBlossomServer = safe(matches(HTTPS_SERVER_RE, LIMITS.maxServerUrl));
 export const isNfMediaImgUrl = matches(NF_IMG_RE, 150) as Guard<NfMediaImgUrl>;
 export const isImageSource: Guard<string> = safe(
   (x): x is string => matches(IMAGE_RE, LIMITS.maxUrl)(x) || isNfMediaImgUrl(x),
@@ -398,7 +396,6 @@ const isUploadInputWire = obj(
   { ...uploadMetaGuards, uploadId: isUploadId, file: isFileToken },
   {
     thumbnailChoice: union(int(0, 63), isThumbnailBytes),
-    mirrorTo: arrayOf(isBlossomServer, 16),
   },
 );
 

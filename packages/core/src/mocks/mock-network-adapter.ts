@@ -469,7 +469,6 @@ export class MockNetworkAdapter implements NetworkAdapter {
       for (const r of ['1080p', '720p', '360p'])
         onProgress({ stage: 'writing', rendition: r, percent: 100 });
       onProgress({ stage: 'publishing' });
-      for (const s of input.mirrorTo ?? []) onProgress({ stage: 'mirroring', server: s, ok: true });
       const base = VIDEOS[0];
       if (!base) throw new Error('no fixture');
       const video: VideoManifest = {

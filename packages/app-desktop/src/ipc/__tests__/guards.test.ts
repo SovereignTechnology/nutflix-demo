@@ -493,6 +493,19 @@ describe('URL rules (consistent with @sovit/ui Settings/Studio validators)', () 
   });
 });
 
+// v6 (Cameron, 2026-09-25): media on Pear only — the renderer cannot hand the host a Blossom
+// mirror list, however well-formed.
+describe('studio.upload carries no mirror list (v6)', () => {
+  it('refuses mirrorTo', () => {
+    const [first] = VALID['studio.upload'];
+    const input = (first as readonly unknown[] | undefined)?.[0] as Record<string, unknown>;
+    expect(validateArgs['studio.upload']([input])).toBe(true);
+    expect(
+      validateArgs['studio.upload']([{ ...input, mirrorTo: ['https://blossom.example'] }]),
+    ).toBe(false);
+  });
+});
+
 describe('data-shape guards against the core fixtures', () => {
   it('every fixture VideoManifest passes isVideoManifest', () => {
     for (const v of mocks.VIDEOS) expect(isVideoManifest(v), v.title).toBe(true);

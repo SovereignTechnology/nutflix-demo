@@ -337,12 +337,8 @@ describe('studio.upload (SE-1 in the preload)', () => {
     expect(grants).toEqual(['/home/u/Videos/clip.mp4']);
     expect(order).toEqual(['grant', 'sub-acked:upload.progress', 'call:studio.upload']);
     expect(calls[0]?.args).toEqual([
-      {
-        uploadId: 'f'.repeat(32),
-        file: `nf-file:${'e'.repeat(32)}`,
-        ...meta,
-        mirrorTo: ['https://blossom.example'],
-      },
+      // v6: media on Pear only — a mirror list the renderer passes never reaches the wire.
+      { uploadId: 'f'.repeat(32), file: `nf-file:${'e'.repeat(32)}`, ...meta },
     ]);
     expect(subs[0]?.topic).toEqual({ t: 'upload.progress', uploadId: 'f'.repeat(32) });
     expect(subs[0]?.unsubscribed).toBe(true);

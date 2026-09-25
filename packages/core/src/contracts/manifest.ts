@@ -79,7 +79,10 @@ export interface Rendition {
    * NOT accepted (`manifest/hyper-url.ts`, `media/hyper-url.ts`, `mocks/fixtures.ts` agree).
    */
   readonly hyperUrl: string;
-  /** Blossom HTTP fallbacks (`fallback` entries), all `https://host/<sha256>`. */
+  /**
+   * Blossom HTTP fallbacks (`fallback` entries) as another publisher wrote them. v6: Nutflix
+   * never fetches them — media is on Pear only — and never writes any (Studio emits `[]`).
+   */
   readonly fallbacks: readonly string[];
   /** Thumbnail as a Blossom URL; its sha256 is verified before display (T16). */
   readonly image?: { readonly url: string; readonly sha256?: Sha256Hex };
@@ -139,6 +142,7 @@ export interface VideoManifest {
   readonly tags: readonly string[]; // `t` hashtags
   readonly renditions: readonly Rendition[];
   readonly price: PricePolicy;
+  /** `blossom` tags as another publisher wrote them; v6: never fetched, never written by Studio. */
   readonly blossomServers: readonly string[];
   /** The verified source event. Signature has been checked before this object exists. */
   readonly event: NostrEvent;

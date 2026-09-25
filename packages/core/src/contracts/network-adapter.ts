@@ -145,7 +145,8 @@ export interface UploadInput {
   readonly satsPerBlock: Sats;
   readonly split: { readonly seeder: number; readonly creator: number };
   readonly thumbnailChoice?: number | BlobLike;
-  readonly mirrorTo?: readonly string[]; // Blossom servers for BUD-02 mirror
+  // v6: no `mirrorTo` — media lives on Pear only (Cameron, 2026-09-25); nothing is mirrored to
+  // Blossom servers and our manifests name none.
 }
 
 export type UploadProgress =
@@ -154,7 +155,6 @@ export type UploadProgress =
   | { readonly stage: 'thumbnails'; readonly candidates: readonly string[] }
   | { readonly stage: 'writing'; readonly rendition: string; readonly percent: number }
   | { readonly stage: 'publishing' }
-  | { readonly stage: 'mirroring'; readonly server: string; readonly ok: boolean }
   | { readonly stage: 'done'; readonly video: VideoManifest }
   | { readonly stage: 'error'; readonly message: string };
 

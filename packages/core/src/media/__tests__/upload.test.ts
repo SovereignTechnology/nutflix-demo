@@ -213,33 +213,35 @@ describe('runStudioUpload', () => {
     expect(custom.sha256).toBe('039058c6f2c0cb492c533b0a4d14ef77cc0f78abccced5287d84a1a2011cfb81');
   });
 
-  it('reports mirrors per server (failure is not fatal), removes the work dir when asked, and supports per-rendition sinks', async () => {
+  // v6 (Cameron, 2026-09-25): media on Pear only — nothing is mirrored to Blossom servers.
+  it('publishes Pear-only renditions (no https fallbacks), removes the work dir when asked, and supports per-rendition sinks', async () => {
     const fs = new MemoryFs();
     const progress: UploadProgress[] = [];
     const sinks = new Map<string, MemorySink>();
-    await runStudioUpload(
-      { ...input, mirrorTo: ['https://a.example', 'https://b.example'] },
-      (p) => progress.push(p),
-      {
-        pipeline: scriptedPipeline(fs),
-        sink: (spec) => {
-          const s = new MemorySink(spec.label.padEnd(64, 'c'));
-          sinks.set(spec.label, s);
-          return s;
-        },
-        publish: () => Promise.resolve(VIDEOS[2]!),
-        mirror: (server) =>
-          server.includes('a.') ? Promise.resolve(true) : Promise.reject(new Error('timeout')),
-        sha256: nodeSha256,
-        fs,
-        workDir: '/work',
-        removeWorkDir: true,
+    const drafts: UploadDraft[] = [];
+    await runStudioUpload(input, (p) => progress.push(p), {
+      pipeline: scriptedPipeline(fs),
+      sink: (spec) => {
+        const s = new MemorySink(spec.label.padEnd(64, 'c'));
+        sinks.set(spec.label, s);
+        return s;
       },
-    );
-    expect(progress.filter((p) => p.stage === 'mirroring')).toEqual([
-      { stage: 'mirroring', server: 'https://a.example', ok: true },
-      { stage: 'mirroring', server: 'https://b.example', ok: false },
-    ]);
+      publish: (draft) => {
+        drafts.push(draft);
+        return Promise.resolve(VIDEOS[2]!);
+      },
+      sha256: nodeSha256,
+      fs,
+      workDir: '/work',
+      removeWorkDir: true,
+    });
+    expect(drafts).toHaveLength(1);
+    for (const r of drafts[0]!.renditions) {
+      expect(r.fallbacks).toEqual([]);
+      expect(r.hyperUrl).toMatch(/^hyper:\/\//);
+    }
+    // Nothing between publishing and done (mirroring used to sit there).
+    expect(progress.slice(-2).map((p) => p.stage)).toEqual(['publishing', 'done']);
     expect([...sinks.keys()]).toEqual(['720p', '360p']);
     expect(fs.removed).toEqual(['/work']);
     expect(progress.at(-1)?.stage).toBe('done');

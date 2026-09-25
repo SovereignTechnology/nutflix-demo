@@ -82,8 +82,6 @@ export interface StudioProps extends ScreenProps {
   readonly resolveFile?: ResolveUploadFile | undefined;
   /** A file the shell hands over already resolved (dropped on the window, "Open with…"). */
   readonly pendingFile?: StudioFile | undefined;
-  /** Blossom servers to pre-fill in "Mirrors" (e.g. the user's gateway). */
-  readonly mirrorServers?: readonly string[] | undefined;
   /** "now" for relative times; stories/tests pin it. */
   readonly now?: UnixSeconds | number | undefined;
   /** Melt-out confirm sheet in flow instead of fixed (Storybook/embedding). */
@@ -94,15 +92,11 @@ export interface StudioProps extends ScreenProps {
 /** `'pending'` until `adapter.me()` answers; `null` = signed out. */
 type Me = 'pending' | NostrPubkey | null;
 
-function draftFor(
-  file: StudioFile | undefined,
-  mirrors: readonly string[] | undefined,
-): StudioDraft {
+function draftFor(file: StudioFile | undefined): StudioDraft {
   return {
     ...EMPTY_DRAFT,
     file,
     title: file ? titleFromFileName(file.name) : '',
-    mirrors: mirrors?.join('\n') ?? '',
   };
 }
 
@@ -115,7 +109,6 @@ export function Studio({
   onRecheckFfmpeg,
   resolveFile,
   pendingFile,
-  mirrorServers,
   now,
   inlineSheet,
   className,
@@ -165,7 +158,7 @@ export function Studio({
   const signedIn = me !== 'pending' && me !== null;
 
   // ---- upload form ------------------------------------------------------------------
-  const [draft, setDraft] = useState<StudioDraft>(() => draftFor(pendingFile, mirrorServers));
+  const [draft, setDraft] = useState<StudioDraft>(() => draftFor(pendingFile));
   const mintsTouched = useRef(false);
   const onDraft = useCallback((patch: Partial<StudioDraft>): void => {
     if (patch.mints !== undefined) mintsTouched.current = true;
@@ -352,8 +345,8 @@ export function Studio({
     runSeq.current++;
     setRun(IDLE_RUN);
     mintsTouched.current = false;
-    setDraft({ ...draftFor(undefined, mirrorServers), mints: defaultMints });
-  }, [defaultMints, mirrorServers]);
+    setDraft({ ...draftFor(undefined), mints: defaultMints });
+  }, [defaultMints]);
 
   // ---- tabs keyboard ---------------------------------------------------------------
   const onTabKeyDown = (e: KeyboardEvent<HTMLDivElement>): void => {
