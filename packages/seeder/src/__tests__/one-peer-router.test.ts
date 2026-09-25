@@ -403,7 +403,7 @@ describe('OnePeerRouter', () => {
     open = new Set([stalledRemote!]);
     r.refresh();
     const more = [w.viewer.get(0), w.viewer.get(3)];
-    await until(() => w.uploads[0] === 2, 5000, 'one more request to seeder 0');
+    await until(() => (w.uploads[0] ?? 0) >= 2, 3000, 'one more request to seeder 0');
     await sleep(100);
     expect(w.uploads[0]).toBe(2);
     expect(r.inflight(stalledRemote!)).toBe(1);
