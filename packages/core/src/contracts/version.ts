@@ -52,6 +52,8 @@
  *       Pear): `Rendition.image.size?` + imeta `image-size` (required with a `hyper://` image,
  *       as is `image-x`), `MAX_IMAGE_BYTES`, `Profile.pictureSha256?/pictureSize?/bannerSha256?/
  *       bannerSize?`, `Settings.seeding.serveImages?`; `NetworkAdapter.setProfilePicture`;
- *       `Wallet.inputFeePpk` (mint fees shown in the price).
+ *       `Wallet.inputFeePpk` (mint fees shown in the price). And issue #2 (auto top-ups
+ *       execute): `Settings.autoTopUp.amountSats?`, `AUTO_TOP_UP_MAX_SATS` (10 000) and
+ *       `AUTO_TOP_UP_MAX_SATS_PER_DAY` (50 000, rolling 24 h).
  */
 export const CONTRACTS_VERSION = 6 as const;

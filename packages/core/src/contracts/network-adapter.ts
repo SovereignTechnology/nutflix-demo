@@ -206,9 +206,24 @@ export interface Settings {
    * (melt there, mint at the target); it never fires for `fromMint` itself. The target must be
    * one of `defaultMints` — never a mint first seen in a video's manifest (security review F4:
    * a creator's own mint would otherwise receive the user's sats unattended).
+   *
+   * v6 amendment (Stage 3, issue #2, Cameron 2026-09-24) — auto top-ups EXECUTE: off by default
+   * (absent, or `belowSats <= 0`); each top-up moves `amountSats` (1 … `AUTO_TOP_UP_MAX_SATS`;
+   * absent = `AUTO_TOP_UP_MAX_SATS`), at most `AUTO_TOP_UP_MAX_SATS_PER_DAY` in any rolling
+   * 24 hours; the first top-up into a given mint needs the money gate's native confirm; every
+   * top-up is a wallet history entry.
    */
-  readonly autoTopUp?: { readonly belowSats: Sats; readonly fromMint: MintUrl };
+  readonly autoTopUp?: {
+    readonly belowSats: Sats;
+    readonly fromMint: MintUrl;
+    readonly amountSats?: Sats;
+  };
 }
+
+/** Issue #2: the most one auto top-up moves (and the default top-up size). */
+export const AUTO_TOP_UP_MAX_SATS = 10_000;
+/** Issue #2: the most auto top-ups move in any rolling 24 hours. */
+export const AUTO_TOP_UP_MAX_SATS_PER_DAY = 50_000;
 
 export interface NetworkAdapter {
   /** Which shell we are in. The UI uses this only for capability copy, never for logic. */
