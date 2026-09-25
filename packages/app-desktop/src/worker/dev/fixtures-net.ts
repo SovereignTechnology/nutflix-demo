@@ -152,11 +152,18 @@ export interface FixtureSeederOptions {
   readonly bootstrap: readonly BootstrapNode[];
   readonly logger: Logger;
   readonly policy: PricePolicy;
+  /** Its unpaid window toward the peers it serves (default: the mock engine's, 4). */
+  readonly windowBlocks?: number;
+  /** Its viewer side's failover delay (`OnePeerRouter`; tests shorten it). */
+  readonly stallMs?: number;
 }
 
 /** One dev seeder: a Seeder + loopback PeerNode + hub `pay/1`, able to pay (mirror) and be paid. */
 export async function createFixtureSeeder(o: FixtureSeederOptions): Promise<FixtureSeeder> {
-  const engine = devEngine(`fixture:${o.name}`);
+  const engine = devEngine(
+    `fixture:${o.name}`,
+    o.windowBlocks !== undefined ? { windowBlocks: o.windowBlocks } : {},
+  );
   const logger = o.logger.child({ fixture: o.name });
   const seeder = await Seeder.create(
     { dataDir: o.dataDir, diskCapBytes: 4 * 1024 ** 3, swarm: null, policy: o.policy },
@@ -169,6 +176,7 @@ export async function createFixtureSeeder(o: FixtureSeederOptions): Promise<Fixt
     credit,
     logger,
     policyFor: (core) => seeder.corePolicyMap().get(core) ?? null,
+    ...(o.stallMs !== undefined ? { stallMs: o.stallMs } : {}),
   });
   const node = new PeerNode({
     seeder,
@@ -192,6 +200,7 @@ export async function createFixtureSeeder(o: FixtureSeederOptions): Promise<Fixt
     credit,
     noiseKeyHex: () => toHex(node.publicKey),
     close: async () => {
+      payer.close();
       await node.destroy();
       await seeder.close();
     },

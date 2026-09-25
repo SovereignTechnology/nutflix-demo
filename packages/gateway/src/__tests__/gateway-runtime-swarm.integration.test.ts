@@ -16,7 +16,7 @@
 import { mkdir, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 
-import { mocks, nostr } from '@sovit/core';
+import { DEFAULT_WINDOW_BLOCKS, mocks, nostr, payment } from '@sovit/core';
 import type { CashuP2pkPubkey, MintUrl, Sats } from '@sovit/core';
 import {
   PASSPHRASE_CREDENTIAL,
@@ -206,7 +206,16 @@ describe('gateway runtime over hyperswarm', () => {
         gateway.credit.size === 0
       );
     }, 20_000);
-    expect(worst).toBeLessThanOrEqual(gwCfg.config.upstream.creditBlocks);
+    // Issue #8: the bound is the upstream's OWN window — its HELLO's `windowBlocks` (4) widened to
+    // fit one minimum PAY (10 sats at 2 sats/block → 5) — no longer the gateway's pool floor
+    // (`creditBlocks`, 4): the gateway is now allowed the seeder's full window, and never more.
+    const upWindow = upRt.engine.window(gw.pubkey as never)!.windowBlocks;
+    expect(upWindow).toBe(
+      payment.effectiveWindowBlocks(DEFAULT_WINDOW_BLOCKS, {
+        satsPerBlock: policy.satsPerBlock as Sats,
+      }),
+    );
+    expect(worst).toBeLessThanOrEqual(upWindow);
 
     // The upstream seeder bound the gateway's key-file identity on the swarm session…
     const session = upSeeder.sessionInfos().find((s) => s.pubkey === gw.pubkey);

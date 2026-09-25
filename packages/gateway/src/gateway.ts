@@ -55,6 +55,7 @@ import { gatewayPolicy, gatewayPrice } from './config.js';
 import { CreditPool } from './upstream/credit.js';
 import { UpstreamPayer, manifestPolicyResolver } from './upstream/payer.js';
 import type { UpstreamPolicyResolver } from './upstream/payer.js';
+import { SeederCredit } from './upstream/seeder-credit.js';
 import { CreditSettler } from './upstream/settle.js';
 import { WsBridge } from './ws/bridge.js';
 
@@ -137,6 +138,8 @@ export class Gateway {
   readonly payer: UpstreamPayer;
   /** Upstream blocks requested or unpaid, across every upstream seeder (F37). */
   readonly credit: CreditPool;
+  /** Per-seeder credit and one-seeder-per-block routing of upstream cores (F33, issue #8). */
+  readonly seeders: SeederCredit;
   private readonly settler: CreditSettler;
   readonly bridge: WsBridge;
   readonly blossom: BlossomHandler;
@@ -167,19 +170,27 @@ export class Gateway {
     for (const [k, v] of Object.entries(config.upstream.policies))
       this.upstreamPolicies.set(k as CoreKeyHex, v);
 
-    // F37: upstream blocks travel only on credit, which comes back when their PAY is ACKed —
-    // so no upstream seeder ever holds more of our unpaid blocks than its window.
+    // F37: upstream blocks travel only on credit, which comes back when their PAY is ACKed.
+    // Issue #8 / F33: each upstream core is routed per seeder — one seeder per block, and a
+    // seeder is asked only while its own window has room; the pool (`creditBlocks` is its floor)
+    // follows the sum of the upstream seeders' windows.
     this.credit = new CreditPool(config.upstream.creditBlocks);
-    this.settler = new CreditSettler({
-      credit: this.credit,
+    const payable = (core: CoreKeyHex): boolean =>
+      deps.upstreamPolicy !== undefined || this.upstreamPolicies.has(core);
+    this.settler = new CreditSettler({ credit: this.credit, logger: this.log, payable });
+    this.seeders = new SeederCredit({
+      settler: this.settler,
+      pool: this.credit,
+      policyFor: (core) => this.upstreamPolicies.get(core) ?? null,
+      payable,
       logger: this.log,
-      payable: (core) => deps.upstreamPolicy !== undefined || this.upstreamPolicies.has(core),
     });
     this.payer = new UpstreamPayer({
       engine: deps.viewerEngine,
       logger: this.log,
       payEveryBlocks: config.upstream.payEveryBlocks,
       credit: this.credit,
+      seederBatch: (noiseHex) => this.seeders.seederBatch(noiseHex),
       ownMints: config.acceptedMints,
       policyFor: deps.upstreamPolicy ?? manifestPolicyResolver(() => this.upstreamPolicies),
     });
@@ -326,6 +337,7 @@ export class Gateway {
     this.detachers.clear();
     for (const off of this.coreDetachers.values()) off();
     this.coreDetachers.clear();
+    this.seeders.dispose();
     await this.seeder.close();
     await Promise.all([this.owners.flushed(), this.reports.flushed()]);
     this.address = null;
@@ -373,7 +385,8 @@ export class Gateway {
     const core = sc.core;
     const hex = sc.keyHex;
     const timeout = opts.timeoutMs ?? 30_000;
-    const lookahead = Math.max(0, opts.lookahead ?? this.credit.limit - 1);
+    // The pool grows with the upstream seeders' windows (issue #8): re-read it per block.
+    const lookahead = (): number => Math.max(0, opts.lookahead ?? this.credit.limit - 1);
     const first = blob.blockOffset;
     const last = blob.blockOffset + blob.blockLength - 1;
     /** `held`: a unit was taken for this block already (lookahead's `tryAcquire`). */
@@ -403,7 +416,7 @@ export class Gateway {
       let p = ahead.get(i);
       ahead.delete(i);
       p ??= fetchBlock(i, false);
-      for (let j = i + 1; j <= last && ahead.size < lookahead; j++) {
+      for (let j = i + 1; j <= last && ahead.size < lookahead(); j++) {
         if (ahead.has(j)) continue;
         if (!this.credit.tryAcquire(hex, j)) break;
         const q = fetchBlock(j, true);
@@ -429,9 +442,12 @@ export class Gateway {
 
   private watchCore(sc: SeedCore): void {
     if (this.coreDetachers.has(sc.keyHex)) return;
+    // Routed first: throws `RoutingUnsupported` (fail closed) if hypercore is not the pinned one.
+    const offRoute = this.seeders.attachCore(sc.core);
     const offSettler = this.settler.attachCore(sc.core);
     const offPayer = this.payer.attachCore(sc.core);
     this.coreDetachers.set(sc.keyHex, () => {
+      offRoute();
       offSettler();
       offPayer();
     });
@@ -494,10 +510,12 @@ export class Gateway {
     const detachBridge = this.seeder.attachPayProtocol(session, protocol);
     // Upstream: the payer's PAYs go through the settler, which gives credit back on their ACKs.
     const settled = this.settler.attachPeer(info.noiseKeyHex, protocol);
+    const detachCredit = this.seeders.attachPeer(info.noiseKeyHex, protocol);
     const detachPayer = this.payer.attachPeer(info.noiseKeyHex, settled.protocol);
     this.detachers.set(info.noiseKeyHex, () => {
       detachBridge();
       detachPayer();
+      detachCredit();
       settled.detach();
     });
     void this.sendHello(session.noiseKeyHex, protocol, mux);

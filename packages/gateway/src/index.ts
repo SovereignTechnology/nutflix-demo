@@ -75,8 +75,11 @@ export { WsBridge } from './ws/bridge.js';
 export type { UpgradeRefusal, WsBridgeOptions } from './ws/bridge.js';
 
 // Upstream paying
-export { UpstreamPayer, manifestPolicyResolver } from './upstream/payer.js';
+export { SeederCredit, UpstreamPayer, manifestPolicyResolver } from './upstream/payer.js';
 export type {
+  SeederBatch,
+  SeederCreditOptions,
+  SeederCreditStats,
   UpstreamPayerOptions,
   UpstreamPayerStats,
   UpstreamPolicyResolver,

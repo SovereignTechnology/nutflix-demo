@@ -533,8 +533,11 @@ export class WorkerHost {
     const sc = await net.seeder.blobs.openCoreByKey(fromHex(core));
     if (this.sessions.has(a.sid)) fail('invalid-argument', 'duplicate session id');
     if (!this.coresAttached.has(core)) {
-      this.coresAttached.add(core);
+      // F33 / issue #8: routes the core (one seeder per block, per-seeder credit). It throws when
+      // hypercore is not the release the router is pinned to — and then the core is NOT marked
+      // attached, so a retry cannot download it unrouted (fail closed).
       net.payer.attachCore(sc.core);
+      this.coresAttached.add(core);
     }
     net.node.join(sc.core.discoveryKey, { server: this.seeding.enabled, client: true });
     const gate = new PlaybackGate({
@@ -851,6 +854,7 @@ export class WorkerHost {
       await this.initialising?.catch(() => undefined);
       for (const sid of [...this.sessions.keys()]) this.closeSession(sid);
       await this.net?.payer.flush().catch(() => undefined);
+      this.net?.payer.close();
       await this.live?.server.close();
       await this.net?.node.destroy();
       await this.fixtures?.close().catch(() => undefined);

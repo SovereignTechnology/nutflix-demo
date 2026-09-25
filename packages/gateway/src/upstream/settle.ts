@@ -9,6 +9,10 @@
  * coinciding ranges cannot be confused. A block from a peer without `pay/1`, of a core nobody pays
  * for, or owed to a peer that disconnected, settles at once: nothing more will ever be paid for
  * it (the seeder decides what that means for us). A rejected PAY settles too — it is never re-sent.
+ *
+ * Issue #8: a unit settled WITHOUT a payment (a rejected PAY, a peer gone with blocks owed) frees
+ * the pool, but the seeder still counts those blocks against its window. `onChange` reports them
+ * per peer (`unpaid`), and `SeederCredit` keeps them off that seeder's credit for good.
  */
 import type {
   AckMessage,
@@ -40,6 +44,12 @@ interface Link {
   closed: boolean;
 }
 
+/**
+ * Something settled for peer `noiseHex`: an ACK (`unpaid` = the blocks of a REJECTED PAY, else 0)
+ * or the peer's `pay/1` going away (`unpaid` = every block it was still owed).
+ */
+export type SettleListener = (noiseHex: string, unpaid: number) => void;
+
 export interface CreditSettlerStats {
   readonly acksRejected: number;
   readonly unmatchedAcks: number;
@@ -51,6 +61,7 @@ export class CreditSettler {
   private readonly o: CreditSettlerOptions;
   private readonly log: Logger;
   private readonly links = new Map<string, Link>();
+  private readonly listeners = new Set<SettleListener>();
   private acksRejected = 0;
   private unmatchedAcks = 0;
 
@@ -63,6 +74,27 @@ export class CreditSettler {
     let owed = 0;
     for (const l of this.links.values()) for (const s of l.owed.values()) owed += s.size;
     return { acksRejected: this.acksRejected, unmatchedAcks: this.unmatchedAcks, owed };
+  }
+
+  /** Blocks downloaded from `noiseHex` on its live `pay/1` link and not settled yet (all cores). */
+  owedBy(noiseHex: string): number {
+    const l = this.links.get(noiseHex);
+    if (l === undefined || l.closed) return 0;
+    let n = 0;
+    for (const s of l.owed.values()) n += s.size;
+    return n;
+  }
+
+  /** Whether `noiseHex` has a live `pay/1` link (blocks from it are owed until ACKed). */
+  linked(noiseHex: string): boolean {
+    const l = this.links.get(noiseHex);
+    return l !== undefined && !l.closed;
+  }
+
+  /** Called after every ACK and every link release (see `SettleListener`). */
+  onChange(cb: SettleListener): () => void {
+    this.listeners.add(cb);
+    return () => this.listeners.delete(cb);
   }
 
   /** Whether a downloaded block is waiting for its ACK (a reader settles a block it never owed). */
@@ -175,6 +207,7 @@ export class CreditSettler {
       owed?.delete(b);
       this.o.credit.settle(core, b);
     }
+    this.emit(link.noiseHex, ack.ok ? 0 : msg.range.toBlock - msg.range.fromBlock + 1);
   }
 
   /** The peer is gone: nothing it is owed will ever be acknowledged. */
@@ -182,7 +215,23 @@ export class CreditSettler {
     if (link.closed) return;
     link.closed = true;
     link.sent.splice(0);
-    for (const [core, set] of link.owed) for (const b of set) this.o.credit.settle(core, b);
+    let unpaid = 0;
+    for (const [core, set] of link.owed)
+      for (const b of set) {
+        unpaid++;
+        this.o.credit.settle(core, b);
+      }
     link.owed.clear();
+    this.emit(link.noiseHex, unpaid);
+  }
+
+  private emit(noiseHex: string, unpaid: number): void {
+    for (const cb of [...this.listeners]) {
+      try {
+        cb(noiseHex, unpaid);
+      } catch {
+        // a listener's failure is its own
+      }
+    }
   }
 }

@@ -44,6 +44,7 @@ import type { Logger } from '@sovit/seeder';
 import { toHex } from '@sovit/seeder';
 
 import type { CreditPool } from './credit.js';
+import type { SeederBatch } from './seeder-credit.js';
 
 /** Policy to pay `core` blocks from this peer under; `null` = do not pay (log + skip). */
 export type UpstreamPolicyResolver = (
@@ -67,6 +68,12 @@ export interface UpstreamPayerOptions {
    * every pending block is paid, so batching can never stall a download that needs credit.
    */
   readonly credit?: Pick<CreditPool, 'limit' | 'pressured' | 'onPressure'>;
+  /**
+   * Issue #8: the batch for ONE seeder (`SeederCredit.seederBatch`): half that seeder's window,
+   * and "pay now" once it is at its cap (nothing more can be asked of it until a PAY lands).
+   * Given and known, it replaces the half-the-pool batch for that seeder; `null` = unknown.
+   */
+  readonly seederBatch?: (noiseHex: string) => SeederBatch | null;
   /**
    * A run shorter than a batch is paid once this many ms pass without a new block from that peer
    * (default `DEFAULT_TAIL_MS`): the end of a video is not left unpaid until the session closes
@@ -106,6 +113,14 @@ interface PeerState {
   readonly inflight: Map<CoreKeyHex, InFlight>;
   /** `flush()` is draining: runs unlocked by an ACK are paid however short. */
   draining: boolean;
+  /**
+   * The tail timer fired, or `flush()` ran: every pending run is paid however short, one per ACK
+   * (one PAY per core in flight), until none is left or a new block arrives. Without it a quiet
+   * peer's SCATTERED runs — hypercore spreads blocks over peers, so one peer's are rarely
+   * contiguous — got one PAY from the timer and the rest waited forever once batches were
+   * per seeder (issue #8; the old small pool's pressure used to mask it).
+   */
+  due: boolean;
   /** Pays the short tail after `tailMs` without a new block (reset per block). */
   tailTimer: ReturnType<typeof setTimeout> | null;
   chain: Promise<void>;
@@ -151,6 +166,7 @@ export class UpstreamPayer {
   private readonly ownMints: readonly MintUrl[];
   private readonly policyFor: UpstreamPolicyResolver;
   private readonly credit: UpstreamPayerOptions['credit'];
+  private readonly seederBatch: UpstreamPayerOptions['seederBatch'];
   private readonly tailMs: number;
   private readonly offPressure: () => void;
   private readonly peers = new Map<string, PeerState>();
@@ -170,11 +186,12 @@ export class UpstreamPayer {
     this.ownMints = o.ownMints;
     this.policyFor = o.policyFor;
     this.credit = o.credit;
+    this.seederBatch = o.seederBatch;
     this.tailMs = o.tailMs ?? DEFAULT_TAIL_MS;
     // Pressure: pay whatever is held so the pool can refill.
     this.offPressure =
       o.credit?.onPressure(() => {
-        for (const s of this.peers.values()) this.schedule(s, s.draining);
+        for (const s of this.peers.values()) this.schedule(s, s.draining || s.due);
       }) ?? ((): void => undefined);
   }
 
@@ -184,12 +201,23 @@ export class UpstreamPayer {
     for (const s of this.peers.values()) this.clearTail(s);
   }
 
-  /** Blocks per PAY right now: `payEveryBlocks`, or with a pool half of it — 1 under pressure. */
-  private batchBlocks(): number {
+  /**
+   * Blocks per PAY to this peer right now: 1 under pool pressure or at the seeder's cap; else
+   * half the seeder's window (issue #8) when known, else half the pool, never below
+   * `payEveryBlocks`; without either, `payEveryBlocks`.
+   */
+  private batchBlocks(state: PeerState): number {
     const c = this.credit;
+    if (c?.pressured === true) return 1;
+    const own = this.seederBatch?.(state.noiseHex) ?? null;
+    if (own !== null) return own.atCap ? 1 : Math.max(this.payEvery, own.batch);
     if (c === undefined) return this.payEvery;
-    if (c.pressured) return 1;
     return Math.max(this.payEvery, Math.floor(c.limit / 2));
+  }
+
+  /** The seeder can be asked for nothing more until it is paid (issue #8). */
+  private atCap(state: PeerState): boolean {
+    return this.seederBatch?.(state.noiseHex)?.atCap === true;
   }
 
   stats(): UpstreamPayerStats {
@@ -208,6 +236,7 @@ export class UpstreamPayer {
       carry: new Map(),
       inflight: new Map(),
       draining: false,
+      due: false,
       tailTimer: null,
       chain: Promise.resolve(),
       closed: false,
@@ -253,7 +282,7 @@ export class UpstreamPayer {
         state.inflight.delete(ack.core);
         // The carry moves only when the seeder accepted the PAY that moved it.
         if (ack.ok) state.carry.set(ack.core, f.carryOut);
-        this.schedule(state, state.draining);
+        this.schedule(state, state.draining || state.due);
       }),
       protocol.on('close', () => {
         state.closed = true;
@@ -294,7 +323,8 @@ export class UpstreamPayer {
       state.pending.set(core, set);
     }
     set.add(index);
-    if (set.size >= this.payEvery) this.schedule(state, false);
+    state.due = false; // not quiet any more: batching resumes, the tail timer restarts
+    if (set.size >= this.payEvery || this.atCap(state)) this.schedule(state, false);
     this.armTail(state);
   }
 
@@ -305,7 +335,9 @@ export class UpstreamPayer {
     this.clearTail(state);
     const t = setTimeout(() => {
       state.tailTimer = null;
-      if (!state.closed) this.schedule(state, true);
+      if (state.closed) return;
+      state.due = true;
+      this.schedule(state, true);
     }, ms);
     (t as { unref?: () => void }).unref?.();
     state.tailTimer = t;
@@ -326,6 +358,7 @@ export class UpstreamPayer {
     for (const s of targets) {
       if (!s) continue;
       s.draining = true;
+      s.due = true;
       try {
         this.schedule(s, true);
         // ACKs that arrive while we wait schedule more work on the same chain: follow it.
@@ -351,12 +384,13 @@ export class UpstreamPayer {
   private async payPending(state: PeerState, force: boolean): Promise<void> {
     if (state.closed || state.hello === null) return;
     const hello = state.hello;
-    const batch = this.batchBlocks();
+    const batch = this.batchBlocks(state);
     // The seeder's window counts this peer's blocks across cores: once the peer's pending total
     // reaches a batch, its runs are paid however short (per-core runs could otherwise each wait).
     let peerPending = 0;
     for (const set of state.pending.values()) peerPending += set.size;
-    const due = force || (this.credit !== undefined && peerPending >= batch);
+    const batching = this.credit !== undefined || this.seederBatch !== undefined;
+    const due = force || (batching && peerPending >= batch);
     for (const [core, set] of state.pending) {
       if (set.size === 0 || state.inflight.has(core)) continue;
       const sorted = [...set].sort((a, b) => a - b);
@@ -409,6 +443,9 @@ export class UpstreamPayer {
         toBlock: range.toBlock,
       });
     }
+    let left = 0;
+    for (const set of state.pending.values()) left += set.size;
+    if (left === 0) state.due = false;
   }
 
   private splitAtPrice(state: PeerState, r: BlockRange): BlockRange[] {
@@ -467,4 +504,19 @@ export function manifestPolicyResolver(
   return (core) => perCore().get(core) ?? null;
 }
 export { CreditCancelled, CreditPool, type CreditWaiter } from './credit.js';
-export { CreditSettler, type CreditSettlerOptions, type CreditSettlerStats } from './settle.js';
+export {
+  CreditSettler,
+  type CreditSettlerOptions,
+  type CreditSettlerStats,
+  type SettleListener,
+} from './settle.js';
+export {
+  MAX_POOL_CREDIT,
+  MAX_REMEMBERED_SEEDERS,
+  MAX_SEEDER_CREDIT,
+  NO_PAY_INFLIGHT,
+  SeederCredit,
+  type SeederBatch,
+  type SeederCreditOptions,
+  type SeederCreditStats,
+} from './seeder-credit.js';
