@@ -487,7 +487,8 @@ describe('OnePeerRouter', () => {
       '_requestBlock',
     ]) {
       const r = complete();
-      const Peer = (r.constructor as { Peer: { prototype: Record<string, unknown> } }).Peer;
+      const Peer = (r.constructor as unknown as { Peer: { prototype: Record<string, unknown> } })
+        .Peer;
       const saved = Peer.prototype[m];
       Peer.prototype[m] = undefined;
       expect(() => routableReplicator(coreWith(r)), `Peer#${m}`).toThrow(RoutingUnsupported);
