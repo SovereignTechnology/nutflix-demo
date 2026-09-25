@@ -35,8 +35,15 @@ export class WorkerRuntimeError extends Error {
 export interface SidecarLoader {
   /** The URL of the module doing the loading (`import.meta.url`: the host bundle when packaged). */
   readonly moduleUrl: string;
-  /** Throws when `path` is not executable by this process (`fs.accessSync(path, X_OK)`). */
-  readonly checkExecutable: (path: string) => void;
+  /**
+   * Throws when `path` is not executable by this process. Defaults to `fs.accessSync(path,
+   * X_OK)`; only tests replace it.
+   */
+  readonly checkExecutable?: (path: string) => void;
+}
+
+function isExecutable(path: string): void {
+  accessSync(path, constants.X_OK);
 }
 
 /**
@@ -55,7 +62,7 @@ export function loadSidecar(o: SidecarLoader): SidecarCtor {
     const asset = fromPkg('require-asset') as (specifier: string, parent: string) => string;
     const binary = asset('#bare', join(pkgDir, 'lib', 'bare.js'));
     try {
-      o.checkExecutable(binary);
+      (o.checkExecutable ?? isExecutable)(binary);
     } catch {
       throw new WorkerRuntimeError(
         'the bundled Bare runtime is not executable; reinstall the app (it is never repaired in place)',
@@ -70,12 +77,7 @@ export function loadSidecar(o: SidecarLoader): SidecarCtor {
 let ctor: SidecarCtor | undefined;
 
 function sidecar(): SidecarCtor {
-  ctor ??= loadSidecar({
-    moduleUrl: import.meta.url,
-    checkExecutable: (p) => {
-      accessSync(p, constants.X_OK);
-    },
-  });
+  ctor ??= loadSidecar({ moduleUrl: import.meta.url });
   return ctor;
 }
 

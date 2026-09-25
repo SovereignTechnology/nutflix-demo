@@ -115,9 +115,12 @@ export function forgeConfig(o: ForgeConfigOptions): ForgeConfig {
     makers: makers(o),
     plugins: [],
     hooks: {
-      packageAfterCopy: async (_cfg, buildPath, _electron, platform, arch) => {
+      packageAfterCopy: async (resolvedCfg, buildPath, _electron, platform, arch) => {
         stripDevDependencies(buildPath);
-        await flipAppFuses(buildPath, platform, arch, false);
+        // Signed or not follows the config (as @electron-forge/plugin-fuses does): an unsigned
+        // arm64 macOS build gets its ad-hoc signature back; a signed one is signed after this.
+        const osxSign: unknown = resolvedCfg.packagerConfig.osxSign;
+        await flipAppFuses(buildPath, platform, arch, Boolean(osxSign));
       },
       postPackage: async (_cfg, { platform, arch, outputPaths }) => {
         const p: TargetPlatform = platform;

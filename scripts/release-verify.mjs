@@ -10,6 +10,9 @@
 //      tags, content (the SHA256SUMS text) and `x` (sha256 of that text) agree;
 //   4. each file you name (or, with --all, every artifact of the release) is listed, and its
 //      size and sha256 match.
+// It prints the release's version and signing date: an OLDER genuine release also verifies (a
+// signature cannot say "latest"), so compare them with the current notice (kind 30071,
+// d = nutflix-desktop) on the relays before trusting a download to be current.
 //
 // Usage:
 //   node scripts/release-verify.mjs <signed-event.json> <file>...        each file must match
@@ -44,8 +47,10 @@ const refuse = (msg) => {
   throw new ReleaseVerifyError(msg);
 };
 
-/** The release's artifact list, from a signature-checked event (checks 1–3). */
-export function checkEvent(input, expectedPubkey) {
+/** The release (version, date, artifacts) from a signature-checked event (checks 1–3). */
+export function checkEvent(input, trustedPubkey) {
+  if (typeof trustedPubkey !== 'string' || !HEX64.test(trustedPubkey))
+    refuse('the trusted key must be a 64-hex public key');
   if (typeof input !== 'object' || input === null || Array.isArray(input))
     refuse('the event is not a JSON object');
   // Plain data only. nostr-tools' verifyEvent trusts a cached `verifiedSymbol` flag on the
@@ -66,7 +71,7 @@ export function checkEvent(input, expectedPubkey) {
     valid = false;
   }
   if (!valid) refuse('bad event: its id or signature does not verify');
-  if (ev.pubkey !== expectedPubkey) refuse('the event is not signed by the SovTech key');
+  if (ev.pubkey !== trustedPubkey) refuse('the event is not signed by the SovTech key');
   if (ev.kind !== RELEASE_NOTICE_KIND)
     refuse(`wrong kind ${String(ev.kind)} (want ${String(RELEASE_NOTICE_KIND)})`);
   const tag = (k) => ev.tags.filter((t) => t[0] === k);
@@ -98,16 +103,22 @@ export function checkEvent(input, expectedPubkey) {
     refuse('the event x tag is not the sha256 of its content');
   if (one('files') !== String(artifacts.length))
     refuse('the files tag does not match the artifact count');
-  return artifacts;
+  const version = one('version');
+  if (!/^[0-9A-Za-z.+-]{1,64}$/.test(version)) refuse('malformed version tag');
+  return { artifacts, version, createdAt: ev.created_at };
 }
 
 /**
  * Checks 1–4. `files`: paths to verify (each must be listed); or `allDir`: every listed
- * artifact must be there. `expectedPubkey` is the SovTech key in the CLI — always; tests pass a
- * throwaway key to reach the file checks.
+ * artifact must be there. `trustedPubkey` defaults to the SovTech key and the CLI never passes
+ * one; tests pass a throwaway key to reach the file checks. Never derive it from the event
+ * (`ev.pubkey`): that would accept any validly signed event from anyone.
  */
-export async function verifyRelease(ev, { files, allDir, expectedPubkey }) {
-  const artifacts = checkEvent(ev, expectedPubkey);
+export async function verifyRelease(
+  ev,
+  { files = [], allDir, trustedPubkey = sovtechPubkeyHex() },
+) {
+  const { artifacts, version, createdAt } = checkEvent(ev, trustedPubkey);
   const byName = new Map(artifacts.map((a) => [a.name, a]));
   const targets = [];
   if (allDir !== undefined) {
@@ -135,7 +146,7 @@ export async function verifyRelease(ev, { files, allDir, expectedPubkey }) {
     if (got.sha256 !== a.sha256) refuse(`${a.name}: sha256 does not match the signed release`);
     ok.push(a);
   }
-  return ok;
+  return { version, createdAt, files: ok };
 }
 
 export async function run(argv) {
@@ -159,12 +170,17 @@ export async function run(argv) {
   } catch {
     refuse('the event file is not JSON');
   }
-  const ok = await verifyRelease(ev, { files, allDir, expectedPubkey: sovtechPubkeyHex() });
-  for (const a of ok) process.stdout.write(`OK  ${a.sha256}  ${a.name}\n`);
+  const r = await verifyRelease(ev, { files, allDir });
+  for (const a of r.files) process.stdout.write(`OK  ${a.sha256}  ${a.name}\n`);
+  // A genuine OLD release verifies too (a signature cannot say "latest"): show which one it is,
+  // so it can be compared with the current release notice on the relays.
   process.stdout.write(
-    `release-verify: ${String(ok.length)} file(s) match the release signed by the SovTech key\n`,
+    `release ${r.version}, signed ${new Date(r.createdAt * 1000).toISOString()}\n`,
   );
-  return ok;
+  process.stdout.write(
+    `release-verify: ${String(r.files.length)} file(s) match the release signed by the SovTech key\n`,
+  );
+  return r;
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {

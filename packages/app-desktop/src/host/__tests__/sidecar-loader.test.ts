@@ -118,6 +118,15 @@ describe('loadSidecar — packaged (inside app.asar)', () => {
   );
 });
 
+describe('loadSidecar — packaged, default check (what the host uses)', () => {
+  it.runIf(posix)('refuses the non-executable runtime with fs.accessSync(X_OK), no chmod', () => {
+    expect(() => loadSidecar({ moduleUrl: hostUrl() })).toThrow(WorkerRuntimeError);
+    expect(statSync(fakeBinary).mode & 0o777).toBe(0o644);
+    chmodSync(fakeBinary, 0o755);
+    expect(typeof loadSidecar({ moduleUrl: hostUrl() })).toBe('function');
+  });
+});
+
 describe('loadSidecar — dev build (not in an archive)', () => {
   it('loads the workspace bare-sidecar and leaves the executable check to it (upstream behaviour)', () => {
     let called = 0;

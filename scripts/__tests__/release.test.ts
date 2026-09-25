@@ -34,8 +34,8 @@ interface NostrEvent {
 interface VerifyLib {
   verifyRelease(
     ev: unknown,
-    o: { files?: string[]; allDir?: string; expectedPubkey: string },
-  ): Promise<Artifact[]>;
+    o: { files?: string[]; allDir?: string; trustedPubkey?: string },
+  ): Promise<{ version: string; createdAt: number; files: Artifact[] }>;
 }
 interface ManifestLib {
   sovtechPubkeyHex(): string;
@@ -218,7 +218,8 @@ describe('scripts/release-manifest.mjs', () => {
       /bunker:\/\//,
       /wss:\/\//,
       /\bfetch\(/,
-      /expectedPubkey:(?!\s*sovtechPubkeyHex\(\))/,
+      // The CLI never picks the trusted key: verifyRelease's default (SovTech) applies.
+      /trustedPubkey:/,
     ])
       expect(verify).not.toMatch(bad);
   });
@@ -259,19 +260,35 @@ describe('scripts/release-verify.mjs', () => {
   });
 
   describe('file checks (reached with the throwaway key through the library entry point)', () => {
+    it('the library defaults to the SovTech key and refuses a malformed trusted key', async () => {
+      expect(manifest().status).toBe(0);
+      const { ev } = signThrowaway(unsigned());
+      const v = await lib<VerifyLib>('release-verify.mjs');
+      await expect(v.verifyRelease(ev, { files: artifactPaths() })).rejects.toThrow(
+        /not signed by the SovTech key/,
+      );
+      for (const bad of ['', 'ab', 'Z'.repeat(64)])
+        await expect(
+          v.verifyRelease(ev, { files: artifactPaths(), trustedPubkey: bad }),
+        ).rejects.toThrow(/trusted key must be a 64-hex/);
+    });
+
     it('accepts matching files and --all', async () => {
       expect(manifest().status).toBe(0);
       const { ev, pubkey } = signThrowaway(unsigned());
       const v = await lib<VerifyLib>('release-verify.mjs');
       expect(
-        (await v.verifyRelease(ev, { files: artifactPaths(), expectedPubkey: pubkey }))
+        (await v.verifyRelease(ev, { files: artifactPaths(), trustedPubkey: pubkey })).files
           .map((a) => a.name)
           .sort(),
       ).toEqual(Object.keys(files).sort());
       const flat = join(dir, 'downloads');
       mkdirSync(flat);
       for (const [n, b] of Object.entries(files)) writeFileSync(join(flat, n), b);
-      expect(await v.verifyRelease(ev, { allDir: flat, expectedPubkey: pubkey })).toHaveLength(3);
+      const all = await v.verifyRelease(ev, { allDir: flat, trustedPubkey: pubkey });
+      expect(all.files).toHaveLength(3);
+      // What was verified is reported: an old genuine release verifies too (no "latest").
+      expect(all).toMatchObject({ version: '0.1.0', createdAt: 1790000000 });
     });
 
     it('refuses a changed byte, a truncated file, a file not in the release, a missing artifact', async () => {
@@ -283,24 +300,24 @@ describe('scripts/release-verify.mjs', () => {
       const flipped = Buffer.from(orig);
       flipped[10] = flipped[10]! ^ 1;
       writeFileSync(deb, flipped);
-      await expect(v.verifyRelease(ev, { files: [deb], expectedPubkey: pubkey })).rejects.toThrow(
+      await expect(v.verifyRelease(ev, { files: [deb], trustedPubkey: pubkey })).rejects.toThrow(
         /sha256 does not match/,
       );
       writeFileSync(deb, orig.subarray(1));
-      await expect(v.verifyRelease(ev, { files: [deb], expectedPubkey: pubkey })).rejects.toThrow(
+      await expect(v.verifyRelease(ev, { files: [deb], trustedPubkey: pubkey })).rejects.toThrow(
         /size/,
       );
       writeFileSync(join(dir, 'Nutflix-9.9.9-x64.AppImage'), 'x');
       await expect(
         v.verifyRelease(ev, {
           files: [join(dir, 'Nutflix-9.9.9-x64.AppImage')],
-          expectedPubkey: pubkey,
+          trustedPubkey: pubkey,
         }),
       ).rejects.toThrow(/not part of this release/);
       await expect(
-        v.verifyRelease(ev, { allDir: join(dir, 'empty-nowhere'), expectedPubkey: pubkey }),
+        v.verifyRelease(ev, { allDir: join(dir, 'empty-nowhere'), trustedPubkey: pubkey }),
       ).rejects.toThrow(/is missing/);
-      await expect(v.verifyRelease(ev, { files: [], expectedPubkey: pubkey })).rejects.toThrow(
+      await expect(v.verifyRelease(ev, { files: [], trustedPubkey: pubkey })).rejects.toThrow(
         /at least one/,
       );
     });
@@ -314,11 +331,15 @@ describe('scripts/release-verify.mjs', () => {
         re: RegExp,
       ): Promise<void> => {
         const { ev, pubkey } = signThrowaway(tpl);
-        await expect(v.verifyRelease(ev, { allDir: make, expectedPubkey: pubkey })).rejects.toThrow(
+        await expect(v.verifyRelease(ev, { allDir: make, trustedPubkey: pubkey })).rejects.toThrow(
           re,
         );
       };
       await check({ ...t, kind: 1 }, /wrong kind/);
+      await check(
+        { ...t, tags: t.tags.filter((x) => x[0] !== 'version') },
+        /exactly one "version" tag/,
+      );
       await check({ ...t, content: `${t.content}deadbeef  extra\n` }, /content does not match/);
       await check(
         { ...t, tags: t.tags.map((x) => (x[0] === 'd' ? ['d', 'nutflix-web'] : x)) },
@@ -345,7 +366,7 @@ describe('scripts/release-verify.mjs', () => {
       await expect(
         v.verifyRelease(
           { ...ev, content: ev.content.replace(/^./, 'f') },
-          { allDir: make, expectedPubkey: pubkey },
+          { allDir: make, trustedPubkey: pubkey },
         ),
       ).rejects.toThrow(/does not verify/);
     });
