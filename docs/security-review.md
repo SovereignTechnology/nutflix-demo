@@ -593,16 +593,19 @@ finding's section above plus its row in §0. **Filing waits for Cameron's go-ahe
 
 | Issue title |
 |---|
-| [Medium] F33: duplicate block deliveries — cap at the quoted price or single-peer ranges (decision) |
+| [Medium] F33: duplicate block deliveries — request each range from one peer (Cameron, 2026-09-24) |
 | [Done] F5: DLEQ off the event loop (Node) and batching on the credit pool (ADR 0011 §10–§11). Residual [Low]: DLEQ in the desktop's Bare worker; a credit pool sized per seeder window |
 | [Done] Seeder: an append-only pending-PAY journal and a cap that stops serving at `maxPendingPays` (daemon + gateway, ADR 0011 §12; the desktop worker too, cap 1024, `stage-3/worker-journal`) |
 | [Done] F37: the gateway's upstream fetches are paced (ADR 0011 §11) |
 | [Done] F10/F11/F12/F31 hooks in the desktop runtime — the worker's seeder engine persists seen secrets and pending PAYs and asks the host for `checkSpent` / `spentByUs` (ADR 0012) |
-| [Done] F31: a lost mint answer is restored (write-ahead journal + NUT-09, ADR 0014 — not NUT-13). Residual [Low]: the desktop's journal is in memory; melt change is not journaled. Open (decision): NUT-13 seed backup |
+| [Done] F31: a lost mint answer is restored (write-ahead journal + NUT-09, ADR 0014). Residual [Low]: the desktop's journal is in memory; melt change is not journaled |
+| [Medium] NUT-13 seed backup in Stage 3 (Cameron, 2026-09-24): design + ADR first |
+| [Medium] F15/Blossom: Pear only — remove the gateway's blob hosting and Studio's Blossom mirroring; quota 2 GiB for what remains (Cameron, 2026-09-24) |
+| [Medium] F18: images hash-addressed only by default; thumbnails in the video's core (seeder's choice, default free, placeholder if paid); avatars from a per-creator Pear core (Cameron, 2026-09-24) |
 | [Done] F15: per-pubkey upload quota (`blossom.maxBytesPerPubkey`) |
 | [Done] F17: NUT-20 locked mint quotes; opaque quote handles over IPC. Residual [Low]: a signer-held wallet key (the seeder daemon) takes unlocked quotes — cashu-ts signs NUT-20 itself and needs the key as a string |
-| [Medium] F4: execute auto top-ups with per-top-up and per-day caps |
-| [Low] F21: packaging — set the Electron fuses when the app is packaged (the dev flags are already refused in a packaged build) |
+| [Medium] F4: execute auto top-ups — off by default, 10 000 sat per top-up, 50 000 sat per day, own mints only, first-time confirm (Cameron, 2026-09-24) |
+| [Low] F21: packaging with Electron Forge + Pear makers (exe, dmg, deb, AppImage, `pear://`), fuses set, releases signed with the SovTech Nostr key (Cameron, 2026-09-24) |
 | [Done] F24: the desktop's file `KeyStore` (ADR 0013) |
 | [Done] Desktop signer: remove the key from this device; NIP-46 `auth_url` approval links (ADR 0013 §7) |
 | [Done] F25: external links open only after main's prompt window showed the real host |

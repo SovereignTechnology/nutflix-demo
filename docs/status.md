@@ -462,6 +462,26 @@ Wallet QR (pass = decodes to text starting `lnbc5000n1pj9x7`).
 | Worker pending-PAY journal (ADR 0011 §12) | `stage-3/worker-journal` (on `stage-3/external-links`) | **done** — the journal's logic is now runtime-neutral (`PendingJournalCore` in the seeder's portable entry). The daemon keeps its behaviour, and the desktop's Bare worker uses it for `payments/pending.jsonl` (append + fsync before the ACK, compaction, the old `pending.json` migrated, an unreadable journal keeps payments off). The worker stops serving at 1024 queued PAYs until a flush drains them |
 | NIP-71 `minpay` (ADR 0010 §3.2 amendment) | `stage-3/manifest-minpay` (on `stage-3/worker-journal`) | **done** — the manifest builder emits and the parser reads `minpay` (1 … 1 000 000 sat, else `bad-price`), so a creator can raise the batching target. The minimum's contribution to the unpaid window is capped at 64 blocks (`MAX_MIN_PAY_WINDOW_BLOCKS`): an untrusted tag cannot open huge unpaid windows. Found on the way: the desktop's exact-key IPC guards would have refused every manifest carrying it (fixed: `minPaySats` optional, bounded) |
 
+### Inputs from Cameron — ANSWERED 2026-09-24 (Stage 3)
+
+Asked one by one, multiple choice; these supersede the open questions above.
+
+| # | Decision | Answer |
+|---|---|---|
+| 1 | F33 duplicate block deliveries | **One peer per range**: request each range from a single seeder, so there are no duplicates and seeders are paid fairly |
+| 2 | F4 auto top-up | **Off by default**; when on, at most **10 000 sat per top-up and 50 000 sat per day**, only into mints on the user's own list, native confirm the first time a mint is funded, each top-up in wallet history |
+| 3 | NUT-13 seed backup | **Yes, in Stage 3** (design + ADR first: the seed's source, per-device counters, the relation to NIP-60) |
+| 4 | Minimum PAY (ADR 0010 §3.3) | Stays a batching target; **expected mint fees are shown in the price** (display only, no protocol change) |
+| 5 | Blossom vs Pear | **Pear only**: the gateway stops hosting blobs (no `PUT /upload` / `/mirror`, no disk store) and Studio stops mirroring to Blossom servers; manifests carry sha256 + `hyper://`; Blossom's Nostr-signed auth (kind 24242) stays where a request must be signed; web viewers get bytes through the gateway, which reads them from Pear |
+| 6 | Per-pubkey upload quota | **2 GiB** (applies to whatever the gateway still stores) |
+| 7 | F18 images | **Hash-addressed only** by default, with a "Load remote images" setting |
+| 8 | Thumbnails | In the video's own Hyperblobs core, fetched from its seeders; **each seeder chooses** whether to charge; default **free**; a charging seeder's thumbnail shows a **placeholder** — browsing never spends sats |
+| 9 | Avatars | A **per-creator Pear profile core** named in kind 0, fetched P2P for free, identicon until it arrives |
+| 10 | `minpay` window cap | **64 blocks** (kept) |
+| 11 | Packaging | **Electron Forge + Pear makers**; targets **Windows .exe, macOS .dmg, Linux .deb, Linux AppImage** and a **`pear://` address** |
+| 12 | Signing | Every release **signed with the SovTech ngit Nostr key** (through Bunker46; the nsec is never written): a Nostr-signed manifest of sha256 sums. macOS Gatekeeper / Windows SmartScreen warnings **accepted for now** |
+| 13 | Outward | **Push** all `stage-2/*` and `stage-3/*` branches to origin and the backup mirror, **one MR** from `stage-3/manifest-minpay` to `main`; **file the open §6 issues** on GitLab; the Wallet QR phone scan now |
+
 Owed from Stage 2 (ADR 0010 Consequences, `docs/security-review.md` §0 and §6). The F1–F4 and
 F30 blockers were fixed on `stage-2/review-fixes` (2026-09-24); F6 verified on two real mints
 (`stage-3/real-mint`); the seeder daemon's runtime is done (`stage-3/seeder-runtime`, ADR 0011).
