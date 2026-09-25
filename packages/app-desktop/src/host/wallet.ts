@@ -4,7 +4,8 @@
  * `spend` events so the WalletChip moves; without it every wallet call rejects
  * `payments-unavailable: …` (reads too — a made-up "0 sats" would be a lie on screen).
  *
- * Nothing here executes an auto top-up (SE-4): the host only evaluates `autoTopUpDue` and logs.
+ * Nothing here executes an auto top-up: with the real wallet `./topup/auto-topup.ts` does
+ * (issue #2); with `--dev-mocks` the host only evaluates `autoTopUpDue` and logs (SE-4).
  */
 import type {
   CashuP2pkPubkey,

@@ -1,7 +1,9 @@
 /**
  * Settings › Mints and top-up: the default mints (add/remove with `https://`-only
  * validation, shown as `MintChip`s with the wallet's balance at each), one-tap adds from the
- * wallet's own mints, and the optional auto top-up (threshold + mint).
+ * wallet's own mints, and the optional auto top-up (threshold, source mint and — issue #2 — the
+ * amount per top-up; off by default, at most `AUTO_TOP_UP_PER_DAY_SATS` a day, the first top-up
+ * into each mint confirmed in a trusted window outside this screen).
  */
 import { useEffect, useState, type SubmitEvent, type ReactElement } from 'react';
 import type { MintUrl, NetworkAdapter, Sats, Settings } from '@sovit/core';
@@ -16,10 +18,14 @@ import {
   type SectionProps,
 } from './controls.js';
 import {
+  AUTO_TOP_UP_AMOUNT_MAX_SATS,
   AUTO_TOP_UP_DEFAULT_SATS,
+  AUTO_TOP_UP_PER_DAY_SATS,
+  autoTopUpAmount,
   autoTopUpEnabled,
   normaliseMintUrl,
   parseThresholdSats,
+  parseTopUpAmountSats,
   validateMintUrl,
 } from './model.js';
 
@@ -131,7 +137,12 @@ export function WalletSection({
   const fallbackMint = mintOptions[0];
   const [threshold, setThreshold] = useState<string | null>(null);
   const [thresholdError, setThresholdError] = useState<string | null>(null);
+  const [amount, setAmount] = useState<string | null>(null);
+  const [amountError, setAmountError] = useState<string | null>(null);
   const canTopUp = signedIn && fallbackMint !== undefined;
+  /** Issue #2: every write keeps the amount the user chose (absent = the max). */
+  const keepAmount = (base: Settings): { amountSats?: Sats } =>
+    base.autoTopUp?.amountSats === undefined ? {} : { amountSats: base.autoTopUp.amountSats };
 
   const saveTopUp = (next: (base: Settings) => Settings['autoTopUp']): Promise<boolean> =>
     save({
@@ -147,14 +158,20 @@ export function WalletSection({
     if (fallbackMint === undefined) return;
     setThreshold(null);
     setThresholdError(null);
+    setAmount(null);
+    setAmountError(null);
     void saveTopUp((base) => {
       const cur = base.autoTopUp;
       const fromMint = cur?.fromMint ?? fallbackMint;
       // "Off" is a zero threshold — `Partial<Settings>` cannot remove the optional field.
-      if (!on) return cur === undefined ? undefined : { belowSats: 0 as Sats, fromMint };
+      if (!on)
+        return cur === undefined
+          ? undefined
+          : { belowSats: 0 as Sats, fromMint, ...keepAmount(base) };
       return {
         belowSats: (autoTopUpEnabled(cur) ? cur.belowSats : AUTO_TOP_UP_DEFAULT_SATS) as Sats,
         fromMint,
+        ...keepAmount(base),
       };
     });
   };
@@ -175,6 +192,7 @@ export function WalletSection({
     void saveTopUp((base) => ({
       belowSats: parsed.value as Sats,
       fromMint: base.autoTopUp?.fromMint ?? topUp.fromMint,
+      ...keepAmount(base),
     })).then((ok) => {
       if (!alive.current) return;
       if (ok) setThreshold((cur) => (cur === submitted ? null : cur));
@@ -185,15 +203,42 @@ export function WalletSection({
     });
   };
 
+  const commitAmount = (): void => {
+    if (amount === null || !enabled) return;
+    const parsed = parseTopUpAmountSats(amount);
+    if (!parsed.ok) {
+      setAmountError(parsed.error);
+      return;
+    }
+    if (parsed.value === autoTopUpAmount(topUp) && amountError === null) {
+      setAmount(null);
+      return;
+    }
+    const submitted = amount;
+    setAmountError(null);
+    void saveTopUp((base) => ({
+      belowSats: base.autoTopUp?.belowSats ?? topUp.belowSats,
+      fromMint: base.autoTopUp?.fromMint ?? topUp.fromMint,
+      amountSats: parsed.value as Sats,
+    })).then((ok) => {
+      if (!alive.current) return;
+      if (ok) setAmount((cur) => (cur === submitted ? null : cur));
+      else
+        setAmountError('Not saved — the amount was not changed. Your amount is kept; try again.');
+    });
+  };
+
   const chooseMint = (fromMint: MintUrl): void => {
     void saveTopUp((base) => ({
       belowSats: (base.autoTopUp?.belowSats ?? AUTO_TOP_UP_DEFAULT_SATS) as Sats,
       fromMint,
+      ...keepAmount(base),
     }));
   };
 
   const addId = `${id}-add`;
   const thresholdId = `${id}-threshold`;
+  const amountId = `${id}-amount`;
   const mintSelectId = `${id}-topup-mint`;
 
   return (
@@ -296,7 +341,7 @@ export function WalletSection({
         <SwitchRow
           id={`${id}-topup`}
           label="Top up automatically"
-          description="Keeps playback from stalling: when your balance at the chosen mint drops below the threshold, the wallet starts a top-up."
+          description="Keeps playback from stalling: when a mint you pay from runs low, the wallet moves sats there from another of your mints. Off until you turn it on."
           checked={enabled}
           disabled={!canTopUp && !enabled}
           busy={pending.has('autoTopUp')}
@@ -346,6 +391,46 @@ export function WalletSection({
                 ) : null}
               </div>
               <div className="nf-settings__field">
+                <label htmlFor={amountId} className="nf-settings__label">
+                  Each top-up
+                </label>
+                <div className="nf-settings__input-unit">
+                  <input
+                    id={amountId}
+                    type="text"
+                    inputMode="numeric"
+                    autoComplete="off"
+                    className="nf-settings__input nf-settings__input--number"
+                    value={amount ?? String(autoTopUpAmount(topUp))}
+                    aria-invalid={amountError !== null || undefined}
+                    aria-describedby={
+                      amountError !== null ? `${amountId}-error` : `${amountId}-hint`
+                    }
+                    onChange={(e) => {
+                      setAmount(e.currentTarget.value);
+                    }}
+                    onBlur={commitAmount}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') {
+                        e.preventDefault();
+                        commitAmount();
+                      }
+                    }}
+                  />
+                  <span className="nf-settings__unit" aria-hidden="true">
+                    sats
+                  </span>
+                </div>
+                {amountError !== null ? (
+                  <FieldError id={`${amountId}-error`}>{amountError}</FieldError>
+                ) : (
+                  <p id={`${amountId}-hint`} className="nf-settings__desc">
+                    Up to{' '}
+                    <SatsBadge sats={AUTO_TOP_UP_AMOUNT_MAX_SATS} variant="neutral" size="sm" />.
+                  </p>
+                )}
+              </div>
+              <div className="nf-settings__field">
                 <label htmlFor={mintSelectId} className="nf-settings__label">
                   From mint
                 </label>
@@ -367,9 +452,17 @@ export function WalletSection({
               </div>
             </div>
             <p className="nf-settings__summary">
-              Tops up when your balance at <strong>{mintHost(topUp.fromMint)}</strong> drops below{' '}
-              <SatsBadge sats={topUp.belowSats} variant="neutral" size="sm" />.
+              When a mint on your list that you pay from drops below{' '}
+              <SatsBadge sats={topUp.belowSats} variant="neutral" size="sm" />, moves{' '}
+              <SatsBadge sats={autoTopUpAmount(topUp)} variant="neutral" size="sm" /> there from{' '}
+              <strong>{mintHost(topUp.fromMint)}</strong>.
             </p>
+            <Note>
+              At most <SatsBadge sats={AUTO_TOP_UP_PER_DAY_SATS} variant="neutral" size="sm" /> in
+              any 24 hours, Lightning fees included. The first top-up into each mint asks you to
+              confirm in a separate Nutflix window; later ones run without asking. Mints a video
+              names that are not on your list are never topped up.
+            </Note>
           </>
         ) : null}
       </div>

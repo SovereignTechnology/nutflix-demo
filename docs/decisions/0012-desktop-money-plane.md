@@ -89,6 +89,41 @@ above the manifest, so no block is ever paid at the wrong price.
   refused. At most 256 are kept. Core locks the quotes themselves with NUT-20 where the mint
   supports it.
 
+- Addendum 2026-09-25 (issue #2, security review F4; Cameron 2026-09-24): **auto top-ups
+  execute** — `host/topup/auto-topup.ts`, with the user's real wallet only (with `--dev-mocks` a
+  due top-up is still only logged). When a payment is about to draw from a mint (a balance change,
+  or a play with nothing to pay with) whose balance is below `Settings.autoTopUp.belowSats`, the
+  host runs `mintQuote(target, amount)` → `meltQuote(fromMint, bolt11)` → `melt` → `pollQuote`
+  at the target. The rules, each refusing before anything moves:
+  - **off by default** (absent, or `belowSats <= 0`); the target is on the user's own list
+    (`defaultMints`) and never `fromMint` — a mint first seen in a manifest is never topped up;
+  - **one at a time**: a second trigger for the same mint joins the top-up in flight, any other
+    is refused; attempts are at least a minute apart, a failure backs off 1 min … 1 h (doubling),
+    a declined question backs that mint off for an hour — no retry per payment, no storm;
+  - **caps**: `amountSats` (1 … `AUTO_TOP_UP_MAX_SATS` = 10 000, absent = the max) per top-up;
+    at most `AUTO_TOP_UP_MAX_SATS_PER_DAY` = 50 000 in any rolling 24 h counting what actually
+    left the source (fees included) plus everything in flight (amount + fee reserve + an
+    input-fee allowance). Fees above 5 % (10-sat floor), or a melt quote for a different amount
+    than the target invoiced, are refused;
+  - **the ledger** (`host/topup/ledger.ts`, userData `auto-topup.json`, atomic, 0600) persists
+    the entries and the allowed mints across restarts. It fails CLOSED: a corrupt, unknown or
+    out-of-shape file is copied aside and replaced by a marker that counts the whole daily cap
+    (top-ups pause 24 h, allowances are forgotten); if even that cannot be written, every top-up
+    is refused for the run. A reservation is persisted before the melt; a melt that fails or is
+    not paid stays counted;
+  - **the first funding of a mint** is asked in main's trusted prompt window (ADR 0013,
+    `PromptForm` `top-up-first`: target, source, amount — data only, the page shows hosts and
+    states the caps; default "Not now"). Only an explicit yes is remembered, per mint, in the
+    ledger; no, a closed window or the prompt's 5-minute deadline moves nothing. The prompt
+    window therefore exists whenever real money can move (also with an injected signer), never
+    with `--dev-mocks`;
+  - **history**: minting writes `in … "top-up"` at the target and the melt `out … "melt to
+    Lightning"` at the source; nothing more is written. Core's melt takes no memo
+    (docs/contract-requests/S3-topup.md), so the host shows that melt as "top-up" by the id the
+    ledger recorded.
+  Main's settings gate (F4/F8) now also asks when `amountSats` changes, and its question states
+  the amount, the daily cap and the first-time confirm.
+
 ## Consequences
 
 - With a signer, the desktop pays and is paid for real: tested end to end — the worker (real

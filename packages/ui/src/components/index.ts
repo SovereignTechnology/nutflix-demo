@@ -82,6 +82,8 @@ export {
   estimateMintFeeSats,
   PAY_INPUTS_ESTIMATE,
   UI_DEFAULT_MIN_PAY_SATS,
+  UI_AUTO_TOP_UP_MAX_SATS,
+  UI_AUTO_TOP_UP_PER_DAY_SATS,
   renditionRatePerMin,
   shortPubkey,
 } from './shared/format.js';

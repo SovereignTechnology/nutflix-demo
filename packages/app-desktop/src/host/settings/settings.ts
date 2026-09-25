@@ -78,8 +78,8 @@ export interface StoredSettings {
 }
 
 /**
- * Whether a top-up of `mint` (whose balance is `balance`) would be due. Nothing EXECUTES a
- * top-up yet (Stage 3); this answers the question the contract defines:
+ * Whether a top-up of `mint` (whose balance is `balance`) is due — the question the contract
+ * defines; `../topup/auto-topup.ts` executes it (issue #2) behind its own caps and confirm:
  *
  *   - SE-4 (docs/reviews/2026-09-23-pre-push-l5-v4.md): "off" when absent or `belowSats <= 0`
  *     (a patch cannot clear the optional key, so Settings/Wallet write `belowSats: 0`); the

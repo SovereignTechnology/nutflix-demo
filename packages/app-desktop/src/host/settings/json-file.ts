@@ -22,17 +22,33 @@ export type LoadResult<T> =
 /** Largest file the host will parse (these files are a few KiB). */
 export const MAX_STATE_FILE_BYTES = 1024 * 1024;
 
+export interface JsonFileOptions {
+  /**
+   * Move a corrupt file aside to `<name>.corrupt` (default `true`). `false` leaves it in place
+   * for a caller that must never read "corrupt" as "missing" on a later load — the auto top-up
+   * ledger (issue #2), which fails CLOSED and replaces the file itself.
+   */
+  readonly moveAsideCorrupt?: boolean;
+}
+
 export class JsonFile<T> {
   readonly path: string;
   private readonly parse: (raw: unknown) => T | null;
   private readonly log: Logger;
+  private readonly moveAside: boolean;
   private chain: Promise<void> = Promise.resolve();
 
   /** `parse` returns `null` for anything that is not a valid `T` (it must not throw). */
-  constructor(path: string, parse: (raw: unknown) => T | null, log: Logger) {
+  constructor(
+    path: string,
+    parse: (raw: unknown) => T | null,
+    log: Logger,
+    opts: JsonFileOptions = {},
+  ) {
     this.path = path;
     this.parse = parse;
     this.log = log;
+    this.moveAside = opts.moveAsideCorrupt ?? true;
   }
 
   async load(): Promise<LoadResult<T>> {
@@ -98,6 +114,10 @@ export class JsonFile<T> {
   }
 
   private async corrupt(reason: string): Promise<LoadResult<T>> {
+    if (!this.moveAside) {
+      this.log.warn('state file is corrupt', { file: basename(this.path), reason });
+      return { kind: 'corrupt', reason };
+    }
     this.log.warn('state file is corrupt; using defaults', { file: basename(this.path), reason });
     try {
       await rename(this.path, `${this.path}.corrupt`);

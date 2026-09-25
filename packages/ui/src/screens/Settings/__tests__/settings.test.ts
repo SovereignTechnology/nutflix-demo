@@ -444,6 +444,51 @@ describe('Settings — default mints and auto top-up', () => {
   });
 });
 
+describe('Settings — auto top-up amount (issue #2)', () => {
+  it('shows the default (and max) 10,000, saves an amount, refuses one above the max, and keeps it through other edits', async () => {
+    const adapter = adapterWith({}, { autoTopUp: { belowSats: 1000 as never, fromMint: MINTS.a } });
+    const update = vi.spyOn(adapter, 'updateSettings');
+    const { r } = await ready(adapter);
+    const s = section(r, 'Mints and top-up');
+    const amount = input(r, '-mints-amount');
+    expect(amount.value).toBe('10000');
+    // The copy: the daily cap, fees, the first-time confirm, never a manifest's mint.
+    expect(s.textContent).toContain('50,000 sats');
+    expect(s.textContent).toContain('in any 24 hours, Lightning fees included');
+    expect(s.textContent).toContain('The first top-up into each mint asks you to confirm');
+    expect(s.textContent).toContain('not on your list are never topped up');
+    type(amount, '12,000');
+    enter(amount);
+    expect(r.get(`[id="${amount.id}-error"]`).textContent).toContain('10,000 sats per top-up');
+    expect(update).not.toHaveBeenCalled();
+    type(amount, '2,500');
+    enter(amount);
+    await flush();
+    expect(update.mock.calls[0]![0]).toEqual({
+      autoTopUp: { belowSats: 1000, fromMint: MINTS.a, amountSats: 2500 },
+    });
+    expect(r.get('.nf-settings__summary').textContent).toContain('2,500 sats');
+    const threshold = input(r, '-mints-threshold');
+    type(threshold, '1,500');
+    enter(threshold);
+    await flush();
+    expect(update.mock.calls[1]![0]).toEqual({
+      autoTopUp: { belowSats: 1500, fromMint: MINTS.a, amountSats: 2500 },
+    });
+    click(input(r, '-mints-topup'));
+    await flush();
+    expect(update.mock.calls[2]![0]).toEqual({
+      autoTopUp: { belowSats: 0, fromMint: MINTS.a, amountSats: 2500 },
+    });
+  });
+
+  it('is off by default', async () => {
+    const { r } = await ready(adapterWith());
+    expect(input(r, '-mints-topup').checked).toBe(false);
+    expect(r.all('[id$="-mints-amount"]')).toHaveLength(0);
+  });
+});
+
 describe('Settings — seeding, playback, appearance', () => {
   it('switches the live seeder through seeder.setEnabled (not updateSettings)', async () => {
     const adapter = adapterWith();

@@ -4,6 +4,10 @@
  * auto-top-up bounds, signer copy and error copy. No React, no adapter calls.
  */
 import type { MintUrl, RelayUrl, SignerStatus } from '@sovit/core';
+import {
+  UI_AUTO_TOP_UP_MAX_SATS,
+  UI_AUTO_TOP_UP_PER_DAY_SATS,
+} from '../../components/shared/format.js';
 
 export type Validation<T> =
   { readonly ok: true; readonly value: T } | { readonly ok: false; readonly error: string };
@@ -173,7 +177,15 @@ export function clampPrefetch(sec: number): number {
 // ---- auto top-up ----------------------------------------------------------------------
 
 export const AUTO_TOP_UP_DEFAULT_SATS = 1_000;
+/** The threshold's ceiling (`Settings.autoTopUp.belowSats`). */
 export const AUTO_TOP_UP_MAX_SATS = 10_000_000;
+/**
+ * Issue #2: the most one auto top-up moves, and its default — core's `AUTO_TOP_UP_MAX_SATS`
+ * (a local copy pinned by a test: the screens import no core runtime code).
+ */
+export const AUTO_TOP_UP_AMOUNT_MAX_SATS = UI_AUTO_TOP_UP_MAX_SATS;
+/** Issue #2: the most auto top-ups move in any rolling 24 hours — core's `AUTO_TOP_UP_MAX_SATS_PER_DAY`. */
+export const AUTO_TOP_UP_PER_DAY_SATS = UI_AUTO_TOP_UP_PER_DAY_SATS;
 
 /**
  * `Settings.autoTopUp` is optional and `updateSettings` takes a `Partial<Settings>` merge, so
@@ -194,6 +206,25 @@ export function parseThresholdSats(text: string): Validation<number> {
   const n = Number(t);
   if (n < 1 || n > AUTO_TOP_UP_MAX_SATS)
     return fail(`Choose between 1 and ${AUTO_TOP_UP_MAX_SATS.toLocaleString('en-US')} sats.`);
+  return ok(n);
+}
+
+/** The sats one auto top-up moves: `amountSats`, absent = the max (issue #2). */
+export function autoTopUpAmount(a: { readonly amountSats?: number } | undefined): number {
+  const n = a?.amountSats;
+  return n === undefined ? AUTO_TOP_UP_AMOUNT_MAX_SATS : Math.min(n, AUTO_TOP_UP_AMOUNT_MAX_SATS);
+}
+
+/** Issue #2: a top-up amount — whole sats, 1 … `AUTO_TOP_UP_AMOUNT_MAX_SATS`. */
+export function parseTopUpAmountSats(text: string): Validation<number> {
+  const t = text.trim().replace(/[,_\s]/g, '');
+  if (t === '') return fail('Enter an amount in sats.');
+  if (!/^\d+$/.test(t)) return fail('Sats are whole numbers, like 5000.');
+  const n = Number(t);
+  if (n < 1 || n > AUTO_TOP_UP_AMOUNT_MAX_SATS)
+    return fail(
+      `Choose between 1 and ${AUTO_TOP_UP_AMOUNT_MAX_SATS.toLocaleString('en-US')} sats per top-up.`,
+    );
   return ok(n);
 }
 

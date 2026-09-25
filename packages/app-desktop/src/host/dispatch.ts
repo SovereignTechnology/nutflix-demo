@@ -75,7 +75,8 @@ export function handlers(a: DesktopNetworkAdapter): HandlerTable {
     'wallet.meltQuote': (_c, [mint, bolt11]) => a.wallet.meltQuote(mint, bolt11),
     // Stage 2: main's money gate (native confirm) sits in front of this.
     'wallet.melt': (_c, [quote]) => a.wallet.melt(quote),
-    'wallet.history': (_c, [opts]) => a.wallet.history(opts),
+    // Issue #2: an auto top-up's funding melt reads "top-up" (core's melt takes no memo).
+    'wallet.history': (_c, [opts]) => a.walletHistory(opts),
     'studio.upload': (c, [input]) => {
       // SE-1: the path comes ONLY from main's token swap, never from the renderer's message.
       if (c.file === undefined) fail('file-token-invalid', 'no file was granted for this upload');

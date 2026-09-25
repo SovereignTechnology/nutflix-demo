@@ -16,6 +16,7 @@
  * `--dev-mocks` (mock sats only) skips the money and settings questions, never the file one.
  */
 import type { Method, MethodTable } from '../ipc/protocol.js';
+import { LIMITS } from '../ipc/protocol.js';
 
 export const MONEY_METHODS = ['wallet.melt', 'seeder.melt', 'nutzap'] as const;
 export type MoneyMethod = (typeof MONEY_METHODS)[number];
@@ -180,9 +181,18 @@ export function describeSettingsPatch(
   const top = patch.autoTopUp;
   if (top !== undefined && Number.isFinite(top.belowSats) && top.belowSats > 0) {
     const was = known?.autoTopUp;
-    if (was?.belowSats !== top.belowSats || was.fromMint !== top.fromMint)
+    // Issue #2: the amount decides how much moves unattended, so changing it is asked too.
+    const amount = Math.min(
+      top.amountSats ?? LIMITS.maxAutoTopUpAmountSats,
+      LIMITS.maxAutoTopUpAmountSats,
+    );
+    if (
+      was?.belowSats !== top.belowSats ||
+      was.fromMint !== top.fromMint ||
+      was.amountSats !== top.amountSats
+    )
       lines.push(
-        `Top up automatically: whenever a trusted mint you pay from falls below ${sats(top.belowSats)}, move sats there from ${host(top.fromMint)} without asking.`,
+        `Top up automatically: whenever a trusted mint you pay from falls below ${sats(top.belowSats)}, move ${sats(amount)} there from ${host(top.fromMint)} — at most ${sats(LIMITS.maxAutoTopUpSatsPerDay)} in any 24 hours, Lightning fees included. The first top-up into each mint asks you first; later ones run without asking.`,
       );
   }
   if (lines.length === 0) return ALLOW;

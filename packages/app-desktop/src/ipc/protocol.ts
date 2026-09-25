@@ -15,6 +15,8 @@
  * unchanged in main, host, preload, renderer and the Bare worker.
  */
 import type {
+  AUTO_TOP_UP_MAX_SATS,
+  AUTO_TOP_UP_MAX_SATS_PER_DAY,
   Comment,
   FeedQuery,
   MeltQuote,
@@ -103,8 +105,15 @@ export const LIMITS = {
   maxSats: 2_100_000_000_000_000,
   /** `Settings.seeding.diskCapBytes` ceiling: 10 000 GiB (Settings' `DISK_CAP_MAX_GB`). */
   maxDiskCapBytes: 10_000 * 1024 ** 3,
-  /** `Settings.autoTopUp.belowSats` ceiling (Settings' `AUTO_TOP_UP_MAX_SATS`). */
+  /** `Settings.autoTopUp.belowSats` ceiling (the Settings screen's threshold maximum). */
   maxAutoTopUpSats: 10_000_000,
+  /**
+   * Issue #2: `Settings.autoTopUp.amountSats` ceiling and the most one auto top-up moves — core's
+   * `AUTO_TOP_UP_MAX_SATS` (pinned below; this module imports no core runtime code).
+   */
+  maxAutoTopUpAmountSats: 10_000,
+  /** Issue #2: the most auto top-ups move in any rolling 24 h — core's `AUTO_TOP_UP_MAX_SATS_PER_DAY`. */
+  maxAutoTopUpSatsPerDay: 50_000,
   /** `PricePolicy.minPaySats` ceiling — core's `MAX_MIN_PAY_SATS` (the manifest parser's bound). */
   maxMinPaySats: 1_000_000,
   /** A custom thumbnail's bytes (same cap as host-fetched images, design §3). */
@@ -272,7 +281,18 @@ export type PromptForm =
    * one piece of upstream data a question carries: an `https:` URL (`isAuthUrl`), whose HOST the
    * page shows; main opens it only when the user clicks "Open in browser".
    */
-  | { readonly kind: 'bunker-auth'; readonly url: string };
+  | { readonly kind: 'bunker-auth'; readonly url: string }
+  /**
+   * Issue #2 (security review F4): the FIRST auto top-up into `target` — move `amount` sats there
+   * from `source`? Both mints come from the user's own Settings (`defaultMints`, `fromMint`), never
+   * from a manifest; the page shows their hosts. Default: no. Only an explicit yes is remembered.
+   */
+  | {
+      readonly kind: 'top-up-first';
+      readonly target: MintUrl;
+      readonly source: MintUrl;
+      readonly amount: Sats;
+    };
 export type PromptKind = PromptForm['kind'];
 
 /**
@@ -298,7 +318,8 @@ export type PromptAnswer =
   | { readonly kind: 'bunker'; readonly uri: Uint8Array; readonly remember: boolean }
   | { readonly kind: 'create-wallet'; readonly create: boolean }
   | { readonly kind: 'remove-key'; readonly confirm: boolean }
-  | { readonly kind: 'bunker-auth'; readonly open: boolean };
+  | { readonly kind: 'bunker-auth'; readonly open: boolean }
+  | { readonly kind: 'top-up-first'; readonly confirm: boolean };
 
 /** What main's keychain holds, one sealed file each. */
 export type KeychainSlot = 'passphrase' | 'nip46';
@@ -744,6 +765,12 @@ interface Checks {
   uploadProgress: UploadProgressWire extends UploadProgress ? true : false;
   /** The runtime media-code list is exactly core's `MediaErrorCode`. */
   mediaCodes: Mutual<(typeof MEDIA_ERROR_CODES)[number], MediaErrorCode>;
+  /** Issue #2: the local top-up caps are exactly core's (a type-only import of the constants). */
+  topUpMax: Mutual<(typeof LIMITS)['maxAutoTopUpAmountSats'], typeof AUTO_TOP_UP_MAX_SATS>;
+  topUpPerDay: Mutual<
+    (typeof LIMITS)['maxAutoTopUpSatsPerDay'],
+    typeof AUTO_TOP_UP_MAX_SATS_PER_DAY
+  >;
 }
 /** Arguments: identical to the contract's parameters (except `studio.upload`, SE-1). */
 type ArgChecks = { [M in AdapterArgChecked]: Mutual<MethodTable[M][0], ContractArgs<M>> };

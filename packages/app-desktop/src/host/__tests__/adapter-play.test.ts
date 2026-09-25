@@ -2,7 +2,8 @@
  * Playback across processes (design §1) and the host backstop (§4): host-minted sids, the
  * blob-server link only ever sent to MAIN (`media-link`), ≤ 1 unpaused session per
  * webContents, `wc-gone`/worker death close everything, spend events debit the `--dev-mocks`
- * wallet, and nothing executes an auto top-up (SE-4).
+ * wallet, and with `--dev-mocks` nothing executes an auto top-up (SE-4; with the real wallet it
+ * does since issue #2 — `auto-topup.test.ts`, `topup-host.test.ts`).
  */
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
@@ -280,7 +281,10 @@ describe('worker events', () => {
   });
 });
 
-describe('SE-4: nothing executes an auto top-up in Stage 1', () => {
+// Issue #2 changed Stage 1's rule for the REAL wallet only (auto top-ups execute there, behind
+// their caps and first-funding confirm). With --dev-mocks (fake sats, no prompt window) a due
+// top-up is still evaluated and logged, never executed — only the log line's wording changed.
+describe('SE-4: with --dev-mocks nothing executes an auto top-up', () => {
   it.each([0, 100])(
     'belowSats %i: balances drain to 0, mintQuote is never called',
     async (below) => {
@@ -306,7 +310,7 @@ describe('SE-4: nothing executes an auto top-up in Stage 1', () => {
       await eventually(() => drained, 'the balance at mint a to reach 0');
       expect(mintQuote).not.toHaveBeenCalled();
       const due = r.log.lines.filter(
-        (l) => l.msg === 'auto top-up would be due; not executed in Stage 1',
+        (l) => l.msg === 'auto top-up would be due; not executed with --dev-mocks',
       );
       expect(due).toHaveLength(below > 0 ? 1 : 0);
     },

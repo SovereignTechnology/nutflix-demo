@@ -45,6 +45,9 @@ import type { Nip46Connector } from './signer/desktop-signer.js';
 import { DesktopSigner } from './signer/desktop-signer.js';
 import { MainBridge } from './signer/main-bridge.js';
 import { TopicRegistry } from './topics.js';
+import { AutoTopUp } from './topup/auto-topup.js';
+import type { AutoTopUpOptions } from './topup/auto-topup.js';
+import { TopUpLedger } from './topup/ledger.js';
 
 export interface HostOptions {
   /** Electron's userData directory (absolute). */
@@ -74,6 +77,8 @@ export interface HostOptions {
   readonly random?: (n: number) => Uint8Array;
   readonly now?: () => UnixSeconds;
   readonly workerStartTimeoutMs?: number;
+  /** Tests: the auto top-up's wall clock (ms, shared with its ledger) and target polling. */
+  readonly topUp?: Pick<AutoTopUpOptions, 'now' | 'sleep' | 'pollAttempts' | 'pollIntervalMs'>;
 }
 
 export class Host {
@@ -297,15 +302,18 @@ export async function createHost(o: HostOptions): Promise<Host> {
     });
 
   // ADR 0013: without an injected signer and without --dev-mocks, the user connects one through
-  // main's trusted prompt window, and the money plane follows it.
+  // main's trusted prompt window, and the money plane follows it. Issue #2: the prompt window
+  // also asks before the first auto top-up into a mint, so it exists whenever real money can
+  // move (an injected signer too), never with --dev-mocks.
   const switching = new SwitchingWallet();
-  let bridge: MainBridge | undefined;
+  const bridge: MainBridge | undefined = flags.devMocks
+    ? undefined
+    : new MainBridge({
+        post: (out) => late.post?.(out),
+        ...(o.timers === undefined ? {} : { timers: o.timers }),
+      });
   let signerFlow: DesktopSigner | undefined;
-  if (o.identity === undefined && !flags.devMocks) {
-    bridge = new MainBridge({
-      post: (out) => late.post?.(out),
-      ...(o.timers === undefined ? {} : { timers: o.timers }),
-    });
+  if (o.identity === undefined && bridge !== undefined) {
     const flow: DesktopSigner = new DesktopSigner({
       dir: join(o.userData, 'signer'),
       bridge,
@@ -354,6 +362,30 @@ export async function createHost(o: HostOptions): Promise<Host> {
       : fixedMoney === undefined
         ? createWalletProvider(flags.devMocks)
         : { kind: 'real', wallet: fixedMoney.wallet };
+  // Issue #2: auto top-ups execute with the user's REAL wallet only, behind the persisted
+  // ledger's caps and the first-funding question in main's prompt window.
+  const topUpNow = o.topUp?.now ?? Date.now;
+  const autoTopUp =
+    walletProvider.kind === 'real'
+      ? new AutoTopUp({
+          settings: () => settings.get(),
+          // The money plane's own wallet (per signer), never the switching facade: a run, and a
+          // paid-but-unminted retry, stay with the wallet that paid.
+          wallet: () => money()?.wallet,
+          ledger: await TopUpLedger.open(o.userData, log, topUpNow),
+          ...(bridge === undefined
+            ? {}
+            : {
+                askFirstFunding: async (q) => {
+                  const a = await bridge.ask({ kind: 'top-up-first', ...q });
+                  return a?.kind === 'top-up-first' && a.confirm;
+                },
+              }),
+          log,
+          ...o.topUp,
+          now: topUpNow,
+        })
+      : undefined;
   const images = new ImageService({
     transport: o.imageTransport ?? httpsTransport(),
     log,
@@ -424,6 +456,7 @@ export async function createHost(o: HostOptions): Promise<Host> {
     ...(signerFlow === undefined ? {} : { signerFlow }),
     wallet: walletProvider,
     money,
+    ...(autoTopUp === undefined ? {} : { autoTopUp }),
     images,
     worker: (m, a) => worker.request(m, a),
     mediaLink: (token, url) => {

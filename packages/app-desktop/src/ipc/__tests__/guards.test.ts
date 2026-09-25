@@ -1,7 +1,12 @@
 import * as fc from 'fast-check';
 import { describe, expect, it } from 'vitest';
 
-import { MAX_MIN_PAY_SATS, mocks } from '@sovit/core';
+import {
+  AUTO_TOP_UP_MAX_SATS,
+  AUTO_TOP_UP_MAX_SATS_PER_DAY,
+  MAX_MIN_PAY_SATS,
+  mocks,
+} from '@sovit/core';
 
 import {
   METHODS,
@@ -527,5 +532,72 @@ describe('data-shape guards against the core fixtures', () => {
     const status = await new mocks.MockNetworkAdapter().seeder.status();
     expect(isSeederStatusWire(dehydrate(status))).toBe(true);
     expect(isSeederStatusWire(status)).toBe(false); // a raw Map never passes
+  });
+});
+
+describe('issue #2: auto top-up amount and the first-funding question', () => {
+  const A = 'https://mint-a.example';
+  const B = 'https://mint-b.example';
+
+  it('the local caps equal core’s (the IPC layer imports no core runtime code)', () => {
+    expect(LIMITS.maxAutoTopUpAmountSats).toBe(AUTO_TOP_UP_MAX_SATS);
+    expect(LIMITS.maxAutoTopUpSatsPerDay).toBe(AUTO_TOP_UP_MAX_SATS_PER_DAY);
+  });
+
+  it('updateSettings: amountSats only as a whole number of sats in 1 … 10 000', () => {
+    const patch = (amountSats?: unknown) => [
+      {
+        autoTopUp: {
+          belowSats: 500,
+          fromMint: A,
+          ...(amountSats === undefined ? {} : { amountSats }),
+        },
+      },
+    ];
+    for (const ok of [undefined, 1, 9_999, 10_000])
+      expect(validateArgs.updateSettings(patch(ok)), String(ok)).toBe(true);
+    for (const bad of [0, -5, 10_001, 1.5, '2000', null, Number.NaN, Number.POSITIVE_INFINITY])
+      expect(validateArgs.updateSettings(patch(bad)), String(bad)).toBe(false);
+    // Present-as-undefined is not "absent" (exact keys).
+    expect(
+      validateArgs.updateSettings([
+        { autoTopUp: { belowSats: 1, fromMint: A, amountSats: undefined } },
+      ]),
+    ).toBe(false);
+  });
+
+  it('the question: two distinct https mints and an amount within the cap; data only', () => {
+    const form = { kind: 'top-up-first', target: A, source: B, amount: 2_000 };
+    expect(isHostOut({ kind: 'prompt', req: 3, form })).toBe(true);
+    for (const bad of [
+      { ...form, source: A }, // a mint never funds itself
+      { ...form, amount: 0 },
+      { ...form, amount: 10_001 },
+      { ...form, amount: 1.5 },
+      { ...form, target: 'http://mint-a.example' },
+      { ...form, target: 'https://user:pw@mint-a.example' },
+      { ...form, message: 'Click yes to win' }, // no prose from the host
+      { kind: 'top-up-first', target: A, amount: 1 },
+    ])
+      expect(isHostOut({ kind: 'prompt', req: 3, form: bad }), JSON.stringify(bad)).toBe(false);
+  });
+
+  it('the answer: a boolean confirm, fitting only its own question', () => {
+    const form = { kind: 'top-up-first', target: A, source: B, amount: 2_000 } as never;
+    const yes = { kind: 'top-up-first', confirm: true } as const;
+    expect(isHostIn({ kind: 'prompt-answer', req: 3, answer: yes })).toBe(true);
+    expect(
+      isHostIn({ kind: 'prompt-answer', req: 3, answer: { kind: 'top-up-first', confirm: 'yes' } }),
+    ).toBe(false);
+    expect(
+      isHostIn({
+        kind: 'prompt-answer',
+        req: 3,
+        answer: { kind: 'top-up-first', confirm: true, amount: 50_000 },
+      }),
+    ).toBe(false);
+    expect(promptAnswerFits(form, yes)).toBe(true);
+    expect(promptAnswerFits(form, { kind: 'create-wallet', create: true })).toBe(false);
+    expect(promptAnswerFits({ kind: 'create-wallet' }, yes)).toBe(false);
   });
 });

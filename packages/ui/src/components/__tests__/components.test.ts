@@ -4,7 +4,12 @@
  */
 import { createElement, createRef, type ReactElement } from 'react';
 import { describe, expect, it, vi } from 'vitest';
-import { DEFAULT_MIN_PAY_SATS, mocks } from '@sovit/core';
+import {
+  AUTO_TOP_UP_MAX_SATS,
+  AUTO_TOP_UP_MAX_SATS_PER_DAY,
+  DEFAULT_MIN_PAY_SATS,
+  mocks,
+} from '@sovit/core';
 import type { NostrPubkey, Profile, Sats, UnixSeconds } from '@sovit/core';
 import { Avatar, ProfileAvatar } from '../Avatar/Avatar.js';
 import { Button, IconButton } from '../Button/Button.js';
@@ -36,6 +41,8 @@ import {
 import { click, fire, keydown, render } from '../testing/render.js';
 import {
   PAY_INPUTS_ESTIMATE,
+  UI_AUTO_TOP_UP_MAX_SATS,
+  UI_AUTO_TOP_UP_PER_DAY_SATS,
   UI_DEFAULT_MIN_PAY_SATS,
   estimateMintFeeSats,
 } from '../shared/format.js';
@@ -47,6 +54,13 @@ function must<T>(v: T | undefined): T {
 const video = must(mocks.VIDEOS[1]);
 const channel = must(mocks.CHANNELS[0]);
 const sats = (n: number): Sats => n as Sats;
+
+describe('issue #2: the auto top-up caps the screens state', () => {
+  it('equal core’s (the UI imports no core runtime code)', () => {
+    expect(UI_AUTO_TOP_UP_MAX_SATS).toBe(AUTO_TOP_UP_MAX_SATS);
+    expect(UI_AUTO_TOP_UP_PER_DAY_SATS).toBe(AUTO_TOP_UP_MAX_SATS_PER_DAY);
+  });
+});
 
 describe('estimateMintFeeSats (Cameron 2026-09-24: fees shown in the price)', () => {
   it('PAYs × the swap fee of one PAY; 0 for a free mint; the UI default matches core', () => {

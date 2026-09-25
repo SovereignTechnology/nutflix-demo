@@ -178,6 +178,7 @@ function summarizeAnswer(a: PromptAnswer | null): { kind: string; bytes: number 
   if (a.kind === 'create-wallet') return { kind: `create-wallet:${String(a.create)}`, bytes: 0 };
   if (a.kind === 'remove-key') return { kind: `remove-key:${String(a.confirm)}`, bytes: 0 };
   if (a.kind === 'bunker-auth') return { kind: `bunker-auth:${String(a.open)}`, bytes: 0 };
+  if (a.kind === 'top-up-first') return { kind: `top-up-first:${String(a.confirm)}`, bytes: 0 };
   return { kind: `local-setup:${a.method}:${a.flow}`, bytes: 0 };
 }
 

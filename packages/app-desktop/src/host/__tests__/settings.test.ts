@@ -92,6 +92,58 @@ describe('SettingsStore (atomic JSON in userData)', () => {
   });
 });
 
+describe('Settings.autoTopUp.amountSats (issue #2)', () => {
+  it('accepts a whole number of sats in 1 … AUTO_TOP_UP_MAX_SATS, and absence (= the max)', async () => {
+    const s = new SettingsStore(dir, memoryLogger());
+    await s.load();
+    for (const amountSats of [1, 2_500, 10_000]) {
+      const next = await s.update({
+        autoTopUp: { belowSats: 500 as Sats, fromMint: MINT, amountSats: amountSats as Sats },
+      });
+      expect(next.autoTopUp).toEqual({ belowSats: 500, fromMint: MINT, amountSats });
+    }
+    const reread = new SettingsStore(dir, memoryLogger());
+    expect((await reread.load()).autoTopUp).toEqual({
+      belowSats: 500,
+      fromMint: MINT,
+      amountSats: 10_000,
+    });
+    expect(
+      (await s.update({ autoTopUp: { belowSats: 500 as Sats, fromMint: MINT } })).autoTopUp,
+    ).toEqual({ belowSats: 500, fromMint: MINT });
+  });
+
+  it('refuses anything else — in a patch and in the stored file (which then reads as the defaults: off)', async () => {
+    const s = new SettingsStore(dir, memoryLogger());
+    await s.load();
+    const bad: unknown[] = [0, -1, 10_001, 1.5, '100', null, Number.NaN, 2 ** 53];
+    for (const amountSats of bad) {
+      await expect(
+        s.update({
+          autoTopUp: { belowSats: 500 as Sats, fromMint: MINT, amountSats: amountSats as Sats },
+        }),
+        String(amountSats),
+      ).rejects.toThrow(TypeError);
+      expect(
+        parseStoredSettings({
+          v: 1,
+          settings: { autoTopUp: { belowSats: 500, fromMint: MINT, amountSats } },
+        }),
+        String(amountSats),
+      ).toBeNull();
+    }
+    expect(s.get()).toEqual(DEFAULT_SETTINGS);
+    await writeFile(
+      join(dir, SETTINGS_FILE),
+      JSON.stringify({
+        v: 1,
+        settings: { autoTopUp: { belowSats: 1, fromMint: MINT, amountSats: 1e6 } },
+      }),
+    );
+    expect((await new SettingsStore(dir, memoryLogger()).load()).autoTopUp).toBeUndefined();
+  });
+});
+
 describe('autoTopUpDue (SE-4, v5, security review F4)', () => {
   const FUNDING = 'https://funding.example' as MintUrl;
   /** The user's own mints are MINT and FUNDING; top-ups are funded from FUNDING. */

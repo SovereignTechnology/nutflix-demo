@@ -907,6 +907,32 @@ describe('Wallet — auto top-up (Settings.autoTopUp)', () => {
     expect(card(r).querySelector('[data-state]')?.textContent).toBe('Off');
   });
 
+  it('issue #2: saving here keeps the amount per top-up chosen in Settings, and the card states the caps', async () => {
+    const base = adapterFor(seeded());
+    await base.updateSettings({
+      autoTopUp: { belowSats: 500 as Sats, fromMint: MINTS.b, amountSats: 2_500 as Sats },
+    });
+    const updateSettings = vi.spyOn(base, 'updateSettings');
+    const { r } = mount(base);
+    await flush();
+    expect(card(r).textContent).toContain('2,500 sats');
+    expect(card(r).textContent).toContain('50,000 sats');
+    expect(card(r).textContent).toContain('The first top-up into each mint asks you to confirm');
+    const below = card(r).querySelector<HTMLInputElement>('input[inputmode="numeric"]');
+    if (!below) throw new Error('no threshold');
+    typeInto(below, '700');
+    click(button(card(r), 'Save'));
+    expect(updateSettings).toHaveBeenLastCalledWith({
+      autoTopUp: { belowSats: 700, fromMint: MINTS.b, amountSats: 2_500 },
+    });
+    await flush();
+    click(card(r).querySelector<HTMLInputElement>('input[type="checkbox"]')!);
+    click(button(card(r), 'Save'));
+    expect(updateSettings).toHaveBeenLastCalledWith({
+      autoTopUp: { belowSats: 0, fromMint: MINTS.b, amountSats: 2_500 },
+    });
+  });
+
   it('an invalid threshold is refused without saving', async () => {
     const base = adapterFor(seeded());
     const updateSettings = vi.spyOn(base, 'updateSettings');
@@ -1099,6 +1125,10 @@ describe('Wallet helpers', () => {
       destroyed: [],
     };
     expect(historyLabel({ ...base, memo: 'top-up' }).title).toBe('Top-up via Lightning');
+    // Issue #2: the source side of an auto top-up.
+    expect(historyLabel({ ...base, direction: 'out', memo: 'top-up' }).title).toBe(
+      'Auto top-up (moved to another mint)',
+    );
     expect(historyLabel({ ...base, direction: 'out', memo: 'melt-out' }).title).toBe(
       'Withdrawal to Lightning',
     );

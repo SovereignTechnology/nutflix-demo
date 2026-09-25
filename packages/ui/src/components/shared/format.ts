@@ -85,6 +85,10 @@ export function renditionPriceSats(rendition: Rendition, policy: PricePolicy): S
 
 /** Core's `DEFAULT_MIN_PAY_SATS` (the UI imports no core runtime code; a test pins the two). */
 export const UI_DEFAULT_MIN_PAY_SATS = 10;
+/** Issue #2: core's `AUTO_TOP_UP_MAX_SATS` — the most (and the default) one auto top-up moves. */
+export const UI_AUTO_TOP_UP_MAX_SATS = 10_000;
+/** Issue #2: core's `AUTO_TOP_UP_MAX_SATS_PER_DAY` — the most auto top-ups move in any 24 hours. */
+export const UI_AUTO_TOP_UP_PER_DAY_SATS = 50_000;
 /** Input proofs a viewer's PAY swap typically spends: an estimate (power-of-two denominations). */
 export const PAY_INPUTS_ESTIMATE = 2;
 

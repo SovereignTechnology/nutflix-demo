@@ -7,7 +7,8 @@
 import { afterEach, describe, expect, it } from 'vitest';
 
 import type { PromptForm } from '../../ipc/protocol.js';
-import { MIN_PASSPHRASE_CHARS, mount } from '../prompt/prompt.js';
+import { LIMITS } from '../../ipc/protocol.js';
+import { MIN_PASSPHRASE_CHARS, TOP_UP_PER_DAY_SATS, mount } from '../prompt/prompt.js';
 
 let root: HTMLElement;
 afterEach(() => {
@@ -180,5 +181,32 @@ describe('prompt page', () => {
     root.remove();
     show({ kind: 'bunker-auth', url: 'https://аuth.example/' }); // a Cyrillic "а"
     expect(find('.host code').textContent).toMatch(/^xn--/);
+  });
+
+  it('issue #2 first top-up: names target, source and amount (hosts only), the daily cap; defaults to Not now', () => {
+    expect(TOP_UP_PER_DAY_SATS).toBe(LIMITS.maxAutoTopUpSatsPerDay);
+    const form = {
+      kind: 'top-up-first',
+      target: 'https://mint.target.example/cashu/api?x=SECRET',
+      source: 'https://source.example:3338',
+      amount: 2_000,
+    } as unknown as PromptForm;
+    const a = show(form);
+    const facts = find('dl.facts').textContent;
+    expect(facts).toContain('mint.target.example');
+    expect(facts).toContain('source.example:3338');
+    expect(facts).toContain('2,000 sats');
+    expect(root.textContent).not.toMatch(/SECRET|cashu\/api/);
+    expect(root.textContent).toContain('50,000 sats in any 24 hours');
+    expect(document.activeElement?.textContent).toBe('Not now');
+    document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape' }));
+    expect(a.sent).toEqual([{ kind: 'top-up-first', confirm: false }]);
+    root.remove();
+    const b = show(form);
+    submit();
+    expect(b.sent).toEqual([{ kind: 'top-up-first', confirm: true }]);
+    root.remove();
+    show({ ...form, target: 'https://аmint.example/' } as PromptForm); // a Cyrillic "а"
+    expect(find('dl.facts code').textContent).toMatch(/^xn--/);
   });
 });

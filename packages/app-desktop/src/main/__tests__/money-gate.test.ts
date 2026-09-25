@@ -115,6 +115,37 @@ describe('describeSettingsPatch (F4/F8)', () => {
     });
   });
 
+  it('issue #2: changing the amount is asked; the question states the amount, the daily cap and the first-time confirm', () => {
+    const on = { ...SETTINGS, autoTopUp: { belowSats: 500 as never, fromMint: MINT } };
+    const raise = describeSettingsPatch(
+      { autoTopUp: { belowSats: 500 as never, fromMint: MINT, amountSats: 2_000 as never } },
+      on,
+    );
+    expect(raise).toMatchObject({ kind: 'ask' });
+    if (raise.kind === 'ask') {
+      expect(raise.prompt.detail).toContain('move 2,000 sats there');
+      expect(raise.prompt.detail).toContain('at most 50,000 sats in any 24 hours');
+      expect(raise.prompt.detail).toContain('first top-up into each mint asks you first');
+    }
+    // Absent = the max, and the question says so.
+    const dflt = describeSettingsPatch(
+      { autoTopUp: { belowSats: 700 as never, fromMint: MINT } },
+      on,
+    );
+    if (dflt.kind === 'ask') expect(dflt.prompt.detail).toContain('move 10,000 sats there');
+    expect(dflt.kind).toBe('ask');
+    const same = {
+      ...SETTINGS,
+      autoTopUp: { belowSats: 500 as never, fromMint: MINT, amountSats: 2_000 as never },
+    };
+    expect(
+      describeSettingsPatch(
+        { autoTopUp: { belowSats: 500 as never, fromMint: MINT, amountSats: 2_000 as never } },
+        same,
+      ),
+    ).toEqual({ kind: 'allow' });
+  });
+
   it('an unchanged auto top-up is not asked again', () => {
     const on = { ...SETTINGS, autoTopUp: { belowSats: 500 as never, fromMint: MINT } };
     expect(
