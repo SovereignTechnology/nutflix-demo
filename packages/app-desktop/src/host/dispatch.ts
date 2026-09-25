@@ -31,6 +31,7 @@ export function handlers(a: DesktopNetworkAdapter): HandlerTable {
     signer: () => a.signer(),
     me: () => a.me(),
     profile: (_c, [pk]) => a.profile(pk),
+    setProfilePicture: (_c, [image]) => a.setProfilePicture(image),
     feed: (_c, [q]) => a.feed(q),
     video: (_c, [id]) => a.video(id),
     stats: (_c, [id]) => a.stats(id),

@@ -66,6 +66,7 @@ export interface MockNetworkAdapterOptions {
 }
 
 export class MockNetworkAdapter implements NetworkAdapter {
+  private myProfile: Profile = MY_PROFILE;
   readonly platform = 'mock' as const;
   readonly wallet: Wallet;
 
@@ -145,8 +146,22 @@ export class MockNetworkAdapter implements NetworkAdapter {
     );
   }
   profile(pubkey: NostrPubkey): Promise<Profile | null> {
-    if (pubkey === ME) return this.delay(MY_PROFILE);
+    if (pubkey === ME) return this.delay(this.myProfile);
     return this.delay(CHANNELS.find((c) => c.pubkey === pubkey)?.profile ?? null);
+  }
+
+  /** v6: the picture changes to a fixture URL (the desktop writes it into a Pear profile core). */
+  setProfilePicture(image: {
+    readonly bytes: Uint8Array;
+    readonly type: string;
+  }): Promise<Profile> {
+    if (image.bytes.byteLength === 0 || !/^image\/(jpeg|png|webp)$/.test(image.type))
+      return Promise.reject(new Error('unsupported-input: not a JPEG, PNG or WebP image'));
+    this.myProfile = {
+      ...this.myProfile,
+      picture: `https://fixture.example/avatars/me-${String(image.bytes.byteLength)}.jpg`,
+    };
+    return this.delay(this.myProfile);
   }
 
   // ---- catalog

@@ -30,6 +30,7 @@ import { MAX_IMAGE_BYTES, manifest, media } from '@sovit/core';
 import type { LogLevel, Logger, SeedCore } from '@sovit/seeder';
 import { Seeder, fromHex, toHex } from '@sovit/seeder';
 
+import { fromHex as hexToBytes } from '../ipc/codec.js';
 import { IpcError } from '../ipc/errors.js';
 import type { ErrorCode, FfmpegStatus, SeederStatusWire, SessionId } from '../ipc/protocol.js';
 import { LIMITS } from '../ipc/protocol.js';
@@ -270,6 +271,8 @@ export class WorkerHost {
         return this.upload(req.a);
       case 'image.fetch':
         return this.imageFetch(req.a);
+      case 'profile.putImage':
+        return this.putProfileImage(hexToBytes(req.a.hex));
     }
   }
 
@@ -672,12 +675,15 @@ export class WorkerHost {
     return sc;
   }
 
-  /** Studio: write a thumbnail into our profile core; the host names it in the manifest. */
-  private async putThumbnail(
+  /**
+   * Write an image into our profile core — a Studio thumbnail (the host names it in the manifest)
+   * or our avatar (the host names it in our kind 0).
+   */
+  private async putProfileImage(
     bytes: Uint8Array,
   ): Promise<{ url: string; sha256: Sha256Hex; size: number }> {
     if (bytes.byteLength < 1 || bytes.byteLength > MAX_IMAGE_BYTES)
-      fail('invalid-argument', 'thumbnail is empty or larger than the image cap');
+      fail('invalid-argument', 'image is empty or larger than the image cap');
     const sc = await this.ownProfile();
     const blob = await sc.blobs.put(bytes);
     const h = sodiumSha256();
@@ -818,7 +824,7 @@ export class WorkerHost {
         sha256: sodiumSha256,
         logger: live.log,
         publish: (draft) => this.o.request('studio.publish', draft),
-        putThumbnail: (bytes) => this.putThumbnail(bytes),
+        putThumbnail: (bytes) => this.putProfileImage(bytes),
         progress: (p: UploadProgress) => {
           this.o.emit({ op: 'ev', e: 'upload.progress', uploadId: a.uploadId, progress: p });
         },

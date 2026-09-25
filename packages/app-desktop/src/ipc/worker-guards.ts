@@ -70,6 +70,8 @@ const isHyperImageUrl = matches(
   200,
 );
 const isImageSize = int(1, LIMITS.maxThumbnailBytes);
+/** An image as lower-case hex: at most the image cap (two characters a byte). */
+const isImageHex = matches(/^(?:[0-9a-f]{2})+$/, 2 * LIMITS.maxThumbnailBytes);
 
 const isSeeding = obj(
   { enabled: bool, diskCapBytes: int(0, LIMITS.maxDiskCapBytes) },
@@ -157,6 +159,7 @@ export const validateWorkerArgs: {
   'studio.ffmpeg': safe(obj({ recheck: bool }, { path: isAbsolutePath })),
   'studio.upload': safe(isStudioUpload),
   'image.fetch': safe(obj({ url: isHyperImageUrl, sha256: isSha256, size: isImageSize })),
+  'profile.putImage': safe(obj({ hex: isImageHex })),
 };
 
 const isUndefined = (x: unknown): x is undefined => x === undefined;
@@ -194,7 +197,8 @@ export const validateWorkerResult: {
   'studio.ffmpeg': safe(isFfmpegStatus),
   'studio.upload': safe(isVideoManifest),
   // At most the image cap as hex (two characters a byte).
-  'image.fetch': safe(obj({ hex: matches(/^(?:[0-9a-f]{2})+$/, 2 * LIMITS.maxThumbnailBytes) })),
+  'image.fetch': safe(obj({ hex: isImageHex })),
+  'profile.putImage': safe(obj({ url: isHyperImageUrl, sha256: isSha256, size: isImageSize })),
 };
 
 const isRenditionDraft = obj(renditionDraftGuards.req, renditionDraftGuards.opt);

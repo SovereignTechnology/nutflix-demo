@@ -127,6 +127,34 @@ export function buildProfileEvent(input: ProfileInput, createdAt: UnixSeconds): 
   };
 }
 
+/**
+ * ADR 0015 part c: a kind 0 that keeps every field of `previous` (the user's own newest, verified
+ * kind 0 — fields this client does not know included) and sets the fields of `patch`. A
+ * `previous` whose content is not a JSON object contributes nothing.
+ */
+export function mergeProfileEvent(
+  previous: NostrEvent | null,
+  patch: Readonly<Record<string, string | number>>,
+  createdAt: UnixSeconds,
+): EventDraft {
+  let base: Record<string, unknown> = {};
+  if (previous !== null && previous.kind === NostrKind.Profile) {
+    try {
+      const json: unknown = JSON.parse(previous.content);
+      if (typeof json === 'object' && json !== null && !Array.isArray(json))
+        base = json as Record<string, unknown>;
+    } catch {
+      // not JSON: start from nothing
+    }
+  }
+  return {
+    kind: NostrKind.Profile,
+    created_at: createdAt,
+    tags: [],
+    content: JSON.stringify({ ...base, ...patch }),
+  };
+}
+
 /** Run the NIP-05 lookup for a parsed profile and return it with the resulting status. */
 export async function withNip05Status(profile: Profile, fetch: FetchLike): Promise<Profile> {
   if (profile.nip05 === undefined) return { ...profile, nip05Status: 'none' };

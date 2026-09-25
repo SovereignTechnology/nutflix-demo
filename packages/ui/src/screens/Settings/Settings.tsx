@@ -226,6 +226,10 @@ export function Settings({
           id={sectionId('account')}
           signer={signer}
           onChangeSigner={onChangeSigner}
+          onChangePicture={async (image) => {
+            await adapter.setProfilePicture(image);
+            signer.refresh();
+          }}
           headingRef={refFor('account')}
         />
         <AppearanceSection

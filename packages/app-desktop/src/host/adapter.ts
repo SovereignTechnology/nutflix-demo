@@ -45,7 +45,7 @@ import type {
   VideoStats,
   Wallet,
 } from '@sovit/core';
-import { NostrKind, manifest, nostr } from '@sovit/core';
+import { MAX_IMAGE_BYTES, NostrKind, manifest, nostr } from '@sovit/core';
 
 import { toHex } from '../ipc/codec.js';
 import { IpcError } from '../ipc/errors.js';
@@ -67,6 +67,7 @@ import type { IdentityProvider } from './identity.js';
 import type { DesktopSigner } from './signer/desktop-signer.js';
 import { QuoteHandles } from './quote-handles.js';
 import type { ImageService } from './images/images.js';
+import { sniffImage } from './images/images.js';
 import type { Logger } from './log.js';
 import { redact } from './log.js';
 import type { DesktopConfig, SettingsStore } from './settings/settings.js';
@@ -274,6 +275,38 @@ export class DesktopNetworkAdapter implements NetworkAdapter {
 
   me(): Promise<NostrPubkey | null> {
     return this.o.identity.me();
+  }
+
+  /**
+   * ADR 0015 part c: our picture goes into our profile core (the worker writes it), then our
+   * newest kind 0 is re-published with every other field kept and `picture` = its `hyper://`
+   * URL, `picture_sha256` and `picture_size`.
+   */
+  async setProfilePicture(image: {
+    readonly bytes: Uint8Array;
+    readonly type: string;
+  }): Promise<Profile> {
+    if (this.o.identity.signer() === undefined)
+      fail('no-signer', 'no signer connected (sign in to change your picture)');
+    if (image.bytes.byteLength < 1 || image.bytes.byteLength > MAX_IMAGE_BYTES)
+      fail('invalid-argument', 'the picture is empty or larger than 5 MiB');
+    // The type is whatever the bytes are, not what the renderer said.
+    if (sniffImage(image.bytes) === null)
+      fail('unsupported-input', 'the picture must be a JPEG, PNG or WebP image');
+    const put = await this.o.worker('profile.putImage', { hex: toHex(image.bytes) });
+    return this.write(async (c, me) => {
+      const previous = await c.queryOne({ kinds: [NostrKind.Profile], authors: [me] });
+      const draft = nostr.mergeProfileEvent(
+        previous,
+        { picture: put.url, picture_sha256: put.sha256, picture_size: put.size },
+        this.now(),
+      );
+      const { event } = await c.publish(draft);
+      const verified = nostr.verifyIncoming(event);
+      const p = verified === null ? null : nostr.parseProfile(verified, this.now());
+      if (p === null) fail('internal', 'the published profile did not verify');
+      return p;
+    });
   }
 
   profile(pubkey: NostrPubkey): Promise<Profile | null> {

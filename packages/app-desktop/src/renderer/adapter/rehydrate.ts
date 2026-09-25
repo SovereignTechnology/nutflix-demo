@@ -101,6 +101,7 @@ export function adapterFromBridge(b: NutflixBridge): NetworkAdapter {
     signer: () => settle(b.signer()),
     me: () => settle(b.me()),
     profile: (pk) => settle(b.profile(pk)),
+    setProfilePicture: (image) => settle(b.setProfilePicture(image)),
     feed: (q) => settle(b.feed(q)),
     video: (id) => settle(b.video(id)),
     stats: (id) => settle(b.stats(id)),

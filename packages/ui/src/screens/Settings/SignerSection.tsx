@@ -11,6 +11,7 @@ import { useCallback, useEffect, useRef, useState, type ReactElement } from 'rea
 import type { NetworkAdapter, Profile, SignerStatus } from '@sovit/core';
 import {
   Avatar,
+  Button,
   EmptyState,
   ErrorState,
   Skeleton,
@@ -107,6 +108,12 @@ export interface SignerSectionProps {
    * read-only. When it returns a promise, the screen re-reads `adapter.signer()` after it.
    */
   readonly onChangeSigner?: ((kind: SignerKind) => void | Promise<void>) | undefined;
+  /**
+   * ADR 0015 part c: set the profile picture (`adapter.setProfilePicture`, then a re-read). When
+   * omitted there is no "Change picture" control.
+   */
+  readonly onChangePicture?:
+    ((image: { readonly bytes: Uint8Array; readonly type: string }) => Promise<void>) | undefined;
   readonly headingRef?: ((el: HTMLHeadingElement | null) => void) | undefined;
 }
 
@@ -114,6 +121,7 @@ export function SignerSection({
   id,
   signer,
   onChangeSigner,
+  onChangePicture,
   headingRef,
 }: SignerSectionProps): ReactElement {
   const alive = useRef(true);
@@ -204,6 +212,9 @@ export function SignerSection({
             </span>
             <span>{signerTitle(s.kind)}</span>
           </p>
+          {onChangePicture !== undefined && state === 'connected' ? (
+            <ChangePicture id={id} onChange={onChangePicture} />
+          ) : null}
         </div>
       </div>
     );
@@ -307,5 +318,81 @@ export function SignerSection({
         </div>
       </fieldset>
     </SectionFrame>
+  );
+}
+
+/** The largest picture accepted (the host's cap, `MAX_IMAGE_BYTES`). */
+const MAX_PICTURE_BYTES = 5 * 1024 * 1024;
+
+/** ADR 0015 part c: pick an image → it becomes the profile picture (on Pear, not a website). */
+function ChangePicture({
+  id,
+  onChange,
+}: {
+  readonly id: string;
+  readonly onChange: (image: {
+    readonly bytes: Uint8Array;
+    readonly type: string;
+  }) => Promise<void>;
+}): ReactElement {
+  const input = useRef<HTMLInputElement | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const pick = async (file: File | undefined): Promise<void> => {
+    if (file === undefined) return;
+    setError(null);
+    if (!/^image\/(jpeg|png|webp)$/.test(file.type)) {
+      setError('Choose a JPEG, PNG or WebP image.');
+      return;
+    }
+    if (file.size > MAX_PICTURE_BYTES) {
+      setError('The picture must be at most 5 MB.');
+      return;
+    }
+    setBusy(true);
+    try {
+      await onChange({ bytes: new Uint8Array(await file.arrayBuffer()), type: file.type });
+    } catch (err: unknown) {
+      setError(errorMessage(err) || 'Could not change your picture.');
+    } finally {
+      setBusy(false);
+      if (input.current !== null) input.current.value = '';
+    }
+  };
+  return (
+    <div className="nf-settings__picture">
+      <input
+        ref={input}
+        id={`${id}-picture`}
+        type="file"
+        accept="image/jpeg,image/png,image/webp"
+        hidden
+        aria-label="Profile picture"
+        onChange={(e) => {
+          void pick(e.currentTarget.files?.[0]);
+        }}
+      />
+      <Button
+        variant="secondary"
+        size="sm"
+        loading={busy}
+        disabled={busy}
+        onClick={() => {
+          input.current?.click();
+        }}
+      >
+        Change picture
+      </Button>
+      {error !== null ? (
+        <p className="nf-settings__error" role="alert">
+          {error}
+        </p>
+      ) : (
+        <p className="nf-settings__desc">
+          Stored on Pear beside your videos’ thumbnails: viewers get it from you and from seeders,
+          never from a website.
+        </p>
+      )}
+    </div>
   );
 }

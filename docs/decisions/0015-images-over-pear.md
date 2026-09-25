@@ -11,8 +11,8 @@ Accepted for Stage 3 (issue #5, parts b and c). Cameron's decisions, 2026-09-24/
 - each seeder chooses whether to serve them (serve free, or not at all), on by default;
 - browsing never spends sats.
 
-Implementation: parts a and b on `stage-3/image-privacy` and `stage-3/images-over-pear`
-(2026-09-25). Part c (setting one's own avatar) follows.
+Implementation (2026-09-25): part a on `stage-3/image-privacy`, part b on
+`stage-3/images-over-pear`, part c on `stage-3/profile-picture`.
 
 ## Context
 

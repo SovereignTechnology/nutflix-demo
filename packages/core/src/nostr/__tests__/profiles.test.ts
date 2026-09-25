@@ -5,6 +5,7 @@ import { lookupNip05, parseNip05, verifyNip05 } from '../nip05.js';
 import {
   buildProfileEvent,
   fetchProfile,
+  mergeProfileEvent,
   fetchProfiles,
   parseProfile,
   publishProfile,
@@ -91,6 +92,27 @@ describe('lookupNip05 / verifyNip05 (injected fetch, no sockets)', () => {
 });
 
 describe('kind 0 profiles', () => {
+  it('mergeProfileEvent keeps every previous field and sets the patch (ADR 0015 part c)', async () => {
+    const s = new TestSigner();
+    const prev = await sign(s, {
+      kind: 0,
+      created_at: T0,
+      tags: [],
+      content: JSON.stringify({ name: 'bob', website: 'https://w', picture: 'https://old' }),
+    });
+    const next = mergeProfileEvent(prev, { picture: 'hyper://x/0-1', picture_size: 3 }, T0);
+    expect(next.kind).toBe(0);
+    expect(JSON.parse(next.content)).toEqual({
+      name: 'bob',
+      website: 'https://w',
+      picture: 'hyper://x/0-1',
+      picture_size: 3,
+    });
+    expect(JSON.parse(mergeProfileEvent(null, { name: 'x' }, T0).content)).toEqual({ name: 'x' });
+    const junk = await sign(s, { kind: 0, created_at: T0, tags: [], content: '[1,2]' });
+    expect(JSON.parse(mergeProfileEvent(junk, { name: 'y' }, T0).content)).toEqual({ name: 'y' });
+  });
+
   // ADR 0015: a picture in the creator's profile core carries its hash and size.
   it('a hyper:// picture keeps its sha256 and size; without both it is dropped; https keeps what is valid', async () => {
     const s = new TestSigner();

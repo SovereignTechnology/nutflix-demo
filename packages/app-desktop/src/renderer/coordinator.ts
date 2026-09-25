@@ -102,6 +102,7 @@ export class PlaybackCoordinator {
       signer: () => a.signer(),
       me: () => a.me(),
       profile: (pk) => a.profile(pk),
+      setProfilePicture: (image) => a.setProfilePicture(image),
       feed: (q) => a.feed(q),
       video: (id) => a.video(id),
       stats: (id) => a.stats(id),

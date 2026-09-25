@@ -127,6 +127,19 @@ describe('ADR 0015: images over Pear (creator → desktop worker)', () => {
     ).rejects.toThrow(/^hash-mismatch/);
   }, 60_000);
 
+  // ADR 0015 part c: our own avatar goes into our own profile core, which is never closed.
+  it('profile.putImage writes into our own profile core; it reads back and stays open', async () => {
+    const put = await worker.call('profile.putImage', { hex: Buffer.from(JPEG).toString('hex') });
+    expect(put).toMatchObject({ sha256: SHA, size: JPEG.byteLength });
+    const s = workerSeeder(worker.host);
+    const own = await s.blobs.openCore('nutflix-profile');
+    expect(manifest.decodeHyperUrl(put.url, put.size)?.core).toBe(own.keyHex);
+    const { hex } = await worker.call('image.fetch', put);
+    expect(hex).toBe(Buffer.from(JPEG).toString('hex'));
+    expect(s.blobs.coreByKey(own.keyHex)).toBeDefined(); // ours: never released
+    expect(s.isFreeCore(own.keyHex)).toBe(true);
+  }, 60_000);
+
   it('serves it free while seeding with serveImages on; switching serveImages off releases it', async () => {
     await worker.call('seeder.configure', {
       enabled: true,

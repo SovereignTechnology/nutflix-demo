@@ -57,6 +57,7 @@ export interface NutflixBridge {
   signer: Call<'signer'>;
   me: Call<'me'>;
   profile: Call<'profile'>;
+  setProfilePicture: Call<'setProfilePicture'>;
   feed: Call<'feed'>;
   video: Call<'video'>;
   stats: Call<'stats'>;

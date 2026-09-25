@@ -336,6 +336,11 @@ export interface MethodTable {
   signer: [args: [], result: SignerStatus];
   me: [args: [], result: NostrPubkey | null];
   profile: [args: [pubkey: NostrPubkey], result: Profile | null];
+  /** ADR 0015 part c: the bytes cross as a `Uint8Array` (structured clone), at most 5 MiB. */
+  setProfilePicture: [
+    args: [image: { readonly bytes: Uint8Array; readonly type: string }],
+    result: Profile,
+  ];
   // catalog
   feed: [args: [q: FeedQuery], result: Page<VideoManifest>];
   video: [args: [id: NostrEventId], result: VideoManifest | null];

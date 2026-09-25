@@ -49,6 +49,7 @@ export const VALID: Samples = {
   signer: [[]],
   me: [[]],
   profile: [[PUBKEY]],
+  setProfilePicture: [[{ bytes: Uint8Array.of(0xff, 0xd8, 0xff), type: 'image/jpeg' }]],
   feed: [
     [{ source: 'trending' }],
     [{ source: 'shorts', limit: 12, cursor: '12' }],
@@ -198,6 +199,12 @@ export const VALID: Samples = {
 /** Hand-picked invalid argument lists per method (on top of the generic mutations). */
 export const INVALID: Partial<Record<Method, readonly unknown[][]>> = {
   profile: [['npub1xyz'], [PUBKEY.toUpperCase()], [PUBKEY.slice(1)], [42]],
+  setProfilePicture: [
+    [{ bytes: Uint8Array.of(1), type: 'image/svg+xml' }],
+    [{ bytes: 'ffd8', type: 'image/jpeg' }],
+    [{ bytes: new Uint8Array(5 * 1024 * 1024 + 1), type: 'image/jpeg' }],
+    [],
+  ],
   feed: [
     [{ source: 'everything' }],
     [{ source: 'trending', limit: 0 }],

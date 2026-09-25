@@ -600,6 +600,34 @@ describe('Settings — save model', () => {
     expect(images.checked).toBe(false);
   });
 
+  // ADR 0015 part c: the profile picture goes to Pear through the adapter, then a re-read.
+  it('"Change picture" sends the chosen image and refreshes; a wrong type is refused before', async () => {
+    const adapter = adapterWith();
+    const set = vi.spyOn(adapter, 'setProfilePicture');
+    const profile = vi.spyOn(adapter, 'profile');
+    const { r } = await ready(adapter);
+    const pickerInput = input(r, '-account-picture');
+    const choose = async (file: File): Promise<void> => {
+      Object.defineProperty(pickerInput, 'files', { value: [file], configurable: true });
+      fire(pickerInput, new Event('change', { bubbles: true }));
+      await flush();
+    };
+    await choose(new File(['<svg/>'], 'a.svg', { type: 'image/svg+xml' }));
+    expect(set).not.toHaveBeenCalled();
+    expect(r.get('.nf-settings__picture [role="alert"]').textContent).toContain(
+      'JPEG, PNG or WebP',
+    );
+    const before = profile.mock.calls.length;
+    await choose(
+      new File([Uint8Array.of(0xff, 0xd8, 0xff, 0xe0)], 'me.jpg', { type: 'image/jpeg' }),
+    );
+    expect(set).toHaveBeenCalledTimes(1);
+    const arg = set.mock.calls[0]![0];
+    expect(arg.type).toBe('image/jpeg');
+    expect([...arg.bytes]).toEqual([0xff, 0xd8, 0xff, 0xe0]);
+    expect(profile.mock.calls.length).toBeGreaterThan(before); // the signer re-read the profile
+  });
+
   it('never loses typed input when a save fails', async () => {
     const adapter = adapterWith();
     vi.spyOn(adapter, 'updateSettings').mockRejectedValue(new Error('disk full'));

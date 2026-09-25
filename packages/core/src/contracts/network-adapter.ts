@@ -218,6 +218,12 @@ export interface NetworkAdapter {
   signer(): Promise<SignerStatus>;
   me(): Promise<NostrPubkey | null>;
   profile(pubkey: NostrPubkey): Promise<Profile | null>;
+  /**
+   * v6 (ADR 0015 part c): set the signed-in user's profile picture. The image (JPEG, PNG or WebP,
+   * at most `MAX_IMAGE_BYTES`) goes into their profile core on Pear, and their kind 0 is
+   * re-published with every other field kept and `picture` = its `hyper://` URL (+ sha256, size).
+   */
+  setProfilePicture(image: { readonly bytes: Uint8Array; readonly type: string }): Promise<Profile>;
 
   // ---- catalog -------------------------------------------------------------------
   feed(q: FeedQuery): Promise<Page<VideoManifest>>;

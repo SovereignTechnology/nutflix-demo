@@ -922,3 +922,12 @@ p.nf-settings__label {
   border-radius: var(--nf-radius-lg);
   overflow: hidden;
 }
+
+/* ADR 0015 part c: "Change picture" under the identity. */
+.nf-settings__picture {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--nf-space-4);
+  margin-top: var(--nf-space-8);
+}

@@ -85,6 +85,7 @@ const ARGS: { readonly [M in WorkerMethod]: readonly WorkerMethodTable[M][0][] }
   ],
   // ADR 0015: a profile-core image.
   'image.fetch': [{ url: HYPER_IMG, sha256: R.sha256, size: 1000 }],
+  'profile.putImage': [{ hex: 'ffd8ffe0' }],
 };
 
 const status = dehydrate(await new mocks.MockNetworkAdapter().seeder.status());
@@ -106,6 +107,7 @@ const RESULTS: { readonly [M in WorkerMethod]: readonly WorkerMethodTable[M][1][
   ],
   'studio.upload': [VIDEO],
   'image.fetch': [{ hex: 'ffd8ffe0' }],
+  'profile.putImage': [{ url: HYPER_IMG, sha256: R.sha256, size: 4 }],
 };
 
 const draft: PublishDraft = {

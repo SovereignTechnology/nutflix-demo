@@ -48,6 +48,7 @@ export type { Nip05Identifier, Nip05Lookup } from './nip05.js';
 export {
   parseProfile,
   buildProfileEvent,
+  mergeProfileEvent,
   withNip05Status,
   fetchProfile,
   fetchProfiles,

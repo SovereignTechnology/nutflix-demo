@@ -437,6 +437,7 @@ export const validateArgs: { readonly [M in Method]: Guard<MethodTable[M][0]> } 
   signer: tuple([]),
   me: tuple([]),
   profile: tuple([isPubkey]),
+  setProfilePicture: tuple([isThumbnailBytes]),
   feed: tuple([isFeedQuery]),
   video: tuple([isEventId]),
   stats: tuple([isEventId]),

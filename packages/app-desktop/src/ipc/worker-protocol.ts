@@ -157,6 +157,11 @@ export interface WorkerMethodTable {
     args: { readonly url: string; readonly sha256: Sha256Hex; readonly size: number },
     result: { readonly hex: string },
   ];
+  /** ADR 0015 part c: write an image (hex) into this node's own profile core. */
+  'profile.putImage': [
+    args: { readonly hex: string },
+    result: { readonly url: string; readonly sha256: Sha256Hex; readonly size: number },
+  ];
 }
 export type WorkerMethod = keyof WorkerMethodTable;
 
