@@ -194,6 +194,17 @@ describe('SealedJournal (the journal at rest)', () => {
     const relabelled = memFile(JSON.stringify({ ...env, pubkey: await other.getPublicKey() }));
     await unreadable(opened(other, relabelled));
     expect(relabelled.writes).toBe(0);
+    // The header is bound to the body (associated data): the SAME key under a fresh wrap — valid,
+    // but not the header this body was sealed with — does not open it.
+    const me = await s.getPublicKey();
+    const rewrapped = memFile(
+      JSON.stringify({
+        ...env,
+        wrap: await s.nip44Encrypt(me, await s.nip44Decrypt(me, String(env['wrap']))),
+      }),
+    );
+    await unreadable(opened(s, rewrapped));
+    expect(rewrapped.writes).toBe(0);
     // Too large to be a journal.
     const huge = memFile('x'.repeat(MAX_JOURNAL_BYTES + 1));
     await unreadable(opened(s, huge));

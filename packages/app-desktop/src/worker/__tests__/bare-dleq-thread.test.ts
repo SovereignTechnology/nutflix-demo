@@ -67,7 +67,9 @@ ipc.on('data', async (c) => {
   // An entry that cannot load core: it answers FAIL through the mailbox; the process lives on.
   let brokenOutcome = 'accepted?';
   const b = new DleqThread({ spawn: bareDleqThread(new URL(${JSON.stringify(pathToFileURL(broken).href)})), startMs: 5000 });
+  const tb = Date.now();
   try { await b.verify(checks.slice(0, 1)); } catch (e) { brokenOutcome = String(e.message); }
+  const brokenMs = Date.now() - tb;
   b.close();
   ipc.write(Buffer.from(JSON.stringify({
     inline: { total: inline.total, stall: inline.stall, verdicts: inline.value },
@@ -75,6 +77,7 @@ ipc.on('data', async (c) => {
     chunked: { total: chunked.total, stall: chunked.stall, verdicts: chunked.value },
     missing: missing === null ? 'no-thread' : 'started',
     broken: brokenOutcome,
+    brokenMs,
     alive: true,
   }) + '\\n'));
   setTimeout(() => Bare.exit(0), 50);
@@ -139,6 +142,7 @@ interface Report {
   readonly chunked: { total: number; stall: number; verdicts: boolean[] };
   readonly missing: string;
   readonly broken: string;
+  readonly brokenMs: number;
   readonly alive: boolean;
 }
 
@@ -198,6 +202,8 @@ describe('DLEQ off the Bare worker’s event loop (issue #8 d, F5)', () => {
       // Failure is never acceptance, and never an abort.
       expect(report.missing).toBe('no-thread');
       expect(report.broken).toMatch(/did not start/);
+      // …answered through the mailbox (FAIL) at once, not found out by the 5 s start timeout.
+      expect(report.brokenMs).toBeLessThan(4000);
       expect(report.alive).toBe(true);
       expect(exited).toBe(0);
       // The numbers themselves, for the lane report: NUTFLIX_DLEQ_MEASURE=<file> writes them.

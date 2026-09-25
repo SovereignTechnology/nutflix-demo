@@ -115,6 +115,12 @@ import { payment } from '@sovit/core';
 import { serveDleqMailbox } from '${join(HERE, '..', 'pay', 'dleq-thread.ts').replaceAll('\\', '/')}';
 serveDleqMailbox(workerData, (p, k) => payment.proofDleqOk(p, k));
 `;
+/** The real serve loop with a verifier that throws on every check. */
+const THROWING = `
+import { workerData } from 'node:worker_threads';
+import { serveDleqMailbox } from '${join(HERE, '..', 'pay', 'dleq-thread.ts').replaceAll('\\', '/')}';
+serveDleqMailbox(workerData, () => { throw new Error('boom'); });
+`;
 /** Says FAIL at start (as the Bare entry does when core does not load). */
 const FAIL_AT_START = `
 import { workerData } from 'node:worker_threads';
@@ -153,7 +159,7 @@ const SILENT = `setInterval(() => {}, 1000);`;
 beforeAll(async () => {
   dir = join(ROOT, 'node_modules', '.cache', `nf-s3res-dleq-${randomBytes(6).toString('hex')}`);
   await mkdir(dir, { recursive: true });
-  const sources = { SERVE, FAIL_AT_START, WRONG_COUNT, HANG, SILENT };
+  const sources = { SERVE, THROWING, FAIL_AT_START, WRONG_COUNT, HANG, SILENT };
   for (const [name, contents] of Object.entries(sources)) {
     const outfile = join(dir, `${name}.mjs`);
     await build({
@@ -226,6 +232,22 @@ describe('DleqThread (the mailbox) — parity and liveness', () => {
       expect(off.stall).toBeLessThan(on.stall / 4);
     } finally {
       t.close();
+    }
+  });
+
+  it('on the thread, a check that throws, or is not a check at all, is a failed check — never a pass', async () => {
+    const t = new DleqThread({ spawn: nodeSpawner('THROWING') });
+    try {
+      expect(await t.verify(checks(3))).toEqual([false, false, false]);
+    } finally {
+      t.close();
+    }
+    const real = new DleqThread({ spawn: nodeSpawner('SERVE') });
+    try {
+      const junk = [null, { proof: 1 }, {}] as unknown as Check[];
+      expect(await real.verify([...junk, ...checks(1)])).toEqual([false, false, false, true]);
+    } finally {
+      real.close();
     }
   });
 

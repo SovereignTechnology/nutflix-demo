@@ -171,6 +171,50 @@ describe('issue #8 (c): an unresolved send holds its inputs out of the balance',
   });
 });
 
+describe('issue #8: held inputs are nobody’s — not a melt’s, not a restore’s to inflate', () => {
+  it('a melt cannot select the inputs an unresolved send holds', async () => {
+    const n = net();
+    const { mint, store, wallet } = rig({ wrap: n.wrap });
+    await fund(wallet, mint, 64); // one proof
+    n.refuseNext('/v1/swap');
+    await expect(wallet.send(sats(3), { p2pk: pub(5), mint: MINT })).rejects.toMatchObject({
+      code: 'mint-error',
+    });
+    const q = await wallet.meltQuote(MINT, INVOICE_20);
+    await expect(wallet.melt(q)).rejects.toMatchObject({ code: 'insufficient-funds' });
+    expect(mint.calls.filter((c) => c === 'POST /v1/melt/bolt11')).toHaveLength(0);
+    expect(await store.pending(MINT)).toHaveLength(1);
+  });
+
+  it('a restore that names other amounts than the journaled outputs is refused (only melt blanks take the mint’s)', async () => {
+    const n = net();
+    const { mint, store, wallet } = rig({ wrap: n.wrap });
+    // A mint without NUT-12 (no DLEQ to catch the lie): the amount check is what stands.
+    n.st.rewrite = (path, res) => {
+      if (path.endsWith('/v1/info')) {
+        const nuts = res['nuts'] as Record<string, unknown>;
+        delete nuts['12'];
+      }
+      if (path.endsWith('/v1/restore'))
+        for (const sig of res['signatures'] as { amount: number; dleq?: unknown }[]) {
+          sig.amount = sig.amount * 2;
+          delete sig.dleq;
+        }
+    };
+    const set = { mint: MINT, proofs: mint.issue(8) };
+    n.dropNext('/v1/swap');
+    await expect(wallet.receive(set)).rejects.toMatchObject({ code: 'mint-error' });
+    expect(await wallet.balance(MINT)).toBe(0); // nothing inflated
+    expect(await store.proofs(MINT)).toEqual([]);
+    expect(await store.pending(MINT)).toHaveLength(1); // kept for an honest answer
+    n.st.rewrite = (path, res) => {
+      if (path.endsWith('/v1/info')) delete (res['nuts'] as Record<string, unknown>)['12'];
+    };
+    expect(await wallet.recoverPending()).toEqual({ recovered: 1, left: 0 });
+    expect(await wallet.balance(MINT)).toBe(8);
+  });
+});
+
 describe('issue #8 (b): melt change outputs are journaled (NUT-08 blanks, NUT-09 restore)', () => {
   it('a melt whose answer was lost after the mint paid returns paid, with its change restored', async () => {
     const n = net();
