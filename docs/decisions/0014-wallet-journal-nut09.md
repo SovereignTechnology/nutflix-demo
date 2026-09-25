@@ -101,3 +101,105 @@ is counted once (tested).
   - while a send is unresolved, its inputs still count in the balance.
 - Not done: NUT-13 seed backup. If Cameron wants a wallet that can be rebuilt from words alone,
   that is a separate decision: the seed's source, per-device counters, and the relation to NIP-60.
+
+## Amendment (2026-09-25): the three residuals (issue #8, lane `S3-residuals`)
+
+The three [Low] residuals above are closed. Decisions 5, 7 (the desktop line) and 9 are
+superseded as follows; everything else stands.
+
+### (a) The desktop journal is durable, and sealed
+
+`Nip60ProofStore` takes an optional `Nip60Journal`. The desktop host gives it one:
+`SealedJournal` (`core/src/wallet/nip60-journal.ts`) over a private file,
+`<userData>/wallet/journal-<pubkey>.sealed` (`app-desktop/src/host/wallet-journal.ts`).
+
+- **What is in it.** The pending operations and the outbox of unpublished NIP-60 events, in one
+  file. Both are written in the same write, so an operation's result (its new token event, still
+  unpublished) and the removal of its entry land together. This restores decision 1's atomicity
+  on a store whose proofs live on relays: without the outbox in the file, a crash between the
+  relay publish and the journal write would either lose the proofs (outbox in memory) or replay
+  an entry whose proofs were already committed and maybe spent. As the outbox grows during a
+  relay outage, unpublished token events that a newer one supersedes are dropped from it. The
+  newer token carries their proofs, and the kind-5 deletion still names them.
+- **Write-ahead.** Every transition is written and fsynced before `commit` resolves. The file
+  write uses a fresh exclusive temp file (0600), fsync, rename, then a directory fsync, the
+  signer key file's rules. So a `begin` is on disk before `completeSwap` / `completeMint` /
+  `completeMelt` sends the request. A write that fails rejects the commit and changes nothing,
+  and the request is never sent. Writes to one path are serialised across wallet instances, and
+  an open waits for the last one: a signer swap closes the old plane while one of its operations
+  may still be writing. A closed journal (lock, sign-out, swap) wipes its key and refuses every
+  later save.
+- **Sealing: at least the proofs' protection, libraries only.** A random 32-byte journal key
+  (sodium `randombytes_buf`, held in secure memory) is wrapped with NIP-44 to the user's own
+  pubkey through the signer, which is exactly how NIP-60 protects the proofs. Every write is
+  sealed with XChaCha20-Poly1305 (sodium, the key file's AEAD) under a fresh 24-byte nonce, with
+  the header (format, version, pubkey, wrapped key) as associated data. The signer is asked once
+  per open (to unwrap) or once per identity (to wrap a new key), never on the payment path. A
+  NIP-46 signer is therefore not asked for a relay round trip before every PAY. That round trip
+  was decision 7's reason for keeping the journal in memory. Measured on this laptop (ZFS): about
+  8 ms per durable save for one pending send, 11 ms with three unpublished events.
+- **Recovery.** `MoneyPlane.open` loads the journal, merges its unpublished events into what the
+  relays hold (and publishes them again), and, when entries are left, runs
+  `Wallet.recoverPending` in the background (`MoneyPlane.recovery`). Every operation at a mint
+  settles it first anyway.
+- **A journal that does not open fails loudly and is kept.** This covers a bad header, another
+  identity, a key the signer cannot unwrap, a tag that does not verify, a body that is not
+  exactly a journal (every entry is checked with core's `isPendingOp`, now shared with the
+  daemon's `FileProofStore`; every outbox event is signature-verified, by us, of a NIP-60 kind),
+  or a file past 32 MiB. `open` throws `journal-unreadable`, writes nothing, and the wallet does
+  not open. It never starts without the journal: an unreadable entry may be money. The host logs
+  an error, and the unavailable wallet says the journal is unreadable, not "no wallet". A
+  symlinked file, a file owned by another user, or a file others can read is refused the same
+  way.
+
+### (b) Melt change is journaled
+
+A melt is prepared with cashu-ts `prepareMelt` (NUT-08 blanks) and journaled as a `melt`
+`PendingOp`: `keep` holds the blanks, `spends` the inputs, `key` the quote id. Only then is the
+request sent (`completeMelt`). The cases:
+
+- a refusal (a mint error code) drops the entry and reconciles the inputs, as before;
+- a lost answer restores the change by NUT-09. A blank's amount is the one the mint assigned when
+  it signed it, so a restored signature's amount is the mint's, checked by its DLEQ against the
+  key for that amount. Every other kind still requires the journaled amount;
+- a melt the mint reports `PENDING` keeps its entry. Its change is restored once the mint signs it;
+- with no signatures, the inputs' NUT-07 state decides:
+  - PENDING: wait, however old the entry;
+  - all SPENT after `PENDING_SETTLE_AFTER_S`: paid with no change, committed as paid;
+  - anything else after the wait: dropped like a send the mint never saw;
+- a second melt of a quote whose first is unresolved is refused locally;
+- a retry after recovery returns the first melt's result without paying twice;
+- a melt with nothing to come back (no blanks) is not journaled.
+
+`FileProofStore` (the daemon, whose `melt` CLI goes through it) reads melt entries too.
+
+### (c) Held inputs are out of the balance
+
+`CashuWallet.balance` (and so `balances()`, the change events, and the desktop's header chip)
+subtracts the inputs of every journaled operation that spends: a send or a melt. They are held
+out of every new selection, as before, and out of the balance, because they are not spendable
+until the mint answers. They come back if the mint never executed the operation, and leave with
+it if it did, exactly once. A failed send now emits a balance event too. The daemon's payout,
+which sends "the whole balance", no longer tries to spend held inputs.
+
+### Consequences of the amendment
+
+- Tests:
+  - crash injection across a real process kill: the host's money plane in a child process,
+    SIGKILLed after the mint executed and before its answer, for a send and a melt, then
+    recovered by a new process;
+  - a damaged journal (refused, byte for byte kept, then recovered from its original bytes);
+  - the sealed file's every failure mode;
+  - melt change on the test mint and on Nutshell 0.21.0 and cdk-mintd 0.18.1;
+  - held inputs across both outcomes.
+- Each desktop operation now costs up to three sealed writes (begin, result, and the outbox
+  shrink once the relays took the events).
+- Residual [Low]:
+  - a result commit whose journal write fails after the mint executed leaves the entry on disk.
+    The keep outputs come back at the next settle, but a send's locked outputs reach nobody
+    (they are the recipient's, and the recipient never got them);
+  - melt blanks at a mint without NUT-12 take the mint's amount on trust: a lying mint could
+    hand us a proof it will not honour, which is no worse than any mint refusing to honour its
+    proofs;
+  - the journal key passes through the signer's NIP-44 as a hex string, which cannot be wiped
+    (the NIP-60 wallet key's limit).
