@@ -4,12 +4,12 @@
  * and the `studio.publish` request to the host carrying a `PublishDraft` the host guard
  * accepts. Plus the `ffmpeg-not-found` path.
  */
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 
 import type { NostrEvent, NostrEventId, NostrPubkey, VideoManifest } from '@sovit/core';
-import { mocks } from '@sovit/core';
+import { manifest, mocks } from '@sovit/core';
 import { nodeProcessRunner } from '@sovit/core/media/node';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
@@ -155,6 +155,17 @@ describe.skipIf(!hasFfmpeg)('studio.upload with the system ffmpeg', () => {
         // The worker now charges the manifest price for it downstream.
         expect(seeder.policyFor(r.hyper.core).satsPerBlock).toBe(meta.satsPerBlock);
       }
+
+      // ADR 0015: the thumbnail went into this node's own profile core, served free.
+      const thumb = draft.thumbnailImage;
+      expect(thumb).toBeDefined();
+      expect(thumb?.sha256).toBe(draft.thumbnail.sha256);
+      const own = await seeder.blobs.openCore('nutflix-profile');
+      const ref = manifest.decodeHyperUrl(thumb!.url, thumb!.size);
+      expect(ref?.core).toBe(own.keyHex);
+      const bytes = await own.blobs.get(ref!.blob);
+      expect(createHash('sha256').update(bytes!).digest('hex')).toBe(thumb?.sha256);
+      expect(seeder.isFreeCore(own.keyHex)).toBe(true);
 
       const stages = w.events
         .filter(

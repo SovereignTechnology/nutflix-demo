@@ -4,8 +4,14 @@
  * `nip05Status` is `verified` ONLY after a live lookup for this exact pubkey succeeded
  * (T9: the UI shows the verified pubkey/NIP-05, not just a display name).
  */
-import type { NostrEvent, NostrPubkey, Profile, UnixSeconds } from '../contracts/index.js';
-import { NostrKind } from '../contracts/index.js';
+import type {
+  NostrEvent,
+  NostrPubkey,
+  Profile,
+  Sha256Hex,
+  UnixSeconds,
+} from '../contracts/index.js';
+import { MAX_IMAGE_BYTES, NostrKind } from '../contracts/index.js';
 import type { NostrClient } from './client.js';
 import { verifyNip05 } from './nip05.js';
 import type { EventDraft, FetchLike } from './types.js';
@@ -16,9 +22,46 @@ export interface ProfileInput {
   readonly displayName?: string;
   readonly about?: string;
   readonly picture?: string;
+  /** ADR 0015: with a `hyper://` picture (the profile core), its sha256 and size. */
+  readonly pictureSha256?: Sha256Hex;
+  readonly pictureSize?: number;
   readonly banner?: string;
+  readonly bannerSha256?: Sha256Hex;
+  readonly bannerSize?: number;
   readonly nip05?: string;
   readonly lud16?: string;
+}
+
+const HEX64 = /^[0-9a-f]{64}$/;
+
+/**
+ * An image field of a kind 0 (`picture` / `banner`) with its ADR 0015 `<field>_sha256` /
+ * `<field>_size`. A `hyper://` image without a valid hash and size is dropped (it cannot be
+ * verified); an `https:` one keeps whichever of the two are valid.
+ */
+function imageField(
+  o: Record<string, unknown>,
+  field: 'picture' | 'banner',
+): { url?: string; sha256?: Sha256Hex; size?: number } {
+  const url = str(o, field);
+  if (url === undefined) return {};
+  const shaRaw = o[`${field}_sha256`];
+  const sizeRaw = o[`${field}_size`];
+  const sha256 =
+    typeof shaRaw === 'string' && HEX64.test(shaRaw) ? (shaRaw as Sha256Hex) : undefined;
+  const size =
+    typeof sizeRaw === 'number' &&
+    Number.isSafeInteger(sizeRaw) &&
+    sizeRaw >= 1 &&
+    sizeRaw <= MAX_IMAGE_BYTES
+      ? sizeRaw
+      : undefined;
+  if (url.startsWith('hyper://') && (sha256 === undefined || size === undefined)) return {};
+  return {
+    url,
+    ...(sha256 === undefined ? {} : { sha256 }),
+    ...(size === undefined ? {} : { size }),
+  };
 }
 
 const str = (o: Record<string, unknown>, k: string): string | undefined => {
@@ -38,6 +81,8 @@ export function parseProfile(ev: NostrEvent, fetchedAt: UnixSeconds): Profile | 
   if (typeof json !== 'object' || json === null || Array.isArray(json)) return null;
   const o = json as Record<string, unknown>;
   const nip05 = str(o, 'nip05');
+  const picture = imageField(o, 'picture');
+  const banner = imageField(o, 'banner');
   const p: Profile = {
     pubkey: ev.pubkey,
     nip05Status: nip05 === undefined ? 'none' : 'unverified',
@@ -45,8 +90,12 @@ export function parseProfile(ev: NostrEvent, fetchedAt: UnixSeconds): Profile | 
     ...opt('name', str(o, 'name')),
     ...opt('displayName', str(o, 'display_name') ?? str(o, 'displayName')),
     ...opt('about', str(o, 'about')),
-    ...opt('picture', str(o, 'picture')),
-    ...opt('banner', str(o, 'banner')),
+    ...opt('picture', picture.url),
+    ...opt('pictureSha256', picture.sha256),
+    ...opt('pictureSize', picture.size),
+    ...opt('banner', banner.url),
+    ...opt('bannerSha256', banner.sha256),
+    ...opt('bannerSize', banner.size),
     ...opt('nip05', nip05),
     ...opt('lud16', str(o, 'lud16')),
   };
@@ -58,12 +107,16 @@ function opt<K extends string, V>(k: K, v: V | undefined): Partial<Record<K, V>>
 }
 
 export function buildProfileEvent(input: ProfileInput, createdAt: UnixSeconds): EventDraft {
-  const content: Record<string, string> = {};
+  const content: Record<string, string | number> = {};
   if (input.name !== undefined) content['name'] = input.name;
   if (input.displayName !== undefined) content['display_name'] = input.displayName;
   if (input.about !== undefined) content['about'] = input.about;
   if (input.picture !== undefined) content['picture'] = input.picture;
+  if (input.pictureSha256 !== undefined) content['picture_sha256'] = input.pictureSha256;
+  if (input.pictureSize !== undefined) content['picture_size'] = input.pictureSize;
   if (input.banner !== undefined) content['banner'] = input.banner;
+  if (input.bannerSha256 !== undefined) content['banner_sha256'] = input.bannerSha256;
+  if (input.bannerSize !== undefined) content['banner_size'] = input.bannerSize;
   if (input.nip05 !== undefined) content['nip05'] = input.nip05;
   if (input.lud16 !== undefined) content['lud16'] = input.lud16;
   return {

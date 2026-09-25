@@ -29,6 +29,7 @@ import type {
 import { MINT, PUBKEY, SID, UPLOAD_ID, VIDEO, sats } from './samples.js';
 
 const R = VIDEO.renditions[0]!;
+const HYPER_IMG = `hyper://${'ab'.repeat(32)}/0-1`;
 const seeding = { enabled: true, diskCapBytes: 50 * 1024 ** 3 };
 const meta = {
   title: 'My video',
@@ -82,6 +83,8 @@ const ARGS: { readonly [M in WorkerMethod]: readonly WorkerMethodTable[M][0][] }
     },
     { uploadId: UPLOAD_ID, path: '/a.mp4', name: 'a.mp4', meta, thumbnailChoice: 1 },
   ],
+  // ADR 0015: a profile-core image.
+  'image.fetch': [{ url: HYPER_IMG, sha256: R.sha256, size: 1000 }],
 };
 
 const status = dehydrate(await new mocks.MockNetworkAdapter().seeder.status());
@@ -102,6 +105,7 @@ const RESULTS: { readonly [M in WorkerMethod]: readonly WorkerMethodTable[M][1][
     { found: true, path: '/usr/bin/ffmpeg', version: '8.1.2', os: 'linux' },
   ],
   'studio.upload': [VIDEO],
+  'image.fetch': [{ hex: 'ffd8ffe0' }],
 };
 
 const draft: PublishDraft = {
@@ -130,6 +134,7 @@ const draft: PublishDraft = {
     intervalSec: 5,
   },
   codec: 'h264',
+  thumbnailImage: { url: HYPER_IMG, sha256: R.sha256, size: 1000 },
 };
 const P2PK = `02${'5e'.repeat(32)}` as never;
 const PROOF = {
@@ -289,6 +294,11 @@ describe('host → worker', () => {
       ['studio.upload', { ...up, meta: { ...meta, mirrorTo: ['https://blossom.example'] } }],
       ['seeder.status', { extra: 1 }],
       ['studio.ffmpeg', { recheck: true, path: 'ffmpeg' }],
+      // ADR 0015: only a profile-core reference, within the image cap.
+      ['image.fetch', { url: 'https://x.example/a.jpg', sha256: R.sha256, size: 10 }],
+      ['image.fetch', { url: HYPER_IMG, sha256: R.sha256, size: 0 }],
+      ['image.fetch', { url: HYPER_IMG, sha256: R.sha256, size: 5 * 1024 * 1024 + 1 }],
+      ['image.fetch', { url: HYPER_IMG, size: 10 }],
     ] as const)
       expect((validateWorkerArgs[m] as Guard<unknown>)(a), `${m} ${JSON.stringify(a)}`).toBe(false);
     expect(
@@ -298,6 +308,8 @@ describe('host → worker', () => {
       validateWorkerResult['play.open']({ key: R.hyper.core, link: 'http://127.0.0.1:0/x' }),
     ).toBe(false);
     expect(validateWorkerResult.init({})).toBe(false);
+    expect(validateWorkerResult['image.fetch']({ hex: 'abc' })).toBe(false); // odd length
+    expect(validateWorkerResult['image.fetch']({ hex: 'ZZ' })).toBe(false);
     expect(isHostToWorker({ op: 'req', id: 1, m: 'studio.publish', a: draft })).toBe(false); // wrong direction
     expect(isHostToWorker({ op: 'req', id: 1, m: 'hasOwnProperty', a: {} })).toBe(false);
     expect(isHostToWorker({ op: 'ev', e: 'ready', v: WORKER_V, port: 1 })).toBe(false);

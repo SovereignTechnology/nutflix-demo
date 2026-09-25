@@ -127,6 +127,15 @@ export class PeerNode {
     return d;
   }
 
+  /** Stop announcing and looking up `discoveryKey` (ADR 0015: a profile core read, not served). */
+  leave(discoveryKey: Uint8Array): void {
+    const hex = toHex(discoveryKey);
+    const prev = this.joined.get(hex);
+    if (prev === undefined) return;
+    this.joined.delete(hex);
+    void prev.d.destroy().catch(() => undefined);
+  }
+
   /** Re-announce every joined topic with `server` (seeding switched on/off). */
   setServing(server: boolean): void {
     for (const [hex, j] of [...this.joined]) {

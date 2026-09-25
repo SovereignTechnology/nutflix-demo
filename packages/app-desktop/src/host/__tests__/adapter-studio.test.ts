@@ -222,7 +222,8 @@ describe('seeder over the worker; settings side effects', () => {
     await a.seeder.setEnabled(true);
     expect((await a.settings()).seeding.enabled).toBe(true);
     expect(r.worker().calls('seeder.configure')).toEqual([
-      { enabled: true, diskCapBytes: 10 * 1024 ** 3 },
+      // ADR 0015: the default shares creators' images while seeding.
+      { enabled: true, diskCapBytes: 10 * 1024 ** 3, serveImages: true },
     ]);
     // Unchanged seeding → no push.
     await a.updateSettings({ theme: 'dark' });

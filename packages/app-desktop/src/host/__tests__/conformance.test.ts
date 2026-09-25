@@ -160,7 +160,7 @@ const isSettings = obj(
   {
     relays: arrayOf(obj({ url: isRelayUrl, read: bool, write: bool }), 256),
     defaultMints: arrayOf(isMintUrl, 256),
-    seeding: obj({ enabled: bool, diskCapBytes: isCount }),
+    seeding: obj({ enabled: bool, diskCapBytes: isCount }, { serveImages: bool }),
     prefetchSeconds: num(0, 600),
     hoverPreview: bool,
     loadRemoteImages: bool,
@@ -235,6 +235,12 @@ interface Side {
 const PNG = Uint8Array.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0]);
 /** F18: the fixture image is hash-addressed, so it loads with remote images off (the default). */
 const PNG_SHA = createHash('sha256').update(PNG).digest('hex') as Sha256Hex;
+/** ADR 0015: a thumbnail in the creator's profile core, as the worker hands it over. */
+const PROFILE_THUMB = {
+  url: `hyper://${'ab'.repeat(32)}/0-1`,
+  sha256: 'e'.repeat(64) as Sha256Hex,
+  size: 1000,
+};
 const images: ImageTransport = (url) =>
   url.href === 'https://img.example/p.png'
     ? Promise.resolve({
@@ -301,6 +307,8 @@ async function desktopSide(o: { signedIn?: boolean; failWith?: DeskFailure } = {
           ),
           thumbnail: { kind: 'custom', sha256: 'e'.repeat(64) as never, type: 'image/jpeg' },
           codec: 'h264',
+          // ADR 0015: the worker wrote the thumbnail into the creator's profile core.
+          thumbnailImage: PROFILE_THUMB,
         })) as VideoManifest,
     },
   };
@@ -756,6 +764,32 @@ describe('conformance: deliberate differences from the (cheatable) mock', () => 
       expect(o.err.code).toBe('no-signer');
     }
     if (!upload.ok) expect(ui.classifyStudioError(upload.err)).toBe('no-signer');
+  });
+
+  // ADR 0015: the published manifest names the thumbnail in the creator's profile core.
+  it('an upload publishes the worker’s profile-core thumbnail on the first rendition', async () => {
+    const [, d] = await pair();
+    const video = await d.a.studio.upload(
+      {
+        file: '/tmp/clip.mp4',
+        title: 'With a thumbnail',
+        description: '',
+        tags: [],
+        kind: 21,
+        mints: [mocks.MINTS.a],
+        satsPerBlock: 1 as never,
+        split: { seeder: 50, creator: 50 },
+      },
+      () => undefined,
+    );
+    expect(video.renditions[0]?.image).toEqual(PROFILE_THUMB);
+    expect(video.event.tags.find((t) => t[0] === 'imeta')).toEqual(
+      expect.arrayContaining([
+        `image ${PROFILE_THUMB.url}`,
+        `image-x ${PROFILE_THUMB.sha256}`,
+        `image-size ${String(PROFILE_THUMB.size)}`,
+      ]),
+    );
   });
 
   it('play of an unknown rendition label is refused (the mock silently falls back to the first)', async () => {

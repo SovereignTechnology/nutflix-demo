@@ -4,6 +4,7 @@
  * a few imeta keys this network needs that NIP-92/94 do not define:
  *
  *   image-x <sha256>            thumbnail hash (T16: verify before display)
+ *   image-size <bytes>          thumbnail size (ADR 0015: required with a hyper:// image)
  *   label <text>                rendition label shown in the player
  *   bitrate <bits/sec>          NIP-71 (kbps × 1000)
  *   placeholder <data-url>      inline blur-up placeholder
@@ -12,9 +13,9 @@
  *   block_size <bytes>          top-level tag, only when not the 64 KiB default
  */
 import type { NostrTag, Rendition, UnixSeconds, VideoManifest } from '../contracts/index.js';
-import { DEFAULT_BLOCK_SIZE, MAX_MIN_PAY_SATS } from '../contracts/index.js';
+import { DEFAULT_BLOCK_SIZE, MAX_IMAGE_BYTES, MAX_MIN_PAY_SATS } from '../contracts/index.js';
 import type { EventDraft } from '../nostr/types.js';
-import { encodeHyperUrl } from './hyper-url.js';
+import { decodeHyperUrl, encodeHyperUrl } from './hyper-url.js';
 import type { ImetaEntry } from './imeta.js';
 import { serializeImetaTag } from './imeta.js';
 
@@ -119,8 +120,23 @@ export function renditionToImeta(r: Rendition): NostrTag {
   if (r.width !== undefined && r.height !== undefined)
     e.push({ key: 'dim', value: `${r.width}x${r.height}` });
   if (r.image) {
-    e.push({ key: 'image', value: r.image.url });
-    if (r.image.sha256 !== undefined) e.push({ key: 'image-x', value: r.image.sha256 });
+    const { url: imageUrl, sha256: imageX, size: imageSize } = r.image;
+    if (
+      imageSize !== undefined &&
+      (!Number.isSafeInteger(imageSize) || imageSize < 1 || imageSize > MAX_IMAGE_BYTES)
+    )
+      throw new ManifestBuildError(`rendition ${r.label}: bad image size`);
+    // ADR 0015: a profile-core thumbnail names its hash and size, and its reference agrees.
+    if (
+      imageUrl.startsWith('hyper://') &&
+      (imageX === undefined || imageSize === undefined || !decodeHyperUrl(imageUrl, imageSize))
+    )
+      throw new ManifestBuildError(
+        `rendition ${r.label}: a hyper:// image needs its sha256, its size and a matching reference`,
+      );
+    e.push({ key: 'image', value: imageUrl });
+    if (imageX !== undefined) e.push({ key: 'image-x', value: imageX });
+    if (imageSize !== undefined) e.push({ key: 'image-size', value: String(imageSize) });
   }
   for (const f of r.fallbacks) e.push({ key: 'fallback', value: f });
   e.push({ key: 'label', value: r.label });

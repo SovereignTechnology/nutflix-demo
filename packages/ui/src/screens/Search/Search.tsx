@@ -56,6 +56,7 @@ import {
   shortPubkey,
 } from '../../components/index.js';
 import type { ScreenProps } from '../shared/route.js';
+import { avatarSrc, thumbnailSrc } from '../shared/image.js';
 
 /** Keystrokes (query box and tags box) are batched by this much before a search runs. */
 export const SEARCH_DEBOUNCE_MS = 300;
@@ -594,7 +595,7 @@ export function Search({
         req.thumbs.add(video.id);
         const image = video.renditions[0]?.image;
         if (image) {
-          adapter.image(image.url, image.sha256).then(
+          thumbnailSrc(adapter, image).then(
             (src) => {
               if (alive.current) setThumbs((prev) => ({ ...prev, [video.id]: src }));
             },
@@ -637,9 +638,10 @@ export function Search({
   useEffect(() => {
     for (const profile of channelMatches) {
       const req = requested.current.avatars;
-      if (req.has(profile.pubkey) || !profile.picture) continue;
+      const pending = avatarSrc(adapter, profile);
+      if (req.has(profile.pubkey) || pending === null) continue;
       req.add(profile.pubkey);
-      adapter.image(profile.picture).then(
+      pending.then(
         (src) => {
           if (alive.current) setAvatars((prev) => ({ ...prev, [profile.pubkey]: src }));
         },

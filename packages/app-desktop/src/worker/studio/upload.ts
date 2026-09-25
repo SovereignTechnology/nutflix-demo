@@ -16,19 +16,20 @@
  * messages go through the ipc scrubber: no paths, one line, capped).
  */
 import type {
+  BlobLike,
   BlobSink,
+  FsAdapter,
   HyperblobRef,
+  MediaPipeline,
   ProcessRunner,
   RenditionSpec,
+  Sha256Hex,
+  TranscodeOutput,
   UploadInput,
   UploadProgress,
   VideoManifest,
-  FsAdapter,
-  BlobLike,
-  MediaPipeline,
-  TranscodeOutput,
 } from '@sovit/core';
-import { media } from '@sovit/core';
+import { MAX_IMAGE_BYTES, media } from '@sovit/core';
 import type { Logger, Seeder } from '@sovit/seeder';
 
 import { fromHex as hexToBytes } from '../../ipc/codec.js';
@@ -44,6 +45,13 @@ export interface WorkerUploadDeps {
   readonly logger: Logger;
   /** Worker → host `studio.publish`. */
   readonly publish: (draft: PublishDraft) => Promise<VideoManifest>;
+  /**
+   * ADR 0015: write the chosen thumbnail into the creator's profile core; the reference goes into
+   * the manifest. Absent (tests): the video is published without a thumbnail.
+   */
+  readonly putThumbnail?: (
+    bytes: Uint8Array,
+  ) => Promise<{ url: string; sha256: Sha256Hex; size: number }>;
   readonly progress: (p: UploadProgress) => void;
   /** x264 preset (tests use `ultrafast`). */
   readonly preset?: string;
@@ -65,6 +73,35 @@ function blobLike(hex: string, type: string): BlobLike {
     type,
     arrayBuffer: () => Promise.resolve(Uint8Array.from(bytes).buffer),
   };
+}
+
+/**
+ * ADR 0015: the chosen thumbnail into the creator's profile core. A thumbnail that cannot be
+ * written (too large, unreadable, hash drift) is logged and left out: the video still publishes.
+ */
+async function publishThumbnail(
+  draft: media.UploadDraft,
+  deps: WorkerUploadDeps,
+  log: Logger,
+): Promise<PublishDraft['thumbnailImage']> {
+  if (deps.putThumbnail === undefined) return undefined;
+  try {
+    const t = draft.thumbnail;
+    const bytes = t.kind === 'candidate' ? await deps.fs.readFile(t.path) : t.bytes;
+    if (bytes.byteLength < 1 || bytes.byteLength > MAX_IMAGE_BYTES) {
+      log.warn('thumbnail larger than the image cap: published without one');
+      return undefined;
+    }
+    const put = await deps.putThumbnail(bytes);
+    if (put.sha256 !== t.sha256) {
+      log.warn('thumbnail changed since it was hashed: published without one');
+      return undefined;
+    }
+    return put;
+  } catch {
+    log.warn('thumbnail could not be written: published without one');
+    return undefined;
+  }
 }
 
 export async function runWorkerUpload(
@@ -168,10 +205,12 @@ export async function runWorkerUpload(
             : {}),
           codec: first?.spec.codec ?? 'h264',
         };
+        const thumbnailImage = await publishThumbnail(draft, deps, log);
         log.info('upload transcoded; asking the host to publish', {
           renditions: draft.renditions.length,
+          thumbnail: thumbnailImage !== undefined,
         });
-        return deps.publish(pd);
+        return deps.publish(thumbnailImage === undefined ? pd : { ...pd, thumbnailImage });
       },
     },
   );

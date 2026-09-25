@@ -107,6 +107,15 @@ export function SeedingSection({
     });
   };
 
+  // ADR 0015: creators' thumbnails and avatars (their profile cores), served free while seeding.
+  const serveImages = (on: boolean): void => {
+    void save({
+      field: 'seeding',
+      label: 'image serving',
+      patch: (base) => ({ seeding: { ...base.seeding, serveImages: on } }),
+    });
+  };
+
   const commit = (text: string): void => {
     const parsed = parseDiskCapGb(text);
     if (!parsed.ok) {
@@ -194,6 +203,14 @@ export function SeedingSection({
         checked={view.seeding.enabled}
         busy={pending.has('seeding')}
         onChange={toggle}
+      />
+      <SwitchRow
+        id={`${id}-images`}
+        label="Share creators’ thumbnails and avatars"
+        description="While seeding, pass on the thumbnails and profile pictures you have already seen, for free, so other viewers see them without contacting any website. Off: they are shown to you and shared with no one."
+        checked={view.seeding.serveImages !== false}
+        busy={pending.has('seeding')}
+        onChange={serveImages}
       />
       {usage()}
       <fieldset className="nf-settings__fieldset">

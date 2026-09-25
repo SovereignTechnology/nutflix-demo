@@ -563,8 +563,8 @@ export class DesktopNetworkAdapter implements NetworkAdapter {
       fail('no-balance', `no balance at ${mints[0] ?? 'any accepted mint'}`);
   }
 
-  image(url: string, sha256?: Sha256Hex): Promise<NfMediaImgUrl> {
-    return this.o.images.image(url, sha256);
+  image(url: string, sha256?: Sha256Hex, size?: number): Promise<NfMediaImgUrl> {
+    return this.o.images.image(url, sha256, size);
   }
 
   // ---- studio ----------------------------------------------------------------------------
@@ -669,8 +669,10 @@ export class DesktopNetworkAdapter implements NetworkAdapter {
       publishedAt: this.now(),
       durationSec: draft.durationSec,
       tags: draft.meta.tags,
-      // Stage 1 hosts no thumbnail (no Blossom upload yet), so renditions carry no `image`.
-      renditions: draft.renditions,
+      // ADR 0015: the thumbnail the worker wrote into our profile core goes on the first rendition.
+      renditions: draft.renditions.map((r, i) =>
+        i === 0 && draft.thumbnailImage !== undefined ? { ...r, image: draft.thumbnailImage } : r,
+      ),
       price: {
         satsPerBlock: draft.meta.satsPerBlock,
         blockSize: draft.blockSize,

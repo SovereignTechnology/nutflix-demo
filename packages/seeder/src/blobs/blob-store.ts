@@ -113,6 +113,19 @@ export class BlobStore {
     return this.byKey.get(keyHex);
   }
 
+  /**
+   * ADR 0015: close a replica opened with `openCoreByKey` (a profile core read only for display),
+   * so the corestore stops replicating — and serving — it. Refuses a core this store writes to.
+   */
+  async closeCoreByKey(keyHex: string): Promise<void> {
+    const sc = this.byKey.get(keyHex);
+    if (sc === undefined) return;
+    if (sc.name !== `key:${keyHex}`) throw new Error('refusing to close a core opened by name');
+    this.byKey.delete(keyHex);
+    this.cores.delete(sc.name);
+    await sc.core.close();
+  }
+
   openCores(): readonly SeedCore[] {
     return [...this.cores.values()];
   }

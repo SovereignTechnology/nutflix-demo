@@ -46,7 +46,12 @@ describe('PeerSession', () => {
   });
   afterEach(() => cleanup());
 
-  async function make(windowBlocks = 4, withPeerInfo = true, accepting?: () => boolean) {
+  async function make(
+    windowBlocks = 4,
+    withPeerInfo = true,
+    accepting?: () => boolean,
+    isFree?: (core: string) => boolean,
+  ) {
     const engine = honestEngine(windowBlocks);
     const banList = await loadedBanList(dir);
     const stream = new FakeStream(noiseKey(1));
@@ -59,9 +64,31 @@ describe('PeerSession', () => {
       logger: log.logger,
       peerInfo,
       ...(accepting === undefined ? {} : { accepting }),
+      ...(isFree === undefined ? {} : { isFree }),
     });
     return { engine, banList, stream, peerInfo, session };
   }
+
+  // ADR 0015: a creator's profile core (thumbnails, avatars) is served outside payment.
+  it('a free core is never recorded or cut, and is served even under back-pressure; a paid core still is', async () => {
+    let ok = false; // the pending-PAY queue is full
+    const { engine, stream, session } = await make(
+      4,
+      true,
+      () => ok,
+      (c) => c === 'profile',
+    );
+    for (let i = 0; i < 20; i++) session.onUpload('profile', i, 1024);
+    expect(stream.destroyed).toBe(false);
+    expect(engine.window(session.accountId())?.uploaded ?? 0).toBe(0);
+    expect(session.uploadedBlocks).toBe(0);
+    expect(session.info().uploadedBytes).toBe(20 * 1024);
+    ok = true;
+    for (let i = 0; i < 4; i++) expect(session.onUpload('core', i, 1024)?.outstanding).toBe(i + 1);
+    expect(stream.destroyed).toBe(false); // twenty free blocks took nothing from the window
+    expect(session.onUpload('core', 4, 1024)?.banned).toBe(true);
+    expect(session.cutReason).toBe('window-exceeded');
+  });
 
   it('the pending-PAY cap: while not accepting, the next block is not served — a local cut, no ban, nothing recorded', async () => {
     let ok = true;

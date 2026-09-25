@@ -91,6 +91,48 @@ describe('lookupNip05 / verifyNip05 (injected fetch, no sockets)', () => {
 });
 
 describe('kind 0 profiles', () => {
+  // ADR 0015: a picture in the creator's profile core carries its hash and size.
+  it('a hyper:// picture keeps its sha256 and size; without both it is dropped; https keeps what is valid', async () => {
+    const s = new TestSigner();
+    const HYPER = `hyper://${'ab'.repeat(32)}/0-1`;
+    const SHA = 'cd'.repeat(32) as never;
+    const ev = await sign(
+      s,
+      buildProfileEvent({ name: 'bob', picture: HYPER, pictureSha256: SHA, pictureSize: 1000 }, T0),
+    );
+    expect(JSON.parse(ev.content)).toEqual({
+      name: 'bob',
+      picture: HYPER,
+      picture_sha256: SHA,
+      picture_size: 1000,
+    });
+    expect(parseProfile(ev, T0)).toMatchObject({
+      picture: HYPER,
+      pictureSha256: SHA,
+      pictureSize: 1000,
+    });
+    const raw = async (content: Record<string, unknown>) =>
+      parseProfile(
+        await sign(s, { kind: 0, created_at: T0, tags: [], content: JSON.stringify(content) }),
+        T0,
+      );
+    expect((await raw({ picture: HYPER }))?.picture).toBeUndefined(); // no hash: dropped
+    expect(
+      (await raw({ picture: HYPER, picture_sha256: SHA, picture_size: 6 * 1024 ** 2 }))?.picture,
+    ).toBeUndefined();
+    expect(await raw({ picture: 'https://p', picture_sha256: 'nope' })).toMatchObject({
+      picture: 'https://p',
+    });
+    expect(
+      (await raw({ picture: 'https://p', picture_sha256: 'nope' }))?.pictureSha256,
+    ).toBeUndefined();
+    expect(await raw({ banner: HYPER, banner_sha256: SHA, banner_size: 5 })).toMatchObject({
+      banner: HYPER,
+      bannerSha256: SHA,
+      bannerSize: 5,
+    });
+  });
+
   it('parses the common fields and sets nip05Status unverified/none', async () => {
     const s = new TestSigner();
     const ev = await sign(

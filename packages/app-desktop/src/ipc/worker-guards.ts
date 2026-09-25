@@ -64,7 +64,17 @@ import { WORKER_V } from './worker-protocol.js';
 
 const anyValue = (_x: unknown): _x is unknown => true;
 
-const isSeeding = obj({ enabled: bool, diskCapBytes: int(0, LIMITS.maxDiskCapBytes) });
+/** ADR 0015: a blob in a creator's profile core, and an image's byte size. */
+const isHyperImageUrl = matches(
+  /^hyper:\/\/[0-9a-f]{64}\/[0-9]{1,15}-[0-9]{1,15}(?:\+[0-9]{1,15})?$/,
+  200,
+);
+const isImageSize = int(1, LIMITS.maxThumbnailBytes);
+
+const isSeeding = obj(
+  { enabled: bool, diskCapBytes: int(0, LIMITS.maxDiskCapBytes) },
+  { serveImages: bool },
+);
 const isPrefetch = num(0, LIMITS.maxPrefetchSec);
 const isPort = int(1, 65535);
 const isSid = obj({ sid: isSessionId });
@@ -146,6 +156,7 @@ export const validateWorkerArgs: {
   'seeder.unban': safe(obj({ pubkey: isPubkey })),
   'studio.ffmpeg': safe(obj({ recheck: bool }, { path: isAbsolutePath })),
   'studio.upload': safe(isStudioUpload),
+  'image.fetch': safe(obj({ url: isHyperImageUrl, sha256: isSha256, size: isImageSize })),
 };
 
 const isUndefined = (x: unknown): x is undefined => x === undefined;
@@ -182,6 +193,8 @@ export const validateWorkerResult: {
   'seeder.unban': isVoid,
   'studio.ffmpeg': safe(isFfmpegStatus),
   'studio.upload': safe(isVideoManifest),
+  // At most the image cap as hex (two characters a byte).
+  'image.fetch': safe(obj({ hex: matches(/^(?:[0-9a-f]{2})+$/, 2 * LIMITS.maxThumbnailBytes) })),
 };
 
 const isRenditionDraft = obj(renditionDraftGuards.req, renditionDraftGuards.opt);
@@ -208,6 +221,7 @@ const publishDraftShape = obj(
       rows: int(1, 1000),
       intervalSec: num(0, 1e6),
     }),
+    thumbnailImage: obj({ url: isHyperImageUrl, sha256: isSha256, size: isImageSize }),
   },
 );
 

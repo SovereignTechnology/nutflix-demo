@@ -42,6 +42,7 @@ import type {
   NostrPubkey,
   Playlist,
   Profile,
+  Rendition,
   SeederStatus,
   Sha256Hex,
   UnixSeconds,
@@ -68,6 +69,7 @@ import {
   shortPubkey,
 } from '../../components/index.js';
 import type { Route, ScreenProps } from '../shared/route.js';
+import { resolveImage } from '../shared/image.js';
 
 /** The four Channel tabs; kept in sync with `Route['tab']` for `name: 'channel'`. */
 export type ChannelTab = NonNullable<Extract<Route, { readonly name: 'channel' }>['tab']>;
@@ -144,9 +146,7 @@ type ImageState =
 const imageKey = (url: string, sha256: Sha256Hex | undefined): string => `${sha256 ?? '-'} ${url}`;
 
 /** The thumbnail of a video: the first rendition that carries one. */
-function thumbOf(
-  video: VideoManifest,
-): { readonly url: string; readonly sha256?: Sha256Hex } | undefined {
+function thumbOf(video: VideoManifest): Rendition['image'] {
   return video.renditions.find((r) => r.image !== undefined)?.image;
 }
 
@@ -311,11 +311,11 @@ export function Channel({
   const [images, setImages] = useState<ImageCache>({});
   const requestedImages = useRef(new Set<string>());
   const requestImage = useCallback(
-    (url: string, sha256: Sha256Hex | undefined): void => {
+    (url: string, sha256: Sha256Hex | undefined, size?: number): void => {
       const key = imageKey(url, sha256);
       if (requestedImages.current.has(key)) return;
       requestedImages.current.add(key);
-      const call = sha256 === undefined ? adapter.image(url) : adapter.image(url, sha256);
+      const call = resolveImage(adapter, url, sha256, size);
       call.then(
         (src) => {
           if (alive.current) setImages((prev) => ({ ...prev, [key]: src }));
@@ -511,7 +511,7 @@ export function Channel({
     if (videos.status !== 'ready') return;
     for (const v of videos.items) {
       const image = thumbOf(v);
-      if (image) requestImage(image.url, image.sha256);
+      if (image) requestImage(image.url, image.sha256, image.size);
       if (requestedStats.current.has(v.id)) continue;
       requestedStats.current.add(v.id);
       adapter.stats(v.id).then(
@@ -543,8 +543,10 @@ export function Channel({
 
   useEffect(() => {
     if (profile === null) return;
-    if (profile.banner !== undefined) requestImage(profile.banner, undefined);
-    if (profile.picture !== undefined) requestImage(profile.picture, undefined);
+    if (profile.banner !== undefined)
+      requestImage(profile.banner, profile.bannerSha256, profile.bannerSize);
+    if (profile.picture !== undefined)
+      requestImage(profile.picture, profile.pictureSha256, profile.pictureSize);
   }, [profile, requestImage]);
 
   // ---- playlists (NIP-51 kind 30005 video sets by this author), lazy per tab --------------
@@ -601,7 +603,7 @@ export function Channel({
   useEffect(() => {
     for (const v of Object.values(firstVideos)) {
       const image = v ? thumbOf(v) : undefined;
-      if (image) requestImage(image.url, image.sha256);
+      if (image) requestImage(image.url, image.sha256, image.size);
     }
   }, [firstVideos, requestImage]);
 

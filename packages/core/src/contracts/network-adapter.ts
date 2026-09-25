@@ -180,7 +180,15 @@ export interface SeederStatus {
 export interface Settings {
   readonly relays: readonly RelayConfig[];
   readonly defaultMints: readonly MintUrl[];
-  readonly seeding: { readonly enabled: boolean; readonly diskCapBytes: number };
+  readonly seeding: {
+    readonly enabled: boolean;
+    readonly diskCapBytes: number;
+    /**
+     * v6 (ADR 0015): serve creators' thumbnails and avatars (their profile cores), free, while
+     * seeding. Absent = `true`. `false`: images are read for display and not served.
+     */
+    readonly serveImages?: boolean;
+  };
   readonly prefetchSeconds: number;
   readonly hoverPreview: boolean;
   /**
@@ -262,8 +270,12 @@ export interface NetworkAdapter {
 
   // ---- playback ------------------------------------------------------------------
   play(videoId: NostrEventId, rendition?: string): Promise<PlaySession>;
-  /** Verifies the Blossom `x` hash before handing back a displayable URL (T16). */
-  image(url: string, sha256?: Sha256Hex): Promise<string>;
+  /**
+   * Verifies the Blossom `x` hash before handing back a displayable URL (T16). v6 (ADR 0015): a
+   * `hyper://` image (a creator's profile core) is read over Pear and needs `sha256` AND `size`
+   * (`Rendition.image.size`, `Profile.pictureSize`).
+   */
+  image(url: string, sha256?: Sha256Hex, size?: number): Promise<string>;
 
   // ---- money ---------------------------------------------------------------------
   readonly wallet: Wallet;

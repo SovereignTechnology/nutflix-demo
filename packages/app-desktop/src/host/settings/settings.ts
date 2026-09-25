@@ -29,7 +29,8 @@ export const DEFAULT_SETTINGS: Settings = Object.freeze({
     Object.freeze({ url: 'wss://relay.primal.net' as RelayUrl, read: true, write: true }),
   ]),
   defaultMints: Object.freeze([]),
-  seeding: Object.freeze({ enabled: false, diskCapBytes: 10 * 1024 ** 3 }),
+  // ADR 0015: once seeding is on, creators' thumbnails and avatars are shared too (free).
+  seeding: Object.freeze({ enabled: false, diskCapBytes: 10 * 1024 ** 3, serveImages: true }),
   prefetchSeconds: 30,
   hoverPreview: true,
   // Security review F18: only hash-addressed images until the user opts in.

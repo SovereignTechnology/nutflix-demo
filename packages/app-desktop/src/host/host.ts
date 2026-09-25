@@ -13,6 +13,7 @@ import { join } from 'node:path';
 import type { Signer, UnixSeconds } from '@sovit/core';
 import { mocks, nostr, signer as signerMod } from '@sovit/core';
 
+import { fromHex } from '../ipc/codec.js';
 import { toWireError, wireError } from '../ipc/errors.js';
 import { isHostIn, isMsgId, isWcId } from '../ipc/guards.js';
 import type { AnyCallMsg, HostIn, HostOut, PromptAnswer, ReplyMsg } from '../ipc/protocol.js';
@@ -20,6 +21,7 @@ import { IPC_V, LIMITS } from '../ipc/protocol.js';
 import { dehydrate } from '../ipc/wiremap.js';
 import type { WorkerInit } from '../ipc/worker-protocol.js';
 import { WORKER_V } from '../ipc/worker-protocol.js';
+import { hostError } from './errors.js';
 import { DesktopNetworkAdapter } from './adapter.js';
 import { FixtureCatalog } from './catalog/fixture-catalog.js';
 import type { HandlerTable } from './dispatch.js';
@@ -358,6 +360,13 @@ export async function createHost(o: HostOptions): Promise<Host> {
     fileRoot: storage,
     // Security review F18: unsigned images only when the user opted in (Settings).
     remoteImages: () => settings.get().loadRemoteImages,
+    // ADR 0015: a creator's profile-core image, read over Pear by the worker.
+    fetchHyper: async (url, sha256, size) => {
+      const w = late.worker;
+      if (w === undefined) throw hostError('backend-down', 'worker is not running');
+      const { hex } = await w.request('image.fetch', { url, sha256, size });
+      return fromHex(hex);
+    },
     ...(o.random === undefined ? {} : { random: o.random }),
   });
 

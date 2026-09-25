@@ -56,6 +56,7 @@ import {
   historyProgress,
 } from './libraryFormat.js';
 import { PlaylistForm, type PlaylistFormValues } from './PlaylistForm.js';
+import { avatarSrc, thumbnailSrc } from '../shared/image.js';
 
 /** The four Library tabs; kept in sync with `Route['tab']` for `name: 'library'`. */
 export type LibraryTab = NonNullable<Extract<Route, { readonly name: 'library' }>['tab']>;
@@ -428,7 +429,7 @@ export function Library({
           req.thumbs.add(video.id);
           const image = video.renditions[0]?.image;
           if (image) {
-            adapter.image(image.url, image.sha256).then(
+            thumbnailSrc(adapter, image).then(
               (src) => {
                 if (alive.current) setThumbs((prev) => ({ ...prev, [video.id]: src }));
               },
@@ -443,8 +444,9 @@ export function Library({
             (p) => {
               if (!alive.current) return;
               setProfiles((prev) => ({ ...prev, [author]: p }));
-              if (p?.picture) {
-                adapter.image(p.picture).then(
+              const pending = avatarSrc(adapter, p);
+              if (pending !== null) {
+                pending.then(
                   (src) => {
                     if (alive.current) setAvatars((prev) => ({ ...prev, [author]: src }));
                   },

@@ -585,6 +585,21 @@ describe('Settings — save model', () => {
     expect(remote.checked).toBe(true);
   });
 
+  // ADR 0015: sharing creators' thumbnails and avatars while seeding, on unless turned off.
+  it('"Share creators’ thumbnails and avatars" starts on and saves seeding.serveImages', async () => {
+    const adapter = adapterWith();
+    const update = vi.spyOn(adapter, 'updateSettings');
+    const { r } = await ready(adapter);
+    const images = input(r, '-seeding-images');
+    expect(images.checked).toBe(true);
+    click(images);
+    await flush();
+    expect(update).toHaveBeenLastCalledWith({
+      seeding: expect.objectContaining({ serveImages: false }) as unknown,
+    });
+    expect(images.checked).toBe(false);
+  });
+
   it('never loses typed input when a save fails', async () => {
     const adapter = adapterWith();
     vi.spyOn(adapter, 'updateSettings').mockRejectedValue(new Error('disk full'));

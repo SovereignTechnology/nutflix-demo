@@ -149,6 +149,14 @@ export interface WorkerMethodTable {
   ];
   /** Progress arrives as `upload.progress` events; the worker calls `studio.publish` on the host. */
   'studio.upload': [args: StudioUploadArgs, result: VideoManifest];
+  /**
+   * ADR 0015: read one image from a creator's profile core over Pear. The worker checks the
+   * length and sha256; the bytes come back as hex.
+   */
+  'image.fetch': [
+    args: { readonly url: string; readonly sha256: Sha256Hex; readonly size: number },
+    result: { readonly hex: string },
+  ];
 }
 export type WorkerMethod = keyof WorkerMethodTable;
 
@@ -181,6 +189,15 @@ export interface PublishDraft {
     readonly intervalSec: number;
   };
   readonly codec: RenditionSpec['codec'];
+  /**
+   * ADR 0015: the chosen thumbnail as written into the creator's profile core — the host puts it
+   * on the first rendition (`image`, with `image-x` and `image-size`).
+   */
+  readonly thumbnailImage?: {
+    readonly url: string;
+    readonly sha256: Sha256Hex;
+    readonly size: number;
+  };
 }
 
 /** A proof set on the worker → host hop (ADR 0012: the host redeems / checks it). */

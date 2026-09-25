@@ -18,7 +18,12 @@ import type {
   UnixSeconds,
   VideoManifest,
 } from '../contracts/index.js';
-import { DEFAULT_BLOCK_SIZE, MAX_MIN_PAY_SATS, NostrKind } from '../contracts/index.js';
+import {
+  DEFAULT_BLOCK_SIZE,
+  MAX_IMAGE_BYTES,
+  MAX_MIN_PAY_SATS,
+  NostrKind,
+} from '../contracts/index.js';
 import { decodeHyperUrl } from './hyper-url.js';
 import { imetaAll, imetaFirst, parseImetaTag } from './imeta.js';
 
@@ -158,6 +163,21 @@ function parseRendition(tag: NostrTag, index: number): Result<Rendition, Manifes
   const imageUrl = imetaFirst(entries, 'image');
   const imageX = imetaFirst(entries, 'image-x');
   if (imageX !== undefined && !HEX64.test(imageX)) return bad('image-x is not a sha256 hex');
+  const imageSizeRaw = imetaFirst(entries, 'image-size');
+  const imageSize = imageSizeRaw === undefined ? undefined : parseUintStr(imageSizeRaw);
+  if (
+    imageSizeRaw !== undefined &&
+    (imageSize === undefined || imageSize < 1 || imageSize > MAX_IMAGE_BYTES)
+  )
+    return bad('image-size is not a byte count within the image cap');
+  // ADR 0015: a thumbnail in the creator's profile core must name its hash and size, and its
+  // hyper:// reference must agree with that size.
+  if (imageUrl?.startsWith('hyper://') === true) {
+    if (imageX === undefined || imageSize === undefined)
+      return bad('a hyper:// image needs image-x and image-size');
+    if (!decodeHyperUrl(imageUrl, imageSize))
+      return bad('image is not a well-formed hyper:// reference');
+  }
 
   const label =
     imetaFirst(entries, 'label') ?? (height !== undefined ? `${height}p` : `variant-${index + 1}`);
@@ -214,6 +234,7 @@ function parseRendition(tag: NostrTag, index: number): Result<Rendition, Manifes
           image: {
             url: imageUrl,
             ...(imageX === undefined ? {} : { sha256: imageX as Sha256Hex }),
+            ...(imageSize === undefined ? {} : { size: imageSize }),
           },
         }),
     ...(placeholder === undefined ? {} : { placeholder }),

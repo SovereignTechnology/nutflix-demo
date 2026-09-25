@@ -22,12 +22,13 @@ import type {
   PeerSpend,
   PricePolicy,
   Sats,
+  Sha256Hex,
   UploadProgress,
   VideoManifest,
 } from '@sovit/core';
-import { media } from '@sovit/core';
-import type { LogLevel, Logger } from '@sovit/seeder';
-import { Seeder, fromHex } from '@sovit/seeder';
+import { MAX_IMAGE_BYTES, manifest, media } from '@sovit/core';
+import type { LogLevel, Logger, SeedCore } from '@sovit/seeder';
+import { Seeder, fromHex, toHex } from '@sovit/seeder';
 
 import { IpcError } from '../ipc/errors.js';
 import type { ErrorCode, FfmpegStatus, SeederStatusWire, SessionId } from '../ipc/protocol.js';
@@ -72,6 +73,10 @@ export const MAX_SESSIONS = 16;
 const RATE_WINDOW_MS = 60_000;
 /** At most one `seeder.status` push per this many ms. */
 const STATUS_THROTTLE_MS = 1000;
+/** ADR 0015: the corestore name of this node's own profile core (avatar, thumbnails). */
+export const PROFILE_CORE_NAME = 'nutflix-profile';
+/** How long one image read may take over the swarm. */
+export const IMAGE_FETCH_TIMEOUT_MS = 15_000;
 const ZERO_PUBKEY = '00'.repeat(32) as NostrPubkey;
 
 export type HostRequester = <M extends HostMethod>(
@@ -132,6 +137,19 @@ function fail(code: ErrorCode, detail: string): never {
   throw new IpcError(code, `${code}: ${detail}`);
 }
 
+/** `p`, or a rejection after `ms` (a read that never finishes is a failed read). */
+function withDeadline<T>(p: Promise<T>, ms: number): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => {
+      reject(new Error('deadline'));
+    }, ms);
+  });
+  return Promise.race([p, deadline]).finally(() => {
+    clearTimeout(timer);
+  });
+}
+
 function trailingSum(recent: { at: number; amount: number }[], now: number): number {
   while (recent.length > 0 && (recent[0]?.at ?? now) < now - RATE_WINDOW_MS) recent.shift();
   let s = 0;
@@ -157,6 +175,11 @@ export class WorkerHost {
   private seeding: WorkerInit['seeding'] = { enabled: false, diskCapBytes: 0 };
   private readonly sessions = new Map<string, Session>();
   private readonly corePolicies = new Map<CoreKeyHex, PricePolicy>();
+  /**
+   * ADR 0015: profile cores the image path uses — `opened` when that path opened them (a replica
+   * read for display, closed again when this node may not serve it), `refs` = reads in flight.
+   */
+  private readonly imageCores = new Map<CoreKeyHex, { refs: number; opened: boolean }>();
   private readonly coresAttached = new Set<string>();
   private readonly lastSidForCore = new Map<string, Session>();
   private readonly uploads = new Set<string>();
@@ -245,6 +268,8 @@ export class WorkerHost {
         return this.probe(req.a.recheck, req.a.path);
       case 'studio.upload':
         return this.upload(req.a);
+      case 'image.fetch':
+        return this.imageFetch(req.a);
     }
   }
 
@@ -379,6 +404,10 @@ export class WorkerHost {
     seeder.start();
     node.start();
     this.net = { providers, seeder, node, payer, credit };
+    // ADR 0015: our own profile core (avatar, thumbnails) is served free while seeding.
+    this.ownProfile().catch(() => {
+      log.warn('the profile core could not be opened');
+    });
     log.info('worker initialised', { seeding: a.seeding.enabled, port: server.port });
 
     if (dev?.fixtures === true && bootstrap !== null) void this.startFixtures(bootstrap);
@@ -627,9 +656,113 @@ export class WorkerHost {
     };
   }
 
+  // ------------------------------------------------------------------ images (ADR 0015)
+
+  /** Whether this node serves creators' profile cores (thumbnails, avatars): free, while seeding. */
+  private servesImages(): boolean {
+    return this.seeding.enabled && this.seeding.serveImages !== false;
+  }
+
+  /** Our own profile core: our avatar and our videos' thumbnails, always free while seeding. */
+  private async ownProfile(): Promise<SeedCore> {
+    const net = this.requireNet();
+    const sc = await net.seeder.blobs.openCore(PROFILE_CORE_NAME);
+    net.seeder.setFreeCore(sc.keyHex, true);
+    net.node.join(sc.core.discoveryKey, { server: this.seeding.enabled, client: true });
+    return sc;
+  }
+
+  /** Studio: write a thumbnail into our profile core; the host names it in the manifest. */
+  private async putThumbnail(
+    bytes: Uint8Array,
+  ): Promise<{ url: string; sha256: Sha256Hex; size: number }> {
+    if (bytes.byteLength < 1 || bytes.byteLength > MAX_IMAGE_BYTES)
+      fail('invalid-argument', 'thumbnail is empty or larger than the image cap');
+    const sc = await this.ownProfile();
+    const blob = await sc.blobs.put(bytes);
+    const h = sodiumSha256();
+    h.update(bytes);
+    return {
+      url: manifest.encodeHyperUrl({ core: sc.keyHex, blob }),
+      sha256: h.digest(),
+      size: bytes.byteLength,
+    };
+  }
+
+  /**
+   * `image.fetch`: one image from a creator's profile core, over Pear. Served on (free) only while
+   * this node serves images; otherwise a replica opened here is closed once no read needs it, so
+   * it is neither announced nor replicated.
+   */
+  private async imageFetch(a: {
+    readonly url: string;
+    readonly sha256: Sha256Hex;
+    readonly size: number;
+  }): Promise<{ hex: string }> {
+    const net = this.requireNet();
+    const ref = manifest.decodeHyperUrl(a.url, a.size);
+    if (ref === null) fail('invalid-argument', 'not a hyper:// image');
+    if (!Number.isSafeInteger(a.size) || a.size < 1 || a.size > MAX_IMAGE_BYTES)
+      fail('invalid-argument', 'image size out of range');
+    const core = ref.core;
+    let entry = this.imageCores.get(core);
+    if (entry === undefined) {
+      entry = { refs: 0, opened: net.seeder.blobs.coreByKey(core) === undefined };
+      this.imageCores.set(core, entry);
+    }
+    entry.refs++;
+    try {
+      const sc = await net.seeder.blobs.openCoreByKey(fromHex(core));
+      const serve = this.servesImages();
+      // Free before it can be served: no block of a profile core is ever sold.
+      if (serve) net.seeder.setFreeCore(core, true);
+      net.node.join(sc.core.discoveryKey, { server: serve, client: true });
+      const bytes = await withDeadline(
+        sc.blobs.get(ref.blob, { timeout: IMAGE_FETCH_TIMEOUT_MS }),
+        IMAGE_FETCH_TIMEOUT_MS,
+      );
+      if (bytes === null) fail('not-found', 'image not found on the swarm');
+      const h = sodiumSha256();
+      h.update(bytes);
+      if (bytes.byteLength !== a.size || h.digest() !== a.sha256)
+        fail('hash-mismatch', 'image does not match its hash');
+      return { hex: toHex(bytes) };
+    } catch (err) {
+      if (err instanceof IpcError) throw err;
+      return fail('not-found', 'image could not be read from the swarm');
+    } finally {
+      entry.refs--;
+      if (entry.refs === 0 && !this.servesImages()) void this.releaseImageCore(core);
+    }
+  }
+
+  /** Stop serving and close every idle profile-core replica the image path opened. */
+  private async releaseImageCores(): Promise<void> {
+    for (const [core, e] of [...this.imageCores])
+      if (e.refs === 0) await this.releaseImageCore(core);
+  }
+
+  private async releaseImageCore(core: CoreKeyHex): Promise<void> {
+    const e = this.imageCores.get(core);
+    const net = this.net;
+    if (e === undefined || e.refs > 0 || net === null) return;
+    this.imageCores.delete(core);
+    if (!e.opened) return; // a core we write to, or one a playback opened: not ours to close
+    net.seeder.setFreeCore(core, false);
+    const sc = net.seeder.blobs.coreByKey(core);
+    if (sc !== undefined) net.node.leave(sc.core.discoveryKey);
+    try {
+      await net.seeder.blobs.closeCoreByKey(core);
+    } catch {
+      // already closed, or re-opened as a named core since: leave it
+    }
+  }
+
   private configureSeeding(a: WorkerInit['seeding']): void {
     const prevCap = this.seeding.diskCapBytes;
     this.seeding = a;
+    // ADR 0015: stop serving other creators' images first, so `setServing` cannot re-announce them.
+    if (!this.servesImages()) void this.releaseImageCores();
     this.net?.node.setServing(a.enabled);
     if (a.diskCapBytes !== prevCap)
       this.live?.log.info('disk cap change applies at the next worker start', {
@@ -685,6 +818,7 @@ export class WorkerHost {
         sha256: sodiumSha256,
         logger: live.log,
         publish: (draft) => this.o.request('studio.publish', draft),
+        putThumbnail: (bytes) => this.putThumbnail(bytes),
         progress: (p: UploadProgress) => {
           this.o.emit({ op: 'ev', e: 'upload.progress', uploadId: a.uploadId, progress: p });
         },

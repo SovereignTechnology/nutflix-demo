@@ -371,7 +371,10 @@ export interface MethodTable {
   'library.liked': [args: [], result: readonly VideoManifest[]];
   // playback
   play: [args: [videoId: NostrEventId, rendition?: string | undefined], result: PlaySessionWire];
-  image: [args: [url: string, sha256?: Sha256Hex | undefined], result: NfMediaImgUrl];
+  image: [
+    args: [url: string, sha256?: Sha256Hex | undefined, size?: number | undefined],
+    result: NfMediaImgUrl,
+  ];
   'session.pause': [args: [sid: SessionId], result: undefined];
   'session.resume': [args: [sid: SessionId], result: undefined];
   'session.setPrefetchSeconds': [args: [sid: SessionId, sec: number], result: undefined];

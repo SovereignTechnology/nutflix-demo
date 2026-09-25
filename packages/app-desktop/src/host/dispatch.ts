@@ -53,7 +53,7 @@ export function handlers(a: DesktopNetworkAdapter): HandlerTable {
     'library.savePlaylist': (_c, [p]) => a.library.savePlaylist(p),
     'library.liked': () => a.library.liked(),
     play: async (c, [id, rendition]) => (await a.openSession(c.wc, id, rendition)).toWire(),
-    image: (_c, [url, sha]) => a.image(url, sha),
+    image: (_c, [url, sha, size]) => a.image(url, sha, size),
     'session.pause': (c, [sid]) => session(c, sid).pauseAsync(),
     'session.resume': (c, [sid]) => session(c, sid).resumeAsync(),
     'session.setPrefetchSeconds': (c, [sid, sec]) => session(c, sid).setPrefetchAsync(sec),

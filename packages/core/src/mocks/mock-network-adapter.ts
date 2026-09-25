@@ -445,7 +445,7 @@ export class MockNetworkAdapter implements NetworkAdapter {
     return session;
   }
 
-  image(url: string, _sha256?: Sha256Hex): Promise<string> {
+  image(url: string, _sha256?: Sha256Hex, _size?: number): Promise<string> {
     return this.delay(url);
   }
 

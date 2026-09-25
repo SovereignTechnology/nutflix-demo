@@ -22,6 +22,7 @@ const SETTINGS = {
   seeding: { enabled: false, diskCapBytes: 0 },
   prefetchSeconds: 30,
   hoverPreview: false,
+  loadRemoteImages: false,
   theme: 'system',
 } as const;
 

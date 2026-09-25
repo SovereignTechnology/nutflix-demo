@@ -105,6 +105,7 @@ import { WatchComments } from './WatchComments.js';
 import { NutzapSheet, ReportSheet, ShortcutsSheet } from './WatchSheets.js';
 import { PeerOverlay, PricePanel, StageNote, UpNextOverlay } from './WatchParts.js';
 import { WatchRelated, type RelatedList } from './WatchRelated.js';
+import { thumbnailSrc } from '../shared/image.js';
 
 export interface WatchProps extends ScreenProps {
   /** The video to watch (`Route { name: 'watch', videoId }`). A change reloads the screen. */
@@ -597,7 +598,7 @@ export function Watch({
         // or unreachable image simply never replaces the placeholder — never an error here.
         const thumb = video.renditions.find((r) => r.image !== undefined)?.image;
         if (thumb !== undefined) {
-          adapter.image(thumb.url, thumb.sha256).then(
+          thumbnailSrc(adapter, thumb).then(
             (src) => {
               if (!cancelled()) patchData({ thumbSrc: src });
             },

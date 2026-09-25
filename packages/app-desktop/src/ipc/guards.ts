@@ -292,6 +292,8 @@ const IMAGE_RE = new RegExp(
   `^[Hh][Tt][Tt][Pp][Ss]://${HOST}${PORT}(?:[/?#][^\\s\\u0000-\\u001f\\u007f]*)?$`,
 );
 const NF_IMG_RE = /^nf-media:\/\/img\/[A-Za-z0-9_-]{1,128}$/;
+/** ADR 0015: a blob in a creator's profile core (the rendition `hyper://` grammar). */
+const HYPER_IMG_RE = /^hyper:\/\/[0-9a-f]{64}\/[0-9]{1,15}-[0-9]{1,15}(?:\+[0-9]{1,15})?$/;
 /** ADR 0013 NIP-46 approval links: like `IMAGE_RE`, and no C1 controls or bidi overrides either. */
 const AUTH_URL_RE = new RegExp(
   `^[Hh][Tt][Tt][Pp][Ss]://${HOST}${PORT}(?:[/?#][^\\s\\u0000-\\u001f\\u007f-\\u009f\\u2028\\u2029\\u202a-\\u202e\\u2066-\\u2069]*)?$`,
@@ -301,7 +303,8 @@ export const isRelayUrl = safe(branded<RelayUrl>(matches(RELAY_RE, LIMITS.maxSer
 export const isMintUrl = safe(branded<MintUrl>(matches(HTTPS_SERVER_RE, LIMITS.maxServerUrl)));
 export const isNfMediaImgUrl = matches(NF_IMG_RE, 150) as Guard<NfMediaImgUrl>;
 export const isImageSource: Guard<string> = safe(
-  (x): x is string => matches(IMAGE_RE, LIMITS.maxUrl)(x) || isNfMediaImgUrl(x),
+  (x): x is string =>
+    matches(IMAGE_RE, LIMITS.maxUrl)(x) || isNfMediaImgUrl(x) || matches(HYPER_IMG_RE, 200)(x),
 );
 
 // ---- text fields ----------------------------------------------------------------------------
@@ -406,7 +409,10 @@ const isSettingsPatch = obj(
   {
     relays: arrayOf(isRelayConfig, LIMITS.maxArray),
     defaultMints: arrayOf(isMintUrl, LIMITS.maxArray),
-    seeding: obj({ enabled: bool, diskCapBytes: int(0, LIMITS.maxDiskCapBytes) }),
+    seeding: obj(
+      { enabled: bool, diskCapBytes: int(0, LIMITS.maxDiskCapBytes) },
+      { serveImages: bool },
+    ),
     prefetchSeconds: num(0, LIMITS.maxPrefetchSec),
     hoverPreview: bool,
     loadRemoteImages: bool,
@@ -456,7 +462,7 @@ export const validateArgs: { readonly [M in Method]: Guard<MethodTable[M][0]> } 
   'library.savePlaylist': tuple([isSavePlaylist]),
   'library.liked': tuple([]),
   play: tuple([isEventId], [isLabel]),
-  image: tuple([isImageSource], [isSha256]),
+  image: tuple([isImageSource], [isSha256, int(1, LIMITS.maxThumbnailBytes)]),
   'session.pause': tuple([isSessionId]),
   'session.resume': tuple([isSessionId]),
   'session.setPrefetchSeconds': tuple([isSessionId, isPrefetchSeconds]),
@@ -721,7 +727,10 @@ export const isPricePolicy: Guard<PricePolicy> = obj(
   { minPaySats: int(1, LIMITS.maxMinPaySats) as Guard<Sats> },
 );
 
-const isMaybeHashedUrl = obj({ url: text(1, LIMITS.maxUrl) }, { sha256: isSha256 });
+const isMaybeHashedUrl = obj(
+  { url: text(1, LIMITS.maxUrl) },
+  { sha256: isSha256, size: int(1, LIMITS.maxThumbnailBytes) },
+);
 
 export const renditionDraftGuards = {
   req: {

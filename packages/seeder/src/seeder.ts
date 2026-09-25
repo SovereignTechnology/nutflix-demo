@@ -112,6 +112,8 @@ export class Seeder {
   private readonly unsubs: (() => void)[] = [];
   private policyOverride: PricePolicy | null;
   private readonly corePolicies = new Map<CoreKeyHex, PricePolicy>();
+  /** ADR 0015: cores served outside payment. */
+  private readonly freeCores = new Set<CoreKeyHex>();
   /**
    * Per session × core, the price boundaries announced to that peer (security review F9): each
    * entry applies from `fromBlock` on. A PAY is verified against the entry in force at its first
@@ -147,6 +149,7 @@ export class Seeder {
       // (no default either) is served unpriced — its PAYs cannot be verified anyway.
       pricing: (core) => this.pricingFor(core),
       ...(deps.accepting ? { accepting: deps.accepting } : {}),
+      isFree: (core) => this.freeCores.has(core),
       ...(config.announceCorePrices
         ? {
             onFirstUpload: (session: PeerSession, core: CoreKeyHex) => {
@@ -464,6 +467,21 @@ export class Seeder {
   /** Per-core policies currently set (does not include the default). */
   corePolicyMap(): ReadonlyMap<CoreKeyHex, PricePolicy> {
     return this.corePolicies;
+  }
+
+  /**
+   * ADR 0015: serve `core` outside payment (a creator's profile core — thumbnails, avatars), or
+   * stop. A free core's blocks are never recorded against a peer's window. A core that also has
+   * a price policy stays free while marked: the caller marks only profile cores.
+   */
+  setFreeCore(core: CoreKeyHex, free: boolean): void {
+    if (free) this.freeCores.add(core);
+    else this.freeCores.delete(core);
+  }
+
+  /** Whether `core` is served outside payment. */
+  isFreeCore(core: CoreKeyHex): boolean {
+    return this.freeCores.has(core);
   }
 
   /**

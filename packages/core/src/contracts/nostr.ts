@@ -1,4 +1,4 @@
-import type { NostrEventId, NostrPubkey, RelayUrl, UnixSeconds } from './primitives.js';
+import type { NostrEventId, NostrPubkey, RelayUrl, Sha256Hex, UnixSeconds } from './primitives.js';
 
 /**
  * Nostr wire types. Shape-compatible with `nostr-tools` `Event`/`UnsignedEvent`/`Filter`
@@ -82,7 +82,17 @@ export interface Profile {
   readonly displayName?: string;
   readonly about?: string;
   readonly picture?: string;
+  /**
+   * v6 (ADR 0015): when `picture` is a `hyper://` URL in the creator's profile core, its sha256 and
+   * byte size (kind 0 `picture_sha256` / `picture_size`); a `hyper://` picture without both is
+   * dropped by the parser.
+   */
+  readonly pictureSha256?: Sha256Hex;
+  readonly pictureSize?: number;
   readonly banner?: string;
+  /** v6 (ADR 0015): as `pictureSha256` / `pictureSize`, for `banner`. */
+  readonly bannerSha256?: Sha256Hex;
+  readonly bannerSize?: number;
   readonly nip05?: string;
   /** `verified` only after a live NIP-05 lookup succeeded for this pubkey. */
   readonly nip05Status: 'none' | 'unverified' | 'verified' | 'failed';

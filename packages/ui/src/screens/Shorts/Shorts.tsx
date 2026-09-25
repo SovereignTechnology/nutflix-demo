@@ -81,6 +81,7 @@ import {
   type ToastItem,
 } from '../../components/index.js';
 import type { ScreenProps } from '../shared/route.js';
+import { avatarSrc, thumbnailSrc } from '../shared/image.js';
 
 /** Shorts per `adapter.feed({ source: 'shorts' })` page. */
 export const SHORTS_PAGE_SIZE = 10;
@@ -655,7 +656,7 @@ export function Shorts({
         req.thumbs.add(video.id);
         const image = video.renditions[0]?.image;
         if (image) {
-          adapter.image(image.url, image.sha256).then(
+          thumbnailSrc(adapter, image).then(
             (src) => {
               if (aliveRef.current) setThumbs((prev) => ({ ...prev, [video.id]: src }));
             },
@@ -675,9 +676,9 @@ export function Shorts({
           (p) => {
             if (!aliveRef.current) return;
             setProfiles((prev) => ({ ...prev, [pubkey]: p }));
-            const picture = p?.picture;
-            if (picture) {
-              adapter.image(picture).then(
+            const pending = avatarSrc(adapter, p);
+            if (pending !== null) {
+              pending.then(
                 (src) => {
                   if (aliveRef.current) setAvatars((prev) => ({ ...prev, [pubkey]: src }));
                 },

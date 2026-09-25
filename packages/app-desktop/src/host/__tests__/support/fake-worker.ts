@@ -241,6 +241,8 @@ export class FakeWorker extends EventEmitter implements WorkerProcess {
         return Promise.reject(
           new Error('not-found: the fake worker needs a studio.upload handler'),
         );
+      case 'image.fetch':
+        return Promise.reject(new Error('not-found: the fake worker needs an image.fetch handler'));
     }
   }
 }

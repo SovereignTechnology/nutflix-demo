@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import type { NostrEvent, Rendition, Sats, VideoManifest } from '../../contracts/index.js';
-import { DEFAULT_BLOCK_SIZE, MAX_MIN_PAY_SATS } from '../../contracts/index.js';
+import { DEFAULT_BLOCK_SIZE, MAX_IMAGE_BYTES, MAX_MIN_PAY_SATS } from '../../contracts/index.js';
 import { VIDEOS, asCoreKey, asSha256 } from '../../mocks/fixtures.js';
 import { TestSigner, asRaw, tamper } from '../../nostr/__tests__/helpers.js';
 import { ManifestBuildError, buildVideoEvent, renditionToImeta } from '../build.js';
@@ -255,6 +255,34 @@ describe('parse leniency and extras', () => {
     expect(() =>
       buildVideoEvent({ ...v, price: { ...v.price, minPaySats: (MAX_MIN_PAY_SATS + 1) as Sats } }),
     ).toThrow(/minPaySats/);
+  });
+
+  // ADR 0015: a thumbnail in the creator's profile core.
+  it('a hyper:// thumbnail round-trips with image-x and image-size; without them it is refused', async () => {
+    const HYPER = `hyper://${'ab'.repeat(32)}/3-2+100`;
+    const image = { url: HYPER, sha256: asSha256('thumb'), size: 70_000 };
+    const [first, ...rest] = v.renditions;
+    const withImage: VideoManifest = { ...v, renditions: [{ ...first!, image }, ...rest] };
+    const ev = await signer.signEvent(buildVideoEvent(withImage));
+    const r = verifyVideoEvent(asRaw(ev));
+    expect(r.ok && r.value.renditions[0]!.image).toEqual(image);
+    // The builder refuses what the parser would.
+    for (const bad of [
+      { url: HYPER, size: 70_000 },
+      { url: HYPER, sha256: image.sha256 },
+      { url: HYPER, sha256: image.sha256, size: MAX_IMAGE_BYTES + 1 },
+      { url: `hyper://${'ab'.repeat(32)}/0-0`, sha256: image.sha256, size: 10 },
+    ])
+      expect(() =>
+        buildVideoEvent({ ...v, renditions: [{ ...first!, image: bad }, ...rest] }),
+      ).toThrow(ManifestBuildError);
+    // A raw event with a hyper:// image and no image-size is a bad imeta.
+    const draft = buildVideoEvent(withImage);
+    const tags = draft.tags.map((t) =>
+      t[0] === 'imeta' ? t.filter((e) => !e.startsWith('image-size ')) : t,
+    );
+    const got = verifyVideoEvent(asRaw(await signer.signEvent({ ...draft, tags })));
+    expect(got.ok ? 'accepted' : got.error.code).toBe('bad-imeta');
   });
 
   it('derives a label from dim when none is given', async () => {

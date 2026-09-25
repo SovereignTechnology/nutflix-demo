@@ -59,6 +59,12 @@ export interface PeerSessionOptions {
    * no ban). Checked on every upload, before anything is recorded.
    */
   readonly accepting?: () => boolean;
+  /**
+   * ADR 0015: cores served OUTSIDE payment (a creator's profile core: thumbnails, avatars). Their
+   * blocks are sent without `recordUpload`, without the window check and without a `PRICE`, and
+   * never trip the pending-PAY back-pressure. Default: none.
+   */
+  readonly isFree?: (core: CoreKeyHex) => boolean;
   readonly noiseKey: Uint8Array;
   readonly stream: ReplicationStream;
   readonly engine: PaymentEngineSeeder;
@@ -109,6 +115,7 @@ export class PeerSession {
   private readonly onBind: ((session: PeerSession, pubkey: NostrPubkey) => void) | undefined;
   private readonly onFirstUpload: PeerSessionOptions['onFirstUpload'];
   private readonly accepting: PeerSessionOptions['accepting'];
+  private readonly isFree: PeerSessionOptions['isFree'];
 
   constructor(opts: PeerSessionOptions) {
     this.noiseKey = opts.noiseKey;
@@ -123,6 +130,7 @@ export class PeerSession {
     this.onBind = opts.onBind;
     this.onFirstUpload = opts.onFirstUpload;
     this.accepting = opts.accepting;
+    this.isFree = opts.isFree;
     this.stream.once('close', () => {
       this.isClosed = true;
       opts.onClose?.(this);
@@ -198,6 +206,11 @@ export class PeerSession {
    */
   onUpload(coreKeyHex: string, index: number, byteLength: number): PeerWindow | null {
     if (this.cutWith !== null || this.isClosed) return null;
+    // ADR 0015: a free core's block is not a sale — nothing to record, no window, no PRICE.
+    if (this.isFree?.(coreKeyHex as CoreKeyHex) === true) {
+      this.uploadedBytesTotal += byteLength; // bytes sent, but not a sold block
+      return this.engine.window(this.accountId()) ?? null;
+    }
     if (this.accepting !== undefined && !this.accepting()) {
       // Back-pressure, not a verdict on the peer: it may come back once the queue drains.
       this.log.warn('pending-PAY queue full — not serving, cutting the session');

@@ -412,6 +412,52 @@ describe('ImageService — remote images (security review F18)', () => {
   });
 });
 
+// ADR 0015: thumbnails and avatars in a creator's profile core, read over Pear by the worker.
+describe('ImageService — hyper:// images (ADR 0015)', () => {
+  const HYPER = `hyper://${'ab'.repeat(32)}/0-1`;
+  it('reads over Pear only (never https, no opt-in needed), checks hash and size again, sniffs, caches', async () => {
+    const reads: string[] = [];
+    const requested: string[] = [];
+    const s = new ImageService({
+      transport: (u) => {
+        requested.push(u.href);
+        return Promise.reject(new Error('no https here'));
+      },
+      log: silentLogger,
+      fetchHyper: (url) => {
+        reads.push(url);
+        return Promise.resolve(JPEG);
+      },
+    });
+    const a = await s.image(HYPER, sha(JPEG), JPEG.byteLength);
+    expect(a).toMatch(/^nf-media:\/\/img\//);
+    expect(await s.image(HYPER, sha(JPEG), JPEG.byteLength)).toBe(a); // cached
+    expect(reads).toEqual([HYPER]);
+    expect(requested).toEqual([]);
+    expect((await s.serve(a.slice('nf-media://img/'.length)))?.type).toBe('image/jpeg');
+  });
+
+  it('refuses without hash and size, a wrong hash or size, a non-image, and with no reader', async () => {
+    const s = (bytes: Uint8Array) =>
+      new ImageService({
+        transport: () => Promise.reject(new Error('no')),
+        log: silentLogger,
+        fetchHyper: () => Promise.resolve(bytes),
+      });
+    expect(await code(s(JPEG).image(HYPER))).toBe('invalid-argument');
+    expect(await code(s(JPEG).image(HYPER, sha(JPEG)))).toBe('invalid-argument');
+    expect(await code(s(JPEG).image(HYPER, sha(PNG), JPEG.byteLength))).toBe('hash-mismatch');
+    expect(await code(s(JPEG).image(HYPER, sha(JPEG), JPEG.byteLength + 1))).toBe('hash-mismatch');
+    const text = new TextEncoder().encode('<svg/>');
+    expect(await code(s(text).image(HYPER, sha(text), text.byteLength))).toBe('forbidden');
+    const none = new ImageService({
+      transport: () => Promise.reject(new Error('no')),
+      log: silentLogger,
+    });
+    expect(await code(none.image(HYPER, sha(JPEG), JPEG.byteLength))).toBe('backend-down');
+  });
+});
+
 describe('ImageService.registerFile (Studio thumbnail candidates)', () => {
   let root = '';
   beforeAll(async () => {

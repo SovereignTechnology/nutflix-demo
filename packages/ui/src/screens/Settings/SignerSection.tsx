@@ -19,6 +19,7 @@ import {
 } from '../../components/index.js';
 import { Note, SectionFrame } from './controls.js';
 import { SIGNER_KINDS, errorMessage, signerTitle, type SignerKind } from './model.js';
+import { avatarSrc as profileAvatar } from '../shared/image.js';
 
 export interface SignerState {
   readonly status: 'loading' | 'ready' | 'error';
@@ -68,8 +69,9 @@ export function useSigner(adapter: NetworkAdapter): SignerState {
         const p = await adapter.profile(s.pubkey);
         if (cancelled()) return;
         setProfile(p);
-        if (p?.picture) {
-          const src = await adapter.image(p.picture); // T16: verified before display
+        const pending = profileAvatar(adapter, p); // T16 (and ADR 0015): verified before display
+        if (pending !== null) {
+          const src = await pending;
           if (!cancelled()) setAvatarSrc(src);
         }
       } catch {

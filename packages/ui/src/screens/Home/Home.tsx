@@ -45,6 +45,7 @@ import {
   renditionPriceSats,
 } from '../../components/index.js';
 import type { Route, ScreenProps } from '../shared/route.js';
+import { avatarSrc, thumbnailSrc } from '../shared/image.js';
 
 /** The three Home feeds; kept in sync with `Route['tab']` for `name: 'home'`. */
 export type HomeTab = NonNullable<Extract<Route, { readonly name: 'home' }>['tab']>;
@@ -379,9 +380,10 @@ export function Home({
   });
 
   const resolveAvatar = useCallback(
-    (pubkey: NostrPubkey, picture: string | undefined): void => {
-      if (!picture) return;
-      adapter.image(picture).then(
+    (pubkey: NostrPubkey, p: Profile | null | undefined): void => {
+      const pending = avatarSrc(adapter, p);
+      if (pending === null) return;
+      pending.then(
         (src) => {
           if (alive.current) setAvatars((prev) => ({ ...prev, [pubkey]: src }));
         },
@@ -400,7 +402,7 @@ export function Home({
         (p) => {
           if (!alive.current) return;
           setProfiles((prev) => ({ ...prev, [pubkey]: p }));
-          resolveAvatar(pubkey, p?.picture);
+          resolveAvatar(pubkey, p);
         },
         () => {
           if (alive.current) setProfiles((prev) => ({ ...prev, [pubkey]: null }));
@@ -418,7 +420,7 @@ export function Home({
         req.thumbs.add(video.id);
         const image = video.renditions[0]?.image;
         if (image) {
-          adapter.image(image.url, image.sha256).then(
+          thumbnailSrc(adapter, image).then(
             (src) => {
               if (alive.current) setThumbs((prev) => ({ ...prev, [video.id]: src }));
             },
@@ -477,7 +479,7 @@ export function Home({
             fetchedAt: 0 as UnixSeconds,
           };
           list.push({ profile, busy: false, subscribed: false });
-          resolveAvatar(pubkey, profile.picture);
+          resolveAvatar(pubkey, profile);
         });
         done = true;
         setSuggestions({ status: 'ready', list });

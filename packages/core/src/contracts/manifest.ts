@@ -59,6 +59,9 @@ export const DEFAULT_MIN_PAY_SATS = 10 as const;
  */
 export const MAX_MIN_PAY_WINDOW_BLOCKS = 64 as const;
 
+/** v6 (ADR 0015): the largest image (thumbnail, avatar) fetched or published, in bytes. */
+export const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
+
 /** The largest `minpay` a manifest may state (a sanity bound; the window cap is the real one). */
 export const MAX_MIN_PAY_SATS = 1_000_000 as const;
 
@@ -84,8 +87,12 @@ export interface Rendition {
    * never fetches them — media is on Pear only — and never writes any (Studio emits `[]`).
    */
   readonly fallbacks: readonly string[];
-  /** Thumbnail as a Blossom URL; its sha256 is verified before display (T16). */
-  readonly image?: { readonly url: string; readonly sha256?: Sha256Hex };
+  /**
+   * Thumbnail; its sha256 is verified before display (T16). v6 (ADR 0015): a `hyper://` URL in the
+   * creator's profile core — then `sha256` and `size` (imeta `image-size`, ≤ `MAX_IMAGE_BYTES`) are
+   * REQUIRED and the parser checks the URL against the size. Otherwise another publisher's `https:`.
+   */
+  readonly image?: { readonly url: string; readonly sha256?: Sha256Hex; readonly size?: number };
   /** Optional tiny inline placeholder (data: URL) for blur-up. */
   readonly placeholder?: string;
   /** WebVTT captions as a Blossom blob. */

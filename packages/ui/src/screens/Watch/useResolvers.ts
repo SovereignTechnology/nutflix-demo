@@ -14,6 +14,7 @@ import type {
   VideoManifest,
   VideoStats,
 } from '@sovit/core';
+import { avatarSrc, thumbnailSrc } from '../shared/image.js';
 
 export interface Resolvers {
   /** `null` = looked up, no profile (or the lookup failed). Missing = not asked yet. */
@@ -54,9 +55,9 @@ export function useResolvers(adapter: NetworkAdapter): Resolvers {
         (p) => {
           if (!alive.current) return;
           setProfiles((prev) => ({ ...prev, [pubkey]: p }));
-          const picture = p?.picture;
-          if (picture === undefined || picture === '') return;
-          adapter.image(picture).then(
+          const pending = avatarSrc(adapter, p);
+          if (pending === null) return;
+          pending.then(
             (src) => {
               if (alive.current) setAvatars((prev) => ({ ...prev, [pubkey]: src }));
             },
@@ -78,7 +79,7 @@ export function useResolvers(adapter: NetworkAdapter): Resolvers {
       req.add(video.id);
       const image = video.renditions.find((r) => r.image !== undefined)?.image;
       if (image === undefined) return;
-      adapter.image(image.url, image.sha256).then(
+      thumbnailSrc(adapter, image).then(
         (src) => {
           if (alive.current) setThumbs((prev) => ({ ...prev, [video.id]: src }));
         },

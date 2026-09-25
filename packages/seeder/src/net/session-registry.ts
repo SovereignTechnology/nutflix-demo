@@ -37,6 +37,8 @@ export interface SessionRegistryOptions {
   readonly onFirstUpload?: (session: PeerSession, core: CoreKeyHex) => void;
   /** Forwarded to every session (`PeerSessionOptions.accepting`: the pending-PAY cap). */
   readonly accepting?: () => boolean;
+  /** Forwarded to every session (`PeerSessionOptions.isFree`: ADR 0015 free cores). */
+  readonly isFree?: (core: CoreKeyHex) => boolean;
 }
 
 export class SessionRegistry {
@@ -52,6 +54,7 @@ export class SessionRegistry {
   private readonly pricing: ((core: CoreKeyHex) => UploadPricing) | undefined;
   private readonly onFirstUpload: SessionRegistryOptions['onFirstUpload'];
   private readonly accepting: SessionRegistryOptions['accepting'];
+  private readonly isFree: SessionRegistryOptions['isFree'];
 
   constructor(opts: SessionRegistryOptions) {
     this.engine = opts.engine;
@@ -61,6 +64,7 @@ export class SessionRegistry {
     this.now = opts.now;
     this.onFirstUpload = opts.onFirstUpload;
     this.accepting = opts.accepting;
+    this.isFree = opts.isFree;
     this.pricing = opts.pricing;
   }
 
@@ -126,6 +130,7 @@ export class SessionRegistry {
       ...(this.pricing ? { pricing: this.pricing } : {}),
       ...(this.onFirstUpload ? { onFirstUpload: this.onFirstUpload } : {}),
       ...(this.accepting ? { accepting: this.accepting } : {}),
+      ...(this.isFree ? { isFree: this.isFree } : {}),
       onClose: (s) => {
         admitted.release();
         this.live.delete(s);

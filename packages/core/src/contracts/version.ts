@@ -48,6 +48,9 @@
  *       `hyper://` only. `blossom` / `fallback` tags in other publishers' events are still
  *       parsed and never fetched. (The gateway's Blossom endpoints stay: they are an HTTP face
  *       over its own Pear seeder.) Also (security review F18): `Settings.loadRemoteImages`
- *       (default `false`: only images with a signed sha256 load).
+ *       (default `false`: only images with a signed sha256 load). And ADR 0015 (images over
+ *       Pear): `Rendition.image.size?` + imeta `image-size` (required with a `hyper://` image,
+ *       as is `image-x`), `MAX_IMAGE_BYTES`, `Profile.pictureSha256?/pictureSize?/bannerSha256?/
+ *       bannerSize?`, `Settings.seeding.serveImages?`.
  */
 export const CONTRACTS_VERSION = 6 as const;

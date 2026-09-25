@@ -15,6 +15,10 @@
  * otherwise it is refused before any request, so a publisher's URL cannot act as a tracking
  * pixel. Hash-addressed images always load, verified.
  *
+ * ADR 0015: a `hyper://` image (a creator's profile core) is read over Pear by the worker
+ * (`fetchHyper`), never over `https:`; it needs its sha256 and size, both checked again here,
+ * and is sniffed like any other image. No opt-in is needed: no third-party host is contacted.
+ *
  * Studio's thumbnail candidates are worker files: `registerFile` maps a path (which must live
  * under the worker's storage directory) to an id; it is read, capped and sniffed when served.
  */
@@ -87,6 +91,8 @@ export interface ImageServiceOptions {
   readonly cacheBytes?: number;
   /** Whether images without a sha256 may be fetched (F18). Default: never. */
   readonly remoteImages?: () => boolean;
+  /** ADR 0015: read a `hyper://` image over Pear (the worker checks size and sha256). */
+  readonly fetchHyper?: (url: string, sha256: Sha256Hex, size: number) => Promise<Uint8Array>;
   readonly random?: (n: number) => Uint8Array;
 }
 
@@ -97,6 +103,7 @@ export class ImageService {
   private readonly cacheBytes: number;
   private readonly random: (n: number) => Uint8Array;
   private readonly remoteImages: () => boolean;
+  private readonly fetchHyper: ImageServiceOptions['fetchHyper'];
   /** id → entry, in least-recently-used order (Map iteration order). */
   private readonly entries = new Map<string, Entry>();
   /** `url|sha` → id, so a repeated `image()` call does not refetch. */
@@ -111,10 +118,11 @@ export class ImageService {
     this.cacheBytes = opts.cacheBytes ?? 64 * 1024 * 1024;
     this.random = opts.random ?? ((n) => randomBytes(n));
     this.remoteImages = opts.remoteImages ?? ((): boolean => false);
+    this.fetchHyper = opts.fetchHyper;
   }
 
   /** `NetworkAdapter.image`: fetch + check, or pass back an `nf-media://img/` id we issued. */
-  async image(url: string, sha256?: Sha256Hex): Promise<NfMediaImgUrl> {
+  async image(url: string, sha256?: Sha256Hex, size?: number): Promise<NfMediaImgUrl> {
     if (url.startsWith(NF_IMG_PREFIX)) {
       const id = url.slice(NF_IMG_PREFIX.length);
       if (!this.entries.has(id)) fail('not-found', 'unknown image id');
@@ -125,6 +133,7 @@ export class ImageService {
       }
       return url as NfMediaImgUrl;
     }
+    if (url.startsWith('hyper://')) return this.hyperImage(url, sha256, size);
     // F18: no signed hash → only when the user allows remote images; refused before any request.
     if (sha256 === undefined && !this.remoteImages())
       fail('forbidden', 'remote images without a hash are off (Settings)');
@@ -137,6 +146,47 @@ export class ImageService {
     const pending = this.inflight.get(key);
     if (pending) return pending;
     const p = this.fetchAndStore(url, sha256, key).finally(() => {
+      this.inflight.delete(key);
+    });
+    this.inflight.set(key, p);
+    return p;
+  }
+
+  /** ADR 0015: a profile-core image, read over Pear, cached like any other. */
+  private hyperImage(
+    url: string,
+    sha256: Sha256Hex | undefined,
+    size: number | undefined,
+  ): Promise<NfMediaImgUrl> {
+    if (sha256 === undefined || size === undefined)
+      fail('invalid-argument', 'a hyper:// image needs its sha256 and size');
+    if (!Number.isSafeInteger(size) || size < 1 || size > MAX_IMAGE_BYTES)
+      fail('invalid-argument', 'image size out of range');
+    const read = this.fetchHyper;
+    if (read === undefined) fail('backend-down', 'no Pear image reader');
+    const key = `${url}|${sha256}`;
+    const known = this.byKey.get(key);
+    if (known !== undefined && this.entries.has(known)) {
+      this.touch(known);
+      const hit: NfMediaImgUrl = `${NF_IMG_PREFIX}${known}`;
+      return Promise.resolve(hit);
+    }
+    const pending = this.inflight.get(key);
+    if (pending) return pending;
+    const p = (async (): Promise<NfMediaImgUrl> => {
+      const bytes = await read(url, sha256, size);
+      // Checked by the worker already; checked again here, where the bytes are served from.
+      if (bytes.byteLength !== size || sha256Hex(bytes) !== sha256)
+        fail('hash-mismatch', 'image hash mismatch');
+      const type = sniffImage(bytes);
+      if (type === null) fail('forbidden', 'not a JPEG, PNG or WebP image');
+      const id = this.newId();
+      this.entries.set(id, { kind: 'bytes', img: { bytes, type } });
+      this.byKey.set(key, id);
+      this.cached += bytes.byteLength;
+      this.evict();
+      return `${NF_IMG_PREFIX}${id}`;
+    })().finally(() => {
       this.inflight.delete(key);
     });
     this.inflight.set(key, p);
