@@ -113,6 +113,7 @@ export class MockNetworkAdapter implements NetworkAdapter {
       seeding: { enabled: opts.seeding ?? true, diskCapBytes: 50 * 1024 ** 3 },
       prefetchSeconds: 30,
       hoverPreview: true,
+      loadRemoteImages: false,
       theme: 'dark',
     };
   }

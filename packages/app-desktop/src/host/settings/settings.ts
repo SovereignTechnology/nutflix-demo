@@ -32,6 +32,8 @@ export const DEFAULT_SETTINGS: Settings = Object.freeze({
   seeding: Object.freeze({ enabled: false, diskCapBytes: 10 * 1024 ** 3 }),
   prefetchSeconds: 30,
   hoverPreview: true,
+  // Security review F18: only hash-addressed images until the user opts in.
+  loadRemoteImages: false,
   theme: 'system' as const,
 });
 
@@ -41,6 +43,7 @@ const SETTINGS_KEYS: readonly (keyof Settings)[] = [
   'seeding',
   'prefetchSeconds',
   'hoverPreview',
+  'loadRemoteImages',
   'theme',
   'autoTopUp',
 ];

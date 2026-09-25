@@ -87,10 +87,12 @@ function once(b: Uint8Array): () => Uint8Array | undefined {
 }
 
 let seq = 0;
+/** The fetch-rule tests run with remote images ON (F18's policy has its own tests below). */
 const service = (t: ImageTransport, fileRoot?: string): ImageService =>
   new ImageService({
     transport: t,
     log: silentLogger,
+    remoteImages: () => true,
     ...(fileRoot === undefined ? {} : { fileRoot }),
     random: (n) => {
       seq++;
@@ -371,11 +373,42 @@ describe('ImageService.image', () => {
       }),
       log: silentLogger,
       cacheBytes: 1000,
+      remoteImages: () => true,
     });
     const one = (await s.image('https://i.example/1')).slice(15);
     const two = (await s.image('https://i.example/2')).slice(15);
     expect(await s.serve(one)).toBeNull();
     expect(await s.serve(two)).not.toBeNull();
+  });
+});
+
+describe('ImageService — remote images (security review F18)', () => {
+  it('by default refuses an image without a signed hash BEFORE any request; a hash-addressed one loads, verified', async () => {
+    const requested: string[] = [];
+    const inner = fakeTransport({ 'https://i.example/p.jpg': { body: JPEG } });
+    const s = new ImageService({
+      transport: (u) => {
+        requested.push(u.href);
+        return inner(u);
+      },
+      log: silentLogger,
+    });
+    expect(await code(s.image('https://i.example/p.jpg'))).toBe('forbidden');
+    expect(requested).toEqual([]);
+    expect(await s.image('https://i.example/p.jpg', sha(JPEG))).toMatch(/^nf-media:\/\/img\//);
+    expect(requested).toEqual(['https://i.example/p.jpg']);
+  });
+
+  it('follows the setting live: on loads unsigned images; off again refuses even a cached URL', async () => {
+    let on = true;
+    const s = new ImageService({
+      transport: fakeTransport({ 'https://i.example/p.jpg': { body: JPEG } }),
+      log: silentLogger,
+      remoteImages: () => on,
+    });
+    expect(await s.image('https://i.example/p.jpg')).toMatch(/^nf-media:\/\/img\//);
+    on = false;
+    expect(await code(s.image('https://i.example/p.jpg'))).toBe('forbidden');
   });
 });
 

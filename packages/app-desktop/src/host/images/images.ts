@@ -10,6 +10,11 @@
  * the bytes must sniff as JPEG, PNG or WebP (SVG and friends are refused — the sniffed type is
  * what main serves); `sha256` enforced when given. No cookies, no credentials, no referrer.
  *
+ * Security review F18: an image WITHOUT a sha256 (a profile picture, an unsigned thumbnail) is
+ * fetched only while `remoteImages()` says so (`Settings.loadRemoteImages`, default off) —
+ * otherwise it is refused before any request, so a publisher's URL cannot act as a tracking
+ * pixel. Hash-addressed images always load, verified.
+ *
  * Studio's thumbnail candidates are worker files: `registerFile` maps a path (which must live
  * under the worker's storage directory) to an id; it is read, capped and sniffed when served.
  */
@@ -80,6 +85,8 @@ export interface ImageServiceOptions {
   readonly fileRoot?: string;
   /** Bytes of fetched images kept for serving; least recently used are dropped. */
   readonly cacheBytes?: number;
+  /** Whether images without a sha256 may be fetched (F18). Default: never. */
+  readonly remoteImages?: () => boolean;
   readonly random?: (n: number) => Uint8Array;
 }
 
@@ -89,6 +96,7 @@ export class ImageService {
   private readonly fileRoot: string | undefined;
   private readonly cacheBytes: number;
   private readonly random: (n: number) => Uint8Array;
+  private readonly remoteImages: () => boolean;
   /** id → entry, in least-recently-used order (Map iteration order). */
   private readonly entries = new Map<string, Entry>();
   /** `url|sha` → id, so a repeated `image()` call does not refetch. */
@@ -102,6 +110,7 @@ export class ImageService {
     this.fileRoot = opts.fileRoot === undefined ? undefined : resolvePath(opts.fileRoot);
     this.cacheBytes = opts.cacheBytes ?? 64 * 1024 * 1024;
     this.random = opts.random ?? ((n) => randomBytes(n));
+    this.remoteImages = opts.remoteImages ?? ((): boolean => false);
   }
 
   /** `NetworkAdapter.image`: fetch + check, or pass back an `nf-media://img/` id we issued. */
@@ -116,6 +125,9 @@ export class ImageService {
       }
       return url as NfMediaImgUrl;
     }
+    // F18: no signed hash → only when the user allows remote images; refused before any request.
+    if (sha256 === undefined && !this.remoteImages())
+      fail('forbidden', 'remote images without a hash are off (Settings)');
     const key = `${url}|${sha256 ?? ''}`;
     const known = this.byKey.get(key);
     if (known !== undefined && this.entries.has(known)) {

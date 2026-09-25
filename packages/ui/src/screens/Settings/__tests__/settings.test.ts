@@ -572,6 +572,19 @@ describe('Settings — save model', () => {
     expect(r.all('.nf-toast')).toHaveLength(0);
   });
 
+  // Security review F18: images without a signed hash stay placeholders until the user opts in.
+  it('"Load images from any website" starts off and saves loadRemoteImages', async () => {
+    const adapter = adapterWith();
+    const update = vi.spyOn(adapter, 'updateSettings');
+    const { r } = await ready(adapter);
+    const remote = input(r, '-appearance-remote-images');
+    expect(remote.checked).toBe(false);
+    click(remote);
+    await flush();
+    expect(update).toHaveBeenLastCalledWith({ loadRemoteImages: true });
+    expect(remote.checked).toBe(true);
+  });
+
   it('never loses typed input when a save fails', async () => {
     const adapter = adapterWith();
     vi.spyOn(adapter, 'updateSettings').mockRejectedValue(new Error('disk full'));

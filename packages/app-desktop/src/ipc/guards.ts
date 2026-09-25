@@ -409,6 +409,7 @@ const isSettingsPatch = obj(
     seeding: obj({ enabled: bool, diskCapBytes: int(0, LIMITS.maxDiskCapBytes) }),
     prefetchSeconds: num(0, LIMITS.maxPrefetchSec),
     hoverPreview: bool,
+    loadRemoteImages: bool,
     theme: oneOf(['dark', 'light', 'system'] as const),
     // SE-4: `belowSats: 0` is the v4 "off" sentinel; the host treats `<= 0` as disabled.
     autoTopUp: obj({

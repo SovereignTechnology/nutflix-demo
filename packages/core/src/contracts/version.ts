@@ -47,6 +47,7 @@
  *       no longer names or mirrors to Blossom servers, so our manifests carry sha256 +
  *       `hyper://` only. `blossom` / `fallback` tags in other publishers' events are still
  *       parsed and never fetched. (The gateway's Blossom endpoints stay: they are an HTTP face
- *       over its own Pear seeder.)
+ *       over its own Pear seeder.) Also (security review F18): `Settings.loadRemoteImages`
+ *       (default `false`: only images with a signed sha256 load).
  */
 export const CONTRACTS_VERSION = 6 as const;

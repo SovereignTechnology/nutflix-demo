@@ -2,12 +2,15 @@
  * Settings › Appearance: light / dark / follow the device (ADR 0005 — "system" is the
  * default). The screen only persists the choice through `updateSettings({ theme })`; applying
  * it to the document is the shell's job (it hears the confirmed value via `onSettingsChange`).
+ *
+ * Also "Load images from any website" (security review F18, default off): off, only images whose
+ * hash the publisher signed are shown — an arbitrary image URL is a tracking pixel.
  */
 import type { ReactElement } from 'react';
 import type { Settings } from '@sovit/core';
 import { cx } from '../../components/index.js';
 import { useResolvedTheme } from '../../tokens/index.js';
-import { SectionFrame, type SectionProps } from './controls.js';
+import { SectionFrame, SwitchRow, type SectionProps } from './controls.js';
 
 type Theme = Settings['theme'];
 
@@ -37,7 +40,7 @@ export function AppearanceSection({
       id={id}
       title="Appearance"
       description="Applies to Nutflix on this device."
-      busy={pending.has('theme')}
+      busy={pending.has('theme') || pending.has('loadRemoteImages')}
       headingRef={headingRef}
     >
       <fieldset className="nf-settings__fieldset">
@@ -76,6 +79,21 @@ export function AppearanceSection({
         </div>
         {pending.has('theme') ? <span className="nf-settings__saving">Saving…</span> : null}
       </fieldset>
+
+      <SwitchRow
+        id={`${id}-remote-images`}
+        label="Load images from any website"
+        description="Off: only thumbnails and pictures whose fingerprint the publisher signed are shown; the rest stay as placeholders. On: every image loads, and each website that hosts one sees your IP address."
+        checked={view.loadRemoteImages}
+        busy={pending.has('loadRemoteImages')}
+        onChange={(on) => {
+          void save({
+            field: 'loadRemoteImages',
+            label: 'image loading',
+            patch: () => ({ loadRemoteImages: on }),
+          });
+        }}
+      />
     </SectionFrame>
   );
 }

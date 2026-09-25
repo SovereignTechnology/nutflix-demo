@@ -10,9 +10,17 @@
  *
  * Deliberate differences are asserted too, each with its reason, at the bottom.
  */
+import { createHash } from 'node:crypto';
+
 import { afterEach, describe, expect, it } from 'vitest';
 
-import type { NetworkAdapter, NostrEventId, NostrPubkey, VideoManifest } from '@sovit/core';
+import type {
+  NetworkAdapter,
+  NostrEventId,
+  NostrPubkey,
+  Sha256Hex,
+  VideoManifest,
+} from '@sovit/core';
 import { NostrKind, mocks, nostr } from '@sovit/core';
 
 import { fromWireError, toWireError } from '../../ipc/errors.js';
@@ -155,6 +163,7 @@ const isSettings = obj(
     seeding: obj({ enabled: bool, diskCapBytes: isCount }),
     prefetchSeconds: num(0, 600),
     hoverPreview: bool,
+    loadRemoteImages: bool,
     theme: oneOf(['dark', 'light', 'system'] as const),
   },
   { autoTopUp: obj({ belowSats: isSats, fromMint: isMintUrl }) },
@@ -224,6 +233,8 @@ interface Side {
 }
 
 const PNG = Uint8Array.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0]);
+/** F18: the fixture image is hash-addressed, so it loads with remote images off (the default). */
+const PNG_SHA = createHash('sha256').update(PNG).digest('hex') as Sha256Hex;
 const images: ImageTransport = (url) =>
   url.href === 'https://img.example/p.png'
     ? Promise.resolve({
@@ -508,7 +519,7 @@ const HAPPY: Happy[] = [
       return pickData(ps);
     },
   },
-  { name: 'image', guard: text(1, 4096), run: (s) => s.a.image(s.imageUrl) },
+  { name: 'image', guard: text(1, 4096), run: (s) => s.a.image(s.imageUrl, PNG_SHA) },
   { name: 'wallet.mints', guard: arrayOf(isMintUrl, 64), run: (s) => s.a.wallet.mints() },
   { name: 'wallet.balance', guard: isSats, run: (s) => s.a.wallet.balance(mocks.MINTS.a) },
   { name: 'wallet.balances', guard: wireMap(isMintUrl, isSats), run: (s) => s.a.wallet.balances() },
@@ -765,6 +776,9 @@ describe('conformance: deliberate differences from the (cheatable) mock', () => 
   it('image() returns nf-media://img/<id>, never the remote URL (the mock echoes the URL)', async () => {
     const [m, d] = await pair();
     expect(await m.a.image(m.imageUrl)).toBe(m.imageUrl);
-    expect(await d.a.image(d.imageUrl)).toMatch(/^nf-media:\/\/img\/[0-9a-f]{32}$/);
+    expect(await d.a.image(d.imageUrl, PNG_SHA)).toMatch(/^nf-media:\/\/img\/[0-9a-f]{32}$/);
+    // F18: without a signed hash the desktop refuses, before any request, while remote images
+    // are off (the default).
+    await expect(d.a.image(d.imageUrl)).rejects.toThrow(/^forbidden/);
   });
 });

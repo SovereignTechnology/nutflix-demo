@@ -356,6 +356,8 @@ export async function createHost(o: HostOptions): Promise<Host> {
     transport: o.imageTransport ?? httpsTransport(),
     log,
     fileRoot: storage,
+    // Security review F18: unsigned images only when the user opted in (Settings).
+    remoteImages: () => settings.get().loadRemoteImages,
     ...(o.random === undefined ? {} : { random: o.random }),
   });
 

@@ -183,6 +183,13 @@ export interface Settings {
   readonly seeding: { readonly enabled: boolean; readonly diskCapBytes: number };
   readonly prefetchSeconds: number;
   readonly hoverPreview: boolean;
+  /**
+   * v6 (security review F18, Cameron 2026-09-24): `false` (the default) loads only images whose
+   * sha256 the publisher signed (a Blossom `x` / `image-x`), verified; any other image — a
+   * tracking pixel in waiting — is refused and the UI keeps its placeholder. `true` loads any
+   * `https:` image, and its host sees the viewer's IP address.
+   */
+  readonly loadRemoteImages: boolean;
   readonly theme: 'dark' | 'light' | 'system';
   /**
    * v5 (L5-Settings/Wallet, L6-B, SE-4) — normative: `belowSats <= 0` means DISABLED (a patch
