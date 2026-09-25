@@ -1,7 +1,7 @@
 /**
  * Issue #8 (d) under the REAL Bare runtime the desktop ships (bare-sidecar's prebuilt `bare`),
  * against the BUILT worker modules (`dist/worker/…`, the unbundled tsc output the host runs;
- * skipped when `dist/` predates them — `npm run build` first, as CI does): `bareDleqThread` starts
+ * skipped when `dist/` lacks them — `npm run build` first, as CI does): `bareDleqThread` starts
  * `dist/worker/pay/dleq-thread-entry.mjs` on a `Bare.Thread`, and the worker's event loop is
  * measured while a maximal PAY (2 sets × 64 proofs) is checked — inline on the loop (the engine's
  * behaviour before), on the thread, and on the chunked fallback — with the same verdicts each way
