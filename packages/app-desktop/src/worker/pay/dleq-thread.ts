@@ -304,7 +304,8 @@ export async function chunkedDleq(
   chunk: number = DLEQ_INLINE_CHUNK,
 ): Promise<boolean[]> {
   const out: boolean[] = [];
-  const step = Math.max(1, Math.floor(chunk));
+  // A chunk that is not a positive integer (0, NaN, -1) means the default, never "no checks".
+  const step = Number.isSafeInteger(chunk) && chunk > 0 ? chunk : DLEQ_INLINE_CHUNK;
   for (let i = 0; i < checks.length; i += step) {
     if (i > 0) await new Promise<void>((r) => setTimeout(r, 0));
     for (const c of checks.slice(i, i + step)) {

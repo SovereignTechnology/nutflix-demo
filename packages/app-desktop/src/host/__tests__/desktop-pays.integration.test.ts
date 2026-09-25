@@ -148,6 +148,7 @@ describe('the desktop app pays a seeder daemon for real (ADR 0012)', () => {
     });
     plane = await MoneyPlane.open({
       signer,
+      journalDir: null, // in memory: these tests are not about the journal
       pool,
       relays: () => [{ url: RELAY, read: true, write: true }],
       defaultMints: () => [MINT],

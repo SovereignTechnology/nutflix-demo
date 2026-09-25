@@ -239,6 +239,7 @@ describe('the host says why payments are off', () => {
     const mint = new mocks.TestMint({ url: MINT, seed: new Uint8Array(32).fill(0x2f) });
     await MoneyPlane.open({
       signer: s,
+      journalDir: null, // only publishes the wallet event; the host opens the journal below
       pool,
       relays: () => [{ url: RELAY, read: true, write: true }],
       defaultMints: () => [MINT],

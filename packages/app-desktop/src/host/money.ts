@@ -73,10 +73,11 @@ export interface MoneyPlaneOptions {
   /** Tests: the in-process `TestMint` transport. Default: the global `fetch` (the host has JIT). */
   readonly mintRequest?: RequestFn;
   /**
-   * Where the sealed wallet journal lives (`<userData>/wallet`, created 0700). Without it (tests)
-   * the journal stays in memory and a crash loses an operation whose answer was lost.
+   * Where the sealed wallet journal lives (`<userData>/wallet`, created 0700). Required, so no
+   * caller loses durability by leaving it out: `null` (tests only) keeps the journal in memory,
+   * where a crash loses an operation whose answer was lost.
    */
-  readonly journalDir?: string;
+  readonly journalDir: string | null;
   /**
    * Make a NEW wallet key when the relays hold none — only for an explicit "create my wallet".
    * Default false: at startup a miss may just be unreachable relays, and creating then would
@@ -172,7 +173,7 @@ export class MoneyPlane {
     let journal: walletMod.SealedJournal | undefined;
     try {
       // Sealed to this identity; a file that does not open refuses the wallet (and is kept).
-      if (o.journalDir !== undefined)
+      if (o.journalDir !== null)
         journal = await openWalletJournal({ dir: o.journalDir, signer: o.signer, pubkey });
       const store = await walletMod.Nip60ProofStore.load({
         signer: o.signer,

@@ -350,6 +350,9 @@ describe('chunkedDleq — bounded work per turn', () => {
       clearInterval(iv);
     }
     expect(turns).toBeGreaterThan(0);
+    // A chunk size that is not a positive integer still checks every proof.
+    for (const bad of [0, -1, Number.NaN, 1.5])
+      expect(await chunkedDleq(cs, verify, bad), String(bad)).toEqual(inline(cs));
     // A verifier that throws counts as a failed check, never as a pass.
     expect(
       await chunkedDleq(cs.slice(0, 2), () => {
