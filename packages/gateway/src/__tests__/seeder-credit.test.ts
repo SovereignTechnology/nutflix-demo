@@ -339,12 +339,12 @@ describe('UpstreamPayer — the per-seeder batch (issue #8)', () => {
 
   it('a seeder at its cap is paid at once, even below payEveryBlocks', async () => {
     let atCap = false;
-    const r = payerRig(() => ({ batch: 1, atCap }), 2);
+    const r = payerRig(() => ({ batch: 2, atCap }), 3);
     r.payer.onDownload(CORE, 0, A);
     await flush();
     expect(r.proto.sentPays).toHaveLength(0);
     atCap = true;
-    r.payer.onDownload(CORE, 5, A);
+    r.payer.onDownload(CORE, 5, A); // 2 pending: below payEveryBlocks (3) and the batch (2 runs of 1)
     await flush();
     expect(r.proto.sentPays.map((p) => [p.range.fromBlock, p.range.toBlock])).toEqual([[0, 0]]);
   });
