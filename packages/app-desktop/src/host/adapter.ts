@@ -608,9 +608,11 @@ export class DesktopNetworkAdapter implements NetworkAdapter {
         // Issue #2: nothing to pay with — top up a TRUSTED paying mint first (the first funding
         // of a mint asks the user in main's prompt window; a manifest's other mints are never
         // topped up: `autoTopUpDue` requires the user's own list). One top-up at a time.
+        // The first mint that is due decides: done, declined, capped or failed, no second mint
+        // is tried (and asked about) for the same play.
         for (const m of mints) {
           const out = await top.check(m, 0 as Sats);
-          if (out === 'done') break;
+          if (out !== 'not-due') break;
         }
         balances = await Promise.all(mints.map((m) => this.wallet.balance(m)));
       } else {

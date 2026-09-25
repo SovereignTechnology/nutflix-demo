@@ -382,8 +382,14 @@ export async function createHost(o: HostOptions): Promise<Host> {
                 },
               }),
           log,
-          ...o.topUp,
+          // Picked, never spread: a test hook must not be able to replace the question, the
+          // wallet or the settings the top-up is checked against.
           now: topUpNow,
+          ...(o.topUp?.sleep === undefined ? {} : { sleep: o.topUp.sleep }),
+          ...(o.topUp?.pollAttempts === undefined ? {} : { pollAttempts: o.topUp.pollAttempts }),
+          ...(o.topUp?.pollIntervalMs === undefined
+            ? {}
+            : { pollIntervalMs: o.topUp.pollIntervalMs }),
         })
       : undefined;
   const images = new ImageService({

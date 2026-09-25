@@ -8,7 +8,12 @@ import { afterEach, describe, expect, it } from 'vitest';
 
 import type { PromptForm } from '../../ipc/protocol.js';
 import { LIMITS } from '../../ipc/protocol.js';
-import { MIN_PASSPHRASE_CHARS, TOP_UP_PER_DAY_SATS, mount } from '../prompt/prompt.js';
+import {
+  MIN_PASSPHRASE_CHARS,
+  TOP_UP_MAX_SATS,
+  TOP_UP_PER_DAY_SATS,
+  mount,
+} from '../prompt/prompt.js';
 
 let root: HTMLElement;
 afterEach(() => {
@@ -185,6 +190,7 @@ describe('prompt page', () => {
 
   it('issue #2 first top-up: names target, source and amount (hosts only), the daily cap; defaults to Not now', () => {
     expect(TOP_UP_PER_DAY_SATS).toBe(LIMITS.maxAutoTopUpSatsPerDay);
+    expect(TOP_UP_MAX_SATS).toBe(LIMITS.maxAutoTopUpAmountSats);
     const form = {
       kind: 'top-up-first',
       target: 'https://mint.target.example/cashu/api?x=SECRET',
@@ -198,6 +204,8 @@ describe('prompt page', () => {
     expect(facts).toContain('2,000 sats');
     expect(root.textContent).not.toMatch(/SECRET|cashu\/api/);
     expect(root.textContent).toContain('50,000 sats in any 24 hours');
+    // A later raise of the amount (asked by main's settings gate) is covered by the words here.
+    expect(root.textContent).toContain('never more than 10,000 sats');
     expect(document.activeElement?.textContent).toBe('Not now');
     document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape' }));
     expect(a.sent).toEqual([{ kind: 'top-up-first', confirm: false }]);

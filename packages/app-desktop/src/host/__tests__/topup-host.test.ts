@@ -30,6 +30,7 @@ const kit = await coreTestKit();
 const TARGET = 'https://mint-target.topup-host.test' as MintUrl;
 const SOURCE = 'https://mint-source.topup-host.test' as MintUrl;
 const STRANGER = 'https://creator-mint.topup-host.test' as MintUrl;
+const SECOND = 'https://mint-second.topup-host.test' as MintUrl;
 
 let r: Rig | undefined;
 afterEach(async () => {
@@ -57,10 +58,12 @@ interface World {
   readonly stranger: mocks.TestMint;
   readonly trusted: VideoManifest;
   readonly foreign: VideoManifest;
+  /** A video paid at two of the user's trusted mints. */
+  readonly both: VideoManifest;
   answer: boolean;
 }
 
-async function world(): Promise<World> {
+async function world(o: { readonly hooks?: object } = {}): Promise<World> {
   const lightning = new mocks.TestLightning();
   const target = new mocks.TestMint({
     url: TARGET,
@@ -74,7 +77,13 @@ async function world(): Promise<World> {
     feeReserve: 2,
   });
   const stranger = new mocks.TestMint({ url: STRANGER, seed: new Uint8Array(32).fill(0x53) });
+  const second = new mocks.TestMint({
+    url: SECOND,
+    seed: new Uint8Array(32).fill(0x54),
+    lightning,
+  });
   const byUrl: Record<string, mocks.TestMint> = {
+    [SECOND]: second,
     [TARGET]: target,
     [SOURCE]: source,
     [STRANGER]: stranger,
@@ -105,6 +114,7 @@ async function world(): Promise<World> {
     identity: new SignerIdentity(signer),
     mintRequest,
     topUp: {
+      ...o.hooks,
       now: () => (t += 1_000),
       sleep: () => Promise.resolve(),
       pollAttempts: 3,
@@ -126,7 +136,7 @@ async function world(): Promise<World> {
   });
   await rr.ready();
   await rr.host.adapter.updateSettings({
-    defaultMints: [TARGET, SOURCE],
+    defaultMints: [TARGET, SOURCE, SECOND],
     autoTopUp: { belowSats: 1_000 as Sats, fromMint: SOURCE, amountSats: 2_000 as Sats },
   });
   // Fund the source mint (the user's own Lightning top-up there).
@@ -135,15 +145,25 @@ async function world(): Promise<World> {
   source.payQuote(q.quoteId);
   await wallet.pollQuote(q);
   const fixture = mocks.VIDEOS[0]!;
-  const [trusted, foreign] = await seedVideos(kit, rr.pool, new kit.TestSigner(), [
+  const [trusted, foreign, both] = await seedVideos(kit, rr.pool, new kit.TestSigner(), [
     { ...fixture, price: { ...fixture.price, mints: [TARGET] } },
     {
       ...fixture,
       title: 'A creator-run mint',
       price: { ...fixture.price, mints: [STRANGER] },
     },
+    {
+      ...fixture,
+      title: 'Two trusted mints',
+      price: { ...fixture.price, mints: [TARGET, SECOND] },
+    },
   ]);
-  return Object.assign(w, { r: rr, trusted: trusted!.video, foreign: foreign!.video });
+  return Object.assign(w, {
+    r: rr,
+    trusted: trusted!.video,
+    foreign: foreign!.video,
+    both: both!.video,
+  });
 }
 
 const balance = async (rr: Rig, mint: MintUrl): Promise<number> => {
@@ -195,7 +215,10 @@ describe('auto top-up through the host (issue #2)', () => {
   }, 30_000);
 
   it('declined: nothing moves, play fails no-balance, the next play does not ask again', async () => {
-    const w = await world();
+    // A test hook smuggling its own "yes" (or wallet) through HostOptions.topUp is ignored.
+    const w = await world({
+      hooks: { askFirstFunding: () => Promise.resolve(true), settings: () => ({}) },
+    });
     r = w.r;
     w.answer = false;
     const first = await invoke(w.r, 'play', [w.trusted.id]);
@@ -205,6 +228,18 @@ describe('auto top-up through the host (issue #2)', () => {
     expect(w.asked).toHaveLength(1);
     expect(w.lightning.paid).toEqual([]);
     expect(await balance(w.r, SOURCE)).toBe(20_000);
+  }, 30_000);
+
+  it('a video paid at two trusted mints, declined: ONE question for the play, not one per mint', async () => {
+    const w = await world();
+    r = w.r;
+    w.answer = false;
+    const res = await invoke(w.r, 'play', [w.both.id]);
+    expect(!res.ok && res.error.code).toBe('no-balance');
+    expect(w.asked).toEqual([
+      { kind: 'top-up-first', target: TARGET, source: SOURCE, amount: 2_000 },
+    ]);
+    expect(w.lightning.paid).toEqual([]);
   }, 30_000);
 
   it('two plays at once: one question, one top-up, both plays go ahead', async () => {

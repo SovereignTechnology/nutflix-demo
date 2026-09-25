@@ -30,6 +30,7 @@ import {
   AutoTopUp,
   TOP_UP_DECLINED_BACKOFF_MS,
   TOP_UP_FAIL_BACKOFF_MS,
+  TOP_UP_MAX_BACKOFF_MS,
   TOP_UP_MIN_INTERVAL_MS,
   maxFeeReserve,
   topUpAmount,
@@ -68,6 +69,8 @@ interface Setup {
   readonly log: ReturnType<typeof memoryLogger>;
   readonly dir: string;
   settings: Settings;
+  /** The wallet the AutoTopUp sees now (a signer change swaps it). */
+  current: Wallet | undefined;
   answer: boolean | Error | (() => boolean);
   t: number;
   /** A fresh AutoTopUp over a re-opened ledger in the same directory (a restart). */
@@ -136,10 +139,11 @@ async function setup(
   };
   s.answer = true;
   const w = o.wrap ? o.wrap(wallet) : wallet;
+  s.current = w;
   const make = (l: TopUpLedger): AutoTopUp =>
     new AutoTopUp({
       settings: () => s.settings,
-      wallet: () => w,
+      wallet: () => s.current,
       ledger: l,
       ...(o.noAsk === true
         ? {}
@@ -579,11 +583,80 @@ describe('AutoTopUp — paid at the source, not yet minted at the target', () =>
       'auto top-up paid but not yet minted at the target; retried later',
     );
     later(s, TOP_UP_FAIL_BACKOFF_MS + 1);
+    // Another signer's wallet meanwhile: the paid quote is NOT minted into it.
+    const paying = s.current!;
+    const other = new walletMod.CashuWallet({
+      mints: new walletMod.CashuMintConnections({
+        request: (m) => (m === TARGET ? s.target.request : s.source.request),
+      }),
+      store: new walletMod.MemoryProofStore(),
+    });
+    const otherPoll = vi.spyOn(other, 'pollQuote');
+    s.current = other;
+    expect(await s.top.check(TARGET, 0 as Sats)).not.toBe('done');
+    expect(otherPoll).not.toHaveBeenCalled();
+    expect(await other.balance(TARGET)).toBe(0);
+    s.current = paying;
+    later(s, TOP_UP_MAX_BACKOFF_MS);
     // The retry mints it; the target is then above its threshold: nothing else moves.
     expect(await s.top.check(TARGET, 0 as Sats)).toBe('not-due');
     expect(await s.wallet.balance(TARGET)).toBe(2_000);
     expect(await s.wallet.balance(SOURCE)).toBe(18_000);
     expect(s.lightning.paid).toHaveLength(1);
+  });
+});
+
+describe('AutoTopUp — a melt of the user’s own at the source, in the same moment', () => {
+  it('is neither labelled "top-up" nor counted: only the top-up’s own melt line is', async () => {
+    let userMelt: Promise<unknown> | undefined;
+    const s: Setup = await setup({
+      fund: 30_000,
+      amountSats: 2_000,
+      wrap: (w) =>
+        Object.assign(Object.create(w) as Wallet, {
+          melt: async (q: Parameters<Wallet['melt']>[0]) => {
+            // The user withdraws 7 000 sats from the same mint while the top-up's melt runs.
+            userMelt = (async () => {
+              const inv = await w.mintQuote(SECOND, 7_000 as Sats);
+              await w.melt(await w.meltQuote(SOURCE, inv.bolt11));
+            })();
+            await userMelt;
+            return w.melt(q);
+          },
+        }),
+    });
+    expect(await s.top.check(TARGET)).toBe('done');
+    await userMelt;
+    expect(s.ledger.used(s.t)).toBe(2_000);
+    const outs = (await s.wallet.history({ mint: SOURCE }))
+      .filter((e) => e.direction === 'out')
+      .map((e) => [e.amount, s.top.relabel(e).memo]);
+    expect(outs).toEqual([
+      [2_000, 'top-up'],
+      [7_000, 'melt to Lightning'],
+    ]);
+  });
+
+  it('a count the file could not hold is clamped, never written (the ledger stays readable)', async () => {
+    const dir = await tempDir();
+    const l = await TopUpLedger.open(dir, memoryLogger(), () => T0);
+    const id = await l.reserve({ amount: 10, sats: 12, target: TARGET, from: SOURCE });
+    await l.settle(id, { state: 'done', sats: 10 ** 12 });
+    const again = await TopUpLedger.open(dir, memoryLogger(), () => T0);
+    expect(again.snapshot().entries).toMatchObject([{ state: 'done', sats: 100_000 }]);
+    expect(again.fits(1)).toBe(false);
+    // Nor is a mint URL or an amount the file's guard would refuse.
+    const fresh = await TopUpLedger.open(await tempDir(), memoryLogger(), () => T0);
+    for (const bad of [
+      { amount: 10, sats: 12, target: 'javascript:x' as MintUrl, from: SOURCE },
+      { amount: 10, sats: 12, target: TARGET, from: 'https://a b.example' as MintUrl },
+      { amount: 0, sats: 12, target: TARGET, from: SOURCE },
+      { amount: 10, sats: 9, target: TARGET, from: SOURCE },
+      { amount: 10.5, sats: 12, target: TARGET, from: SOURCE },
+    ])
+      await expect(fresh.reserve(bad), JSON.stringify(bad)).rejects.toThrow(/ledger stores/);
+    await expect(fresh.allow('file:///etc' as MintUrl)).rejects.toThrow(/ledger stores/);
+    expect(fresh.snapshot()).toEqual({ allowed: [], entries: [] });
   });
 });
 

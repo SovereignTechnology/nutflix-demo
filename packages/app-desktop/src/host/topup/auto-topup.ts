@@ -143,12 +143,18 @@ interface Flight {
   readonly done: Promise<TopUpOutcome>;
 }
 
-/** The source mint's history just before the melt: what is NOT in it is the melt's own entry. */
+/**
+ * The source mint's history just before the melt: a NEW melt line there, for between the top-up
+ * amount and its whole reservation, is the melt's own (a user's own melt at the same mint, at the
+ * same moment, for a different amount never is).
+ */
 interface Before {
   readonly mint: MintUrl;
   readonly ids: ReadonlySet<string>;
   /** The newest entry's time then (`Infinity` when the history could not be read: match none). */
   readonly newest: number;
+  readonly min: number;
+  readonly max: number;
 }
 
 export class AutoTopUp {
@@ -280,7 +286,7 @@ export class AutoTopUp {
     if (!this.o.ledger.fits(reserved)) return 'cap';
     const entry = await this.o.ledger.reserve({ amount, sats: reserved, target, from });
 
-    const before = await this.historyBefore(w, from);
+    const before = await this.historyBefore(w, from, amount, reserved);
     this.meltInFlight = before;
     let paid: { paid: boolean; change: Sats };
     try {
@@ -361,12 +367,13 @@ export class AutoTopUp {
   }
 
   /** The source mint's recent history before the melt (never rejects). */
-  private async historyBefore(w: Wallet, mint: MintUrl): Promise<Before> {
+  private async historyBefore(w: Wallet, mint: MintUrl, min: number, max: number): Promise<Before> {
     try {
       const h = await w.history({ limit: HISTORY_WINDOW, mint });
-      return { mint, ids: new Set(h.map((e) => e.id)), newest: Math.max(0, ...h.map((e) => e.at)) };
+      const newest = Math.max(0, ...h.map((e) => e.at));
+      return { mint, ids: new Set(h.map((e) => e.id)), newest, min, max };
     } catch {
-      return { mint, ids: new Set(), newest: Number.POSITIVE_INFINITY };
+      return { mint, ids: new Set(), newest: Number.POSITIVE_INFINITY, min, max };
     }
   }
 
@@ -377,7 +384,7 @@ export class AutoTopUp {
   ): Promise<{ readonly id: NostrEventId; readonly amount: number } | undefined> {
     try {
       const h = await w.history({ limit: HISTORY_WINDOW, mint: before.mint });
-      const e = h.find(
+      const found = h.filter(
         (x) =>
           x.direction === 'out' &&
           x.memo === MELT_MEMO &&
@@ -385,9 +392,9 @@ export class AutoTopUp {
           !this.o.ledger.isTopUpMelt(x.id) &&
           isHistoryId(x.id),
       );
-      return e === undefined || !Number.isSafeInteger(e.amount)
-        ? undefined
-        : { id: e.id, amount: e.amount };
+      // Exactly one candidate, or none: an ambiguous history labels and counts nothing by it.
+      const e = found.length === 1 ? found[0] : undefined;
+      return e === undefined ? undefined : { id: e.id, amount: e.amount };
     } catch {
       return undefined;
     }
@@ -417,7 +424,14 @@ export class AutoTopUp {
   }
 }
 
-/** An entry at `b.mint` that appeared after `b` was taken. */
+/** An entry at `b.mint`, new since `b` was taken, for an amount the top-up's melt can have. */
 function isNewMelt(e: WalletHistoryEntry, b: Before): boolean {
-  return e.mint === b.mint && !b.ids.has(e.id) && e.at >= b.newest;
+  return (
+    e.mint === b.mint &&
+    !b.ids.has(e.id) &&
+    e.at >= b.newest &&
+    Number.isSafeInteger(e.amount) &&
+    e.amount >= b.min &&
+    e.amount <= b.max
+  );
 }

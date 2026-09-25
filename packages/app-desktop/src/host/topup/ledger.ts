@@ -42,6 +42,8 @@ export const DAY_MS = 24 * 60 * 60 * 1000;
  * top-ups at least a minute apart, so a real day holds at most 1 440).
  */
 export const MAX_LEDGER_ENTRIES = 2000;
+/** The most one entry may count (twice the daily cap: any entry at the ceiling closes the day). */
+const MAX_ENTRY_SATS = AUTO_TOP_UP_MAX_SATS_PER_DAY * 2;
 /** Most mints remembered as allowed (the Settings mint list has the same cap). */
 const MAX_ALLOWED = LIMITS.maxArray;
 
@@ -97,7 +99,7 @@ const isEntry: Guard<LedgerEntry> = obj(
   {
     id: matches(/^[0-9a-f]{16}$/, 16),
     at: int(0, Number.MAX_SAFE_INTEGER),
-    sats: int(0, AUTO_TOP_UP_MAX_SATS_PER_DAY * 2),
+    sats: int(0, MAX_ENTRY_SATS),
     amount: int(0, LIMITS.maxAutoTopUpAmountSats),
     state: oneOf(['pending', 'done', 'unknown', 'failed', 'closed'] as const),
   },
@@ -122,7 +124,7 @@ function isEntryAmount(e: { readonly amount: number; readonly sats: number }): b
     e.amount <= LIMITS.maxAutoTopUpAmountSats &&
     Number.isSafeInteger(e.sats) &&
     e.sats >= e.amount &&
-    e.sats <= AUTO_TOP_UP_MAX_SATS_PER_DAY * 2
+    e.sats <= MAX_ENTRY_SATS
   );
 }
 
@@ -274,8 +276,11 @@ export class TopUpLedger {
   ): Promise<void> {
     this.entries = this.entries.map((e) => {
       if (e.id !== id) return e;
-      // Never lower a count below the amount that reached (or may have reached) the target.
-      const sats = patch.sats === undefined ? e.sats : Math.max(patch.sats, e.amount);
+      // Never lower a count below the amount that reached (or may have reached) the target, and
+      // never write a number the file's own guard would refuse (a self-corrupted ledger would
+      // fail closed for a day): the ceiling is already twice the daily cap.
+      const want = patch.sats === undefined ? e.sats : Math.max(patch.sats, e.amount);
+      const sats = Number.isSafeInteger(want) ? Math.min(want, MAX_ENTRY_SATS) : MAX_ENTRY_SATS;
       return {
         ...e,
         state: patch.state,

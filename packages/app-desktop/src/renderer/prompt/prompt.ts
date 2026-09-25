@@ -24,6 +24,8 @@ export const MIN_PASSPHRASE_CHARS = 12;
  * (core's `AUTO_TOP_UP_MAX_SATS_PER_DAY`), pinned by a test: the page bundle imports nothing.
  */
 export const TOP_UP_PER_DAY_SATS = 50_000;
+/** Issue #2: the most one auto top-up moves — `LIMITS.maxAutoTopUpAmountSats`, pinned by a test. */
+export const TOP_UP_MAX_SATS = 10_000;
 
 type Answer =
   | {
@@ -404,7 +406,7 @@ function view(q: WindowForm): View {
           el(
             'p',
             { class: 'hint' },
-            `If you allow it, later top-ups into this mint run without asking: at most ${satsText(q.amount)} each and ${perDay} in any 24 hours, Lightning fees included. Turn auto top-up off in Settings › Mints and top-up.`,
+            `If you allow it, later top-ups into this mint run without asking: each at most the amount set in Settings (never more than ${satsText(TOP_UP_MAX_SATS)}), and ${perDay} in any 24 hours, Lightning fees included. Turn auto top-up off in Settings › Mints and top-up.`,
           ),
         ],
         submitLabel: 'Allow top-ups',
