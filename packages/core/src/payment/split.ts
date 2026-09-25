@@ -9,7 +9,7 @@
  * is cryptography.
  */
 import type { PricePolicy } from '../contracts/manifest.js';
-import { DEFAULT_MIN_PAY_SATS } from '../contracts/manifest.js';
+import { DEFAULT_MIN_PAY_SATS, MAX_MIN_PAY_WINDOW_BLOCKS } from '../contracts/manifest.js';
 
 /** The carry is `units mod 100`, so it always lies in `[0, CARRY_MODULUS)`. */
 export const CARRY_MODULUS = 100;
@@ -97,8 +97,9 @@ export function minPaySats(policy: Pick<PricePolicy, 'minPaySats'>): number {
 
 /**
  * The unpaid window a peer downloading under `policy` must be allowed (ADR 0007): big enough
- * for one minimum PAY, never below the configured window. A `satsPerBlock` of 0 (a free
- * video) needs no more than the configured window.
+ * for one minimum PAY, never below the configured window — but a minimum PAY widens it by at
+ * most `MAX_MIN_PAY_WINDOW_BLOCKS` (the policy's `minPaySats` is a creator's untrusted tag).
+ * A `satsPerBlock` of 0 (a free video) needs no more than the configured window.
  */
 export function effectiveWindowBlocks(
   windowBlocks: number,
@@ -106,5 +107,8 @@ export function effectiveWindowBlocks(
 ): number {
   const price = policy.satsPerBlock;
   if (!(price > 0)) return windowBlocks;
-  return Math.max(windowBlocks, Math.ceil(minPaySats(policy) / price));
+  return Math.max(
+    windowBlocks,
+    Math.min(Math.ceil(minPaySats(policy) / price), MAX_MIN_PAY_WINDOW_BLOCKS),
+  );
 }

@@ -460,6 +460,7 @@ Wallet QR (pass = decodes to text starting `lnbc5000n1pj9x7`).
 | Packaged builds refuse dev flags (F21, part) | `stage-3/f21-dev-flags` (on `stage-3/wallet-journal`) | **done** — `app.isPackaged` + `--dev-mocks` / `--dev-fixtures` / `--e2e-hooks` exits 78 before anything is registered. The fuses wait for the packaging lane (they are set on the packaged binary) |
 | External links (F25) | `stage-3/external-links` (on `stage-3/f21-dev-flags`) | **done** — a link clicked in the app (Markdown `_blank`) is denied as a window-open, then main asks in its trusted prompt window, which shows the real host (IDNA ASCII) and a warning that link text may lie; main opens its own copy only on "Open in browser". `https:` only, app webContents only, one question at a time, ≤ 5/min (ADR 0013 §8). Electron e2e updated: the click shows `example.com`, Cancel opens nothing |
 | Worker pending-PAY journal (ADR 0011 §12) | `stage-3/worker-journal` (on `stage-3/external-links`) | **done** — the journal's logic is now runtime-neutral (`PendingJournalCore` in the seeder's portable entry). The daemon keeps its behaviour, and the desktop's Bare worker uses it for `payments/pending.jsonl` (append + fsync before the ACK, compaction, the old `pending.json` migrated, an unreadable journal keeps payments off). The worker stops serving at 1024 queued PAYs until a flush drains them |
+| NIP-71 `minpay` (ADR 0010 §3.2 amendment) | `stage-3/manifest-minpay` (on `stage-3/worker-journal`) | **done** — the manifest builder emits and the parser reads `minpay` (1 … 1 000 000 sat, else `bad-price`), so a creator can raise the batching target. The minimum's contribution to the unpaid window is capped at 64 blocks (`MAX_MIN_PAY_WINDOW_BLOCKS`): an untrusted tag cannot open huge unpaid windows. Found on the way: the desktop's exact-key IPC guards would have refused every manifest carrying it (fixed: `minPaySats` optional, bounded) |
 
 Owed from Stage 2 (ADR 0010 Consequences, `docs/security-review.md` §0 and §6). The F1–F4 and
 F30 blockers were fixed on `stage-2/review-fixes` (2026-09-24); F6 verified on two real mints
@@ -468,4 +469,4 @@ Still owed: "paid views" → sats per video (ADR 0011 §8.4, UI polish);
 executing auto top-ups with caps (F4); packaging
 (F21: the fuses); a contract-level `NetworkAdapter` signer control for the web shell (the desktop uses shell
 methods, ADR 0013) + `SignerStatus` "none"; the deferred
-L5/L6-B/L6-C requests; the NIP-71 `minpay` tag in the manifest parser.
+L5/L6-B/L6-C requests.

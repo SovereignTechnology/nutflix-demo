@@ -711,13 +711,17 @@ const isHyperblobId: Guard<HyperblobId> = obj({
 });
 export const isHyperblobRef: Guard<HyperblobRef> = obj({ core: isCoreKey, blob: isHyperblobId });
 
-export const isPricePolicy: Guard<PricePolicy> = obj({
-  satsPerBlock: isSats,
-  blockSize: int(1, 2 ** 31),
-  mints: arrayOf(isMintUrl, 32),
-  split: isSplit,
-  creatorP2pk: isCashuP2pk,
-});
+export const isPricePolicy: Guard<PricePolicy> = obj(
+  {
+    satsPerBlock: isSats,
+    blockSize: int(1, 2 ** 31),
+    mints: arrayOf(isMintUrl, 32),
+    split: isSplit,
+    creatorP2pk: isCashuP2pk,
+  },
+  // v5: a creator's NIP-71 `minpay` (1 … the manifest parser's bound).
+  { minPaySats: int(1, LIMITS.maxMinPaySats) as Guard<Sats> },
+);
 
 const isMaybeHashedUrl = obj({ url: text(1, LIMITS.maxUrl) }, { sha256: isSha256 });
 

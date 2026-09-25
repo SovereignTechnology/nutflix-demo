@@ -12,7 +12,7 @@
  *   block_size <bytes>          top-level tag, only when not the 64 KiB default
  */
 import type { NostrTag, Rendition, UnixSeconds, VideoManifest } from '../contracts/index.js';
-import { DEFAULT_BLOCK_SIZE } from '../contracts/index.js';
+import { DEFAULT_BLOCK_SIZE, MAX_MIN_PAY_SATS } from '../contracts/index.js';
 import type { EventDraft } from '../nostr/types.js';
 import { encodeHyperUrl } from './hyper-url.js';
 import type { ImetaEntry } from './imeta.js';
@@ -63,6 +63,13 @@ export function buildVideoEvent(
   if (!Number.isInteger(input.price.blockSize) || input.price.blockSize <= 0) {
     throw new ManifestBuildError('blockSize must be a positive integer');
   }
+  const minPay = input.price.minPaySats;
+  if (
+    minPay !== undefined &&
+    (!Number.isInteger(minPay) || minPay < 1 || minPay > MAX_MIN_PAY_SATS)
+  ) {
+    throw new ManifestBuildError(`minPaySats must be an integer 1…${String(MAX_MIN_PAY_SATS)}`);
+  }
 
   const tags: NostrTag[] = [
     ['title', input.title],
@@ -71,6 +78,7 @@ export function buildVideoEvent(
   for (const r of input.renditions) tags.push(renditionToImeta(r));
   for (const m of input.price.mints) tags.push(['mint', m]);
   tags.push(['price', String(input.price.satsPerBlock), 'sat']);
+  if (minPay !== undefined) tags.push(['minpay', String(minPay), 'sat']);
   tags.push(['split', `seeder:${seeder}`, `creator:${creator}`]);
   tags.push(['p2pk', input.price.creatorP2pk]);
   for (const t of input.tags) tags.push(['t', t]);

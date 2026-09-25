@@ -105,6 +105,8 @@ export const LIMITS = {
   maxDiskCapBytes: 10_000 * 1024 ** 3,
   /** `Settings.autoTopUp.belowSats` ceiling (Settings' `AUTO_TOP_UP_MAX_SATS`). */
   maxAutoTopUpSats: 10_000_000,
+  /** `PricePolicy.minPaySats` ceiling — core's `MAX_MIN_PAY_SATS` (the manifest parser's bound). */
+  maxMinPaySats: 1_000_000,
   /** A custom thumbnail's bytes (same cap as host-fetched images, design §3). */
   maxThumbnailBytes: 5 * 1024 * 1024,
   /** `WireError.message` after sanitising. */

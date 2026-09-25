@@ -59,7 +59,8 @@ export interface HelloMessage {
   /**
    * v5 (L6-C request 3): seeder → viewer, the seeder's configured unpaid window in blocks.
    * The window a viewer must stay under for a core is
-   * `max(windowBlocks, ceil(minPaySats / satsPerBlock))` (`effectiveWindowBlocks`).
+   * `max(windowBlocks, min(ceil(minPaySats / satsPerBlock), MAX_MIN_PAY_WINDOW_BLOCKS))`
+   * (`effectiveWindowBlocks`).
    * Viewer → seeder: 0.
    */
   readonly windowBlocks: number;

@@ -103,7 +103,8 @@ export interface PeerWindow {
   /** `uploaded − paid`. Past `windowBlocks` the stream is destroyed and the peer banned. */
   readonly outstanding: number;
   /**
-   * v5: the EFFECTIVE window — `max(config.windowBlocks, ceil(minPaySats / satsPerBlock))`
+   * v5: the EFFECTIVE window — `max(config.windowBlocks, min(ceil(minPaySats / satsPerBlock),
+   * MAX_MIN_PAY_WINDOW_BLOCKS))`
    * over the policies of every core recorded for this peer (ADR 0007: the unpaid window must
    * fit one minimum PAY). `effectiveWindowBlocks()` in `payment/split.ts` computes it.
    */

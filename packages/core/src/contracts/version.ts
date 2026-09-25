@@ -39,5 +39,8 @@
  *       `VideoStats.seedersOnline?` (absent = unknown); `UploadInput.file` = file token on
  *       desktop; `Settings.autoTopUp` semantics normative; `SignerConnectRequest` /
  *       `SignerControl` (core side only; the NetworkAdapter bridge is Stage 3).
+ *       Amended 2026-09-24 (Stage 3, no bump): the NIP-71 `minpay` tag is parsed (1 …
+ *       `MAX_MIN_PAY_SATS`), and the part of the effective window a minimum PAY adds is capped
+ *       at `MAX_MIN_PAY_WINDOW_BLOCKS` (64): a creator's tag must not open huge unpaid windows.
  */
 export const CONTRACTS_VERSION = 5 as const;

@@ -1,7 +1,7 @@
 import * as fc from 'fast-check';
 import { describe, expect, it } from 'vitest';
 
-import { mocks } from '@sovit/core';
+import { MAX_MIN_PAY_SATS, mocks } from '@sovit/core';
 
 import {
   METHODS,
@@ -497,6 +497,16 @@ describe('data-shape guards against the core fixtures', () => {
   it('every fixture VideoManifest passes isVideoManifest', () => {
     for (const v of mocks.VIDEOS) expect(isVideoManifest(v), v.title).toBe(true);
     expect(isVideoManifest({ ...mocks.VIDEOS[0], renditions: [] })).toBe(false);
+  });
+
+  it('v5: a manifest carrying a creator’s minpay crosses; one outside the parser’s bound does not', () => {
+    expect(LIMITS.maxMinPaySats).toBe(MAX_MIN_PAY_SATS);
+    const v = mocks.VIDEOS[0]!;
+    const withMin = (n: unknown): unknown => ({ ...v, price: { ...v.price, minPaySats: n } });
+    expect(isVideoManifest(withMin(50))).toBe(true);
+    expect(isVideoManifest(withMin(MAX_MIN_PAY_SATS))).toBe(true);
+    for (const bad of [0, -1, 1.5, MAX_MIN_PAY_SATS + 1, '50', undefined])
+      expect(isVideoManifest(withMin(bad)), String(bad)).toBe(false);
   });
 
   it("the mock seeder's status, dehydrated, passes isSeederStatusWire", async () => {

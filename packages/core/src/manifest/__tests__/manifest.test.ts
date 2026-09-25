@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
-import type { NostrEvent, Rendition, VideoManifest } from '../../contracts/index.js';
-import { DEFAULT_BLOCK_SIZE } from '../../contracts/index.js';
+import type { NostrEvent, Rendition, Sats, VideoManifest } from '../../contracts/index.js';
+import { DEFAULT_BLOCK_SIZE, MAX_MIN_PAY_SATS } from '../../contracts/index.js';
 import { VIDEOS, asCoreKey, asSha256 } from '../../mocks/fixtures.js';
 import { TestSigner, asRaw, tamper } from '../../nostr/__tests__/helpers.js';
 import { ManifestBuildError, buildVideoEvent, renditionToImeta } from '../build.js';
@@ -225,6 +225,36 @@ describe('parse leniency and extras', () => {
     expect(got.storyboard).toEqual(rich.storyboard);
     expect(r.value.price.blockSize).toBe(32_768);
     expect({ ...got, hyperUrl: '' }).toStrictEqual(rich);
+  });
+
+  it('v5: a creator’s minpay round-trips; absent is the default; a bad one is refused', async () => {
+    const withMin: VideoManifest = { ...v, price: { ...v.price, minPaySats: 50 as Sats } };
+    const ev = await signer.signEvent(buildVideoEvent(withMin));
+    expect(ev.tags).toContainEqual(['minpay', '50', 'sat']);
+    const r = verifyVideoEvent(asRaw(ev));
+    expect(r.ok && r.value.price.minPaySats).toBe(50);
+    const plain = verifyVideoEvent(asRaw(await signFixture(v)));
+    expect(plain.ok && plain.value.price.minPaySats).toBeUndefined();
+    const draft = buildVideoEvent(v);
+    for (const bad of [
+      ['minpay', '0', 'sat'],
+      ['minpay', '-5', 'sat'],
+      ['minpay', '1.5', 'sat'],
+      ['minpay', String(MAX_MIN_PAY_SATS + 1), 'sat'],
+      ['minpay', '50', 'msat'],
+      ['minpay'],
+    ]) {
+      const got = verifyVideoEvent(
+        asRaw(await signer.signEvent({ ...draft, tags: [...draft.tags, bad] })),
+      );
+      expect(got.ok ? 'accepted' : got.error.code, JSON.stringify(bad)).toBe('bad-price');
+    }
+    expect(() => buildVideoEvent({ ...v, price: { ...v.price, minPaySats: 0 as Sats } })).toThrow(
+      /minPaySats/,
+    );
+    expect(() =>
+      buildVideoEvent({ ...v, price: { ...v.price, minPaySats: (MAX_MIN_PAY_SATS + 1) as Sats } }),
+    ).toThrow(/minPaySats/);
   });
 
   it('derives a label from dim when none is given', async () => {

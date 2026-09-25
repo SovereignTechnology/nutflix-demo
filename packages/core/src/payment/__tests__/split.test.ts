@@ -6,7 +6,7 @@
 import { describe, expect, it } from 'vitest';
 import * as fc from 'fast-check';
 
-import { DEFAULT_MIN_PAY_SATS } from '../../contracts/index.js';
+import { DEFAULT_MIN_PAY_SATS, MAX_MIN_PAY_WINDOW_BLOCKS } from '../../contracts/index.js';
 import {
   CARRY_MODULUS,
   MAX_PAY_SATS,
@@ -118,6 +118,14 @@ describe('minimum PAY (a batching target, ADR 0010) and the effective window (AD
       25,
     );
     expect(effectiveWindowBlocks(4, { satsPerBlock: 0 as never })).toBe(4);
+    // v5 amendment: an absurd `minpay` cannot open a huge unpaid window; a seeder's own larger
+    // window still wins.
+    expect(
+      effectiveWindowBlocks(4, { satsPerBlock: 1 as never, minPaySats: 1_000_000 as never }),
+    ).toBe(MAX_MIN_PAY_WINDOW_BLOCKS);
+    expect(
+      effectiveWindowBlocks(128, { satsPerBlock: 1 as never, minPaySats: 1_000_000 as never }),
+    ).toBe(128);
     fc.assert(
       fc.property(
         fc.integer({ min: 1, max: 64 }),
@@ -129,9 +137,15 @@ describe('minimum PAY (a batching target, ADR 0010) and the effective window (AD
             minPaySats: min as never,
           });
           expect(w).toBeGreaterThanOrEqual(window);
-          expect(w * price).toBeGreaterThanOrEqual(min); // one minimum PAY always fits
-          // …and it is the smallest window that does (or the configured one).
-          if (w > window) expect((w - 1) * price).toBeLessThan(min);
+          const needed = Math.ceil(min / price);
+          if (needed <= MAX_MIN_PAY_WINDOW_BLOCKS) {
+            expect(w * price).toBeGreaterThanOrEqual(min); // one minimum PAY fits…
+            // …and it is the smallest window that does (or the configured one).
+            if (w > window) expect((w - 1) * price).toBeLessThan(min);
+          } else {
+            // v5 amendment: a creator's minimum widens the window by at most the cap.
+            expect(w).toBe(Math.max(window, MAX_MIN_PAY_WINDOW_BLOCKS));
+          }
         },
       ),
     );

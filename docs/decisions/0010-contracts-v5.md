@@ -98,6 +98,18 @@ the cores it has recorded for that peer; `PeerWindow.windowBlocks` reports it. `
 the seeder's configured `windowBlocks`; the payer computes the same effective window from the
 manifest policy.
 
+**Amendment (Stage 3, 2026-09-24, `stage-3/manifest-minpay`; no contracts bump).** The manifest
+parser now reads the NIP-71 `minpay` tag: an integer from 1 to `MAX_MIN_PAY_SATS` (1 000 000)
+sat, anything else `bad-price`. That makes `minPaySats` a creator's untrusted input, and the
+formula above would let one tag make every seeder of the video grant an unbounded unpaid window.
+A bound on the tag relative to the price cannot hold either, since a seeder may serve below the
+manifest price (`PRICE` carries only `satsPerBlock`). So the part a minimum PAY adds is capped:
+`effectiveWindowBlocks = max(windowBlocks, min(ceil(minPaySats / satsPerBlock),
+MAX_MIN_PAY_WINDOW_BLOCKS))`, with the cap at 64 blocks (4 MiB at the default block size). A
+seeder's own larger `windowBlocks` still wins, and above the cap viewers pay PAYs below the
+minimum, which §3.3 already allows. Both sides compute it with the same core function, so they
+agree.
+
 ### 3.3 The minimum PAY — AMENDED: a batching target, not a rejection
 
 ADR 0007 said "a PAY's amount must be ≥ `minPaySats`, except the final PAY that settles the last

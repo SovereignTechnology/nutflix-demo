@@ -18,7 +18,7 @@ import type {
   UnixSeconds,
   VideoManifest,
 } from '../contracts/index.js';
-import { DEFAULT_BLOCK_SIZE, NostrKind } from '../contracts/index.js';
+import { DEFAULT_BLOCK_SIZE, MAX_MIN_PAY_SATS, NostrKind } from '../contracts/index.js';
 import { decodeHyperUrl } from './hyper-url.js';
 import { imetaAll, imetaFirst, parseImetaTag } from './imeta.js';
 
@@ -66,6 +66,17 @@ export function parseVideoEvent(ev: NostrEvent): Result<VideoManifest, ManifestE
   if (blockSize === undefined || blockSize === 0)
     return fail({ code: 'bad-price', reason: 'bad block_size' });
 
+  // v5: the batching target a creator may raise (the window it implies is capped downstream).
+  const minpayTag = first(tags, 'minpay');
+  let minPay: number | undefined;
+  if (minpayTag) {
+    minPay = parseUintStr(minpayTag[1]);
+    if (minPay === undefined || minPay < 1 || minPay > MAX_MIN_PAY_SATS)
+      return fail({ code: 'bad-price', reason: `minpay must be 1…${String(MAX_MIN_PAY_SATS)}` });
+    if (minpayTag[2] !== undefined && minpayTag[2] !== 'sat')
+      return fail({ code: 'bad-price', reason: `minpay unit must be sat, got ${minpayTag[2]}` });
+  }
+
   const splitTag = first(tags, 'split');
   const split = splitTag
     ? parseSplit(splitTag)
@@ -82,6 +93,7 @@ export function parseVideoEvent(ev: NostrEvent): Result<VideoManifest, ManifestE
     blockSize,
     mints,
     split: split.value,
+    ...(minPay === undefined ? {} : { minPaySats: minPay as Sats }),
     creatorP2pk: p2pk as CashuP2pkPubkey,
   };
 

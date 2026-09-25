@@ -48,6 +48,20 @@ export const DEFAULT_WINDOW_BLOCKS = 4 as const;
  */
 export const DEFAULT_MIN_PAY_SATS = 10 as const;
 
+/**
+ * v5 amendment (Stage 3, 2026-09-24): the most blocks a minimum PAY may widen the unpaid window
+ * to. A creator's `minpay` is untrusted: unbounded, it would make every seeder of the video grant
+ * a huge unpaid window (and a seeder may serve below the manifest price, so a bound on the tag
+ * alone cannot hold). The effective window is
+ * `max(windowBlocks, min(ceil(minPaySats / satsPerBlock), MAX_MIN_PAY_WINDOW_BLOCKS))` — a
+ * seeder's own larger `windowBlocks` still wins. Viewers then pay PAYs below the minimum, which
+ * a seeder never refuses (ADR 0010 §3.3).
+ */
+export const MAX_MIN_PAY_WINDOW_BLOCKS = 64 as const;
+
+/** The largest `minpay` a manifest may state (a sanity bound; the window cap is the real one). */
+export const MAX_MIN_PAY_SATS = 1_000_000 as const;
+
 export interface Rendition {
   /** Label shown in the player, e.g. "1080p". */
   readonly label: string;
@@ -104,11 +118,10 @@ export interface PricePolicy {
   /**
    * v5 (ADR 0007 as amended by ADR 0010 §minimum): the PAY size in sats a viewer SHOULD batch
    * to; absent = `DEFAULT_MIN_PAY_SATS` (10). The unpaid window must fit one such PAY, so the
-   * effective window for this video is `max(windowBlocks, ceil(minPaySats / satsPerBlock))`
-   * (`effectiveWindowBlocks`). A seeder does NOT refuse a smaller PAY: a viewer streaming
-   * from several seeders under one credit budget cannot always reach it (ADR 0010). A creator
-   * raises it with the NIP-71 `minpay` tag (parsing it is owed to the manifest layer — until
-   * then the default applies to every video).
+   * effective window for this video is `max(windowBlocks, min(ceil(minPaySats / satsPerBlock),
+   * MAX_MIN_PAY_WINDOW_BLOCKS))` (`effectiveWindowBlocks`). A seeder does NOT refuse a smaller
+   * PAY: a viewer streaming from several seeders under one credit budget cannot always reach it
+   * (ADR 0010). A creator raises it with the NIP-71 `minpay` tag (1 … `MAX_MIN_PAY_SATS`).
    */
   readonly minPaySats?: Sats;
   /** Creator's Cashu P2PK pubkey from their kind 10019. */
