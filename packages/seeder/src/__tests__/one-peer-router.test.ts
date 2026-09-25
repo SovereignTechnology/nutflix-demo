@@ -436,6 +436,65 @@ describe('OnePeerRouter', () => {
     expect(() => router.attachCore(w.viewer)).toThrow(RoutingUnsupported);
   });
 
+  it('refuses a replicator missing ANY member it relies on', () => {
+    const complete = (): Record<string, unknown> => {
+      class Peer {
+        getMaxInflight(): number {
+          return 16;
+        }
+        getMaxHotswapInflight(): number {
+          return 16;
+        }
+        _cancelRequest(): void {
+          // no wire
+        }
+        _requestBlock(): boolean {
+          return false;
+        }
+      }
+      class Replicator {
+        static Peer: unknown = Peer;
+        hotswaps: Record<string, unknown> = { add: noop, remove: noop, pick: noop };
+        peers: unknown[] = [];
+        updateAll = noop;
+        updatePeer = noop;
+        _updateHotswap = noop;
+      }
+      return new Replicator() as unknown as Record<string, unknown>;
+    };
+    const noop = (): void => undefined;
+    const coreWith = (replicator: unknown): RoutableCore =>
+      Object.assign(new EventEmitter(), {
+        key: new Uint8Array(32),
+        opened: true,
+        replicator,
+      }) as unknown as RoutableCore;
+    expect(() => routableReplicator(coreWith(complete()))).not.toThrow();
+    for (const m of ['hotswaps', 'peers', 'updateAll', 'updatePeer', '_updateHotswap']) {
+      const r = complete();
+      r[m] = undefined;
+      expect(() => routableReplicator(coreWith(r)), m).toThrow(RoutingUnsupported);
+    }
+    for (const m of ['add', 'remove', 'pick']) {
+      const r = complete();
+      (r['hotswaps'] as Record<string, unknown>)[m] = undefined;
+      expect(() => routableReplicator(coreWith(r)), `hotswaps.${m}`).toThrow(RoutingUnsupported);
+    }
+    for (const m of [
+      'getMaxInflight',
+      'getMaxHotswapInflight',
+      '_cancelRequest',
+      '_requestBlock',
+    ]) {
+      const r = complete();
+      const Peer = (r.constructor as { Peer: { prototype: Record<string, unknown> } }).Peer;
+      const saved = Peer.prototype[m];
+      Peer.prototype[m] = undefined;
+      expect(() => routableReplicator(coreWith(r)), `Peer#${m}`).toThrow(RoutingUnsupported);
+      Peer.prototype[m] = saved;
+    }
+  });
+
   it('a block found in flight at two peers without a failover is counted and logged (an unknown path)', async () => {
     const w = await world(2, 2);
     const r = routed(w.viewer, { budget: unlimited });

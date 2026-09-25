@@ -40,7 +40,7 @@ afterEach(async () => {
   await cleanupRigs();
 });
 
-const UP_BLOCK = 16_384;
+const UP_BLOCK = 65_536;
 const N = 32;
 /** 2 sats/block with a 2-sat minimum PAY: every upstream's window is exactly its own. */
 const POLICY: PricePolicy = { ...basePolicy(2), mints: [MINT_A], minPaySats: 2 as Sats };
