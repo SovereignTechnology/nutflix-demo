@@ -243,6 +243,25 @@ describe('SealedJournal (the journal at rest)', () => {
     }
   });
 
+  it('a signer that is not there is not a damaged journal: its error goes up as it is, the file untouched', async () => {
+    const s = await signer();
+    const me = await s.getPublicKey();
+    const file = memFile();
+    await opened(s, file);
+    const before = file.text;
+    const away = {
+      nip44Encrypt: (pk: NostrPubkey, t: string) => s.nip44Encrypt(pk, t),
+      nip44Decrypt: () => Promise.reject(new Error('remote-signer: the bunker did not answer')),
+    };
+    await expect(SealedJournal.open({ file, signer: away, pubkey: me })).rejects.toThrow(
+      /^remote-signer: /,
+    );
+    expect(file.text).toBe(before);
+    // Any other refusal to unwrap is the journal's problem, and says so.
+    const wrong = { ...away, nip44Decrypt: () => Promise.reject(new Error('nip44: bad mac')) };
+    await unreadable(SealedJournal.open({ file, signer: wrong, pubkey: me }));
+  });
+
   it('a closed journal refuses to save (a commit then fails before its request)', async () => {
     const s = await signer();
     const j = await opened(s, memFile());

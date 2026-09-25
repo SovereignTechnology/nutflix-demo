@@ -81,6 +81,12 @@ function unhexInto(s: string, out: Uint8Array): boolean {
   return true;
 }
 
+/** The signer's own "I am not available" errors (`signer/remote.ts`), by their code prefix. */
+function signerUnavailable(e: unknown): boolean {
+  const m = e instanceof Error ? e.message : '';
+  return /^(remote-signer|no-signer|signer-locked|cancelled):/.test(m);
+}
+
 function requireAead(): {
   seal: NonNullable<typeof sodium.crypto_aead_xchacha20poly1305_ietf_encrypt>;
   open: NonNullable<typeof sodium.crypto_aead_xchacha20poly1305_ietf_decrypt>;
@@ -237,7 +243,10 @@ export class SealedJournal implements Nip60Journal {
       let unwrapped: string;
       try {
         unwrapped = await o.signer.nip44Decrypt(o.pubkey, env.wrap);
-      } catch {
+      } catch (e) {
+        // A signer that is not there (a bunker that did not answer, a locked signer) says
+        // nothing about the file: that error goes up as it is, and the next unlock tries again.
+        if (signerUnavailable(e)) throw e;
         throw new JournalError('the journal key does not open with this identity');
       }
       if (!HEX64.test(unwrapped) || !unhexInto(unwrapped, key))

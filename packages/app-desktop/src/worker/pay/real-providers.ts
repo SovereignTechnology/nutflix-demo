@@ -36,7 +36,7 @@ import type { SessionId } from '../../ipc/protocol.js';
 import type { HostMethod, HostMethodTable, WorkerInit } from '../../ipc/worker-protocol.js';
 import type { StateFs } from '../runtime.js';
 import type { WorkerProviders } from '../providers.js';
-import { dleqVerifier, type SpawnDleqThread } from './dleq-thread.js';
+import { dleqVerifier, type DleqVerifier, type SpawnDleqThread } from './dleq-thread.js';
 
 export type HostRequester = <M extends HostMethod>(
   m: M,
@@ -145,6 +145,8 @@ function loadPending(state: StateFs, path: string): payment.PendingPay[] {
 
 export interface RealProviders extends WorkerProviders {
   readonly engine: payment.RealPaymentEngine;
+  /** The seller engine's off-loop DLEQ checks (issue #8 d). */
+  readonly dleq: DleqVerifier;
 }
 
 /** Build the real providers. Throws when the pending-PAY file cannot be trusted. */
@@ -255,6 +257,7 @@ export function realProviders(o: RealProviderOptions): RealProviders {
 
   return {
     engine,
+    dleq,
     seederEngine: engine,
     accepting: () => engine.pendingCount() < (o.maxPendingPays ?? WORKER_MAX_PENDING_PAYS),
     pay: (range, seeder, policy: PricePolicy, opts) => {

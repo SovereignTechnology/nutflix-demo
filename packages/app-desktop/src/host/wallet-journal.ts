@@ -47,7 +47,16 @@ export function journalFile(path: string): walletMod.JournalFile {
   return {
     read: async () => {
       await settled(path);
-      const bytes = await readPrivateFile(path, walletMod.MAX_JOURNAL_BYTES);
+      let bytes: Uint8Array | null;
+      try {
+        bytes = await readPrivateFile(path, walletMod.MAX_JOURNAL_BYTES);
+      } catch {
+        // A symlink, another user's file, one others can read, one too large: refused like a
+        // damaged journal — loudly, and left where it is (the reason names no path).
+        throw new walletMod.JournalError(
+          'the journal file is refused: it must be a regular 0600 file of this user, at most 32 MiB',
+        );
+      }
       if (bytes === null) return null;
       try {
         return new TextDecoder('utf-8', { fatal: true }).decode(bytes);

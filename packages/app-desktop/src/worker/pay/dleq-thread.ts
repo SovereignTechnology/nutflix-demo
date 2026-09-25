@@ -19,7 +19,8 @@
  * terminated and replaced once; a second failure to start leaves the chunked path on for good.
  *
  * The thread is started on the first job, not at init: a viewer that seeds nothing never pays for
- * a second isolate. Nothing here logs a proof; the thread logs nothing at all.
+ * a second isolate. Verification never waits for it to start: until it is up (a few hundred ms)
+ * the checks run on the chunked path. Nothing here logs a proof; the thread logs nothing at all.
  */
 import type { payment } from '@sovit/core';
 
@@ -118,10 +119,33 @@ export class DleqThread {
     return !this.closed && this.failedStarts < 2;
   }
 
+  /** True while a thread is up and serving (started, not retired). */
+  get started(): boolean {
+    return this.handle !== null && this.mailbox !== null && this.starting === null;
+  }
+
+  /** The checks on the thread, waiting for it to start if need be. */
   verify(checks: readonly Check[]): Promise<boolean[]> {
     const run = this.queue.then(() => this.run(checks));
     this.queue = run.catch(() => undefined);
     return run;
+  }
+
+  /**
+   * The checks on the thread if it is up; otherwise `null` — and a start is begun in the
+   * background, so a later job finds it (the caller checks this one elsewhere, now).
+   */
+  tryVerify(checks: readonly Check[]): Promise<boolean[]> | null {
+    if (!this.usable) return null;
+    if (this.started) return this.verify(checks);
+    if (this.starting === null) void this.ensureStarted().catch(() => undefined);
+    return null;
+  }
+
+  /** Resolves once the start in progress (if any) is over: `true` when a thread is up. */
+  async ready(): Promise<boolean> {
+    await this.starting?.catch(() => undefined);
+    return this.started;
   }
 
   /** Ask the thread to quit, stop it, and wait for it. Idempotent. */
@@ -297,13 +321,16 @@ export async function chunkedDleq(
 export interface DleqVerifier {
   /** `PaymentEngineDeps.dleq`. */
   readonly verify: (checks: readonly Check[]) => Promise<boolean[]>;
+  /** Resolves once a thread start in progress is over: `true` when the thread is up (tests). */
+  ready(): Promise<boolean>;
   close(): void;
 }
 
 /**
- * `PaymentEngineDeps.dleq` for the worker: the thread when there is one, else (or when it fails)
- * chunked inline checks. It never rejects for a thread failure, so the engine's own fallback —
- * one synchronous pass over every proof — does not run on this event loop.
+ * `PaymentEngineDeps.dleq` for the worker: the thread when it is up, else (while it starts, when
+ * it fails, or where there is none) chunked inline checks. It never waits for a thread to start,
+ * and never rejects for a thread failure, so the engine's own fallback — one synchronous pass over
+ * every proof — does not run on this event loop.
  */
 export function dleqVerifier(o: {
   readonly spawn: SpawnDleqThread | undefined;
@@ -324,9 +351,10 @@ export function dleqVerifier(o: {
   let warned = false;
   return {
     verify: async (checks) => {
-      if (thread?.usable === true) {
+      const onThread = thread?.tryVerify(checks) ?? null;
+      if (onThread !== null) {
         try {
-          return await thread.verify(checks);
+          return await onThread;
         } catch {
           if (!warned) {
             warned = true;
@@ -336,6 +364,7 @@ export function dleqVerifier(o: {
       }
       return chunkedDleq(checks, o.verify, o.chunk);
     },
+    ready: () => thread?.ready() ?? Promise.resolve(false),
     close: () => {
       thread?.close();
     },

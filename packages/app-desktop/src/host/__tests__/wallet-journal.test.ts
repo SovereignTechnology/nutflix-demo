@@ -89,15 +89,17 @@ describe('the journal file (host)', () => {
     const p = journalPath(wdir, me);
     await chmod(p, 0o644);
     await expect(openWalletJournal({ dir: wdir, signer: s, pubkey: me })).rejects.toThrow(
-      /0600|other users/,
+      /^journal-unreadable: the journal file is refused/,
     );
     const other = join(dir, 'elsewhere.sealed');
     await writeFile(other, await readFile(p), { mode: 0o600 });
     await rm(p);
     await symlink(other, p);
     await expect(openWalletJournal({ dir: wdir, signer: s, pubkey: me })).rejects.toThrow(
-      /not a regular file/,
+      /^journal-unreadable: the journal file is refused/,
     );
+    // Neither refusal wrote anything: the file behind the link is what it was.
+    expect((await readFile(other)).equals(await readFile(p))).toBe(true);
   });
 
   it('writes to one path land in call order, and a read waits for the write in flight', async () => {

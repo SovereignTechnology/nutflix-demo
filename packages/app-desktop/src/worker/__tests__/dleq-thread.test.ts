@@ -290,8 +290,11 @@ describe('dleqVerifier — failure is never acceptance', () => {
       const spawn = nodeSpawner(name);
       const v = dleqVerifier({ spawn, verify, startMs: 300, jobMs: 300 });
       try {
-        expect(await v.verify(cs)).toEqual(want);
-        expect(await v.verify(cs)).toEqual(want);
+        // Three PAYs, each after the start that the one before began is over.
+        for (let i = 0; i < 3; i++) {
+          expect(await v.verify(cs)).toEqual(want);
+          await v.ready();
+        }
       } finally {
         v.close();
       }
@@ -311,10 +314,22 @@ describe('dleqVerifier — failure is never acceptance', () => {
     t.close();
   });
 
+  it('never waits for a start: the first PAY is checked inline while the thread comes up', async () => {
+    const spawn = nodeSpawner('SILENT'); // a start that would take the whole start timeout
+    const v = dleqVerifier({ spawn, verify, startMs: 5000 });
+    const t0 = performance.now();
+    expect(await v.verify(cs)).toEqual(want);
+    expect(performance.now() - t0).toBeLessThan(4000);
+    expect(spawn.spawned).toBe(1); // …but the start was begun
+    v.close();
+  });
+
   it('close stops the thread; later checks still get verdicts (chunked)', async () => {
     const spawn = nodeSpawner('SERVE');
     const v = dleqVerifier({ spawn, verify });
-    expect(await v.verify(cs)).toEqual(want);
+    expect(await v.verify(cs)).toEqual(want); // inline; the thread starts meanwhile
+    expect(await v.ready()).toBe(true);
+    expect(await v.verify(cs)).toEqual(want); // on the thread
     v.close();
     expect(spawn.terminated).toBe(1);
     expect(await v.verify(cs)).toEqual(want);
@@ -403,9 +418,14 @@ describe('realProviders: a PAY’s DLEQ checks go to the thread (the wiring)', (
       const range = (a: number, b: number) => ({ core: CORE, fromBlock: a, toBlock: b });
       for (let i = 0; i < 4; i++) p.engine.recordUpload(VIEWER, range(i, i), POLICY);
       const seller = { pubkey: 'ab'.repeat(32) as NostrPubkey, p2pk: SELLER_P2PK, mint: MINT };
-      const honest = await viewer.pay(range(0, 3), seller, POLICY);
+      // The first PAY is checked inline while the thread starts (it is started by that PAY).
+      const first = await viewer.pay(range(0, 1), seller, POLICY);
+      expect(await p.engine.verify(VIEWER, first, POLICY)).toMatchObject({ ok: true });
+      expect(spawn.spawned).toBe(1);
+      expect(await p.dleq.ready()).toBe(true);
+      // From now on the checks go to the thread.
+      const honest = await viewer.pay(range(2, 3), seller, POLICY);
       expect(await p.engine.verify(VIEWER, honest, POLICY)).toMatchObject({ ok: true });
-      expect(spawn.spawned).toBe(1); // the checks went to the thread
       for (let i = 4; i < 8; i++) p.engine.recordUpload(VIEWER, range(i, i), POLICY);
       const next = await viewer.pay(range(4, 7), seller, POLICY);
       const forged = {
