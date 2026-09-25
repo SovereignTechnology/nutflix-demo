@@ -70,6 +70,17 @@ afterEach(async () => {
 
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
+function within<T>(p: Promise<T>, ms: number): Promise<T> {
+  return Promise.race([
+    p,
+    new Promise<never>((_r, reject) => {
+      setTimeout(() => {
+        reject(new Error(`still pending after ${String(ms)} ms`));
+      }, ms);
+    }),
+  ]);
+}
+
 async function until(cond: () => boolean, ms: number, what: string): Promise<void> {
   const end = Date.now() + ms;
   while (!cond()) {
@@ -389,6 +400,33 @@ describe('OnePeerRouter', () => {
     stalledLink.release();
     await sleep(200);
     expect(w.downloads).toHaveLength(1);
+  });
+
+  it('after a failover the replacement seeder vanishes too: the block goes to a third one, never stuck', async () => {
+    const STALL = 300;
+    let open = new Set<string>();
+    const w = await world(4, 3);
+    const r = routed(w.viewer, {
+      budget: (remote) => (open.has(remote) ? 4 : 0),
+      stallMs: STALL,
+    });
+    const [s0, s1, s2] = w.remotes as [string, string, string];
+    w.links[0]!.hold();
+    w.links[1]!.hold();
+    open = new Set([s0]);
+    r.refresh();
+    const got = w.viewer.get(1);
+    await until(() => w.uploads[0] === 1, 5000, 'seeder 0 to take block 1');
+    open = new Set([s1]);
+    r.refresh();
+    await until(() => w.uploads[1] === 1, 5000, 'the failover to seeder 1');
+    expect(r.stats().failovers).toBe(1);
+    // Seeder 1 goes away with the replacement request in flight.
+    open = new Set([s2]);
+    w.links[1]!.destroy();
+    r.refresh();
+    expect(await within(got, 5000)).not.toBeNull();
+    expect(w.downloads).toEqual([{ index: 1, from: s2 }]);
   });
 
   it('a seeder that disconnects mid-range: its blocks are re-requested from the others, each delivered once', async () => {
