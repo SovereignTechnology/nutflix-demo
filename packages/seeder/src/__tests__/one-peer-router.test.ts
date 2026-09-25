@@ -204,7 +204,7 @@ function perIndex(downloads: readonly { index: number }[]): Map<number, number> 
   return m;
 }
 
-const unlimited: PeerBudget = () => Number.POSITIVE_INFINITY;
+const unlimited: PeerBudget = () => null;
 
 function routed(
   viewer: RawCore,
@@ -488,6 +488,15 @@ describe('OnePeerRouter', () => {
     expect(() => router.attachCore(w.viewer)).toThrow(RoutingUnsupported);
   });
 
+  it('refuses a stallMs that would fail over everything', () => {
+    for (const bad of [0, 1, 49, Number.NaN, -1, Number.POSITIVE_INFINITY])
+      expect(
+        () => new OnePeerRouter({ budget: unlimited, logger: silentLogger, stallMs: bad }),
+        String(bad),
+      ).toThrow(RangeError);
+    expect(new OnePeerRouter({ budget: unlimited, logger: silentLogger }).stallMs).toBe(4000);
+  });
+
   it('refuses a replicator missing ANY member it relies on', () => {
     const complete = (): Record<string, unknown> => {
       class Peer {
@@ -576,8 +585,8 @@ describe('OnePeerRouter', () => {
     expect(r.stats().raced).toBe(1);
   });
 
-  it('the cap: Infinity keeps hypercore’s own, a finite budget caps it, NaN / negative / a throw ask nothing', async () => {
-    let budget: () => number = () => Number.POSITIVE_INFINITY;
+  it('the cap: only null keeps hypercore’s own, a finite budget caps it, NaN / ±Infinity / negative / a throw ask nothing', async () => {
+    let budget: () => number | null = () => null;
     const w = await world(2, 1);
     const r = routed(w.viewer, { budget: () => budget() });
     const peer = w.viewer.peers[0]!;
@@ -585,7 +594,14 @@ describe('OnePeerRouter', () => {
     expect(peer.getMaxInflight()).toBe(base);
     budget = () => 3;
     expect(peer.getMaxInflight()).toBe(peer.inflight + 3 - r.used(w.remotes[0]!));
-    for (const bad of [Number.NaN, -1, 0, Number.NEGATIVE_INFINITY]) {
+    for (const bad of [
+      Number.NaN,
+      -1,
+      0,
+      0.5,
+      Number.NEGATIVE_INFINITY,
+      Number.POSITIVE_INFINITY,
+    ]) {
       budget = () => bad;
       expect(peer.getMaxInflight(), String(bad)).toBe(peer.inflight);
     }

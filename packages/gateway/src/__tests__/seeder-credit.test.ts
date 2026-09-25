@@ -74,12 +74,13 @@ function fakeCore(key: CoreKeyHex): Hypercore & EventEmitter & { replicator: Fak
 
 function rig(opts: { floor?: number; policies?: Map<string, PricePolicy> } = {}) {
   const pool = new CreditPool(opts.floor ?? 4);
+  const policies = opts.policies ?? new Map<string, PricePolicy>([[CORE, tight]]);
+  // The settler owns CORE's blocks only (what the gateway / worker configure per core).
   const settler = new CreditSettler({
     credit: pool,
     logger: silentLogger,
-    payable: (c) => (opts.policies ?? new Map([[CORE, tight]])).has(c),
+    payable: (c) => c === CORE,
   });
-  const policies = opts.policies ?? new Map<string, PricePolicy>([[CORE, tight]]);
   const credit = new SeederCredit({
     settler,
     pool,
@@ -265,6 +266,33 @@ describe('SeederCredit — the budget per seeder (issue #8)', () => {
     r.link(A).proto.remoteHello(helloFrom(pubkey('a'), { windowBlocks: 50 }));
     expect(r.pool.limit).toBe(4);
   });
+
+  it('one pool, one SeederCredit: a second would resize it against the first', () => {
+    const r = rig();
+    const again = () =>
+      new SeederCredit({
+        settler: r.settler,
+        pool: r.pool,
+        policyFor: () => tight,
+        logger: silentLogger,
+      });
+    expect(again).toThrow(/already has a SeederCredit/);
+    r.credit.dispose();
+    expect(again).not.toThrow();
+  });
+
+  it('whether a core is paid for is the settler’s rule, so budget and settlement cannot disagree', () => {
+    const r = rig();
+    const a = r.link(A);
+    a.proto.remoteHello(helloFrom(pubkey('a'), { windowBlocks: 3 }));
+    // A policy for OTHER exists here, but the settler does not own OTHER's blocks: a bounded
+    // burst, never the window (the blocks would not come off it as they land).
+    r.policies.set(OTHER, tight);
+    expect(r.settler.isPayable(OTHER)).toBe(false);
+    expect(r.credit.budget(A, OTHER)).toBe(NO_PAY_INFLIGHT);
+    expect(r.settler.isPayable(CORE)).toBe(true);
+    expect(r.credit.budget(A, CORE)).toBe(3);
+  });
 });
 
 describe('CreditSettler — what settled without a payment (issue #8)', () => {
@@ -392,6 +420,13 @@ describe('UpstreamPayer — the per-seeder batch (issue #8)', () => {
       await flush();
     }
     expect(r.proto.sentPays.map((p) => p.range.fromBlock)).toEqual([1, 3, 5]);
+  });
+
+  it('a malformed seeder batch does not stop payments (one block per PAY)', async () => {
+    const r = payerRig(() => ({ batch: Number.NaN, atCap: false }));
+    r.payer.onDownload(CORE, 0, A);
+    await flush();
+    expect(r.proto.sentPays.map((p) => [p.range.fromBlock, p.range.toBlock])).toEqual([[0, 0]]);
   });
 
   it('an unknown seeder window falls back to the pool rule', async () => {

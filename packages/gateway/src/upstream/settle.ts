@@ -85,6 +85,11 @@ export class CreditSettler {
     return n;
   }
 
+  /** Whether blocks of `core` are paid for (and so owed until ACKed): the settler's own rule. */
+  isPayable(core: CoreKeyHex): boolean {
+    return this.o.payable(core);
+  }
+
   /** Whether `noiseHex` has a live `pay/1` link (blocks from it are owed until ACKed). */
   linked(noiseHex: string): boolean {
     const l = this.links.get(noiseHex);

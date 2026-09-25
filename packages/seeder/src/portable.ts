@@ -37,6 +37,7 @@ export { SwarmManager } from './net/swarm.js';
 export {
   DEFAULT_STALL_MS,
   MAX_REMEMBERED_REMOTES,
+  MIN_STALL_MS,
   OnePeerRouter,
   ROUTED_HYPERCORE_VERSION,
   RoutingUnsupported,

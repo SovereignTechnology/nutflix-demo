@@ -182,7 +182,6 @@ export class Gateway {
       settler: this.settler,
       pool: this.credit,
       policyFor: (core) => this.upstreamPolicies.get(core) ?? null,
-      payable,
       logger: this.log,
     });
     this.payer = new UpstreamPayer({

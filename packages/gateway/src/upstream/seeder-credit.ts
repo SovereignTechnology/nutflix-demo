@@ -47,17 +47,19 @@ export const NO_PAY_INFLIGHT = DEFAULT_WINDOW_BLOCKS;
 /** Seeders remembered after they disconnect (their unpaid blocks). */
 export const MAX_REMEMBERED_SEEDERS = 4096;
 
+/** Pools a live `SeederCredit` resizes. */
+const managed = new WeakSet<CreditPool>();
+
 export interface SeederCreditOptions {
   readonly settler: CreditSettler;
   /** Resized to the sum of the seeders' windows; its size at construction is the floor. */
   readonly pool: CreditPool;
-  /** The MANIFEST policy of a core (its price and minimum PAY widen the window). */
-  readonly policyFor: (core: CoreKeyHex) => PricePolicy | null;
   /**
-   * Whether blocks of `core` are paid for (the settler's rule). Default: a policy exists. A core
-   * paid without a policy known here gets the seeder's bare `windowBlocks` (never wider).
+   * The MANIFEST policy of a core (its price and minimum PAY widen the window). Whether a core is
+   * paid for at all is the SETTLER's rule (`CreditSettler.isPayable`), so the two cannot disagree;
+   * a paid core without a policy here gets the seeder's bare `windowBlocks` (never wider).
    */
-  readonly payable?: (core: CoreKeyHex) => boolean;
+  readonly policyFor: (core: CoreKeyHex) => PricePolicy | null;
   readonly logger: Logger;
   /** `OnePeerRouter` failover delay (default `DEFAULT_STALL_MS`). */
   readonly stallMs?: number;
@@ -102,6 +104,9 @@ export class SeederCredit {
   private disposed = false;
 
   constructor(o: SeederCreditOptions) {
+    // Two of them would resize the same pool against each other.
+    if (managed.has(o.pool)) throw new Error('this CreditPool already has a SeederCredit');
+    managed.add(o.pool);
     this.o = o;
     this.floor = o.pool.limit;
     this.router = new OnePeerRouter({
@@ -233,6 +238,7 @@ export class SeederCredit {
     this.disposed = true;
     this.offSettler();
     this.router.close();
+    managed.delete(this.o.pool);
   }
 
   // -------------------------------------------------------------- private
@@ -263,8 +269,7 @@ export class SeederCredit {
   }
 
   private payable(core: string): boolean {
-    const c = core as CoreKeyHex;
-    return this.o.payable !== undefined ? this.o.payable(c) : this.o.policyFor(c) !== null;
+    return this.o.settler.isPayable(core as CoreKeyHex);
   }
 
   /** The seeder's window under `policy`; its bare `windowBlocks` without one. Clamped. */

@@ -25,8 +25,8 @@
  *   2. Each replication `Peer`'s `getMaxInflight()` — hypercore's per-peer pipelining cap, read
  *      before every request it makes to that peer — is capped at
  *      `inflight + budget(remote, core) − used(remote)`, so what is outstanding at a peer never
- *      exceeds its credit, whichever blocks hypercore picks. A budget of `Infinity` leaves
- *      hypercore's own cap.
+ *      exceeds its credit, whichever blocks hypercore picks. Only an explicit `null` budget
+ *      leaves hypercore's own cap.
  *   3. `refresh()` re-runs hypercore's scheduler (`updateAll()`) after a budget grew (an ACK, a
  *      HELLO), and while a request is stalled a ticker runs `updatePeer()` so a failover can fire.
  *
@@ -50,6 +50,8 @@ export const ROUTED_HYPERCORE_VERSION = '11.35.3';
  * well under a second from any peer worth streaming from; the default prefetch (30 s) covers it.
  */
 export const DEFAULT_STALL_MS = 4000;
+/** The shortest `stallMs` accepted: below it nearly every request would be failed over. */
+export const MIN_STALL_MS = 50;
 /** Remotes whose lost-request count is remembered after their last peer is gone. */
 export const MAX_REMEMBERED_REMOTES = 4096;
 /** `PRIORITY.CANCELLED` in `hypercore/lib/replicator.js`: a request cancelled or answered. */
@@ -72,16 +74,17 @@ export interface RoutableCore {
 
 /**
  * Blocks `remote` (its Noise key, hex) may have outstanding toward us right now, for a request on
- * `core`: its credit — its window less the blocks it delivered that are not paid yet. `Infinity`
- * = no cap. Read before every request; anything but a finite number ≥ 0 or `Infinity` counts as
- * 0, and so does a throw (fail closed).
+ * `core`: its credit — its window less the blocks it delivered that are not paid yet. Read before
+ * every request. `null` — and only `null` — means "no cap" (hypercore's own); every other value
+ * that is not a finite number ≥ 1 asks nothing: 0, negatives, `NaN`, `±Infinity` (a division by
+ * zero must not uncap a peer) and a throw all fail closed.
  */
-export type PeerBudget = (remote: string, core: string) => number;
+export type PeerBudget = (remote: string, core: string) => number | null;
 
 export interface OnePeerRouterOptions {
   readonly budget: PeerBudget;
   readonly logger: Logger;
-  /** Default `DEFAULT_STALL_MS`. */
+  /** Default `DEFAULT_STALL_MS`; at least `MIN_STALL_MS` (a tiny one would fail over everything). */
   readonly stallMs?: number;
   /** A request was taken from a stalled peer (`remote`) and given to another one. */
   readonly onFailover?: (remote: string, core: string) => void;
@@ -330,7 +333,10 @@ export class OnePeerRouter {
 
   constructor(o: OnePeerRouterOptions) {
     this.o = o;
-    this.stallMs = Math.max(1, o.stallMs ?? DEFAULT_STALL_MS);
+    const stallMs = o.stallMs ?? DEFAULT_STALL_MS;
+    if (!Number.isFinite(stallMs) || stallMs < MIN_STALL_MS)
+      throw new RangeError(`stallMs must be a number ≥ ${String(MIN_STALL_MS)}`);
+    this.stallMs = stallMs;
     this.log = o.logger.child({ component: 'one-peer-router' });
   }
 
@@ -540,14 +546,14 @@ export class OnePeerRouter {
 
   /** hypercore's `getMaxInflight()` for `peer` (`base`), capped by the peer's credit. */
   private cap(route: Route, peer: ReplicationPeerInternals, remote: string, base: number): number {
-    let budget: number;
+    let budget: number | null;
     try {
       budget = this.o.budget(remote, route.keyHex);
     } catch {
       budget = 0;
     }
-    if (budget === Number.POSITIVE_INFINITY) return base;
-    const credit = Number.isFinite(budget) && budget > 0 ? Math.floor(budget) : 0;
+    if (budget === null) return base;
+    const credit = Number.isFinite(budget) && budget >= 1 ? Math.floor(budget) : 0;
     let free = Math.max(0, credit - this.used(remote));
     if (this.stalled.has(remote)) free = Math.min(free, Math.max(0, 1 - this.inflight(remote)));
     return Math.min(base, peer.inflight + free);

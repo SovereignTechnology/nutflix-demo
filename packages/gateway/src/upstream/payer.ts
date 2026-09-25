@@ -210,7 +210,12 @@ export class UpstreamPayer {
     const c = this.credit;
     if (c?.pressured === true) return 1;
     const own = this.seederBatch?.(state.noiseHex) ?? null;
-    if (own !== null) return own.atCap ? 1 : Math.max(this.payEvery, own.batch);
+    if (own !== null) {
+      if (own.atCap) return 1;
+      // A malformed batch (NaN, < 1) must not stop payments: fall back to one block.
+      const b = Number.isSafeInteger(own.batch) && own.batch >= 1 ? own.batch : 1;
+      return Math.max(this.payEvery, b);
+    }
     if (c === undefined) return this.payEvery;
     return Math.max(this.payEvery, Math.floor(c.limit / 2));
   }
