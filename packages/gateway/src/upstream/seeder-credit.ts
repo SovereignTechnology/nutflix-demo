@@ -27,6 +27,8 @@
  *
  * Everything is keyed by the seeder's Noise key, which is stable per seeder node, and remembered
  * after it disconnects (bounded): a seeder that reconnects still counts what we never paid it.
+ * A seeder that comes back under a NEW Noise key but the same (signed) HELLO pubkey inherits what
+ * its old connections left unpaid: its engine keeps our window per OUR pubkey, not per link.
  */
 import { DEFAULT_WINDOW_BLOCKS, payment } from '@sovit/core';
 import type { CoreKeyHex, HelloMessage, PayProtocol, PricePolicy } from '@sovit/core';
@@ -92,6 +94,8 @@ export class SeederCredit {
   private readonly o: SeederCreditOptions;
   private readonly floor: number;
   private readonly seeders = new Map<string, Seeder>();
+  /** HELLO pubkey → the Noise keys that announced it. */
+  private readonly byPubkey = new Map<string, Set<string>>();
   /** Routed cores (their policies size the pool and the batches). */
   private readonly cores = new Map<string, number>();
   private readonly offSettler: () => void;
@@ -132,10 +136,12 @@ export class SeederCredit {
     this.evict();
     seeder.conn = conn;
     seeder.hello = protocol.peer;
+    if (seeder.hello !== null) this.index(noiseHex, seeder.hello);
     seeder.live = protocol.state !== 'closed';
     const offOpen = protocol.on('open', (hello) => {
       if (seeder.conn !== conn) return;
       seeder.hello = hello;
+      this.index(noiseHex, hello);
       this.changed();
     });
     const end = (): void => {
@@ -182,7 +188,7 @@ export class SeederCredit {
     if (s === undefined || !this.payable(core)) return NO_PAY_INFLIGHT;
     if (!s.live || s.hello === null || !this.o.settler.linked(remote)) return 0;
     const win = this.window(s.hello, this.o.policyFor(core as CoreKeyHex));
-    return Math.max(0, win - this.o.settler.owedBy(remote) - s.unpaid);
+    return Math.max(0, win - this.o.settler.owedBy(remote) - this.lostTo(remote, s));
   }
 
   /** `remote`'s window for `core` (`null` before its HELLO). */
@@ -197,7 +203,8 @@ export class SeederCredit {
     const s = this.seeders.get(remote);
     if (s === undefined || !s.live || s.hello === null) return null;
     // Batching must fit the SMALLEST window among the cores being paid for.
-    const credit = this.windowOver(s.hello, Math.min) - s.unpaid - this.router.debt(remote);
+    const credit =
+      this.windowOver(s.hello, Math.min) - this.lostTo(remote, s) - this.router.debt(remote);
     // At its cap when what it delivered fills its credit: blocks still in flight can no longer
     // complete a batch, and nothing more will be asked of it until a PAY is acknowledged.
     const atCap = this.o.settler.owedBy(remote) >= credit;
@@ -229,6 +236,31 @@ export class SeederCredit {
   }
 
   // -------------------------------------------------------------- private
+
+  /**
+   * Blocks the seeder `remote` delivered that will never be paid: its own, plus — for its HELLO
+   * pubkey — what its connections under OTHER Noise keys, now gone, left unpaid or lost.
+   */
+  private lostTo(remote: string, s: Seeder): number {
+    let n = s.unpaid;
+    const pk = s.hello?.pubkey;
+    if (pk === undefined) return n;
+    for (const other of this.byPubkey.get(pk) ?? []) {
+      const o = this.seeders.get(other);
+      if (other !== remote && o !== undefined && !o.live && o.hello?.pubkey === pk)
+        n += o.unpaid + this.router.debt(other);
+    }
+    return n;
+  }
+
+  private index(noiseHex: string, hello: HelloMessage): void {
+    let set = this.byPubkey.get(hello.pubkey);
+    if (set === undefined) {
+      set = new Set();
+      this.byPubkey.set(hello.pubkey, set);
+    }
+    set.add(noiseHex);
+  }
 
   private payable(core: string): boolean {
     const c = core as CoreKeyHex;
@@ -262,7 +294,8 @@ export class SeederCredit {
     for (const [remote, s] of this.seeders) {
       if (!s.live || s.hello === null) continue;
       // The pool spans cores: the seeder's LARGEST window is what it may hold in all.
-      sum += Math.max(0, this.windowOver(s.hello, Math.max) - s.unpaid - this.router.debt(remote));
+      const lost = this.lostTo(remote, s) + this.router.debt(remote);
+      sum += Math.max(0, this.windowOver(s.hello, Math.max) - lost);
     }
     this.o.pool.setLimit(Math.max(this.floor, Math.min(MAX_POOL_CREDIT, sum)));
     this.router.refresh();
@@ -271,7 +304,12 @@ export class SeederCredit {
   private evict(): void {
     for (const [remote, s] of this.seeders) {
       if (this.seeders.size <= MAX_REMEMBERED_SEEDERS) return;
-      if (!s.live) this.seeders.delete(remote);
+      if (s.live) continue;
+      this.seeders.delete(remote);
+      const pk = s.hello?.pubkey;
+      const set = pk === undefined ? undefined : this.byPubkey.get(pk);
+      set?.delete(remote);
+      if (pk !== undefined && set?.size === 0) this.byPubkey.delete(pk);
     }
   }
 }

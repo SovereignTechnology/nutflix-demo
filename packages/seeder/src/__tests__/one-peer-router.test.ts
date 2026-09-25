@@ -55,6 +55,7 @@ interface RawCore extends RoutableCore {
   on(event: 'download' | 'upload', cb: (index: number, bytes: number, peer: RawPeer) => void): this;
   on(event: 'peer-add' | 'peer-remove', cb: (peer: never) => void): this;
   off(event: 'peer-add' | 'peer-remove', cb: (peer: never) => void): this;
+  off(event: 'download', cb: (index: number, bytes: number, peer: RawPeer) => void): this;
 }
 interface RawStream {
   readonly noiseStream: { readonly opened: Promise<boolean>; readonly remotePublicKey: Uint8Array };
@@ -396,10 +397,23 @@ describe('OnePeerRouter', () => {
     // Seeder 0 did send it: it counts it as ours for good, and so do we.
     expect(r.debt(stalledRemote!)).toBe(1);
     expect(r.used(stalledRemote!)).toBe(1);
-    // Its late answer arrives and is dropped: still one delivery.
+    // Until it delivers again, a stalled seeder gets ONE request at a time (its budget would allow
+    // three more): a withholding peer cannot take a fresh batch after every failover.
+    expect(r.isStalled(stalledRemote!)).toBe(true);
+    open = new Set([stalledRemote!]);
+    r.refresh();
+    const more = [w.viewer.get(0), w.viewer.get(3)];
+    await until(() => w.uploads[0] === 2, 5000, 'one more request to seeder 0');
+    await sleep(100);
+    expect(w.uploads[0]).toBe(2);
+    expect(r.inflight(stalledRemote!)).toBe(1);
+    // It answers at last: its late block 2 is dropped (still one delivery of it), the new one
+    // lands, and the limit lifts.
     stalledLink.release();
-    await sleep(200);
-    expect(w.downloads).toHaveLength(1);
+    await Promise.all(more);
+    expect(r.isStalled(stalledRemote!)).toBe(false);
+    expect(w.downloads.filter((d) => d.index === 2)).toHaveLength(1);
+    expect(w.downloads).toHaveLength(3);
   });
 
   it('after a failover the replacement seeder vanishes too: the block goes to a third one, never stuck', async () => {

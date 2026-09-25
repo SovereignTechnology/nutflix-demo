@@ -45,19 +45,29 @@ import { toHex } from '../util/hex.js';
 
 /** The hypercore release whose internals this module was written and tested against. */
 export const ROUTED_HYPERCORE_VERSION = '11.35.3';
-/** A request unanswered this long is moved to another peer that has the block. */
-export const DEFAULT_STALL_MS = 8000;
+/**
+ * A request unanswered this long is moved to another peer that has the block. A 64 KiB block takes
+ * well under a second from any peer worth streaming from; the default prefetch (30 s) covers it.
+ */
+export const DEFAULT_STALL_MS = 4000;
 /** Remotes whose lost-request count is remembered after their last peer is gone. */
 export const MAX_REMEMBERED_REMOTES = 4096;
 /** `PRIORITY.CANCELLED` in `hypercore/lib/replicator.js`: a request cancelled or answered. */
 const CANCELLED = 255;
+
+/** The `peer` of a `download` event (the fields read here). */
+export interface DownloadPeer {
+  readonly remotePublicKey: Uint8Array;
+}
 
 /** What the router needs of a Hypercore session (structural: every package declares its own). */
 export interface RoutableCore {
   readonly key: Uint8Array;
   readonly opened: boolean;
   on(event: 'peer-add' | 'peer-remove', cb: (peer: never) => void): unknown;
+  on(event: 'download', cb: (index: number, bytes: number, peer: DownloadPeer) => void): unknown;
   off(event: 'peer-add' | 'peer-remove', cb: (peer: never) => void): unknown;
+  off(event: 'download', cb: (index: number, bytes: number, peer: DownloadPeer) => void): unknown;
 }
 
 /**
@@ -306,6 +316,12 @@ export class OnePeerRouter {
   private readonly byRemote = new Map<string, Set<ReplicationPeerInternals>>();
   /** remote → requests it may have answered that nothing will ever pay (peers gone). */
   private readonly lost = new Map<string, number>();
+  /**
+   * Remotes that let a request stall since they last delivered a block: one request at a time
+   * until they deliver again. A peer that takes requests and answers none (withholding) would
+   * otherwise take a fresh batch after every failover and delay each block by `stallMs`.
+   */
+  private readonly stalled = new Set<string>();
   private failovers = 0;
   private raced = 0;
   private ticker: ReturnType<typeof setInterval> | null = null;
@@ -369,11 +385,16 @@ export class OnePeerRouter {
     const onRemove = (peer: never): void => {
       this.removePeer(route, peer);
     };
+    const onDownload = (_index: number, _bytes: number, peer: DownloadPeer): void => {
+      if (this.stalled.size > 0) this.stalled.delete(toHex(peer.remotePublicKey));
+    };
     core.on('peer-add', onAdd);
     core.on('peer-remove', onRemove);
+    core.on('download', onDownload);
     route.offs.push(() => {
       core.off('peer-add', onAdd);
       core.off('peer-remove', onRemove);
+      core.off('download', onDownload);
     });
     this.routes.set(keyHex, route);
     // Peers already there. A new one is added in the same tick as `_addPeer` puts it in
@@ -404,6 +425,18 @@ export class OnePeerRouter {
     let n = this.lost.get(remote) ?? 0;
     for (const p of this.byRemote.get(remote) ?? []) n += load(p);
     return n;
+  }
+
+  /** Requests in flight to `remote` and blocks from it being verified, on the routed cores. */
+  inflight(remote: string): number {
+    let n = 0;
+    for (const p of this.byRemote.get(remote) ?? []) n += p.inflight + p.dataProcessing;
+    return n;
+  }
+
+  /** `remote` let a request stall and has delivered nothing since (one request at a time). */
+  isStalled(remote: string): boolean {
+    return this.stalled.has(remote);
   }
 
   /** The part of `used` that never comes back: cancelled after sending, or lost with a channel. */
@@ -515,8 +548,9 @@ export class OnePeerRouter {
     }
     if (budget === Number.POSITIVE_INFINITY) return base;
     const credit = Number.isFinite(budget) && budget > 0 ? Math.floor(budget) : 0;
-    const free = credit - this.used(remote);
-    return Math.min(base, peer.inflight + Math.max(0, free));
+    let free = Math.max(0, credit - this.used(remote));
+    if (this.stalled.has(remote)) free = Math.min(free, Math.max(0, 1 - this.inflight(remote)));
+    return Math.min(base, peer.inflight + free);
   }
 
   /**
@@ -531,9 +565,17 @@ export class OnePeerRouter {
     const i = block.inflight.indexOf(stale);
     if (i !== -1) block.inflight.splice(i, 1);
     this.failovers++;
+    const remote = toHex(stale.peer.remotePublicKey);
+    this.stalled.delete(remote); // re-insert: least recently stalled first
+    this.stalled.add(remote);
+    while (this.stalled.size > MAX_REMEMBERED_REMOTES) {
+      const oldest = this.stalled.values().next();
+      if (oldest.done === true) break;
+      this.stalled.delete(oldest.value);
+    }
     this.log.info('block moved from a stalled peer', { core: route.keyHex, index: block.index });
     try {
-      this.o.onFailover?.(toHex(stale.peer.remotePublicKey), route.keyHex);
+      this.o.onFailover?.(remote, route.keyHex);
     } catch {
       // the listener's failure is its own
     }

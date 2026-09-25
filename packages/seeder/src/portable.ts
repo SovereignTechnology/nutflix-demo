@@ -44,6 +44,7 @@ export {
   routableReplicator,
 } from './net/one-peer.js';
 export type {
+  DownloadPeer,
   OnePeerRouterOptions,
   OnePeerRouterStats,
   PeerBudget,

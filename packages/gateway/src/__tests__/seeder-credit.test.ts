@@ -197,6 +197,22 @@ describe('SeederCredit — the budget per seeder (issue #8)', () => {
     expect(r.credit.budget(A, CORE)).toBe(0);
   });
 
+  it('a seeder back under a NEW Noise key but the same HELLO pubkey inherits what its old link left unpaid', () => {
+    const r = rig();
+    const old = r.link(A);
+    old.proto.remoteHello(helloFrom(pubkey('a'), { windowBlocks: 4 }));
+    r.download(0, A);
+    r.download(1, A);
+    old.proto.remoteClose('remote');
+    const renamed = r.link(B);
+    renamed.proto.remoteHello(helloFrom(pubkey('a'), { windowBlocks: 4 }));
+    expect(r.credit.budget(B, CORE)).toBe(2);
+    // Someone else's pubkey owes nothing of it.
+    const other = r.link('c3'.repeat(32));
+    other.proto.remoteHello(helloFrom(pubkey('c'), { windowBlocks: 4 }));
+    expect(r.credit.budget('c3'.repeat(32), CORE)).toBe(4);
+  });
+
   it('the pool follows the sum of the seeders’ windows, never below its floor nor above the cap', () => {
     const r = rig({ floor: 4 });
     expect(r.pool.limit).toBe(4);
