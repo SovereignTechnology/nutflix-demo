@@ -218,6 +218,48 @@ describe('NIP-46 approval links (ADR 0013 addendum)', () => {
   });
 });
 
+describe('main’s own question: open an external link (F25)', () => {
+  it('shares the queue, never reaches the host, and answers true only for "open"', () => {
+    const r = service();
+    const done: boolean[] = [];
+    expect(r.s.askLink('https://example.com/a', (o) => done.push(o))).toBe(true);
+    const w = r.windows[0]!;
+    expect(r.s.init(from(w))).toEqual({
+      kind: 'open-link',
+      url: 'https://example.com/a',
+    });
+    expect(r.s.submit(from(w), { kind: 'open-link', open: true })).toBe(true);
+    expect(done).toEqual([true]);
+    expect(r.answers).toEqual([]);
+    expect(w.closed).toBe(true);
+  });
+
+  it('a close, a malformed answer or a failed window is "do not open"', () => {
+    const r = service();
+    const done: boolean[] = [];
+    r.s.askLink('https://example.com/a', (o) => done.push(o));
+    r.windows[0]!.close();
+    r.s.askLink('https://example.com/b', (o) => done.push(o));
+    r.s.submit(from(r.windows[1]), { kind: 'open-link', open: 'yes' });
+    r.s.askLink('https://example.com/c', (o) => done.push(o));
+    r.s.submit(from(r.windows[2]), { kind: 'bunker-auth', open: true });
+    expect(done).toEqual([false, false, false]);
+    expect(r.answers).toEqual([]);
+  });
+
+  it('refuses a link main may not open; a host going away leaves main’s question open', () => {
+    const r = service();
+    expect(r.s.askLink('http://example.com/', () => undefined)).toBe(false);
+    expect(r.windows).toHaveLength(0);
+    const done: boolean[] = [];
+    r.s.askLink('https://example.com/a', (o) => done.push(o));
+    r.s.cancelAll();
+    expect(r.windows[0]!.closed).toBe(false);
+    r.s.submit(from(r.windows[0]), { kind: 'open-link', open: true });
+    expect(done).toEqual([true]);
+  });
+});
+
 describe('toPromptAnswer (the page → the host)', () => {
   it('converts text to UTF-8 bytes and keeps only the known keys', () => {
     const a = toPromptAnswer({ kind: 'secret', value: 'pässword' });

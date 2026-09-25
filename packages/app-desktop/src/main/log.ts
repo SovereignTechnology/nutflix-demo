@@ -36,6 +36,11 @@ export type LogEvent =
   | 'prompt.bad-answer'
   | 'prompt.refused-sender'
   | 'prompt.open-failed'
+  | 'link.refused'
+  | 'link.busy'
+  | 'link.throttled'
+  | 'link.opened'
+  | 'link.open-failed'
   | 'keychain.ready';
 
 const RANK: Record<LogLevel, number> = { debug: 0, info: 1, warn: 2, error: 3 };

@@ -55,6 +55,7 @@ interface E2eHooks {
   mediaStatuses(): Record<number, number>;
   mediaRangeStarts(): number[];
   hostRunning(): boolean;
+  externalOpens(): number;
 }
 
 /** Main-process counters behind `--e2e-hooks` (numbers only, never tokens or URLs). */
@@ -74,6 +75,12 @@ const rangeStarts = (app: ElectronApplication): Promise<number[]> =>
     (
       (globalThis as Record<symbol, unknown>)[Symbol.for('nutflix.e2e')] as E2eHooks
     ).mediaRangeStarts(),
+  );
+const externalOpens = (app: ElectronApplication): Promise<number> =>
+  app.evaluate(() =>
+    (
+      (globalThis as Record<symbol, unknown>)[Symbol.for('nutflix.e2e')] as E2eHooks
+    ).externalOpens(),
   );
 const hostRunning = (app: ElectronApplication): Promise<boolean> =>
   app.evaluate(() =>
@@ -231,18 +238,22 @@ void describe(
       });
     });
 
-    void it('a Markdown _blank link opens nothing', async () => {
+    // Security review F25: a Markdown _blank link opens nothing by itself — main asks in its
+    // trusted prompt window, which shows the link's real host; Cancel leaves everything as it was.
+    void it('a Markdown _blank link opens nothing by itself: main asks, showing the real host', async () => {
       // Fixture A's description carries the link; Watch renders it through `Markdown` as
       // `<a target="_blank">`. It must exist — a missing link would make this pass vacuously.
       const link = page.locator('.nf-watch a[href^="https://example.com"][target="_blank"]');
       assert.equal(await link.count(), 1, 'the Markdown link is rendered');
-      const opened: string[] = [];
-      app.on('window', (w) => opened.push(w.url()));
+      const asked = app.waitForEvent('window', { timeout: 20_000 });
       await link.first().click({ modifiers: [] });
-      // Negative check: give a (wrongly allowed) window time to appear. Bounded, not a sync.
-      await new Promise((r) => setTimeout(r, 500));
-      assert.deepEqual(opened, []);
-      assert.equal(app.windows().length, 1);
+      const prompt = await asked;
+      await prompt.waitForSelector('form', { timeout: 20_000 });
+      assert.equal(prompt.url(), 'app://prompt/prompt.html');
+      assert.equal(await prompt.locator('.host code').textContent(), 'example.com');
+      await prompt.keyboard.press('Escape').catch(() => undefined);
+      await waitFor('the prompt window closing', () => Promise.resolve(app.windows().length === 1));
+      assert.equal(await externalOpens(app), 0);
       assert.equal(await page.evaluate(() => location.href), 'app://nutflix/index.html');
     });
 

@@ -17,11 +17,13 @@
  *     opened by main — never the page — and only when the user clicks "Open in browser".
  *   - Closing the window is a cancel. The host's own deadline closes it (`prompt-cancel`); a host
  *     that went away closes everything (`cancelAll`).
+ *   - Main asks one question of its own (security review F25): open an external link? It shares
+ *     the one-at-a-time queue, never reaches the host, and survives a host restart.
  *
  * Electron-free: `main.ts` passes a window factory; the tests pass fakes.
  */
-import { isAuthUrl, promptAnswerFits } from '../ipc/guards.js';
-import type { PromptAnswer, PromptForm } from '../ipc/protocol.js';
+import { isAuthUrl, isExternalLink, promptAnswerFits } from '../ipc/guards.js';
+import type { OpenLinkForm, PromptAnswer, PromptForm, WindowForm } from '../ipc/protocol.js';
 import { MAX_SECRET_BYTES } from '../ipc/protocol.js';
 import type { LogEvent } from './log.js';
 import { APP_SCHEME, PROMPT_HOST } from './schemes.js';
@@ -153,18 +155,33 @@ export function isPromptUrl(url: unknown): boolean {
   }
 }
 
-interface Current {
-  readonly req: number;
-  readonly form: PromptForm;
+/** A queued question: the host's (answered through `deps.answer`), or main's own. */
+type Queued =
+  | { readonly req: number; readonly form: PromptForm; readonly local?: undefined }
+  | { readonly req: number; readonly form: OpenLinkForm; readonly local: (open: boolean) => void };
+
+type Current = Queued & {
   readonly win: PromptWindowLike;
   /** The host got its answer (or cancelled): a later close must not answer again. */
   settled: boolean;
+};
+
+/** The page's answer to an `open-link` question: `true` = open, `false`/`null` = no. */
+export function toLinkAnswer(raw: unknown): boolean | undefined {
+  if (raw === null) return false;
+  if (typeof raw !== 'object') return undefined;
+  const o = raw as Record<string, unknown>;
+  if (Object.keys(o).sort().join(',') !== 'kind,open' || o['kind'] !== 'open-link')
+    return undefined;
+  return typeof o['open'] === 'boolean' ? o['open'] : undefined;
 }
 
 export class PromptService {
   private readonly d: PromptServiceDeps;
-  private queue: { readonly req: number; readonly form: PromptForm }[] = [];
+  private queue: Queued[] = [];
   private current: Current | null = null;
+  /** Main's own questions get negative ids, so they never collide with the host's. */
+  private localSeq = 0;
 
   constructor(deps: PromptServiceDeps) {
     this.d = deps;
@@ -181,6 +198,18 @@ export class PromptService {
     this.pump();
   }
 
+  /**
+   * Main's own question (F25): open `url`? `done(true)` only when the user chose to open; a close,
+   * a cancel or a malformed answer is `false`. `false` = not asked (not a link main may open, or
+   * the queue is full).
+   */
+  askLink(url: string, done: (open: boolean) => void): boolean {
+    if (!isExternalLink(url) || this.queue.length >= MAX_QUEUED) return false;
+    this.queue.push({ req: --this.localSeq, form: { kind: 'open-link', url }, local: done });
+    this.pump();
+    return true;
+  }
+
   /** The host no longer needs `req` (its deadline): close it without answering. */
   cancel(req: number): void {
     this.queue = this.queue.filter((q) => q.req !== req);
@@ -191,11 +220,11 @@ export class PromptService {
     }
   }
 
-  /** The host went away: close everything, answer nothing (nobody is listening). */
+  /** The host went away: close its questions, answer nothing (nobody is listening). Main's own stay. */
   cancelAll(): void {
-    this.queue = [];
+    this.queue = this.queue.filter((q) => q.local !== undefined);
     const c = this.current;
-    if (c !== null) {
+    if (c !== null && c.local === undefined) {
       c.settled = true;
       c.win.close();
     }
@@ -207,7 +236,7 @@ export class PromptService {
   }
 
   /** `nf-prompt:init`: the current question, only for the current prompt window. */
-  init(s: PromptSender): PromptForm | null {
+  init(s: PromptSender): WindowForm | null {
     const c = this.accept(s);
     return c === null ? null : c.form;
   }
@@ -216,8 +245,16 @@ export class PromptService {
   submit(s: PromptSender, raw: unknown): boolean {
     const c = this.accept(s);
     if (c === null) return false;
-    const a = toPromptAnswer(raw);
     c.settled = true;
+    if (c.local !== undefined) {
+      const open = toLinkAnswer(raw);
+      if (open === undefined) this.d.log?.('warn', 'prompt.bad-answer');
+      c.win.close();
+      // Main's own copy of the URL, re-checked where it is used (`ExternalLinks`).
+      c.local(open === true);
+      return true;
+    }
+    const a = toPromptAnswer(raw);
     if (a === undefined || (a !== null && !promptAnswerFits(c.form, a))) {
       wipe(a ?? null);
       this.d.log?.('warn', 'prompt.bad-answer');
@@ -263,16 +300,20 @@ export class PromptService {
       win = this.d.openWindow();
     } catch {
       this.d.log?.('warn', 'prompt.window-failed');
-      this.d.answer(next.req, null);
+      if (next.local !== undefined) next.local(false);
+      else this.d.answer(next.req, null);
       this.pump();
       return;
     }
-    const cur: Current = { req: next.req, form: next.form, win, settled: false };
+    const cur: Current = { ...next, win, settled: false };
     this.current = cur;
     win.onClosed(() => {
       if (this.current !== cur) return;
       this.current = null;
-      if (!cur.settled) this.d.answer(cur.req, null);
+      if (!cur.settled) {
+        if (cur.local !== undefined) cur.local(false);
+        else this.d.answer(cur.req, null);
+      }
       this.pump();
     });
   }

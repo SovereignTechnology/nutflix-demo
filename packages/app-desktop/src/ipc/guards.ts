@@ -579,6 +579,13 @@ const isSecretBytes: Guard<Uint8Array> = (x): x is Uint8Array =>
  */
 export const isAuthUrl: Guard<string> = safe(matches(AUTH_URL_RE, MAX_AUTH_URL));
 
+/**
+ * Security review F25: an external link main may offer to open (a Markdown link the user clicked)
+ * — the same rule as a NIP-46 approval link: `https:`, an ASCII host, no user-info, no
+ * whitespace / control / bidi characters, bounded.
+ */
+export const isExternalLink: Guard<string> = safe(matches(AUTH_URL_RE, MAX_AUTH_URL));
+
 /** ADR 0013: a question for main's prompt window (data only; the page holds the words). */
 export const isPromptForm: Guard<PromptForm> = safe(
   union(

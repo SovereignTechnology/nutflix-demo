@@ -29,6 +29,7 @@ const repo = join(here, '..', '..', '..', '..', '..');
 type Listener = (event: { preventDefault(): void }, ...rest: unknown[]) => void;
 
 class FakeWebContents implements HardenableWebContents {
+  readonly id = 7;
   openHandler: ((details: unknown) => { action: 'deny' }) | undefined;
   readonly listeners = new Map<string, Listener[]>();
   setWindowOpenHandler(h: (details: unknown) => { action: 'deny' }): void {
@@ -86,6 +87,21 @@ describe('hardenWebContents', () => {
     expect(wc.openHandler?.({ url: 'https://example.com/', disposition: 'new-window' })).toEqual({
       action: 'deny',
     });
+  });
+
+  it('F25: hands the URL and the webContents id to main — and still denies, even if that throws', () => {
+    const wc = new FakeWebContents();
+    const seen: unknown[] = [];
+    hardenWebContents(wc, (url, id) => {
+      seen.push([url, id]);
+      throw new Error('boom');
+    });
+    expect(wc.openHandler?.({ url: 'https://example.com/a' })).toEqual({ action: 'deny' });
+    expect(wc.openHandler?.(null)).toEqual({ action: 'deny' });
+    expect(seen).toEqual([
+      ['https://example.com/a', 7],
+      [undefined, 7],
+    ]);
   });
 
   it.each(['will-navigate', 'will-frame-navigate', 'will-redirect', 'will-attach-webview'])(

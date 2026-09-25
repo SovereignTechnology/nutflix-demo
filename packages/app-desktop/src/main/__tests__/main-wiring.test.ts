@@ -374,6 +374,53 @@ describe('main.ts wiring (fake electron)', () => {
     ]);
   });
 
+  // Security review F25.
+  it('a link clicked in the app window asks in the prompt window; main opens it only on "Open in browser"', async () => {
+    await boot();
+    const child = fx.children[0];
+    const handlers = new Map<number, (d: unknown) => unknown>();
+    const created = (id: number): void => {
+      const wc = {
+        id,
+        setWindowOpenHandler: (h: (d: unknown) => unknown) => {
+          handlers.set(id, h);
+        },
+        on: () => undefined,
+        once: () => undefined,
+      };
+      for (const l of fx.appListeners.get('web-contents-created') ?? []) l({}, wc);
+    };
+    created(1); // the app window's webContents
+    created(9); // anything else
+    expect(handlers.get(9)?.({ url: 'https://example.com/elsewhere' })).toEqual({
+      action: 'deny',
+    });
+    expect(handlers.get(1)?.({ url: 'http://example.com/plain' })).toEqual({ action: 'deny' });
+    expect(fx.windows).toHaveLength(1); // neither asked anything
+    expect(handlers.get(1)?.({ url: 'https://example.com/watch?v=1' })).toEqual({
+      action: 'deny',
+    });
+    expect(fx.windows).toHaveLength(2);
+    expect(fx.windows[1]?.url).toBe('app://prompt/prompt.html');
+    const init = fx.ipc.get('nf-prompt:init');
+    const answer = fx.ipc.get('nf-prompt:answer');
+    const ev = {
+      sender: { id: 2 },
+      senderFrame: { url: 'app://prompt/prompt.html', parent: null },
+    };
+    expect(await init?.(ev, undefined)).toEqual({
+      kind: 'open-link',
+      url: 'https://example.com/watch?v=1',
+    });
+    expect(fx.opened).toEqual([]);
+    expect(await answer?.(ev, { kind: 'open-link', open: true })).toBe(true);
+    expect(fx.opened).toEqual(['https://example.com/watch?v=1']);
+    // The host never saw any of it.
+    expect(child?.posted.some((m) => (m as { kind?: string }).kind === 'prompt-answer')).toBe(
+      false,
+    );
+  });
+
   // Security review F22.
   it('a second instance on the same userData quits without a window, a host or IPC handlers', async () => {
     fx.primary = false;

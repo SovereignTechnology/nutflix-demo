@@ -2,7 +2,8 @@
  * Window-level security controls (design §3), installed for EVERY webContents from
  * `app.on('web-contents-created')` and for the session before the window exists:
  *
- *   - `setWindowOpenHandler` → deny (Markdown `_blank` links open nothing in Stage 1);
+ *   - `setWindowOpenHandler` → deny, always; the URL goes to `onWindowOpen` (security review
+ *     F25: main asks, in its trusted prompt window, whether to open an https link in the browser);
  *   - `will-navigate`, `will-frame-navigate`, `will-redirect`, `will-attach-webview` →
  *     `preventDefault()` (the app is one document; programmatic `loadURL` does not emit them);
  *   - permissions: deny everything except `fullscreen` and `clipboard-sanitized-write`, and
@@ -25,6 +26,7 @@ interface PreventableEvent {
 
 /** The `webContents` members `hardenWebContents` uses. */
 export interface HardenableWebContents {
+  readonly id: number;
   setWindowOpenHandler(handler: (details: unknown) => { action: 'deny' }): void;
   on(
     event: 'will-navigate' | 'will-frame-navigate' | 'will-redirect' | 'will-attach-webview',
@@ -33,8 +35,18 @@ export interface HardenableWebContents {
 }
 
 /** Called from `app.on('web-contents-created')` for every webContents, devtools included. */
-export function hardenWebContents(wc: HardenableWebContents): void {
-  wc.setWindowOpenHandler(() => ({ action: 'deny' }));
+export function hardenWebContents(
+  wc: HardenableWebContents,
+  onWindowOpen?: (url: unknown, webContentsId: number) => void,
+): void {
+  wc.setWindowOpenHandler((details) => {
+    try {
+      onWindowOpen?.((details as { url?: unknown } | null)?.url, wc.id);
+    } catch {
+      // the answer is deny either way
+    }
+    return { action: 'deny' };
+  });
   const block = (e: PreventableEvent): void => {
     e.preventDefault();
   };

@@ -9,7 +9,7 @@
  * string cannot be wiped; clearing the DOM is what the page can do). Escape or closing the
  * window cancels.
  */
-import type { PromptForm } from '../../ipc/protocol.js';
+import type { WindowForm } from '../../ipc/protocol.js';
 
 interface PromptApi {
   question(): Promise<unknown>;
@@ -30,6 +30,7 @@ type Answer =
   | { kind: 'create-wallet'; create: boolean }
   | { kind: 'remove-key'; confirm: boolean }
   | { kind: 'bunker-auth'; open: boolean }
+  | { kind: 'open-link'; open: boolean }
   | null;
 
 // ---- tiny DOM helpers --------------------------------------------------------------------
@@ -120,7 +121,7 @@ interface View {
   readonly alt?: { readonly label: string; readonly answer: Answer };
 }
 
-function view(q: PromptForm): View {
+function view(q: WindowForm): View {
   switch (q.kind) {
     case 'local-setup': {
       const body: (Node | string)[] = [];
@@ -339,6 +340,31 @@ function view(q: PromptForm): View {
         collect: () => ({ kind: 'bunker-auth', open: true }),
       };
     }
+    case 'open-link': {
+      // The host as `URL` gives it: ASCII (IDNA-encoded), so no look-alike Unicode.
+      let host: string;
+      try {
+        host = new URL(q.url).host;
+      } catch {
+        host = '(invalid address)';
+      }
+      return {
+        title: 'Open this link in your browser?',
+        body: [
+          el('p', {}, 'The link goes to:'),
+          el('p', { class: 'host' }, el('code', {}, host)),
+          el(
+            'p',
+            { class: 'hint' },
+            'Links in videos and profiles are written by whoever posted them, and the text you clicked may not match where it goes. Continue only if you trust this address.',
+          ),
+        ],
+        submitLabel: 'Open in browser',
+        cancelLabel: 'Cancel',
+        safeNo: { kind: 'open-link', open: false },
+        collect: () => ({ kind: 'open-link', open: true }),
+      };
+    }
     case 'create-wallet': {
       return {
         title: 'No wallet found',
@@ -359,7 +385,7 @@ function view(q: PromptForm): View {
   }
 }
 
-function isForm(x: unknown): x is PromptForm {
+function isForm(x: unknown): x is WindowForm {
   if (typeof x !== 'object' || x === null) return false;
   const k = (x as { kind?: unknown }).kind;
   return (
@@ -370,11 +396,12 @@ function isForm(x: unknown): x is PromptForm {
     k === 'bunker' ||
     k === 'create-wallet' ||
     k === 'remove-key' ||
-    k === 'bunker-auth'
+    k === 'bunker-auth' ||
+    k === 'open-link'
   );
 }
 
-export function mount(root: HTMLElement, api: PromptApi, q: PromptForm): void {
+export function mount(root: HTMLElement, api: PromptApi, q: WindowForm): void {
   const v = view(q);
   let sent = false;
   const error = el('p', { class: 'error', role: 'alert', hidden: true });

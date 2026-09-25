@@ -53,6 +53,7 @@ import {
   PROMPT_URL,
   privilegedSchemes,
 } from './schemes.js';
+import { ExternalLinks } from './external-links.js';
 import { hardenWebContents, installSessionPolicy, sandboxBypassSwitch } from './security.js';
 import { createMainWindow, createPromptWindow } from './window.js';
 
@@ -145,6 +146,22 @@ const prompts = new PromptService({
     log(level, event);
   },
 });
+/** e2e only: how many external links main opened (a count, never a URL). */
+let externalOpens = 0;
+/** Security review F25: a clicked https link — main asks in the prompt window, then opens. */
+const externalLinks = new ExternalLinks({
+  ask: (url, done) => prompts.askLink(url, done),
+  open: (url) => {
+    externalOpens++;
+    void shell.openExternal(url).catch(() => {
+      log('warn', 'link.open-failed');
+    });
+  },
+  now: () => Date.now(),
+  log: (level, event) => {
+    log(level, event);
+  },
+});
 /** Bound in `start()` (safeStorage answers only after `ready`). */
 let keychain: KeychainStore | undefined;
 
@@ -220,7 +237,9 @@ const gate = new IpcGate({
 });
 
 app.on('web-contents-created', (_event, wc) => {
-  hardenWebContents(wc);
+  hardenWebContents(wc, (url, id) => {
+    externalLinks.request(url, appWebContents.has(id));
+  });
   wc.once('destroyed', () => {
     appWebContents.delete(wc.id);
     gate.webContentsGone(wc.id);
@@ -398,6 +417,8 @@ function start(): void {
       promptAnswer: (req: number): { kind: string; bytes: number } | null | 'pending' | undefined =>
         e2ePrompts.get(req),
       promptWindowId: (): number | null => prompts.windowId,
+      /** F25: external links main opened (after the user's click in the prompt window). */
+      externalOpens: (): number => externalOpens,
     });
   }
   showWindow();

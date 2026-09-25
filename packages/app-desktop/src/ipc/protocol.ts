@@ -273,6 +273,18 @@ export type PromptForm =
   | { readonly kind: 'bunker-auth'; readonly url: string };
 export type PromptKind = PromptForm['kind'];
 
+/**
+ * Security review F25: asked by MAIN itself, never by the host (the host's `prompt` guard does
+ * not know it) — open this external link, whose HOST the page shows, in the user's browser?
+ * `https:` only (`isExternalLink`); main opens its own copy, and only on the user's click.
+ */
+export interface OpenLinkForm {
+  readonly kind: 'open-link';
+  readonly url: string;
+}
+/** Every question the prompt window can show: the host's, and main's own. */
+export type WindowForm = PromptForm | OpenLinkForm;
+
 /** The window's answer (main → host); `null` = cancelled. Secrets are UTF-8 bytes. */
 export type PromptAnswer =
   | {

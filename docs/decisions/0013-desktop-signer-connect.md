@@ -154,6 +154,22 @@ Cameron: "do the still missing".
   so closing that would mean a different method (a hardware or OS-biometric unlock), not a fix to
   this one. The prompt says so where the method is chosen.
 
+## 8. Addendum (same day): external links (security review F25)
+
+The prompt window also carries the one question main asks itself: open an external link?
+
+- A link the user clicks in the app (a Markdown `target="_blank"` link in a description) is a
+  window-open request, and main still denies every one. Main then hands the URL to
+  `ExternalLinks`, which asks only when:
+  - the request came from the app's own webContents;
+  - it is an `https:` link under the approval-link rule (`isExternalLink`), re-checked after
+    `URL` normalises it;
+  - no link question is open, and fewer than five were asked in the last minute.
+- The question (`open-link {url}`) is main's alone: the host's `prompt` guard does not know it,
+  and a host restart leaves it open. The page shows the HOST (ASCII, IDNA-encoded) and warns that
+  link text may not match where it goes. "Cancel" is the default and the answer to Escape.
+- **Main** opens its own copy with `shell.openExternal`, only on "Open in browser".
+
 ## Consequences
 
 - The desktop signs, pays and is paid with a signer the user connected, unlocked the way they

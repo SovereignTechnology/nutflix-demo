@@ -47,7 +47,7 @@ directories" for this list. Each fix carries a test that fails without it, excep
 | F22 | **Fixed** | `app.requestSingleInstanceLock()`; a second launch focuses the first window |
 | F23 | **Fixed** | `Nip60ProofStore` verifies every event itself |
 | F24 | **Fixed** — seeder daemon (`stage-3/seeder-runtime`) and desktop (`stage-3/desktop-signer`) | Daemon: key file 0600 (`--keygen`, `O_EXCL`, refused when group/other can read it), headless unlock from the `seeder-key-passphrase` systemd credential (ADR 0011 §1). Desktop (ADR 0013): the file `KeyStore` writes 0600 in a 0700 dir through an `O_EXCL` temp file, reads with `O_NOFOLLOW` and refuses a symlink, another owner or a loose mode before any passphrase is asked; unlock is the user's choice — a passphrase in main's trusted prompt window, the OS keychain (`safeStorage`, never Linux `basic_text`), or a NIP-46 bunker |
-| F25 | **Partly fixed** (`stage-3/desktop-signer`) | The one external link the app opens so far — a NIP-46 approval link — shows its real host in main's prompt window and opens only on the user's click (ADR 0013 §7). Still needed for any future external link (e.g. Markdown links in descriptions) |
+| F25 | **Fixed** (`stage-3/desktop-signer`, `stage-3/external-links`) | NIP-46 approval links (ADR 0013 §7) and now every link the user clicks in the app (Markdown `target="_blank"`): main denies the window-open, then asks in its trusted prompt window, which shows the link's real host (ASCII/IDNA, so no look-alike Unicode) and warns that link text may not match its target. The browser opens main's own copy, only on "Open in browser". `https:` only (no user-info, controls or bidi characters, bounded), only from the app's own webContents, one question at a time, at most 5 a minute. Electron e2e: a clicked link shows `example.com` and Cancel opens nothing |
 | F26 | **Partly fixed** | Natural batching (F30) cuts dust PAYs; explicit batching open (F5) |
 | F27 | **Fixed** (real-mint lane) | Hit by the network-drop test: a new session binding a pubkey now cuts any older live session of it (no ban) — one pay/1 channel per pubkey, so the per-pubkey carry is unambiguous |
 | F28, F29, F32 | Info | Recorded, no change |
@@ -605,7 +605,7 @@ finding's section above plus its row in §0. **Filing waits for Cameron's go-ahe
 | [Low] F21: packaging — set the Electron fuses when the app is packaged (the dev flags are already refused in a packaged build) |
 | [Done] F24: the desktop's file `KeyStore` (ADR 0013) |
 | [Done] Desktop signer: remove the key from this device; NIP-46 `auth_url` approval links (ADR 0013 §7) |
-| [Low] F25: external-link confirm shows the real host |
+| [Done] F25: external links open only after main's prompt window showed the real host |
 
 ## 7. Not verified
 
