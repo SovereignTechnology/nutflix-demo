@@ -63,7 +63,9 @@ interface World {
   answer: boolean;
 }
 
-async function world(o: { readonly hooks?: object } = {}): Promise<World> {
+async function world(
+  o: { readonly hooks?: object; readonly tickMs?: number } = {},
+): Promise<World> {
   const lightning = new mocks.TestLightning();
   const target = new mocks.TestMint({
     url: TARGET,
@@ -115,7 +117,7 @@ async function world(o: { readonly hooks?: object } = {}): Promise<World> {
     mintRequest,
     topUp: {
       ...o.hooks,
-      now: () => (t += 1_000),
+      now: () => (t += o.tickMs ?? 1_000),
       sleep: () => Promise.resolve(),
       pollAttempts: 3,
     },
@@ -231,7 +233,8 @@ describe('auto top-up through the host (issue #2)', () => {
   }, 30_000);
 
   it('a video paid at two trusted mints, declined: ONE question for the play, not one per mint', async () => {
-    const w = await world();
+    // A clock that passes the minute between attempts at every read: the play itself must stop.
+    const w = await world({ tickMs: 61_000 });
     r = w.r;
     w.answer = false;
     const res = await invoke(w.r, 'play', [w.both.id]);

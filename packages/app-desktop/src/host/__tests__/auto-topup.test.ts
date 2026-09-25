@@ -607,35 +607,39 @@ describe('AutoTopUp — paid at the source, not yet minted at the target', () =>
 });
 
 describe('AutoTopUp — a melt of the user’s own at the source, in the same moment', () => {
-  it('is neither labelled "top-up" nor counted: only the top-up’s own melt line is', async () => {
-    let userMelt: Promise<unknown> | undefined;
-    const s: Setup = await setup({
-      fund: 30_000,
-      amountSats: 2_000,
-      wrap: (w) =>
-        Object.assign(Object.create(w) as Wallet, {
-          melt: async (q: Parameters<Wallet['melt']>[0]) => {
-            // The user withdraws 7 000 sats from the same mint while the top-up's melt runs.
-            userMelt = (async () => {
-              const inv = await w.mintQuote(SECOND, 7_000 as Sats);
-              await w.melt(await w.meltQuote(SOURCE, inv.bolt11));
-            })();
-            await userMelt;
-            return w.melt(q);
-          },
-        }),
-    });
-    expect(await s.top.check(TARGET)).toBe('done');
-    await userMelt;
-    expect(s.ledger.used(s.t)).toBe(2_000);
-    const outs = (await s.wallet.history({ mint: SOURCE }))
-      .filter((e) => e.direction === 'out')
-      .map((e) => [e.amount, s.top.relabel(e).memo]);
-    expect(outs).toEqual([
-      [2_000, 'top-up'],
-      [7_000, 'melt to Lightning'],
-    ]);
-  });
+  it.each([7_000, 500])(
+    '(%i sats) is neither labelled "top-up" nor counted: only the top-up’s own melt line is',
+    async (own) => {
+      let userMelt: Promise<unknown> | undefined;
+      const s: Setup = await setup({
+        fund: 30_000,
+        amountSats: 2_000,
+        wrap: (w) =>
+          Object.assign(Object.create(w) as Wallet, {
+            melt: async (q: Parameters<Wallet['melt']>[0]) => {
+              // The user withdraws from the same mint while the top-up's melt runs: more than the
+              // top-up's reservation, or less than its amount.
+              userMelt = (async () => {
+                const inv = await w.mintQuote(SECOND, own as Sats);
+                await w.melt(await w.meltQuote(SOURCE, inv.bolt11));
+              })();
+              await userMelt;
+              return w.melt(q);
+            },
+          }),
+      });
+      expect(await s.top.check(TARGET)).toBe('done');
+      await userMelt;
+      expect(s.ledger.used(s.t)).toBe(2_000);
+      const outs = (await s.wallet.history({ mint: SOURCE }))
+        .filter((e) => e.direction === 'out')
+        .map((e) => [e.amount, s.top.relabel(e).memo]);
+      expect(outs).toEqual([
+        [2_000, 'top-up'],
+        [own, 'melt to Lightning'],
+      ]);
+    },
+  );
 
   it('a count the file could not hold is clamped, never written (the ledger stays readable)', async () => {
     const dir = await tempDir();
