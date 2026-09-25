@@ -411,7 +411,7 @@ merge between the two histories cannot produce two ADRs with one number. **The n
 
 **Cameron, 2026-09-23:** `stage-1` tagged (on `1b0b4d9`, pushed to origin and the backup mirror); **Stage 2
 approved to start now in a fresh session** per `docs/prompts/stage-2-security.md`. Still open:
-one phone scan of the Wallet QR (pass = decodes to text starting `lnbc5000n1pj9x7`). `spec/nfx-suite-m0` (ADR 0006) stays unmerged.
+one phone scan of the Wallet QR (pass = decodes to text starting `lnbc5000n1pj9x7`) — **passed 2026-09-24**. `spec/nfx-suite-m0` (ADR 0006) stays unmerged.
 
 ## Stage 2 — audit surface (single session): DONE 2026-09-23, awaiting review
 
@@ -438,8 +438,8 @@ Test counts: all 27 Stage-2-gated tests run (13 BlossomAuth, 10 pay/1 codec fuzz
 not a rejection (an enforced minimum deadlocks multi-seeder viewers); revisit if you disagree.
 (2) The `pay1` creator-set tag is verified only against the in-process `TestMint` — Stage 3
 must run it against nutshell/cdk (F6). (3) Approve filing the `docs/security-review.md` §6
-issues on GitLab and pushing the branches. (4) Still open from Stage 1: one phone scan of the
-Wallet QR (pass = decodes to text starting `lnbc5000n1pj9x7`).
+issues on GitLab and pushing the branches. (4) From Stage 1: the phone scan of the Wallet QR —
+**passed 2026-09-24** (it decodes to text starting `lnbc5000n1pj9x7`).
 
 ## Stage 3 — integration and polish: STARTED 2026-09-24
 
@@ -480,7 +480,7 @@ Asked one by one, multiple choice; these supersede the open questions above.
 | 10 | `minpay` window cap | **64 blocks** (kept) |
 | 11 | Packaging | **Electron Forge + Pear makers**; targets **Windows .exe, macOS .dmg, Linux .deb, Linux AppImage** and a **`pear://` address** |
 | 12 | Signing | Every release **signed with the SovTech ngit Nostr key** (through Bunker46; the nsec is never written): a Nostr-signed manifest of sha256 sums. macOS Gatekeeper / Windows SmartScreen warnings **accepted for now** |
-| 13 | Outward | **Push** all `stage-2/*` and `stage-3/*` branches to origin and the backup mirror, **one MR** from `stage-3/manifest-minpay` to `main`; **file the open §6 issues** on GitLab; the Wallet QR phone scan now |
+| 13 | Outward | **Push** all `stage-2/*` and `stage-3/*` branches to origin and the backup mirror, **one MR** from `stage-3/manifest-minpay` to `main`; **file the open §6 issues** on GitLab; the Wallet QR phone scan now. Done 2026-09-24: 26 branches on origin and the backup mirror, MR !1, issues #1–#8, and the Wallet QR scan **passed** (the Storybook fund-invoice QR decodes to `lnbc5000n1pj9x7…`) |
 
 Owed from Stage 2 (ADR 0010 Consequences, `docs/security-review.md` §0 and §6). The F1–F4 and
 F30 blockers were fixed on `stage-2/review-fixes` (2026-09-24); F6 verified on two real mints
