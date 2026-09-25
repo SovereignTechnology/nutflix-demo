@@ -26,6 +26,17 @@ const UNAVAILABLE = 'no wallet in Stage 1 (run with --dev-mocks for fake sats)';
 /** Stage 3 (ADR 0013): what a signed-out, locked or wallet-less desktop says. */
 export const NO_WALLET_YET =
   'no wallet: connect and unlock a signer (Settings › Account), and create a wallet';
+/**
+ * ADR 0014 amendment (issue #8): what the desktop says when its wallet journal does not open.
+ * Payments stay off rather than start without it — it may hold ecash — and the file is kept.
+ */
+export const JOURNAL_UNREADABLE =
+  'the wallet journal on this device cannot be read, so payments stay off; the file is kept (it may hold ecash) — see the log';
+
+/** The unavailable-wallet text for a money plane that did not open with `code` (or none). */
+export function unavailableReason(code: string | null | undefined): string {
+  return code === 'journal-unreadable' ? JOURNAL_UNREADABLE : NO_WALLET_YET;
+}
 
 export class UnavailableWallet implements Wallet {
   private readonly why: string;
@@ -87,7 +98,7 @@ export class UnavailableWallet implements Wallet {
 export class SwitchingWallet implements Wallet {
   private current: Wallet | undefined;
   private off: (() => void) | null = null;
-  private readonly none = new UnavailableWallet(NO_WALLET_YET);
+  private none = new UnavailableWallet(NO_WALLET_YET);
   private readonly listeners = new Set<(e: WalletChangeEvent) => void>();
   private gen = 0;
 
@@ -96,7 +107,9 @@ export class SwitchingWallet implements Wallet {
     return this.gen;
   }
 
-  set(w: Wallet | undefined): void {
+  /** `why`: what the unavailable wallet says while there is none (default `NO_WALLET_YET`). */
+  set(w: Wallet | undefined, why: string = NO_WALLET_YET): void {
+    if (w === undefined) this.none = new UnavailableWallet(why);
     if (w === this.current) return;
     this.gen++;
     this.off?.();

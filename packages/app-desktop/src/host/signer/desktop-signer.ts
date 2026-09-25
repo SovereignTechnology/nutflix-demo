@@ -179,6 +179,8 @@ export class DesktopSigner implements IdentityProvider {
   private rememberedValue = false;
   private lockedPubkey: NostrPubkey | null = null;
   private plane: MoneyPlane | undefined;
+  /** Why the last money plane did not open (an error code prefix), or `null`. */
+  private planeError: string | null = null;
   private busy = false;
   private closed = false;
   /** When the user dismissed recent prompts (the throttle). */
@@ -251,6 +253,14 @@ export class DesktopSigner implements IdentityProvider {
   /** The money plane of the unlocked signer, if its wallet opened. */
   money(): MoneyPlane | undefined {
     return this.plane;
+  }
+
+  /**
+   * Why the unlocked signer has no money plane, as an error code prefix (`journal-unreadable`,
+   * `no-wallet`, `relay-down`, …), or `null`. Never a key, a path or a proof.
+   */
+  moneyError(): string | null {
+    return this.plane === undefined ? this.planeError : null;
   }
 
   async info(): Promise<DesktopSignerInfo> {
@@ -615,6 +625,7 @@ export class DesktopSigner implements IdentityProvider {
     await this.o.swap(async () => {
       const old = this.plane;
       this.plane = undefined;
+      this.planeError = null;
       old?.close();
       const s = this.signer();
       if (s === undefined || this.closed) return;
@@ -622,8 +633,17 @@ export class DesktopSigner implements IdentityProvider {
         this.plane = await this.o.openMoney(s, generated);
         return;
       } catch (e) {
-        if (prefix(e) !== 'no-wallet' || !interactive) {
-          this.log.warn('payments stay unavailable', { reason: prefix(e) });
+        this.planeError = prefix(e);
+        if (this.planeError === 'journal-unreadable') {
+          // ADR 0014 amendment: the journal may hold ecash — refuse the wallet, keep the file.
+          this.log.error(
+            'the wallet journal on this device cannot be read: payments stay off, and the file is kept',
+            { reason: this.planeError },
+          );
+          return;
+        }
+        if (this.planeError !== 'no-wallet' || !interactive) {
+          this.log.warn('payments stay unavailable', { reason: this.planeError });
           return;
         }
       }
@@ -634,9 +654,11 @@ export class DesktopSigner implements IdentityProvider {
       }
       try {
         this.plane = await this.o.openMoney(s, true);
+        this.planeError = null;
         this.log.info('created a new NIP-60 wallet at the user’s request');
       } catch (e) {
-        this.log.warn('the wallet could not be created', { reason: prefix(e) });
+        this.planeError = prefix(e);
+        this.log.warn('the wallet could not be created', { reason: this.planeError });
       }
     });
     this.emit();

@@ -16,13 +16,29 @@ export {
 } from './spend.js';
 export {
   MemoryProofStore,
+  PENDING_KINDS,
+  heldSecrets,
+  isPendingOp,
   proofTotal,
   type PendingOp,
   type PendingOutput,
   type ProofStore,
   type WalletTx,
 } from './store.js';
-export { Nip60ProofStore, type Nip60Relays } from './nip60.js';
+export {
+  Nip60ProofStore,
+  type Nip60Journal,
+  type Nip60JournalState,
+  type Nip60Relays,
+} from './nip60.js';
+export {
+  JOURNAL_FORMAT,
+  JOURNAL_VERSION,
+  JournalError,
+  MAX_JOURNAL_BYTES,
+  SealedJournal,
+  type JournalFile,
+} from './nip60-journal.js';
 export { guardedKeyset, type KeysetGuardOptions } from './keyset-guard.js';
 export {
   openNip60Wallet,

@@ -14,7 +14,7 @@
  * A file that exists but does not parse is NOT treated as empty: the first commit would overwrite
  * it and destroy whatever it still held. `load()` throws and the daemon refuses to start.
  *
- * It also holds the wallet's journal (ADR 0014): each send / receive / mint's outputs, written
+ * It also holds the wallet's journal (ADR 0014): each send / receive / mint / melt's outputs, written
  * before the request goes out and dropped with the proofs it produced — so an operation whose
  * answer was lost is restored from the mint (NUT-09), even across a crash. The outputs are bearer
  * ecash once signed, and sealed like the proofs.
@@ -26,14 +26,14 @@ import type {
   UnixSeconds,
   WalletHistoryEntry,
 } from '@sovit/core';
-import type { NostrPubkey, Signer, wallet as walletMod } from '@sovit/core';
+import type { NostrPubkey, Signer } from '@sovit/core';
+import { wallet as walletMod } from '@sovit/core';
 
 import { RuntimeSetupError, assertPrivate, readTextIfExists, writeFileAtomic } from './files.js';
 
 type ProofStore = walletMod.ProofStore;
 type WalletTx = walletMod.WalletTx;
 type PendingOp = walletMod.PendingOp;
-type PendingOutput = walletMod.PendingOutput;
 
 const FORMAT = 'nutflix-seeder-wallet';
 const VERSION = 1;
@@ -136,51 +136,12 @@ function isProof(x: unknown): x is CashuProof {
   );
 }
 
-const DECIMAL = /^[0-9]+$/;
-
-function isPendingOutput(x: unknown): x is PendingOutput {
-  if (typeof x !== 'object' || x === null) return false;
-  const o = x as Record<string, unknown>;
-  const bm = o['blindedMessage'];
-  if (typeof bm !== 'object' || bm === null) return false;
-  const b = bm as Record<string, unknown>;
-  return (
-    typeof b['amount'] === 'string' &&
-    DECIMAL.test(b['amount']) &&
-    typeof b['B_'] === 'string' &&
-    HEX.test(b['B_']) &&
-    typeof b['id'] === 'string' &&
-    HEX.test(b['id']) &&
-    typeof o['blindingFactor'] === 'string' &&
-    DECIMAL.test(o['blindingFactor']) &&
-    typeof o['secret'] === 'string' &&
-    HEX.test(o['secret']) &&
-    (o['ephemeralE'] === undefined ||
-      (typeof o['ephemeralE'] === 'string' && HEX.test(o['ephemeralE'])))
-  );
-}
-
-function isPendingOp(x: unknown): x is PendingOp {
-  if (typeof x !== 'object' || x === null) return false;
-  const o = x as Record<string, unknown>;
-  return (
-    typeof o['id'] === 'string' &&
-    HEX.test(o['id']) &&
-    (o['kind'] === 'receive' || o['kind'] === 'send' || o['kind'] === 'mint') &&
-    typeof o['mint'] === 'string' &&
-    /^https?:\/\//.test(o['mint']) &&
-    Array.isArray(o['key']) &&
-    o['key'].every((k) => typeof k === 'string') &&
-    Array.isArray(o['keep']) &&
-    o['keep'].every(isPendingOutput) &&
-    Array.isArray(o['send']) &&
-    o['send'].every(isPendingOutput) &&
-    Array.isArray(o['spends']) &&
-    o['spends'].every(isProof) &&
-    typeof o['created'] === 'number' &&
-    Number.isSafeInteger(o['created'])
-  );
-}
+/**
+ * A journal entry read back (ADR 0014): core's exact shape check, shared with the desktop's sealed
+ * journal so the two never drift. It knows every kind, `melt` included (ADR 0014 amendment,
+ * issue #8); an entry failing it refuses the start, like any damaged wallet file.
+ */
+const isPendingOp: (x: unknown) => x is PendingOp = walletMod.isPendingOp;
 
 function isEntry(x: unknown): x is WalletHistoryEntry {
   if (typeof x !== 'object' || x === null) return false;

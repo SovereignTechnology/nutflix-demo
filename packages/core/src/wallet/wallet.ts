@@ -30,7 +30,7 @@ import type {
   WalletHistoryEntry,
 } from '../contracts/index.js';
 import { Spender, WalletError, type MintConnections, type WalletKey } from './spend.js';
-import { proofTotal, type ProofStore } from './store.js';
+import { heldSecrets, proofTotal, type ProofStore } from './store.js';
 
 // ---------------------------------------------------------------------------------------
 // Mint connections
@@ -141,8 +141,17 @@ export class CashuWallet implements Wallet {
     return [...new Set([...(this.o.configuredMints ?? []), ...held])];
   }
 
+  /**
+   * What can be spent at `mint`: the proofs held, less those an unresolved journaled send or melt
+   * holds (ADR 0014 amendment, issue #8). Those come back when the mint says the operation never
+   * executed, or leave with it when it did — never counted twice, never forgotten.
+   */
   async balance(mint: MintUrl): Promise<Sats> {
-    return proofTotal(await this.o.store.proofs(mint)) as Sats;
+    const proofs = await this.o.store.proofs(mint);
+    const pending = this.o.store.pending === undefined ? [] : await this.o.store.pending(mint);
+    if (pending.length === 0) return proofTotal(proofs) as Sats;
+    const held = heldSecrets(pending);
+    return proofTotal(proofs.filter((p) => !held.has(p.secret))) as Sats;
   }
 
   async balances(): Promise<ReadonlyMap<MintUrl, Sats>> {
@@ -222,17 +231,23 @@ export class CashuWallet implements Wallet {
       readonly memo?: string;
     },
   ): Promise<LockedProofSet> {
-    const set = await this.spender.send(amount, opts);
-    await this.emitBalance(opts.mint);
-    return set;
+    // A failed send may still move the balance (its inputs held while the mint's answer is
+    // unknown, or reconciled away): the change event goes out either way.
+    try {
+      return await this.spender.send(amount, opts);
+    } finally {
+      await this.emitBalanceSafe(opts.mint);
+    }
   }
 
   async receive(
     set: LockedProofSet | { readonly mint: MintUrl; readonly proofs: readonly CashuProof[] },
   ): Promise<Sats> {
-    const got = await this.spender.receive(set);
-    await this.emitBalance(set.mint);
-    return got;
+    try {
+      return await this.spender.receive(set);
+    } finally {
+      await this.emitBalanceSafe(set.mint);
+    }
   }
 
   /** NUT-07 spent flags for a proof set (the seeder's creator-set check, security review F11). */
@@ -262,10 +277,12 @@ export class CashuWallet implements Wallet {
     let left = 0;
     for (const mint of await this.o.store.mints()) {
       try {
+        const before = (await this.o.store.pending?.(mint))?.length ?? 0;
         const r = await this.spender.recover(mint);
         recovered += r.recovered;
         left += r.left;
-        if (r.recovered > 0) await this.emitBalance(mint);
+        // Held inputs come back (or leave) as entries settle: the balance moves either way.
+        if (r.recovered > 0 || r.left !== before) await this.emitBalance(mint);
       } catch {
         // unreachable now; every operation at this mint settles it first
       }
@@ -289,9 +306,11 @@ export class CashuWallet implements Wallet {
   }
 
   async melt(quote: MeltQuote): Promise<{ paid: boolean; preimage?: string; change: Sats }> {
-    const r = await this.spender.melt(quote);
-    await this.emitBalance(quote.mint);
-    return r;
+    try {
+      return await this.spender.melt(quote);
+    } finally {
+      await this.emitBalanceSafe(quote.mint);
+    }
   }
 
   async keyset(mint: MintUrl, keysetId: string): Promise<MintKeyset> {
@@ -340,6 +359,15 @@ export class CashuWallet implements Wallet {
       } catch {
         // a listener's failure is its own
       }
+    }
+  }
+
+  /** `emitBalance` for a `finally`: a failing read must not replace the operation's own error. */
+  private async emitBalanceSafe(mint: MintUrl): Promise<void> {
+    try {
+      await this.emitBalance(mint);
+    } catch {
+      // the next change event carries the balance
     }
   }
 

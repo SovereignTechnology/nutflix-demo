@@ -32,21 +32,114 @@ export interface PendingOutput {
  * A mint operation journaled BEFORE its request is sent (ADR 0014, security review F31): if the
  * response is lost, the outputs the mint signed are recovered with NUT-09 restore instead of being
  * gone. Settled (dropped) atomically with the proofs it produced.
+ *
+ * While an operation that `spends` proofs (a send, a melt) is journaled, those proofs are held:
+ * out of new selections and out of the balance (ADR 0014 amendment, issue #8), until the mint
+ * says what became of them.
  */
 export interface PendingOp {
   /** The first output's `B_` (random, so unique). */
   readonly id: string;
-  readonly kind: 'receive' | 'send' | 'mint';
+  /**
+   * `melt` (ADR 0014 amendment, issue #8): a NUT-05 melt; `keep` holds its NUT-08 blank change
+   * outputs, whose amounts the mint assigns when it signs them.
+   */
+  readonly kind: 'receive' | 'send' | 'mint' | 'melt';
   readonly mint: MintUrl;
-  /** What a retry of the same operation carries: the inputs' secrets, or the quote id; sorted. */
+  /**
+   * What a retry of the same operation carries: the inputs' secrets, or the quote id (mint and
+   * melt); sorted.
+   */
   readonly key: readonly string[];
-  /** Outputs that become this wallet's proofs. */
+  /** Outputs that become this wallet's proofs (a melt's: its change blanks). */
   readonly keep: readonly PendingOutput[];
   /** Outputs locked to someone else (a P2PK send): restored only to account for them. */
   readonly send: readonly PendingOutput[];
-  /** This wallet's proofs the operation consumes (a send); none for receive and mint. */
+  /** This wallet's proofs the operation consumes (a send, a melt); none for receive and mint. */
   readonly spends: readonly CashuProof[];
   readonly created: UnixSeconds;
+}
+
+/** The kinds a journal entry may have. */
+export const PENDING_KINDS: readonly PendingOp['kind'][] = ['receive', 'send', 'mint', 'melt'];
+
+const HEX = /^[0-9a-f]+$/;
+const DECIMAL = /^[0-9]+$/;
+
+/** A stored proof's shape (hex keyset id and `C`, a positive safe-integer amount, a secret). */
+export function isStoredProof(x: unknown): x is CashuProof {
+  if (typeof x !== 'object' || x === null) return false;
+  const p = x as Record<string, unknown>;
+  return (
+    typeof p['id'] === 'string' &&
+    HEX.test(p['id']) &&
+    typeof p['amount'] === 'number' &&
+    Number.isSafeInteger(p['amount']) &&
+    p['amount'] > 0 &&
+    typeof p['secret'] === 'string' &&
+    p['secret'].length > 0 &&
+    typeof p['C'] === 'string' &&
+    HEX.test(p['C'])
+  );
+}
+
+/** A journaled output's shape (`OutputData.serialize`). */
+export function isPendingOutput(x: unknown): x is PendingOutput {
+  if (typeof x !== 'object' || x === null) return false;
+  const o = x as Record<string, unknown>;
+  const bm = o['blindedMessage'];
+  if (typeof bm !== 'object' || bm === null) return false;
+  const b = bm as Record<string, unknown>;
+  return (
+    typeof b['amount'] === 'string' &&
+    DECIMAL.test(b['amount']) &&
+    typeof b['B_'] === 'string' &&
+    HEX.test(b['B_']) &&
+    typeof b['id'] === 'string' &&
+    HEX.test(b['id']) &&
+    typeof o['blindingFactor'] === 'string' &&
+    DECIMAL.test(o['blindingFactor']) &&
+    typeof o['secret'] === 'string' &&
+    HEX.test(o['secret']) &&
+    (o['ephemeralE'] === undefined ||
+      (typeof o['ephemeralE'] === 'string' && HEX.test(o['ephemeralE'])))
+  );
+}
+
+/**
+ * A journal entry read back from storage (a sealed file): the exact shape, or `false`. A store
+ * that finds an entry failing this refuses to open rather than drop it — it may be money.
+ */
+export function isPendingOp(x: unknown): x is PendingOp {
+  if (typeof x !== 'object' || x === null) return false;
+  const o = x as Record<string, unknown>;
+  return (
+    typeof o['id'] === 'string' &&
+    HEX.test(o['id']) &&
+    (PENDING_KINDS as readonly unknown[]).includes(o['kind']) &&
+    typeof o['mint'] === 'string' &&
+    /^https?:\/\//.test(o['mint']) &&
+    Array.isArray(o['key']) &&
+    o['key'].every((k) => typeof k === 'string') &&
+    Array.isArray(o['keep']) &&
+    o['keep'].every(isPendingOutput) &&
+    Array.isArray(o['send']) &&
+    o['send'].every(isPendingOutput) &&
+    Array.isArray(o['spends']) &&
+    o['spends'].every(isStoredProof) &&
+    typeof o['created'] === 'number' &&
+    Number.isSafeInteger(o['created'])
+  );
+}
+
+/**
+ * The secrets of proofs held by unresolved journaled operations (ADR 0014 amendment): out of new
+ * selections, and out of the balance, until the mint says what became of them.
+ */
+export function heldSecrets(ops: readonly PendingOp[]): Set<string> {
+  const held = new Set<string>();
+  for (const op of ops) for (const p of op.spends) held.add(p.secret);
+  return held;
 }
 
 /** One atomic wallet transition at one mint. */

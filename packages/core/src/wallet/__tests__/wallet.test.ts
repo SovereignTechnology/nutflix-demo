@@ -493,7 +493,11 @@ describe('F31: a lost answer loses nothing (journal + NUT-09 restore)', () => {
     await expect(wallet.send(sats(3), { p2pk: keyOf(5).pub, mint: MINT })).rejects.toMatchObject({
       code: 'mint-error',
     });
-    expect(await wallet.balance(MINT)).toBe(16); // kept: maybe still in flight
+    // Kept (maybe still in flight), but HELD: issue #8 (ADR 0014 amendment) takes a pending
+    // send's inputs out of the balance too, where this test used to expect 16 — they are not
+    // spendable, so showing them was showing money the user cannot use.
+    expect(await store.proofs(MINT)).toHaveLength(1);
+    expect(await wallet.balance(MINT)).toBe(0);
     await expect(wallet.send(sats(3), { p2pk: keyOf(5).pub, mint: MINT })).rejects.toMatchObject({
       code: 'insufficient-funds',
     });
@@ -520,7 +524,10 @@ describe('F31: a lost answer loses nothing (journal + NUT-09 restore)', () => {
       WalletError,
     );
     expect(await store.pending(MINT)).toHaveLength(1);
-    expect(await wallet.balance(MINT)).toBe(16); // held, but out of selection while pending
+    // Held while pending, and out of the balance too since issue #8 (ADR 0014 amendment; this
+    // used to expect 16): the input is still in the store, just not spendable.
+    expect(await store.proofs(MINT)).toHaveLength(1);
+    expect(await wallet.balance(MINT)).toBe(0);
     strip = false;
     await wallet.recoverPending(); // an honest answer now: the change is restored
     expect(await wallet.balance(MINT)).toBe(13);
