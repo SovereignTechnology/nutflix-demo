@@ -207,6 +207,36 @@ describe('play sessions (dev mocks on a local testnet)', () => {
     for (const x of [...sids.slice(1), s]) await w.call('play.close', { sid: x });
   }, 30_000);
 
+  it('F33: a core the one-peer router refuses is not marked attached — a retry is refused too (fail closed)', async () => {
+    const payer = w.host.internals.payer!;
+    const attach = payer.attachCore.bind(payer);
+    let calls = 0;
+    let refuse = true;
+    payer.attachCore = (core) => {
+      calls++;
+      if (refuse) throw new Error('routing-unsupported: not the pinned hypercore');
+      return attach(core);
+    };
+    try {
+      const core = randomBytes(32).toString('hex') as never;
+      await expect(w.call('play.open', open(sid(), core))).rejects.toMatchObject({
+        code: 'internal',
+      });
+      // Not "already attached": the retry asks the router again, and is refused again.
+      await expect(w.call('play.open', open(sid(), core))).rejects.toMatchObject({
+        code: 'internal',
+      });
+      expect(calls).toBe(2);
+      refuse = false;
+      const s = sid();
+      await w.call('play.open', open(s, core));
+      expect(calls).toBe(3);
+      await w.call('play.close', { sid: s });
+    } finally {
+      payer.attachCore = attach;
+    }
+  });
+
   it('reports a valid seeder status and pushes it after changes', async () => {
     const s = await w.call('seeder.status', {});
     expect(isStatus(s)).toBe(true);
