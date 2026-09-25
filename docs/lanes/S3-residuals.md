@@ -171,7 +171,8 @@ Commands:
 - `npx vitest run packages/app-desktop/src/host`: all pass. `money.test.ts` timed out once at
   5 s under the full host run at load 8; it passes alone in 2.4 s. The timeout was not raised.
 - Real mints: see above.
-- The full suite, `npx vitest run --maxWorkers=2`, is in the structured result.
+- The full suite, `npx vitest run --maxWorkers=2` (at `9e18488`): 177 files passed and 3
+  skipped (the opt-in real-mint files); 2763 tests passed and 13 skipped; 207 s.
 - `npx tsc -b --force`: clean.
 - `npx eslint` on every changed file: clean. Prettier: clean.
 - `npm run check:locked`, `npm run lint:electron`: OK. No dependency changed, so
