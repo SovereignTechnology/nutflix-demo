@@ -9,6 +9,7 @@ import type { FsAdapter, ProcessRunner } from '@sovit/core';
 import type { SeederFs } from '@sovit/seeder';
 
 import type { OsName } from './ffmpeg.js';
+import type { SpawnDleqThread } from './pay/dleq-thread.js';
 
 /**
  * Small durable state files, SYNCHRONOUS — the payment engine's pending PAYs are written before
@@ -42,4 +43,9 @@ export interface WorkerRuntime {
   isExecutable(path: string): Promise<boolean>;
   readonly os: OsName;
   readonly stateFs: StateFs;
+  /**
+   * Start the DLEQ thread (issue #8 d: F5's checks off this event loop). Bare's is `Bare.Thread`
+   * (`adapters/bare.ts`); absent, the checks run inline in small chunks.
+   */
+  readonly dleqThread?: SpawnDleqThread;
 }

@@ -14,6 +14,7 @@ import { spawn } from 'bare-subprocess';
 
 import type { OsName } from '../ffmpeg.js';
 import { utf8 } from '../../ipc/codec.js';
+import type { SpawnDleqThread } from '../pay/dleq-thread.js';
 import type { StateFs, WorkerRuntime } from '../runtime.js';
 import type { BareSpawn } from '../transcode/index.js';
 import { createBareProcessRunner } from '../transcode/index.js';
@@ -138,7 +139,45 @@ export const bareStateFs: StateFs = {
   },
 };
 
+/** The runtime's own `Bare.Thread` (no package): an entry file on its own OS thread. */
+type BareThreadClass = new (
+  filename: string,
+  opts: { readonly data: unknown },
+) => { terminate(): void; join(): void };
+
+/** The DLEQ thread's entry, built next to this module's directory (`../pay/`). */
+export const DLEQ_THREAD_ENTRY = new URL('../pay/dleq-thread-entry.mjs', import.meta.url);
+
+/**
+ * `WorkerRuntime.dleqThread` on `Bare.Thread` (issue #8 d), or `undefined` where there is none.
+ * An exception that escapes a Bare thread aborts the whole process — a missing entry file
+ * included — so a thread is only ever started from an entry that exists as a regular file (a
+ * bundled test worker has none: its checks run inline, chunked).
+ */
+export function bareDleqThread(entry: URL = DLEQ_THREAD_ENTRY): SpawnDleqThread | undefined {
+  const Thread = (globalThis as { Bare?: { Thread?: BareThreadClass } }).Bare?.Thread;
+  if (Thread === undefined) return undefined;
+  return (mailbox) => {
+    try {
+      // Under Bare the global URL is bare-url's, which bare-fs takes as a file URL.
+      if (!fs.statSync(entry as unknown as Parameters<typeof fs.statSync>[0]).isFile()) return null;
+    } catch {
+      return null;
+    }
+    const t = new Thread(entry.href, { data: mailbox });
+    return {
+      terminate: () => {
+        t.terminate();
+      },
+      join: () => {
+        t.join();
+      },
+    };
+  };
+}
+
 export function bareRuntime(): WorkerRuntime {
+  const dleqThread = bareDleqThread();
   return {
     stateFs: bareStateFs,
     seederFs: bareSeederFs,
@@ -147,5 +186,6 @@ export function bareRuntime(): WorkerRuntime {
     env: (name) => os.getEnv(name),
     isExecutable,
     os: osName(),
+    ...(dleqThread === undefined ? {} : { dleqThread }),
   };
 }

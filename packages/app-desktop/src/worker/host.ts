@@ -328,6 +328,7 @@ export class WorkerHost {
           dir: fs.join(a.storage, 'payments'),
           join: (...p) => fs.join(...p),
           state: runtime.stateFs,
+          ...(runtime.dleqThread === undefined ? {} : { dleqThread: runtime.dleqThread }),
           request: this.o.request,
           sidFor: (core) => {
             let sid: SessionId | undefined;
@@ -855,6 +856,7 @@ export class WorkerHost {
       await this.net?.node.destroy();
       await this.fixtures?.close().catch(() => undefined);
       await this.net?.seeder.close();
+      this.net?.providers.close?.();
       await this.testnet?.destroy().catch(() => undefined);
     })();
     return this.closing;
