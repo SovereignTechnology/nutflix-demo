@@ -9,12 +9,14 @@
   //   tsconfig.main.json      Electron main (Node)
   //   tsconfig.preload.json   sandboxed preload (DOM, bundled to CJS by scripts/bundle.ts)
   //   tsconfig.renderer.json  renderer (DOM + JSX, bundled by scripts/bundle.ts)
+  //   packaging/tsconfig.json build-time packaging code (issue #6, ADR 0017), never emitted
   "files": [],
   "references": [
     { "path": "./tsconfig.worker.json" },
     { "path": "./tsconfig.host.json" },
     { "path": "./tsconfig.main.json" },
     { "path": "./tsconfig.preload.json" },
-    { "path": "./tsconfig.renderer.json" }
+    { "path": "./tsconfig.renderer.json" },
+    { "path": "./packaging" }
   ]
 }

@@ -10,6 +10,8 @@
  *   dist/renderer/            index.html, app.js, ui.css, shell.css (served by `app:`)
  *   dist/host/main.js         the host utilityProcess entry (lane L6-B)
  *   dist/worker/entry.js      the Bare worker entry the host spawns (lane L6-C; tsc output)
+ * A packaged build (issue #6, ADR 0017) has the same layout inside `resources/app.asar`, except
+ * the worker: it is unpacked beside the archive (`workerEntryFor`, packaging/stage.ts).
  */
 import { randomBytes } from 'node:crypto';
 import * as fsp from 'node:fs/promises';
@@ -36,7 +38,7 @@ import { isPromptForm } from '../ipc/guards.js';
 import type { HostIn, HostOut, PromptAnswer } from '../ipc/protocol.js';
 import { CHANNEL } from '../ipc/protocol.js';
 import { PROMPT_FILES, createAppProtocolHandler } from './app-protocol.js';
-import { HOST_ENTRY, WORKER_ENTRY, devFlagIn, hostArgs, parseMainArgs } from './args.js';
+import { HOST_ENTRY, devFlagIn, hostArgs, parseMainArgs, workerEntryFor } from './args.js';
 import { FileTokenRegistry } from './file-tokens.js';
 import { HostLink } from './host-link.js';
 import { IpcGate } from './ipc-gate.js';
@@ -376,7 +378,7 @@ function start(): void {
         join(distDir, HOST_ENTRY),
         hostArgs(opts, {
           userData: app.getPath('userData'),
-          workerEntry: join(distDir, WORKER_ENTRY),
+          workerEntry: workerEntryFor(distDir),
           keychain: keychainOk,
         }),
         { serviceName: 'nutflix-host', stdio: 'inherit' },

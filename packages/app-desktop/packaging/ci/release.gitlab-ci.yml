@@ -1,0 +1,57 @@
+# Desktop release jobs (issue #6, ADR 0017). NOT ACTIVE: ci/gitlab-ci.yml is itself inactive
+# (no runner yet) and does not include this file. To enable, add to ci/gitlab-ci.yml:
+#
+#   include:
+#     - local: packages/app-desktop/packaging/ci/release.gitlab-ci.yml
+#
+# Runners: the default Linux image, one tagged `macos` (hdiutil/ditto; builds the .dmg and
+# writes the asar integrity digest, which only a macOS host can) and one tagged `windows`
+# (Squirrel.Windows). Manual, and only on `desktop-v*` tags: a person cuts a release.
+#
+# Nothing here signs anything, and no job holds a key. The jobs publish the artifacts, SHA256SUMS
+# and the UNSIGNED Nostr event (scripts/release-manifest.mjs); Cameron signs that event with the
+# SovTech key through Bunker46, and anyone checks downloads with scripts/release-verify.mjs.
+# Gatekeeper / SmartScreen warnings are accepted for now (no platform code signing).
+
+.desktop-release:
+  stage: build
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^desktop-v/'
+      when: manual
+  artifacts:
+    paths: [packages/app-desktop/out/make/, release/]
+    expire_in: 3 months
+
+desktop-linux:
+  extends: .desktop-release
+  script:
+    - export SOURCE_DATE_EPOCH="$(git log -1 --format=%ct HEAD)"
+    - apt-get update && apt-get install -y --no-install-recommends fakeroot squashfs-tools
+    - npm run build
+    # The AppImage runtime is NOT an npm package: fetch the pinned dated release. The maker
+    # refuses it unless its sha256 equals the pin in packaging/maker-appimage.ts.
+    - mkdir -p packages/app-desktop/out/appimage-runtime
+    - curl -fsSLo packages/app-desktop/out/appimage-runtime/runtime-x86_64 https://github.com/AppImage/type2-runtime/releases/download/20251108/runtime-x86_64
+    - npm run -w packages/app-desktop make -- --platform linux --arch x64 --targets deb,appimage
+    - node scripts/release-manifest.mjs packages/app-desktop/out/make --out release/linux
+
+desktop-macos:
+  extends: .desktop-release
+  tags: [macos]
+  script:
+    - export SOURCE_DATE_EPOCH="$(git log -1 --format=%ct HEAD)"
+    - npm run build
+    - npm run -w packages/app-desktop make -- --platform darwin --arch arm64 --targets dmg
+    - npm run -w packages/app-desktop make -- --platform darwin --arch x64 --targets dmg
+    - node scripts/release-manifest.mjs packages/app-desktop/out/make --out release/macos
+
+desktop-windows:
+  extends: .desktop-release
+  tags: [windows]
+  script:
+    # electron-winstaller's install script (skipped by --ignore-scripts, reviewed in
+    # docs/lanes/S3-pack.md) only copies vendor/7z-<arch>.exe/.dll to vendor/7z.exe/.dll.
+    - cd node_modules/electron-winstaller && node script/select-7z-arch.js && cd ../..
+    - npm run build
+    - npm run -w packages/app-desktop make -- --platform win32 --arch x64 --targets squirrel
+    - node scripts/release-manifest.mjs packages/app-desktop/out/make --out release/windows
