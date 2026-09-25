@@ -66,6 +66,7 @@ export function handlers(a: DesktopNetworkAdapter): HandlerTable {
     },
     'wallet.mints': () => a.wallet.mints(),
     'wallet.balance': (_c, [mint]) => a.wallet.balance(mint),
+    'wallet.inputFeePpk': (_c, [mint]) => a.wallet.inputFeePpk(mint),
     'wallet.balances': () => a.wallet.balances(),
     // F17: the renderer holds an opaque handle, never the (bearer) quote id.
     'wallet.mintQuote': (_c, [mint, amount]) =>

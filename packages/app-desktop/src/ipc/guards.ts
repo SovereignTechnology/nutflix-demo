@@ -471,6 +471,7 @@ export const validateArgs: { readonly [M in Method]: Guard<MethodTable[M][0]> } 
   'session.close': tuple([isSessionId]),
   'wallet.mints': tuple([]),
   'wallet.balance': tuple([isMintUrl]),
+  'wallet.inputFeePpk': tuple([isMintUrl]),
   'wallet.balances': tuple([]),
   'wallet.mintQuote': tuple([isMintUrl, isPositiveSats]),
   'wallet.pollQuote': tuple([isMintQuote]),

@@ -66,6 +66,13 @@ async function fund(w: CashuWallet, mint: TestMint, amount: number): Promise<voi
   expect(w.pendingMintQuotes()).toEqual([]);
 }
 
+describe('inputFeePpk (v6: mint fees shown in the price)', () => {
+  it('reports the active keyset’s input_fee_ppk, 0 for a free mint', async () => {
+    expect(await rig({ fee: 100 }).wallet.inputFeePpk(MINT)).toBe(100);
+    expect(await rig().wallet.inputFeePpk(MINT)).toBe(0);
+  });
+});
+
 describe('F17: NUT-20 locked mint quotes', () => {
   const quoteBody = (mint: TestMint, id: string) =>
     mint.request<{ pubkey?: string }>({

@@ -314,6 +314,8 @@ export interface VideoData {
   readonly channel: Profile;
   readonly avatarSrc: string | undefined;
   readonly thumbSrc: string | undefined;
+  /** The paying mint's `input_fee_ppk`, for the fee line beside the price (undefined = unknown). */
+  readonly feePpk?: number | undefined;
   readonly subscribed: boolean;
   /**
    * Like / dislike buttons: both counts and the viewer's own reaction, from `stats()` (v4),

@@ -4,7 +4,7 @@
  */
 import { createElement, createRef, type ReactElement } from 'react';
 import { describe, expect, it, vi } from 'vitest';
-import { mocks } from '@sovit/core';
+import { DEFAULT_MIN_PAY_SATS, mocks } from '@sovit/core';
 import type { NostrPubkey, Profile, Sats, UnixSeconds } from '@sovit/core';
 import { Avatar, ProfileAvatar } from '../Avatar/Avatar.js';
 import { Button, IconButton } from '../Button/Button.js';
@@ -34,6 +34,11 @@ import {
   shortPubkey,
 } from '../shared/format.js';
 import { click, fire, keydown, render } from '../testing/render.js';
+import {
+  PAY_INPUTS_ESTIMATE,
+  UI_DEFAULT_MIN_PAY_SATS,
+  estimateMintFeeSats,
+} from '../shared/format.js';
 
 function must<T>(v: T | undefined): T {
   if (v === undefined) throw new Error('fixture missing');
@@ -42,6 +47,20 @@ function must<T>(v: T | undefined): T {
 const video = must(mocks.VIDEOS[1]);
 const channel = must(mocks.CHANNELS[0]);
 const sats = (n: number): Sats => n as Sats;
+
+describe('estimateMintFeeSats (Cameron 2026-09-24: fees shown in the price)', () => {
+  it('PAYs × the swap fee of one PAY; 0 for a free mint; the UI default matches core', () => {
+    expect(UI_DEFAULT_MIN_PAY_SATS).toBe(DEFAULT_MIN_PAY_SATS);
+    // 1,000 sats at the default 10-sat minimum = 100 PAYs; 2 inputs × 100 ppk = 0.2 → 1 sat each.
+    expect(estimateMintFeeSats(1000, {}, 100)).toBe(100);
+    expect(estimateMintFeeSats(1000, { minPaySats: 50 as never }, 100)).toBe(20);
+    // 2 inputs × 1000 ppk = 2 sats a PAY.
+    expect(estimateMintFeeSats(95, {}, 1000)).toBe(20);
+    expect(estimateMintFeeSats(1000, {}, 0)).toBe(0);
+    expect(estimateMintFeeSats(0, {}, 100)).toBe(0);
+    expect(PAY_INPUTS_ESTIMATE).toBe(2);
+  });
+});
 
 describe('formatting helpers', () => {
   it('formats sats, durations, relative time and pubkeys deterministically', () => {

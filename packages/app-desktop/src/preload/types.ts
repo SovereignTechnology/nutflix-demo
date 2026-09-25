@@ -86,6 +86,7 @@ export interface NutflixBridge {
   readonly wallet: {
     mints: Call<'wallet.mints'>;
     balance: Call<'wallet.balance'>;
+    inputFeePpk: Call<'wallet.inputFeePpk'>;
     balances: Call<'wallet.balances'>;
     mintQuote: Call<'wallet.mintQuote'>;
     pollQuote: Call<'wallet.pollQuote'>;

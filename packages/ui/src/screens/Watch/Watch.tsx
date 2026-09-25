@@ -35,6 +35,8 @@
  */
 import { useCallback, useEffect, useId, useRef, useState, type ReactElement } from 'react';
 import type {
+  MintUrl,
+  NetworkAdapter,
   NostrEventId,
   NostrPubkey,
   PeerSpend,
@@ -105,7 +107,7 @@ import { WatchComments } from './WatchComments.js';
 import { NutzapSheet, ReportSheet, ShortcutsSheet } from './WatchSheets.js';
 import { PeerOverlay, PricePanel, StageNote, UpNextOverlay } from './WatchParts.js';
 import { WatchRelated, type RelatedList } from './WatchRelated.js';
-import { thumbnailSrc } from '../shared/image.js';
+import { avatarSrc, thumbnailSrc } from '../shared/image.js';
 
 export interface WatchProps extends ScreenProps {
   /** The video to watch (`Route { name: 'watch', videoId }`). A change reloads the screen. */
@@ -605,14 +607,23 @@ export function Watch({
             () => undefined,
           );
         }
-        if (channel.picture !== undefined && channel.picture !== '') {
-          adapter.image(channel.picture).then(
+        const avatar = avatarSrc(adapter, channel);
+        if (avatar !== null) {
+          avatar.then(
             (src) => {
               if (!cancelled()) patchData({ avatarSrc: src });
             },
             () => undefined,
           );
         }
+        // Cameron 2026-09-24: the price shows the expected mint fees — those of the mint this
+        // wallet would pay from (the first of the video's mints it holds, else the first listed).
+        void payingMintFeePpk(adapter, video.price.mints).then(
+          (feePpk) => {
+            if (!cancelled() && feePpk !== undefined) patchData({ feePpk });
+          },
+          () => undefined,
+        );
         if (captionsTrack !== undefined) {
           adapter.image(captionsTrack.url, captionsTrack.sha256).then(
             (src) => {
@@ -1776,6 +1787,7 @@ export function Watch({
               onChoose={canChoose ? chooseRendition : undefined}
               mints={live ? undefined : video.price.mints}
               live={live}
+              feePpk={data.feePpk}
             />
             {stageContent}
             {live && showPeers && !player.mini ? (
@@ -2082,4 +2094,25 @@ export function Watch({
       <ToastStack toasts={toasts} onDismiss={dismissToast} />
     </section>
   );
+}
+
+/** The input fee of the mint this wallet would pay `mints` from; `undefined` when unknown. */
+async function payingMintFeePpk(
+  adapter: Pick<NetworkAdapter, 'wallet'>,
+  mints: readonly MintUrl[],
+): Promise<number | undefined> {
+  if (mints.length === 0) return undefined;
+  let held: readonly MintUrl[] = [];
+  try {
+    held = await adapter.wallet.mints();
+  } catch {
+    // no wallet (signed out): the first listed mint still says what the fees would be
+  }
+  const mint = mints.find((m) => held.includes(m)) ?? mints[0];
+  if (mint === undefined) return undefined;
+  try {
+    return await adapter.wallet.inputFeePpk(mint);
+  } catch {
+    return undefined;
+  }
 }

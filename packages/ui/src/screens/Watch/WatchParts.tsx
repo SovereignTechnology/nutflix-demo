@@ -21,6 +21,7 @@ import {
   PeerMeter,
   SatsBadge,
   cx,
+  estimateMintFeeSats,
   formatInteger,
   renditionPriceSats,
   type IconName,
@@ -45,6 +46,11 @@ export interface PricePanelProps {
    * spend (`onSpend`) is in the streaming chip, and an estimate beside it would contradict it.
    */
   readonly live?: boolean | undefined;
+  /**
+   * The paying mint's `input_fee_ppk` (Cameron 2026-09-24: prices show the expected mint fees).
+   * Unknown or 0 = no fee line.
+   */
+  readonly feePpk?: number | undefined;
 }
 
 /**
@@ -60,8 +66,10 @@ export function PricePanel({
   onChoose,
   mints,
   live = false,
+  feePpk,
 }: PricePanelProps): ReactElement | null {
   if (quote === undefined) return null;
+  const fees = feePpk === undefined ? 0 : estimateMintFeeSats(quote.sats, policy, feePpk);
   return (
     <div className="nf-watch__stage-price" role="group" aria-label="Price">
       <SatsBadge sats={quote.sats} variant="price" overlay label={`Price ${priceLabel(quote)}`} />
@@ -77,6 +85,14 @@ export function PricePanel({
       )}
       {!live && quote.ratePerMin > 0 ? (
         <span className="nf-watch__rate-hint">≈ {formatInteger(quote.ratePerMin)} sats/min</span>
+      ) : null}
+      {!live && fees > 0 ? (
+        <span
+          className="nf-watch__fee-hint"
+          title="Each payment is a small mint transaction; the mint charges an input fee for it. An estimate."
+        >
+          + ≈ {formatInteger(fees)} {fees === 1 ? 'sat' : 'sats'} in mint fees
+        </span>
       ) : null}
       {mints !== undefined && mints.length > 0 ? (
         <span className="nf-watch__stage-mints">

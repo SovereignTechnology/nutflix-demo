@@ -18,6 +18,11 @@ export interface Wallet {
   mints(): Promise<readonly MintUrl[]>;
 
   balance(mint: MintUrl): Promise<Sats>;
+  /**
+   * v6 (Cameron 2026-09-24: "show fees in the price"): the input fee of `mint`'s active keyset, in
+   * parts per thousand of a sat per input proof (NUT-02 `input_fee_ppk`; 0 = free). For display.
+   */
+  inputFeePpk(mint: MintUrl): Promise<number>;
   balances(): Promise<ReadonlyMap<MintUrl, Sats>>;
 
   /** The wallet's dedicated NIP-60 P2PK pubkey (from kind 17375), used as the nutzap target. */

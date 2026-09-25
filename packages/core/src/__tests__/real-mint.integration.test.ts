@@ -98,6 +98,13 @@ describe.skipIf(MINT_URL === undefined)(
         expect(info.nuts[nut]?.supported, `NUT-${nut}`).toBe(true);
     });
 
+    it('inputFeePpk reports the mint’s advertised active keyset fee (v6: fees shown in the price)', async () => {
+      const res = await fetch(`${mint}/v1/keysets`);
+      const body = (await res.json()) as { keysets: { active: boolean; input_fee_ppk?: number }[] };
+      const advertised = body.keysets.find((k) => k.active)?.input_fee_ppk ?? 0;
+      expect(await wallet().inputFeePpk(mint)).toBe(advertised);
+    });
+
     it('F17: a NUT-20 locked quote mints only with the wallet key — the amended signature, first try', async () => {
       const info = (await (await fetch(`${mint}/v1/info`)).json()) as {
         nuts: Record<string, { supported?: boolean }>;

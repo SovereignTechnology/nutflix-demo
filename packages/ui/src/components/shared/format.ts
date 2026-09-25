@@ -83,6 +83,27 @@ export function renditionPriceSats(rendition: Rendition, policy: PricePolicy): S
   return (blocks * policy.satsPerBlock) as Sats;
 }
 
+/** Core's `DEFAULT_MIN_PAY_SATS` (the UI imports no core runtime code; a test pins the two). */
+export const UI_DEFAULT_MIN_PAY_SATS = 10;
+/** Input proofs a viewer's PAY swap typically spends: an estimate (power-of-two denominations). */
+export const PAY_INPUTS_ESTIMATE = 2;
+
+/**
+ * Cameron 2026-09-24: prices show the expected mint fees. Each PAY is a swap the viewer pays the
+ * input fee of — ⌈inputs × input_fee_ppk / 1000⌉ sats — and a video of `totalSats` takes about
+ * ⌈totalSats / minPaySats⌉ PAYs. An estimate for display; 0 when the mint charges nothing.
+ */
+export function estimateMintFeeSats(
+  totalSats: number,
+  policy: Pick<PricePolicy, 'minPaySats'>,
+  feePpk: number,
+): Sats {
+  if (!(feePpk > 0) || !(totalSats > 0)) return 0 as Sats;
+  const perPay = Math.ceil((PAY_INPUTS_ESTIMATE * feePpk) / 1000);
+  const pays = Math.ceil(totalSats / Math.max(1, policy.minPaySats ?? UI_DEFAULT_MIN_PAY_SATS));
+  return (pays * perPay) as Sats;
+}
+
 /** Sats per minute of playback at this rendition (for "streaming X sats/min" copy). */
 export function renditionRatePerMin(
   rendition: Rendition,

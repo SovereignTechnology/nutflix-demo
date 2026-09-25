@@ -20,6 +20,7 @@ import {
   resumePositionSec,
   safePlaceholder,
 } from '../model.js';
+import { estimateMintFeeSats } from '../../../components/index.js';
 
 const { MockNetworkAdapter, VIDEOS, CHANNELS, fixtureComments } = mocks;
 
@@ -209,6 +210,25 @@ describe('Watch — structure and loading', () => {
 });
 
 describe('Watch — price before play', () => {
+  // Cameron 2026-09-24: the price shows the expected mint fees.
+  it('shows the estimated mint fees beside the price when the paying mint charges, and none when free', async () => {
+    const charging = new MockNetworkAdapter();
+    vi.spyOn(charging.wallet, 'inputFeePpk').mockResolvedValue(100);
+    const { r } = mount(charging);
+    keep(r);
+    await flush();
+    const quote = r.get('.nf-watch__stage-price .nf-sats--price').getAttribute('aria-label') ?? '';
+    const total = Number(/Price ([\d,]+) sats/.exec(quote)?.[1]?.replace(/,/g, ''));
+    const expected = estimateMintFeeSats(total, VIDEO.price, 100);
+    expect(expected).toBeGreaterThan(0);
+    expect(r.get('.nf-watch__fee-hint').textContent).toContain(expected.toLocaleString('en-US'));
+    r.unmount();
+    const free = mount(new MockNetworkAdapter()).r; // the mock wallet's fee is 0
+    keep(free);
+    await flush();
+    expect(free.all('.nf-watch__fee-hint')).toHaveLength(0);
+  });
+
   it('renders the price badge before the play affordance (DOM order)', async () => {
     const { r } = mount(new MockNetworkAdapter());
     keep(r);

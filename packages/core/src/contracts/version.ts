@@ -51,6 +51,7 @@
  *       (default `false`: only images with a signed sha256 load). And ADR 0015 (images over
  *       Pear): `Rendition.image.size?` + imeta `image-size` (required with a `hyper://` image,
  *       as is `image-x`), `MAX_IMAGE_BYTES`, `Profile.pictureSha256?/pictureSize?/bannerSha256?/
- *       bannerSize?`, `Settings.seeding.serveImages?`; `NetworkAdapter.setProfilePicture`.
+ *       bannerSize?`, `Settings.seeding.serveImages?`; `NetworkAdapter.setProfilePicture`;
+ *       `Wallet.inputFeePpk` (mint fees shown in the price).
  */
 export const CONTRACTS_VERSION = 6 as const;

@@ -25,6 +25,8 @@ export interface MockWalletOptions {
   /** Polls before a mint quote flips to PAID. Default 2. */
   readonly quotePollsUntilPaid?: number;
   readonly now?: () => UnixSeconds;
+  /** v6: every mint's `input_fee_ppk` (display only). Default 0. */
+  readonly inputFeePpk?: number;
 }
 
 export class MockWallet implements Wallet {
@@ -33,10 +35,12 @@ export class MockWallet implements Wallet {
   private readonly listeners = new Set<(e: WalletChangeEvent) => void>();
   private readonly quotes = new Map<string, { quote: MintQuote; polls: number }>();
   private readonly pollsUntilPaid: number;
+  private readonly feePpk: number;
   private readonly now: () => UnixSeconds;
   private seq = 0;
 
   constructor(opts: MockWalletOptions = {}) {
+    this.feePpk = opts.inputFeePpk ?? 0;
     const b = opts.balances ?? { [MINTS.a]: 2100, [MINTS.b]: 0 };
     const entries = b instanceof Map ? [...b.entries()] : Object.entries(b);
     for (const [m, v] of entries) this.bal.set(m as MintUrl, Number(v));
@@ -46,6 +50,10 @@ export class MockWallet implements Wallet {
 
   mints(): Promise<readonly MintUrl[]> {
     return Promise.resolve([...this.bal.keys()]);
+  }
+
+  inputFeePpk(_mint: MintUrl): Promise<number> {
+    return Promise.resolve(this.feePpk);
   }
 
   balance(mint: MintUrl): Promise<Sats> {

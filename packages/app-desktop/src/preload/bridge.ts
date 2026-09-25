@@ -244,6 +244,7 @@ export function createBridge(t: Transport, deps: BridgeDeps): NutflixBridge {
     wallet: {
       mints: call('wallet.mints'),
       balance: call('wallet.balance'),
+      inputFeePpk: call('wallet.inputFeePpk'),
       balances: call('wallet.balances'),
       mintQuote: call('wallet.mintQuote'),
       pollQuote: call('wallet.pollQuote'),

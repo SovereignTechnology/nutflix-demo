@@ -129,6 +129,13 @@ export class CashuWallet implements Wallet {
     this.now = o.now ?? ((): UnixSeconds => Math.floor(Date.now() / 1000) as UnixSeconds);
   }
 
+  /** The active keyset's `input_fee_ppk` (cashu-ts `Keyset.fee`; 0 when the mint sets none). */
+  async inputFeePpk(mint: MintUrl): Promise<number> {
+    const w = await this.o.mints.wallet(mint);
+    const fee = w.getKeyset().fee;
+    return Number.isSafeInteger(fee) && fee >= 0 ? fee : 0;
+  }
+
   async mints(): Promise<readonly MintUrl[]> {
     const held = await this.o.store.mints();
     return [...new Set([...(this.o.configuredMints ?? []), ...held])];

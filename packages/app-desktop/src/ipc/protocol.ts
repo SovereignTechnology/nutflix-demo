@@ -389,6 +389,7 @@ export interface MethodTable {
   // money (read side + melt; D3: never send / receive)
   'wallet.mints': [args: [], result: readonly MintUrl[]];
   'wallet.balance': [args: [mint: MintUrl], result: Sats];
+  'wallet.inputFeePpk': [args: [mint: MintUrl], result: number];
   'wallet.balances': [args: [], result: WireMap<MintUrl, Sats>];
   'wallet.mintQuote': [args: [mint: MintUrl, amount: Sats], result: MintQuote];
   'wallet.pollQuote': [

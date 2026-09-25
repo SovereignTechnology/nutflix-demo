@@ -50,6 +50,7 @@ export const VALID: Samples = {
   me: [[]],
   profile: [[PUBKEY]],
   setProfilePicture: [[{ bytes: Uint8Array.of(0xff, 0xd8, 0xff), type: 'image/jpeg' }]],
+  'wallet.inputFeePpk': [[MINT]],
   feed: [
     [{ source: 'trending' }],
     [{ source: 'shorts', limit: 12, cursor: '12' }],

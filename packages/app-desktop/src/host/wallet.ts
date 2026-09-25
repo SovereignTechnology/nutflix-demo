@@ -41,6 +41,9 @@ export class UnavailableWallet implements Wallet {
   balance(_mint: MintUrl): Promise<Sats> {
     return this.unavailable();
   }
+  inputFeePpk(_mint: MintUrl): Promise<number> {
+    return this.unavailable();
+  }
   balances(): Promise<ReadonlyMap<MintUrl, Sats>> {
     return this.unavailable();
   }
@@ -118,6 +121,9 @@ export class SwitchingWallet implements Wallet {
   }
   balance(mint: MintUrl): Promise<Sats> {
     return this.w().balance(mint);
+  }
+  inputFeePpk(mint: MintUrl): Promise<number> {
+    return this.w().inputFeePpk(mint);
   }
   balances(): Promise<ReadonlyMap<MintUrl, Sats>> {
     return this.w().balances();

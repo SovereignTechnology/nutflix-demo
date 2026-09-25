@@ -84,6 +84,7 @@ export function adapterFromBridge(b: NutflixBridge): NetworkAdapter {
   const wallet: Wallet = {
     mints: () => settle(b.wallet.mints()),
     balance: (mint) => settle(b.wallet.balance(mint)),
+    inputFeePpk: (mint) => settle(b.wallet.inputFeePpk(mint)),
     balances: () => settle(b.wallet.balances()),
     p2pkPubkey: () => settle(b.wallet.p2pkPubkey()),
     mintQuote: (mint, amount) => settle(b.wallet.mintQuote(mint, amount)),
