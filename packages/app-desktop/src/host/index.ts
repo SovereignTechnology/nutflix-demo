@@ -38,3 +38,6 @@ export { FixtureCatalog } from './catalog/fixture-catalog.js';
 export { NostrCatalog } from './catalog/catalog.js';
 export type { CatalogSource } from './catalog/catalog.js';
 export { UnavailableWallet, createWalletProvider } from './wallet.js';
+export { AutoTopUp, maxFeeReserve, topUpAmount } from './topup/auto-topup.js';
+export type { TopUpOutcome } from './topup/auto-topup.js';
+export { TopUpLedger, TOP_UP_LEDGER_FILE } from './topup/ledger.js';

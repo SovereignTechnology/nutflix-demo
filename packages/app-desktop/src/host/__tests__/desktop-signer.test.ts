@@ -161,6 +161,7 @@ function localScript(
       case 'create-wallet':
       case 'remove-key':
       case 'bunker-auth':
+      case 'top-up-first': // issue #2: the auto top-up's question, never part of this flow
         return null;
     }
   };

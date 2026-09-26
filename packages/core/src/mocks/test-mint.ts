@@ -9,7 +9,9 @@
  * `verifyUnblindedSignature`, `verifyP2PKSpendingConditions`, `hashToCurve`) — nothing here is
  * crypto, and none of it may be imported by a production code path.
  *
- * Lightning is simulated: a mint quote is paid with `payQuote()`, a melt quote always pays.
+ * Lightning is simulated: a mint quote is paid with `payQuote()`, a melt quote always pays — and
+ * with a shared `TestLightning`, a melt at one TestMint pays the other TestMint's invoice (the
+ * desktop's auto top-up, issue #2: melt at the source, mint at the target).
  * Test hooks: `issue()` mints proofs directly (optionally P2PK-locked, with extra NUT-10 tags),
  * `markSpent()` spends proofs behind everyone's back, `failNext()` injects a mint outage.
  */
@@ -75,6 +77,38 @@ export interface TestMintOptions {
   readonly nut20?: boolean;
   /** NUT-09 restore (default on, like Nutshell and cdk): signatures are remembered by `B_`. */
   readonly nut09?: boolean;
+  /** Simulated Lightning shared with other TestMints: their melts pay this mint's invoices. */
+  readonly lightning?: TestLightning;
+}
+
+/**
+ * Simulated Lightning between TestMints (tests only): each linked mint's invoices carry a tag of
+ * their own, and a melt at any linked mint that pays one marks that mint's quote PAID.
+ */
+export class TestLightning {
+  private readonly invoices = new Map<string, () => void>();
+  private mints = 0;
+  /** Invoices routed to another mint (tests assert what actually paid). */
+  readonly paid: string[] = [];
+
+  /** @internal A per-mint tag for its invoices (bech32 characters only). */
+  link(): string {
+    return `${bech32Digits(String(++this.mints))}x`;
+  }
+
+  /** @internal */
+  register(request: string, pay: () => void): void {
+    this.invoices.set(request, pay);
+  }
+
+  /** @internal A melt paid `request`: `true` when it was a linked mint's invoice. */
+  pay(request: string): boolean {
+    const p = this.invoices.get(request);
+    if (p === undefined) return false;
+    this.paid.push(request);
+    p();
+    return true;
+  }
 }
 
 interface Quote {
@@ -110,11 +144,15 @@ export class TestMint {
   private readonly melts = new Map<string, MeltQuote>();
   private seq = 0;
   private failures = 0;
+  private readonly lightning: TestLightning | undefined;
+  private readonly invoiceTag: string;
   /** Requests served, by path — tests assert what the code under test actually did. */
   readonly calls: string[] = [];
 
   constructor(o: TestMintOptions) {
     this.url = o.url;
+    this.lightning = o.lightning;
+    this.invoiceTag = o.lightning?.link() ?? '';
     this.inputFeePpk = o.inputFeePpk ?? 0;
     this.feeReserve = o.feeReserve ?? 0;
     this.nut20 = o.nut20 ?? true;
@@ -447,6 +485,9 @@ export class TestMint {
         ? { amount, state: 'UNPAID', pubkey }
         : { amount, state: 'UNPAID' },
     );
+    this.lightning?.register(this.invoice(quote, amount), () => {
+      this.payQuote(quote);
+    });
     return this.mintQuoteState(quote);
   }
 
@@ -457,13 +498,17 @@ export class TestMint {
       quote,
       // bolt11 HRP amounts are in BTC multiples: `n` = 1e-9 BTC = 0.1 sat. The data part must be
       // bech32 (no `1`): the HRP ends at the LAST `1` of the invoice.
-      request: `lnbc${String(q.amount * 10)}n1testmint${bech32Digits(quote)}`,
+      request: this.invoice(quote, q.amount),
       unit: 'sat',
       amount: q.amount,
       state: q.state,
       expiry: 4_102_444_800,
       ...(q.pubkey === undefined ? {} : { pubkey: q.pubkey }),
     };
+  }
+
+  private invoice(quote: string, amount: number): string {
+    return `lnbc${String(amount * 10)}n1testmint${this.invoiceTag}${bech32Digits(quote)}`;
   }
 
   private mintBolt11(body: Record<string, unknown>): unknown {
@@ -533,6 +578,7 @@ export class TestMint {
     if (inputs.total < need) throw new MintOperationError(11002, 'Transaction is not balanced');
     this.spend(inputs);
     q.state = 'PAID';
+    this.lightning?.pay(q.request);
     // NUT-08: the unused fee reserve comes back as change on the blank outputs, if any.
     const blanks = Array.isArray(body['outputs'])
       ? (body['outputs'] as SerializedBlindedMessage[])

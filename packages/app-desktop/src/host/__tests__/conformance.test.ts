@@ -166,7 +166,8 @@ const isSettings = obj(
     loadRemoteImages: bool,
     theme: oneOf(['dark', 'light', 'system'] as const),
   },
-  { autoTopUp: obj({ belowSats: isSats, fromMint: isMintUrl }) },
+  // v6 / issue #2: `amountSats` (1 … AUTO_TOP_UP_MAX_SATS) may be present.
+  { autoTopUp: obj({ belowSats: isSats, fromMint: isMintUrl }, { amountSats: int(1, 10_000) }) },
 );
 const isMintQuote = obj({
   mint: isMintUrl,
@@ -592,6 +593,14 @@ const HAPPY: Happy[] = [
     name: 'updateSettings',
     guard: isSettings,
     run: (s) => s.a.updateSettings({ theme: 'light', prefetchSeconds: 15 }),
+  },
+  {
+    name: 'updateSettings (issue #2: auto top-up with an amount)',
+    guard: isSettings,
+    run: (s) =>
+      s.a.updateSettings({
+        autoTopUp: { belowSats: 500 as never, fromMint: mocks.MINTS.b, amountSats: 2_000 as never },
+      }),
   },
 ];
 

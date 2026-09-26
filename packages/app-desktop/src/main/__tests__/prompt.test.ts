@@ -260,6 +260,42 @@ describe('main’s own question: open an external link (F25)', () => {
   });
 });
 
+describe('issue #2: the first auto top-up into a mint', () => {
+  const FORM: PromptForm = {
+    kind: 'top-up-first',
+    target: 'https://mint-a.example' as never,
+    source: 'https://mint-b.example' as never,
+    amount: 2_000 as never,
+  };
+
+  it('yes and no reach the host; a closed window or a misfitting answer is a cancel (null)', () => {
+    const { s, windows, answers } = service();
+    s.ask(1, FORM);
+    expect(s.init(from(windows[0]))).toEqual(FORM);
+    expect(s.submit(from(windows[0]), { kind: 'top-up-first', confirm: true })).toBe(true);
+    s.ask(2, FORM);
+    s.submit(from(windows[1]), { kind: 'top-up-first', confirm: false });
+    s.ask(3, FORM);
+    windows[2]!.close();
+    s.ask(4, FORM);
+    s.submit(from(windows[3]), { kind: 'create-wallet', create: true });
+    // Only the prompt window may answer, never the app renderer.
+    s.ask(5, FORM);
+    expect(
+      s.submit(from(windows[4], { frameUrl: 'app://nutflix/index.html' }), {
+        kind: 'top-up-first',
+        confirm: true,
+      }),
+    ).toBe(false);
+    expect(answers.map((a) => [a.req, a.answer])).toEqual([
+      [1, { kind: 'top-up-first', confirm: true }],
+      [2, { kind: 'top-up-first', confirm: false }],
+      [3, null],
+      [4, null],
+    ]);
+  });
+});
+
 describe('toPromptAnswer (the page → the host)', () => {
   it('converts text to UTF-8 bytes and keeps only the known keys', () => {
     const a = toPromptAnswer({ kind: 'secret', value: 'pässword' });
@@ -292,6 +328,9 @@ describe('toPromptAnswer (the page → the host)', () => {
     [{ kind: 'remove-key' }],
     [{ kind: 'remove-key', confirm: 'yes' }],
     [{ kind: 'bunker-auth', open: true, url: 'https://evil.example' }],
+    [{ kind: 'top-up-first' }],
+    [{ kind: 'top-up-first', confirm: 'yes' }],
+    [{ kind: 'top-up-first', confirm: true, amount: 50_000 }],
     [{ kind: 'nip07' }],
   ])('refuses %j', (raw) => {
     expect(toPromptAnswer(raw)).toBeUndefined();

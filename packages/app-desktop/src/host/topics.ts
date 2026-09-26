@@ -60,9 +60,9 @@ export class TopicRegistry {
         sub.off = a.notifications(emit);
         break;
       case 'wallet.change':
-        // F17: quote events carry handles, never quote ids.
+        // F17: quote events carry handles, never quote ids. Issue #2: the top-up label.
         sub.off = a.wallet.onChange((e) => {
-          emit(a.quoteHandles.translate(e));
+          emit(a.quoteHandles.translate(a.walletChange(e)));
         });
         break;
       case 'session.peers':

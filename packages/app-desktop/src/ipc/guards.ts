@@ -418,10 +418,16 @@ const isSettingsPatch = obj(
     loadRemoteImages: bool,
     theme: oneOf(['dark', 'light', 'system'] as const),
     // SE-4: `belowSats: 0` is the v4 "off" sentinel; the host treats `<= 0` as disabled.
-    autoTopUp: obj({
-      belowSats: int(0, LIMITS.maxAutoTopUpSats) as Guard<Sats>,
-      fromMint: isMintUrl,
-    }),
+    // Issue #2: `amountSats` is a whole number of sats in 1 … `AUTO_TOP_UP_MAX_SATS` (absent =
+    // the max) — anything else refuses the whole patch (and a stored file, which then reads as
+    // the defaults: auto top-up off).
+    autoTopUp: obj(
+      {
+        belowSats: int(0, LIMITS.maxAutoTopUpThresholdSats) as Guard<Sats>,
+        fromMint: isMintUrl,
+      },
+      { amountSats: int(1, LIMITS.maxAutoTopUpAmountSats) as Guard<Sats> },
+    ),
   },
 );
 
@@ -592,6 +598,18 @@ export const isAuthUrl: Guard<string> = safe(matches(AUTH_URL_RE, MAX_AUTH_URL))
  */
 export const isExternalLink: Guard<string> = safe(matches(AUTH_URL_RE, MAX_AUTH_URL));
 
+/**
+ * Issue #2: the first auto top-up into a mint — two distinct mint URLs (a top-up never funds a
+ * mint from itself) and an amount within the per-top-up cap.
+ */
+const isTopUpFirstForm = (x: unknown): x is Extract<PromptForm, { kind: 'top-up-first' }> =>
+  obj({
+    kind: literal('top-up-first'),
+    target: isMintUrl,
+    source: isMintUrl,
+    amount: int(1, LIMITS.maxAutoTopUpAmountSats) as Guard<Sats>,
+  })(x) && x.target !== x.source;
+
 /** ADR 0013: a question for main's prompt window (data only; the page holds the words). */
 export const isPromptForm: Guard<PromptForm> = safe(
   union(
@@ -602,6 +620,7 @@ export const isPromptForm: Guard<PromptForm> = safe(
     }),
     obj({ kind: literal('bunker'), keychain: bool }),
     obj({ kind: literal('bunker-auth'), url: isAuthUrl }),
+    isTopUpFirstForm,
   ),
 );
 
@@ -618,6 +637,7 @@ export const isPromptAnswer: Guard<PromptAnswer> = safe(
     obj({ kind: literal('create-wallet'), create: bool }),
     obj({ kind: literal('remove-key'), confirm: bool }),
     obj({ kind: literal('bunker-auth'), open: bool }),
+    obj({ kind: literal('top-up-first'), confirm: bool }),
   ),
 );
 
@@ -650,6 +670,8 @@ export function promptAnswerFits(form: PromptForm, a: PromptAnswer): boolean {
       return a.kind === 'remove-key';
     case 'bunker-auth':
       return a.kind === 'bunker-auth';
+    case 'top-up-first':
+      return a.kind === 'top-up-first';
   }
 }
 

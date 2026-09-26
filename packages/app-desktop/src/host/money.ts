@@ -74,6 +74,13 @@ export interface MoneyPlaneOptions {
    */
   readonly createWallet?: boolean;
   readonly now?: () => UnixSeconds;
+  /**
+   * Issue #2: a PAY for an open play session drew (or, short, tried to draw) from `mint` — the
+   * one trigger of an auto top-up outside a play opening. Called after the PAY's authorisation
+   * passed, never for a refused one; not awaited — its result is ignored, and a throw or a
+   * rejected promise is swallowed.
+   */
+  readonly onPayment?: (mint: MintUrl) => unknown;
 }
 
 interface SessionBudget {
@@ -236,6 +243,15 @@ export class MoneyPlane {
     };
   }
 
+  /**
+   * The wallet while the plane still holds its key; `undefined` once `close` ran (signed out,
+   * locked, another signer). Issue #2: what an auto top-up runs with, so one in flight stops
+   * before its melt.
+   */
+  get liveWallet(): walletMod.CashuWallet | undefined {
+    return this.closed ? undefined : this.wallet;
+  }
+
   /** Wipe a wallet key held in memory; later calls reject. */
   close(): void {
     if (this.closed) return;
@@ -276,7 +292,20 @@ export class MoneyPlane {
       if (err instanceof walletMod.WalletError && err.code === 'insufficient-funds')
         throw hostError('no-balance', 'not enough sats at this mint to keep streaming');
       throw err;
+    } finally {
+      // Issue #2: the mint the next PAY draws from (an auto top-up checks it; never awaited).
+      this.paidAt(a.seeder.mint);
     }
+  }
+
+  private paidAt(mint: MintUrl): void {
+    const hook = this.o.onPayment;
+    if (hook === undefined) return;
+    // A top-up check never breaks a payment: a throw — or an async hook's rejection, which a
+    // `try` would not see (an async function passes for a `void` one) — is swallowed here.
+    void Promise.resolve()
+      .then(() => hook(mint))
+      .catch(() => undefined);
   }
 
   private async payHello(

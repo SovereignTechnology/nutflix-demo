@@ -24,6 +24,8 @@ import {
   Skeleton,
   SkeletonLines,
   ToastStack,
+  UI_AUTO_TOP_UP_MAX_SATS,
+  UI_AUTO_TOP_UP_PER_DAY_SATS,
   cx,
   formatRelativeTime,
   formatSats,
@@ -134,7 +136,11 @@ export function historyLabel(entry: WalletHistoryEntry): {
 } {
   const memo = (entry.memo ?? '').trim();
   const fallbackIcon: IconName = entry.direction === 'in' ? 'coin' : 'bolt';
-  if (/^top-?up$/i.test(memo)) return { icon: 'wallet', title: 'Top-up via Lightning' };
+  // Issue #2: an auto top-up's funding melt (at the source mint) reads "top-up" too.
+  if (/^top-?up$/i.test(memo))
+    return entry.direction === 'out'
+      ? { icon: 'wallet', title: 'Auto top-up (moved to another mint)' }
+      : { icon: 'wallet', title: 'Top-up via Lightning' };
   if (/^melt(-?out)?$/i.test(memo)) return { icon: 'bolt', title: 'Withdrawal to Lightning' };
   if (/^receive$/i.test(memo)) return { icon: 'coin', title: 'Received ecash' };
   if (/^stream/i.test(memo)) return { icon: 'play', title: undefined };
@@ -1061,16 +1067,18 @@ function AutoTopUpCard({
     (draft.enabled && (below !== value?.belowSats || draft.from !== value?.fromMint));
   const fromBalance = draft.from !== undefined ? (balances.get(draft.from) ?? 0) : 0;
 
+  // Issue #2: the amount per top-up is set in Settings; saving here keeps it.
+  const keep = value?.amountSats === undefined ? {} : { amountSats: value.amountSats };
   const save = (): void => {
     setTouched(true);
     if (draft.enabled) {
       if (below === undefined || draft.from === undefined) return;
-      onSave({ belowSats: below as Sats, fromMint: draft.from });
+      onSave({ belowSats: below as Sats, fromMint: draft.from, ...keep });
       return;
     }
     const from = draft.from ?? value?.fromMint ?? mints[0];
     if (from === undefined) return;
-    onSave({ belowSats: 0 as Sats, fromMint: from });
+    onSave({ belowSats: 0 as Sats, fromMint: from, ...keep });
   };
 
   let content: ReactElement;
@@ -1164,8 +1172,17 @@ function AutoTopUpCard({
           </>
         ) : null}
         <p className="nf-wallet__hint">
-          Each top-up is a Lightning payment from that mint to the one running low, so the sending
-          mint’s Lightning fee applies. Off unless you turn it on.
+          Each top-up moves{' '}
+          <SatsBadge
+            sats={Math.min(value?.amountSats ?? UI_AUTO_TOP_UP_MAX_SATS, UI_AUTO_TOP_UP_MAX_SATS)}
+            variant="neutral"
+            size="sm"
+          />{' '}
+          (set in Settings) as a Lightning payment from that mint to one on your list that is
+          running low, so the sending mint’s Lightning fee applies — at most{' '}
+          <SatsBadge sats={UI_AUTO_TOP_UP_PER_DAY_SATS} variant="neutral" size="sm" /> in any 24
+          hours, fees included. The first top-up into each mint asks you to confirm. Off unless you
+          turn it on.
         </p>
         {draft.enabled && draft.from !== undefined && fromBalance <= 0 ? (
           <p className="nf-wallet__notice nf-wallet__notice--warning">

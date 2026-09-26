@@ -1,7 +1,11 @@
 /** Pure helpers behind the Settings forms: URL validation, units, bounds, error copy. */
 import { describe, expect, it } from 'vitest';
+import { AUTO_TOP_UP_MAX_SATS as CORE_TOP_UP_MAX, AUTO_TOP_UP_MAX_SATS_PER_DAY } from '@sovit/core';
 import {
+  AUTO_TOP_UP_AMOUNT_MAX_SATS,
+  AUTO_TOP_UP_PER_DAY_SATS,
   GIB,
+  autoTopUpAmount,
   autoTopUpEnabled,
   clampPrefetch,
   describeLoadError,
@@ -10,6 +14,7 @@ import {
   gbFieldValue,
   parseDiskCapGb,
   parseThresholdSats,
+  parseTopUpAmountSats,
   signerTitle,
   validateMintUrl,
   validateRelayUrl,
@@ -127,6 +132,22 @@ describe('units and bounds', () => {
     expect(autoTopUpEnabled(undefined)).toBe(false);
     expect(autoTopUpEnabled({ belowSats: 0 })).toBe(false);
     expect(autoTopUpEnabled({ belowSats: 1 })).toBe(true);
+  });
+
+  it('issue #2: the amount per top-up — the caps are core’s, absent = the max, 1 … 10,000 whole sats', () => {
+    expect(AUTO_TOP_UP_AMOUNT_MAX_SATS).toBe(CORE_TOP_UP_MAX);
+    expect(AUTO_TOP_UP_PER_DAY_SATS).toBe(AUTO_TOP_UP_MAX_SATS_PER_DAY);
+    expect(autoTopUpAmount(undefined)).toBe(10_000);
+    expect(autoTopUpAmount({})).toBe(10_000);
+    expect(autoTopUpAmount({ amountSats: 2_500 })).toBe(2_500);
+    expect(autoTopUpAmount({ amountSats: 99_999 })).toBe(10_000);
+    expect(parseTopUpAmountSats(' 2,500 ')).toEqual({ ok: true, value: 2_500 });
+    expect(parseTopUpAmountSats('10000')).toEqual({ ok: true, value: 10_000 });
+    for (const bad of ['', '0', '10001', '1.5', '-5', 'abc'])
+      expect(parseTopUpAmountSats(bad).ok, bad).toBe(false);
+    expect(parseTopUpAmountSats('20000')).toMatchObject({
+      error: expect.stringContaining('10,000'),
+    });
   });
 });
 

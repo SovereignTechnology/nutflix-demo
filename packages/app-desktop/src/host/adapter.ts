@@ -8,8 +8,11 @@
  *   unreact   NIP-09 kind-5 of the viewer's OWN kind-7 ids on the video, never a `-` (SE-5)
  *   play      worker `play.open` → a `HostPlaySession` (host-minted sid; the blob-server link
  *             goes to main as `media-link`, never into a result)
- *   money     `MockWallet` behind `--dev-mocks`, debited from the worker's `spend` events;
- *             nothing executes an auto top-up (SE-4)
+ *   money     `MockWallet` behind `--dev-mocks`, debited from the worker's `spend` events
+ *             (an auto top-up is only logged there); with the user's real wallet an auto
+ *             top-up EXECUTES behind its caps and first-funding confirm (issue #2,
+ *             `./topup/auto-topup.ts`) — only from the payment path (a play opening here,
+ *             a PAY in the money plane), never from a wallet balance event
  *   settings  atomic JSON in userData
  *   images    `./images/images.ts` (T16)
  *
@@ -44,6 +47,8 @@ import type {
   VideoManifest,
   VideoStats,
   Wallet,
+  WalletChangeEvent,
+  WalletHistoryEntry,
 } from '@sovit/core';
 import { MAX_IMAGE_BYTES, NostrKind, manifest, nostr } from '@sovit/core';
 
@@ -76,6 +81,7 @@ import type { WorkerCall } from './sessions.js';
 import { HostPlaySession, SessionRegistry } from './sessions.js';
 import { buildUnreactDeletion, fetchReactionSummary, ownReactionIds } from './social/reactions.js';
 import type { MoneyPlane } from './money.js';
+import type { AutoTopUp, TopUpOutcome } from './topup/auto-topup.js';
 import type { WalletProvider } from './wallet.js';
 import { DEV_BALANCE_SATS, SwitchingWallet } from './wallet.js';
 
@@ -102,6 +108,11 @@ export interface DesktopAdapterOptions {
    * sessions — and revoked on that same plane when the session closes.
    */
   readonly money?: () => MoneyPlane | undefined;
+  /**
+   * Issue #2: executes due auto top-ups with the user's REAL wallet (absent with `--dev-mocks`,
+   * where a due top-up is only logged).
+   */
+  readonly autoTopUp?: AutoTopUp;
   readonly images: ImageService;
   /** `WorkerSupervisor.request`, bound. */
   readonly worker: WorkerCall;
@@ -122,7 +133,7 @@ const LIST_PAGE = 20;
 const COMMENTS_PAGE = 20;
 /** Upper bound on comments counted for `stats().comments` (one relay query). */
 const MAX_COMMENTS_COUNTED = 500;
-/** How often (ms) a due-but-not-executed auto top-up is logged per mint. */
+/** How often (ms) a due-but-not-executed (`--dev-mocks`) auto top-up is logged per mint. */
 const TOP_UP_LOG_EVERY_MS = 60_000;
 
 /** Watch's report reasons → NIP-56 report types. */
@@ -170,7 +181,7 @@ export class DesktopNetworkAdapter implements NetworkAdapter {
     this.wallet = opts.wallet.wallet;
     this.nostrCatalog = new NostrCatalog(() => this.client());
     this.wallet.onChange((e) => {
-      if (e.type === 'balance') this.checkAutoTopUp(e.mint, e.balance);
+      if (e.type === 'balance') this.logAutoTopUpDue(e.mint, e.balance);
     });
   }
 
@@ -591,9 +602,48 @@ export class DesktopNetworkAdapter implements NetworkAdapter {
     if (this.o.wallet.kind === 'unavailable')
       fail('payments-unavailable', 'no wallet in Stage 1 (run with --dev-mocks for fake sats)');
     const mints = video.price.mints;
-    const balances = await Promise.all(mints.map((m) => this.wallet.balance(m)));
+    let balances = await Promise.all(mints.map((m) => this.wallet.balance(m)));
+    const top = this.o.wallet.kind === 'real' ? this.o.autoTopUp : undefined;
+    if (top !== undefined && mints.length > 0) {
+      if (balances.every((b) => b <= 0)) {
+        // Issue #2: nothing to pay with — top up a TRUSTED paying mint first (the first funding
+        // of a mint asks the user in main's prompt window; a manifest's other mints are never
+        // topped up: `autoTopUpDue` requires the user's own list). One top-up at a time.
+        // The first mint that is due decides: done, declined, capped or failed, no second mint
+        // is tried (and asked about) for the same play.
+        for (const m of mints) {
+          const out = await top.check(m, 0 as Sats);
+          if (out !== 'not-due') break;
+        }
+        balances = await Promise.all(mints.map((m) => this.wallet.balance(m)));
+      } else {
+        mints.forEach((m, i) => {
+          void top.check(m, balances[i] ?? (0 as Sats));
+        });
+      }
+    }
     if (mints.length === 0 || balances.every((b) => b <= 0))
       fail('no-balance', `no balance at ${mints[0] ?? 'any accepted mint'}`);
+  }
+
+  /** `wallet.history` as the screens see it: an auto top-up's funding melt says "top-up". */
+  async walletHistory(opts?: {
+    readonly limit?: number;
+    readonly mint?: MintUrl;
+  }): Promise<readonly WalletHistoryEntry[]> {
+    const list = await this.wallet.history(opts);
+    const top = this.o.autoTopUp;
+    return top === undefined ? list : list.map((e) => top.relabel(e));
+  }
+
+  /** `wallet.change` events as the screens see them (`walletHistory`'s label). */
+  walletChange(e: WalletChangeEvent): WalletChangeEvent {
+    return this.o.autoTopUp?.relabelChange(e) ?? e;
+  }
+
+  /** The auto top-up in flight, if any (tests, shutdown). */
+  topUpInFlight(): Promise<TopUpOutcome> | null {
+    return this.o.autoTopUp?.inFlight ?? null;
   }
 
   image(url: string, sha256?: Sha256Hex, size?: number): Promise<NfMediaImgUrl> {
@@ -896,14 +946,22 @@ export class DesktopNetworkAdapter implements NetworkAdapter {
       }
   }
 
-  /** SE-4: evaluated, logged, NEVER executed in Stage 1. */
-  private checkAutoTopUp(mint: MintUrl, balance: Sats): void {
+  /**
+   * A balance changed. It NEVER starts a top-up (issue #2, independent review finding 1): a
+   * balance event is also the user's own withdrawal, send or nutzap, or a seeder melt, and the
+   * contract compares `belowSats` at the mint a payment is about to draw from — so a real-wallet
+   * top-up starts only from the payment path (`checkBalance` at a play, the money plane's PAY
+   * via `AutoTopUp.paymentAt`). With `--dev-mocks` (fake sats, where the worker's spends debit
+   * the mock wallet) a due top-up is logged, as in Stage 1 (SE-4).
+   */
+  private logAutoTopUpDue(mint: MintUrl, balance: Sats): void {
+    if (this.o.wallet.kind !== 'mock') return;
     if (!autoTopUpDue(this.o.settings.get(), mint, balance)) return;
     const t = Date.now();
     const last = this.topUpLogged.get(mint) ?? 0;
     if (t - last < TOP_UP_LOG_EVERY_MS) return;
     this.topUpLogged.set(mint, t);
-    this.log.info('auto top-up would be due; not executed in Stage 1');
+    this.log.info('auto top-up would be due; not executed with --dev-mocks');
   }
 }
 

@@ -19,6 +19,14 @@ interface PromptApi {
 /** The same floor the host enforces (`MIN_NEW_PASSPHRASE_BYTES`, counted here in characters). */
 export const MIN_PASSPHRASE_CHARS = 12;
 
+/**
+ * Issue #2: the daily auto top-up cap the page states — the host's `LIMITS.maxAutoTopUpSatsPerDay`
+ * (core's `AUTO_TOP_UP_MAX_SATS_PER_DAY`), pinned by a test: the page bundle imports nothing.
+ */
+export const TOP_UP_PER_DAY_SATS = 50_000;
+/** Issue #2: the most one auto top-up moves — `LIMITS.maxAutoTopUpAmountSats`, pinned by a test. */
+export const TOP_UP_MAX_SATS = 10_000;
+
 type Answer =
   | {
       kind: 'local-setup';
@@ -31,6 +39,7 @@ type Answer =
   | { kind: 'remove-key'; confirm: boolean }
   | { kind: 'bunker-auth'; open: boolean }
   | { kind: 'open-link'; open: boolean }
+  | { kind: 'top-up-first'; confirm: boolean }
   | null;
 
 // ---- tiny DOM helpers --------------------------------------------------------------------
@@ -91,6 +100,19 @@ function password(
     maxlength: '1024',
   });
   return { row: el('div', { class: 'field' }, el('label', { for: id }, label), input), input };
+}
+
+/** A URL's host as `URL` gives it: ASCII (IDNA-encoded), so no look-alike Unicode. */
+function hostOf(url: string): string {
+  try {
+    return new URL(url).host;
+  } catch {
+    return '(invalid address)';
+  }
+}
+
+function satsText(n: number): string {
+  return `${n.toLocaleString('en-US')} ${n === 1 ? 'sat' : 'sats'}`;
 }
 
 function checked(form: HTMLFormElement, name: string): string | undefined {
@@ -365,6 +387,34 @@ function view(q: WindowForm): View {
         collect: () => ({ kind: 'open-link', open: true }),
       };
     }
+    case 'top-up-first': {
+      const perDay = satsText(TOP_UP_PER_DAY_SATS);
+      return {
+        title: 'Allow automatic top-ups into this mint?',
+        body: [
+          el('p', {}, 'Auto top-up wants to move sats into this mint for the first time:'),
+          el(
+            'dl',
+            { class: 'facts' },
+            el('dt', {}, 'Into'),
+            el('dd', {}, el('code', {}, hostOf(q.target))),
+            el('dt', {}, 'From'),
+            el('dd', {}, el('code', {}, hostOf(q.source))),
+            el('dt', {}, 'Each top-up'),
+            el('dd', {}, satsText(q.amount)),
+          ),
+          el(
+            'p',
+            { class: 'hint' },
+            `If you allow it, later top-ups into this mint run without asking: each at most the amount set in Settings (never more than ${satsText(TOP_UP_MAX_SATS)}), and ${perDay} in any 24 hours, Lightning fees included. Turn auto top-up off in Settings › Mints and top-up.`,
+          ),
+        ],
+        submitLabel: 'Allow top-ups',
+        cancelLabel: 'Not now',
+        safeNo: { kind: 'top-up-first', confirm: false },
+        collect: () => ({ kind: 'top-up-first', confirm: true }),
+      };
+    }
     case 'create-wallet': {
       return {
         title: 'No wallet found',
@@ -397,7 +447,8 @@ function isForm(x: unknown): x is WindowForm {
     k === 'create-wallet' ||
     k === 'remove-key' ||
     k === 'bunker-auth' ||
-    k === 'open-link'
+    k === 'open-link' ||
+    k === 'top-up-first'
   );
 }
 

@@ -52,6 +52,10 @@ export interface RigOptions {
   readonly nip46?: HostOptions['nip46'];
   /** Plays main: sees every HostOut after it is recorded (answer prompts with `host.handle`). */
   readonly onOut?: (o: HostOut, host: () => Host) => void;
+  /** A relay pool prepared beforehand (e.g. holding the user's NIP-60 wallet event). */
+  readonly pool?: nostr.FakeRelayPool;
+  /** Issue #2: the auto top-up's clock and target polling. */
+  readonly topUp?: HostOptions['topUp'];
 }
 
 /** Polls `check` every few ms until it returns a value, or fails with `what` after `ms`. */
@@ -71,7 +75,7 @@ export async function eventually<T>(
 
 export async function rig(o: RigOptions = {}): Promise<Rig> {
   const userData = await mkdtemp(join(tmpdir(), 'nf-l6b-'));
-  const pool = new nostr.FakeRelayPool();
+  const pool = o.pool ?? new nostr.FakeRelayPool();
   const out: HostOut[] = [];
   const log = memoryLogger('debug');
   const spawner = fakeSpawner(() => new FakeWorkerClass(o.worker));
@@ -98,6 +102,7 @@ export async function rig(o: RigOptions = {}): Promise<Rig> {
     ...(o.mintRequest === undefined ? {} : { mintRequest: o.mintRequest }),
     ...(o.signerCost === undefined ? {} : { signerCost: o.signerCost }),
     ...(o.nip46 === undefined ? {} : { nip46: o.nip46 }),
+    ...(o.topUp === undefined ? {} : { topUp: o.topUp }),
     imageTransport: o.imageTransport ?? (() => Promise.reject(new Error('no network in tests'))),
   });
   late.host = host;

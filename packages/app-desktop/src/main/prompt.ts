@@ -38,6 +38,7 @@ export type PageAnswer =
       | { kind: 'create-wallet' }
       | { kind: 'remove-key' }
       | { kind: 'bunker-auth' }
+      | { kind: 'top-up-first' }
     >
   | { readonly kind: 'secret'; readonly value: string }
   | { readonly kind: 'bunker'; readonly uri: string; readonly remember: boolean }
@@ -117,6 +118,9 @@ export function toPromptAnswer(raw: unknown): PromptAnswer | null | undefined {
       case 'bunker-auth':
         if (keys !== 'kind,open' || typeof o['open'] !== 'boolean') return undefined;
         return { kind: 'bunker-auth', open: o['open'] };
+      case 'top-up-first':
+        if (keys !== 'confirm,kind' || typeof o['confirm'] !== 'boolean') return undefined;
+        return { kind: 'top-up-first', confirm: o['confirm'] };
       case 'secret': {
         if (keys !== 'kind,value' || !isOwnText(o['value'], MAX_SECRET_BYTES)) return undefined;
         const value = enc(o['value']);
