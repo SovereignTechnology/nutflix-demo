@@ -107,7 +107,15 @@ export class Seeder {
   private readonly engine: PaymentEngineSeeder;
   private readonly listeners = new Set<(e: SeederEvent) => void>();
   private readonly readyListeners = new Set<(session: PeerSession) => void>();
-  private readonly gates = new Map<string, () => void>();
+  /**
+   * Upload gates by core key, each with the Hypercore SESSION it is attached to: a core closed by
+   * key and reopened is a new session, and gets a new gate (fix round 4 — keyed by key alone, the
+   * reopened core used to be served with no accounting at all).
+   */
+  private readonly gates = new Map<
+    string,
+    { readonly core: object; readonly detach: () => void }
+  >();
   private readonly protocols = new Map<PeerSession, PayProtocol>();
   private readonly unsubs: (() => void)[] = [];
   private policyOverride: PricePolicy | null;
@@ -168,6 +176,9 @@ export class Seeder {
       logger: this.log,
       onCoreOpened: (sc) => {
         this.onCoreOpened(sc);
+      },
+      onCoreClosed: (sc) => {
+        this.onCoreClosed(sc);
       },
     });
     this.swarm = config.swarm
@@ -249,7 +260,7 @@ export class Seeder {
     for (const off of this.unsubs) off();
     await this.scheduler.stop({ flush: true });
     this.sessions.closeAll();
-    for (const detach of this.gates.values()) detach();
+    for (const g of this.gates.values()) g.detach();
     this.gates.clear();
     if (this.swarm) await this.swarm.destroy();
     await this.blobs.close();
@@ -458,7 +469,11 @@ export class Seeder {
   ): void {
     const prev = this.corePolicies.get(core) ?? this.policyOverride;
     if (policy === null) this.corePolicies.delete(core);
-    else this.corePolicies.set(core, policy);
+    else {
+      this.corePolicies.set(core, policy);
+      // A core with a price is sold, never served free (fix round 4).
+      this.freeCores.delete(core);
+    }
     const next = this.corePolicies.get(core) ?? this.policyOverride;
     if (!(opts.announce ?? true) || prev === null || next === null) return;
     if (prev.satsPerBlock !== next.satsPerBlock) this.announcePrice(core, prev, next);
@@ -471,12 +486,19 @@ export class Seeder {
 
   /**
    * ADR 0015: serve `core` outside payment (a creator's profile core — thumbnails, avatars), or
-   * stop. A free core's blocks are never recorded against a peer's window. A core that also has
-   * a price policy stays free while marked: the caller marks only profile cores.
+   * stop. A free core's blocks are never recorded against a peer's window. Fix round 4: a core
+   * with its own price policy is never marked free (`false` is returned and nothing changes), and
+   * `setCorePolicy` clears the mark — so a caller that names a paid core by mistake (an image URL
+   * pointing at a video) cannot give that video away.
    */
-  setFreeCore(core: CoreKeyHex, free: boolean): void {
-    if (free) this.freeCores.add(core);
-    else this.freeCores.delete(core);
+  setFreeCore(core: CoreKeyHex, free: boolean): boolean {
+    if (!free) {
+      this.freeCores.delete(core);
+      return true;
+    }
+    if (this.corePolicies.has(core)) return false;
+    this.freeCores.add(core);
+    return true;
   }
 
   /** Whether `core` is served outside payment. */
@@ -566,9 +588,20 @@ export class Seeder {
   }
 
   private onCoreOpened(sc: SeedCore): void {
-    if (!this.gates.has(sc.keyHex))
-      this.gates.set(sc.keyHex, this.sessions.attachUploadGate(sc.core));
+    const had = this.gates.get(sc.keyHex);
+    if (had?.core !== sc.core) {
+      had?.detach();
+      this.gates.set(sc.keyHex, { core: sc.core, detach: this.sessions.attachUploadGate(sc.core) });
+    }
     if (this.started && this.swarm) this.swarm.join(sc.core.discoveryKey);
+  }
+
+  /** `closeCoreByKey`: that session's gate goes with it (a reopen attaches a new one). */
+  private onCoreClosed(sc: SeedCore): void {
+    const had = this.gates.get(sc.keyHex);
+    if (had?.core !== sc.core) return;
+    had.detach();
+    this.gates.delete(sc.keyHex);
   }
 
   private onSwarmSession(session: PeerSession, conn: SwarmConnection, _info: PeerInfo): void {

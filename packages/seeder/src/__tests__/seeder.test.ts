@@ -443,6 +443,57 @@ describe('Seeder façade', () => {
     expect(a.log.lines.some((l) => l.includes('session-ready listener threw'))).toBe(true);
   });
 
+  // Fix round 4 (cross-lane review, MEDIUM): the upload gate was attached only when no gate was
+  // recorded for the core's KEY, and `closeCoreByKey` never removed that record — a closed session
+  // leaves the core's monitors, so a core reopened by key served every block with no
+  // `recordUpload`, no window cut and no PRICE (and every PAY for it was then refused).
+  it('a core closed by closeCoreByKey and reopened by key gets its upload gate back: every open is gated', async () => {
+    const s = await make({ windowBlocks: 8 });
+    const key = new Uint8Array(32).fill(0x42);
+    const peer = (k: number) => {
+      const stream = new FakeStream(noiseKey(k));
+      return { remotePublicKey: noiseKey(k), stream };
+    };
+    const first = await s.seeder.blobs.openCoreByKey(key);
+    expect(first.core.listenerCount('upload')).toBe(1);
+    await s.seeder.blobs.closeCoreByKey(first.keyHex);
+    const again = await s.seeder.blobs.openCoreByKey(key);
+    expect(again.core).not.toBe(first.core);
+    expect(again.core.listenerCount('upload')).toBe(1);
+    // …and it records what it serves.
+    const p = peer(31);
+    again.core.emit('upload', 0, BLOCK, p);
+    expect(s.engine.window(toHex(noiseKey(31)) as never)?.uploaded).toBe(1);
+    // A second open of the same (still open) core does not gate it twice.
+    expect((await s.seeder.blobs.openCoreByKey(key)).core.listenerCount('upload')).toBe(1);
+  });
+
+  // Fix round 4 (cross-lane review, MEDIUM): an image read naming a paid core marked it free on
+  // our own seeder, so every peer downloaded that video from us free and was never cut.
+  it('setFreeCore refuses a core with its own price policy, and setCorePolicy clears the free flag', async () => {
+    const s = await make();
+    const priced = 'a1'.repeat(32) as never;
+    const profile = 'b2'.repeat(32) as never;
+    const policy: PricePolicy = {
+      satsPerBlock: 2 as never,
+      blockSize: BLOCK,
+      mints: [mocks.MINTS.a],
+      split: { seeder: 50, creator: 50 },
+      creatorP2pk: mocks.asP2pk('creator'),
+    };
+    s.seeder.setCorePolicy(priced, policy);
+    expect(s.seeder.setFreeCore(priced, true)).toBe(false);
+    expect(s.seeder.isFreeCore(priced)).toBe(false);
+    expect(s.seeder.setFreeCore(profile, true)).toBe(true);
+    expect(s.seeder.isFreeCore(profile)).toBe(true);
+    s.seeder.setCorePolicy(profile, policy); // a price for it now: sold, never free
+    expect(s.seeder.isFreeCore(profile)).toBe(false);
+    s.seeder.setCorePolicy(profile, null);
+    expect(s.seeder.setFreeCore(profile, true)).toBe(true); // no policy any more: may be free
+    expect(s.seeder.setFreeCore(profile, false)).toBe(true);
+    expect(s.seeder.isFreeCore(profile)).toBe(false);
+  });
+
   it('policy() throws until configured; close() is idempotent and flushes', async () => {
     const s = await make();
     expect(() => s.seeder.policy()).toThrow(/PricePolicy/);
