@@ -168,5 +168,7 @@ describe('scripts/native-module-inventory.sh (real repo)', () => {
       env: { NATIVE_INVENTORY_STRICT: process.platform === 'linux' ? '1' : '0' },
     });
     expect(r.status, r.stdout + r.stderr).toBe(0);
-  });
+    // It walks the whole real node_modules (660 packages since the packaging devDependencies,
+    // issue #6): ~2 s alone, past vitest's 5 s default under a loaded full-suite run.
+  }, 30_000);
 });
