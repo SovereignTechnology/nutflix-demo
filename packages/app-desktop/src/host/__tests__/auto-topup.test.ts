@@ -1245,6 +1245,33 @@ describe('AutoTopUp — round 4 (money high): a melt whose outcome is unknown ke
     expect(await s.wallet.balance(TARGET)).toBe(2_000);
   });
 
+  it('the result commit fails after the mint paid (the signer timed out, the plane locked): the quote is kept, minted once, and labelled once the journal settles the melt', async () => {
+    const s = await setup({ fund: 20_000, amountSats: 2_000 });
+    const commit = s.store.commit.bind(s.store);
+    let failOnce = true;
+    vi.spyOn(s.store, 'commit').mockImplementation((tx) => {
+      if (failOnce && tx.history?.memo === 'melt to Lightning') {
+        failOnce = false;
+        return Promise.reject(new Error('remote-signer: the bunker did not answer'));
+      }
+      return commit(tx);
+    });
+    expect(await s.top.check(TARGET)).toBe('failed');
+    expect(s.lightning.paid).toHaveLength(1); // the mint paid the invoice
+    expect(s.ledger.snapshot().entries).toMatchObject([{ state: 'unknown' }]);
+    pastBackoff(s);
+    expect(await s.top.check(TARGET)).toBe('not-due'); // minted at the next trigger
+    expect(await s.wallet.balance(TARGET)).toBe(2_000);
+    expect(s.ledger.openEntries(OWNER)).toMatchObject([{ minted: true }]); // melt still journaled
+    await s.wallet.recoverPending(); // the settle loop restores the change
+    later(s, TOP_UP_RESOLVE_EVERY_MS + 1);
+    await s.top.resume();
+    expect(s.ledger.openEntries(OWNER)).toEqual([]);
+    expect(s.ledger.snapshot().entries).toMatchObject([{ state: 'done', sats: 2_000 }]);
+    expect((await sourceMemos(s)).filter((m) => m === 'top-up')).toHaveLength(2);
+    expect(s.lightning.paid).toHaveLength(1);
+  });
+
   it.each(['before', 'after'] as const)(
     'a restart %s the source settles: the next start mints it once',
     async (when) => {
@@ -1513,16 +1540,18 @@ describe('AutoTopUp — round 4 (info): the startup settle first, a play waits a
   });
 
   it('a play waits for its top-up at most playWaitMs past the question; the top-up finishes in the background', async () => {
+    // Made up front: releasing before the run reaches its melt (a slow run under load) is fine.
     let release: () => void = () => undefined;
+    const paying = new Promise<void>((r) => {
+      release = r;
+    });
     const s: Setup = await setup({
       fund: 20_000,
       amountSats: 2_000,
       wrap: (w) =>
         Object.assign(Object.create(w) as Wallet, {
           melt: async (q: Parameters<Wallet['melt']>[0]) => {
-            await new Promise<void>((r) => {
-              release = r;
-            });
+            await paying;
             return w.melt(q);
           },
         }),
