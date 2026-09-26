@@ -89,6 +89,14 @@ export const DLEQ_INLINE_CHUNK = 2;
 type Check = payment.DleqCheck;
 type Verify = (proof: Check['proof'], keyset: Check['keyset']) => boolean;
 
+/**
+ * A timeout option: a finite number of milliseconds ≥ 0, else `dflt`. NaN would wait for ever
+ * (`Atomics.waitAsync` reads it as +∞); 0 gives up at once, which only ever means the chunked path.
+ */
+export function timeoutOption(v: number | undefined, dflt: number): number {
+  return v !== undefined && Number.isFinite(v) && v >= 0 ? v : dflt;
+}
+
 /** `Atomics.waitAsync` (ES2024; in V8 under Bare and Node, typed here: the lib is ES2023). */
 type WaitAsync = (
   a: Int32Array,
@@ -146,10 +154,11 @@ export class DleqThread {
     readonly dataBytes?: number;
   }) {
     this.spawn = o.spawn;
-    this.startMs = o.startMs ?? DLEQ_THREAD_START_MS;
-    this.jobMs = o.jobMs ?? DLEQ_THREAD_JOB_MS;
-    this.reapMs = o.reapMs ?? DLEQ_THREAD_REAP_MS;
-    this.dataBytes = o.dataBytes ?? MAILBOX_DATA_BYTES;
+    this.startMs = timeoutOption(o.startMs, DLEQ_THREAD_START_MS);
+    this.jobMs = timeoutOption(o.jobMs, DLEQ_THREAD_JOB_MS);
+    this.reapMs = timeoutOption(o.reapMs, DLEQ_THREAD_REAP_MS);
+    const d = o.dataBytes;
+    this.dataBytes = d !== undefined && Number.isSafeInteger(d) && d > 0 ? d : MAILBOX_DATA_BYTES;
   }
 
   /** False once closed, or once the thread failed to start twice. */
@@ -176,6 +185,10 @@ export class DleqThread {
   tryVerify(checks: readonly Check[]): Promise<boolean[]> | null {
     if (!this.usable) return null;
     if (this.started) return this.verify(checks);
+    // A retired thread is still leaving (its job outlived `jobMs`, or its start `startMs`): no
+    // second thread beside it. On a starved CPU each new one would slow the next job past its
+    // timeout too, and they would pile up. The chunked path answers until it is gone.
+    if (this.reaping.size > 0) return null;
     if (this.starting === null) void this.ensureStarted().catch(() => undefined);
     return null;
   }

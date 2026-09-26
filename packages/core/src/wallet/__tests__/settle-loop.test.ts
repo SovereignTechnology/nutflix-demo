@@ -151,6 +151,41 @@ describe('SettleLoop — when the journal settles by itself', () => {
     loop.stop();
   });
 
+  it('a retry is not pushed out by events either: PAYs every 10 s still let the 30 s retry run', async () => {
+    // The retry is planned relative to "now"; recomputed at every event it would always be 30 s
+    // away and never run (the mutation pass found this unpinned).
+    const clock = { t: T0 };
+    const { w, wallet, now } = scripted(clock);
+    const tm = manualTimer();
+    const loop = new SettleLoop({ wallet, now, timer: tm.timer });
+    w.count = 1;
+    w.overdue = 1;
+    loop.start();
+    await loop.idle();
+    expect(loop.plannedAt).toBe(T0 + SETTLE_RETRY_MIN_S);
+    for (const dt of [10, 20, 29]) {
+      clock.t = T0 + dt;
+      w.emit();
+      await loop.idle();
+      expect(loop.plannedAt).toBe(T0 + SETTLE_RETRY_MIN_S);
+    }
+    expect(tm.live()).toHaveLength(1);
+    loop.stop();
+  });
+
+  it('a clock that is not a number plans nothing (no settle "now", again and again)', async () => {
+    const clock = { t: Number.NaN };
+    const { w, wallet, now } = scripted(clock);
+    const tm = manualTimer();
+    const loop = new SettleLoop({ wallet, now, timer: tm.timer });
+    w.count = 1;
+    w.overdue = 1;
+    loop.start();
+    await loop.idle();
+    expect(tm.live()).toHaveLength(0);
+    loop.stop();
+  });
+
   it('retries overdue entries 30 s, 60 s, … up to the wait; from 30 s again once a settle decides one', async () => {
     const clock = { t: T0 };
     const { w, wallet, now } = scripted(clock);

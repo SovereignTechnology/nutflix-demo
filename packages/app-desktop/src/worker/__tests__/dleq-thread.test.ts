@@ -44,6 +44,7 @@ import {
   chunkedDleq,
   dleqVerifier,
   serveDleqMailbox,
+  timeoutOption,
   type DleqThreadHandle,
   type SpawnDleqThread,
 } from '../pay/dleq-thread.js';
@@ -128,12 +129,14 @@ import { workerData } from 'node:worker_threads';
 import { serveDleqMailbox } from '${join(HERE, '..', 'pay', 'dleq-thread.ts').replaceAll('\\', '/')}';
 serveDleqMailbox(workerData, () => { throw new Error('boom'); });
 `;
-/** Says FAIL at start (as the Bare entry does when core does not load). */
+/** Says FAIL at start, then that it is leaving (as the Bare entry does when core does not load). */
 const FAIL_AT_START = `
 import { workerData } from 'node:worker_threads';
-const ctl = new Int32Array(workerData, 0, 2);
+const ctl = new Int32Array(workerData, 0, 3);
 Atomics.store(ctl, 0, ${String(MAILBOX.FAIL)});
 Atomics.notify(ctl, 0);
+Atomics.store(ctl, 2, 1);
+Atomics.notify(ctl, 2);
 `;
 /** Ready, then answers every job with one boolean too few. */
 const WRONG_COUNT = `
@@ -341,17 +344,22 @@ describe('dleqVerifier — failure is never acceptance', () => {
       // reapMs: these stand-in threads never say they are leaving, so they are let go after it.
       const v = dleqVerifier({ spawn, verify, startMs: 300, jobMs: 300, reapMs: 300 });
       try {
-        // Three PAYs, each after the start that the one before began is over.
+        // Three PAYs, each after the start that the one before began is over — and after a
+        // retired thread is gone: no new thread starts beside one still leaving (issue #8
+        // review, finding 2 follow-up), and these stand-ins are let go after reapMs.
         for (let i = 0; i < 3; i++) {
           expect(await v.verify(cs)).toEqual(want);
           await v.ready();
+          await new Promise((r) => setTimeout(r, 400));
         }
       } finally {
         // Awaited since the issue #8 review (finding 2): a retired thread is stopped in the
         // background, never by a blocking join on the event loop.
         await v.close();
       }
-      expect(spawn.joins).toEqual([]); // none said it was leaving: none was joined
+      // Never joined before it said it was leaving (only the FAIL_AT_START stand-in says so).
+      expect(spawn.joins.filter((x) => x !== 1)).toEqual([]);
+      if (name === 'FAIL_AT_START') expect(spawn.joins).toEqual([1, 1]);
       if (name === 'FAIL_AT_START' || name === 'SILENT') expect(spawn.spawned).toBe(2); // two failed starts: off for good
       if (name === 'HANG') expect(spawn.terminated).toBeGreaterThanOrEqual(1); // replaced
     });
@@ -438,6 +446,42 @@ describe('retiring a thread never blocks the event loop (issue #8 review, findin
     expect(spawn.joins).toEqual([]);
     expect(spawn.terminated).toBe(1); // asked to stop (never blocks), then let go
     expect(t.reaps).toEqual({ joined: 0, abandoned: 1 });
+  });
+
+  it('while a retired thread is still leaving, no second thread starts: the checks run chunked', async () => {
+    const spawn = nodeSpawner('SLOW_JOB');
+    const t = new DleqThread({ spawn, jobMs: 200, reapMs: 10_000 });
+    expect(t.tryVerify(cs)).toBeNull(); // begins the start
+    expect(await t.ready()).toBe(true);
+    const onThread = t.tryVerify(cs);
+    expect(onThread).not.toBeNull();
+    await expect(onThread).rejects.toThrow(/timed out/); // the job outlives jobMs
+    // The retired thread is still checking: nothing starts beside it (on a starved CPU new
+    // threads would only pile up).
+    expect(t.tryVerify(cs)).toBeNull();
+    expect(t.tryVerify(cs)).toBeNull();
+    expect(spawn.spawned).toBe(1);
+    await until(() => t.reaps.joined === 1);
+    // Gone: the next PAY begins a new start.
+    expect(t.tryVerify(cs)).toBeNull();
+    expect(spawn.spawned).toBe(2);
+    await t.close();
+  });
+
+  it('a timeout option that is not a finite number ≥ 0 means the default (NaN would wait for ever)', async () => {
+    expect(timeoutOption(undefined, 7)).toBe(7);
+    expect(timeoutOption(Number.NaN, 7)).toBe(7);
+    expect(timeoutOption(Number.POSITIVE_INFINITY, 7)).toBe(7);
+    expect(timeoutOption(-1, 7)).toBe(7);
+    expect(timeoutOption(0, 7)).toBe(0);
+    expect(timeoutOption(250, 7)).toBe(250);
+    // A data area that is not a positive integer means the default one, and checks still work.
+    const t = new DleqThread({ spawn: nodeSpawner('SERVE'), dataBytes: Number.NaN });
+    try {
+      expect(await t.verify(cs)).toEqual(inline(cs));
+    } finally {
+      await t.close();
+    }
   });
 
   it('serveDleqMailbox: a QUIT set before it boots returns at once, keeps QUIT, and says it is leaving', () => {

@@ -145,6 +145,8 @@ export class SettleLoop {
     if (this.busy()) return; // stopped, or a settle began, while the journal was read
     if (s.overdue === 0) this.streak = 0;
     const now = this.now();
+    // A clock that is not a number would plan a settle for "now" again and again: plan none.
+    if (!Number.isFinite(now)) return;
     let at: number | null = null;
     // A stamp in the future (the clock went back) waits at most one full wait.
     if (s.next !== null) at = Math.min(s.next, now + PENDING_SETTLE_AFTER_S) + SETTLE_MARGIN_S;
