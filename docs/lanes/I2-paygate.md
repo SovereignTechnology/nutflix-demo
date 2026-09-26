@@ -134,8 +134,79 @@ Residuals, in the review record:
 - R6: a second wallet in `money.ts` would bypass the gate.
 - R7: the host still cannot cancel a request.
 
+## Cross-lane review (round 4)
+
+Findings from the money-plane cross-lane review (auto top-up #2 × residuals #8) and the I2
+verifier, fixed here on top of the merged top-up and residuals lanes. Commits `bc0e36d` (TestMint
+hooks) and `c2f7312` (fixes and tests); ADR 0012 has a round-4 addendum; the review record has a
+"Cross-lane review (round 4)" section with the finding table, the mutation checks and the
+residuals. Contracts and locked paths still untouched, no contract request.
+
+- **HIGH — an auto top-up whose melt may have paid kept no quote.** Reproduced first with the real
+  `CashuWallet` and two TestMints over TestLightning: a funding melt answered PENDING, then settled
+  paid → Lightning paid twice, source 20 000 → 16 000, ledger `[unknown 2 002, done 2 000]`, one
+  paid quote never minted. Now the target's quote is kept BEFORE the melt — sealed to the identity
+  by the money plane (`topUpVault`: NIP-44 to self through the signer), on the ledger entry
+  (`attach`: `owner`, `open`) — and stays whenever the melt may have run (every throw but a
+  provable nothing-sent, every not-paid). It is minted exactly once when the target says PAID
+  (the run's retry, every later trigger, `resume()` when a plane opens: a restart, an unlock, a
+  signer swap), released only once the melt is settled as not paid (no journal entry, the source
+  mint's quote UNPAID) while it is still UNPAID, and no new top-up runs into a target with one open
+  (`unresolved`). The journal's settled melt line reads "top-up" (found by an anchor the record
+  keeps) and the entry says `done`. Kept on the ledger, sealed, rather than in the sealed wallet
+  journal: a quote id is a read handle for a NUT-20 locked quote but bearer money for an unlocked
+  one (a signer-held key cannot lock), and the journal's body is core's exact format.
+- **LOW (×2) — the retry was tied to the wallet instance and ran only in a due run**: it now
+  follows the identity, and every trigger finishes open top-ups (paced, 30 s) before its due
+  check.
+- **MEDIUM (I2 verifier) — the belt ignored the journal settles inside each PAY send**: the worst
+  time and the belt are per PAY (`payBuildWorstMs` / `payBuildStartByMs`), from the entries at the
+  mint at the PAY's turn and whether the plane has loaded that mint: one entry at a loaded mint
+  leaves 15.6 s, one at a mint not loaded or two leave none (refused, retried). `deadlines.ts`,
+  its pinned test and ADR 0012 say so.
+- **INFO (×3)**: core's refusals before its melt request settle `failed` (`meltSentNothing`,
+  by code and message); a run waits for the plane's startup settle; a play at zero balance waits
+  at most 15 s past the first-funding question (`PLAY_TOP_UP_WAIT_MS`, `checkForPlay`), then fails
+  `no-balance` while the top-up finishes in the background.
+
+Files: new `host/topup/open-topup.ts` (the record, strict), `host/__tests__/support/topup-vault.ts`;
+changed `host/topup/auto-topup.ts`, `host/topup/ledger.ts`, `host/money.ts` (`topUpVault`, the
+store, loaded mints, the per-PAY bound), `host/pay-melt-gate.ts` (`pay(…, startBy)`),
+`ipc/deadlines.ts`, `host/host.ts` (`vault`, `resume`, `playWaitMs`), `host/adapter.ts`
+(`checkForPlay`), `core/src/mocks/test-mint.ts` (`holdNextMelt`, `settleMelts`, `failNextMelt`).
+
+Tests: 32 new — `auto-topup.test.ts` +23, `money.test.ts` +3, `pay-melt-gate.test.ts` +1,
+`deadlines.test.ts` +1, `topup-host.test.ts` +2, core's `test-mint.test.ts` +2 (list in the review
+record). None deleted or weakened; the harness gained a vault per test wallet.
+
+Mutation checks: the reproduction first (pre-fix: Lightning paid twice, ledger
+`[unknown 2 002, done 2 000]`, one paid quote unminted), then M18a–M18t, all 20 killed; the pre-fix
+behaviour of each finding is one of them. One test race found on the way (the play-bound test),
+fixed in `aecddbc`.
+
+Checks (at `aecddbc` plus these docs):
+
+- `npx vitest run packages/app-desktop packages/core --maxWorkers=2`: 138 files passed,
+  2 skipped; 2227 tests passed, 17 skipped.
+- Whole suite, `npx vitest run --maxWorkers=2`: 206 files passed, 3 skipped; 3152 tests passed,
+  21 skipped. No timing failure this time.
+- `npx tsc -b --force`: clean.
+- `eslint` and `prettier --check` on the 17 changed `.ts` files and the three docs: clean.
+- `npm run check:locked`: OK.
+- `npm run lint:electron`: OK (229 files, 0 violations).
+- Electron e2e not run (lane rule).
+
+Residuals R4-R1 … R4-R8 in the review record. The ones to know:
+
+- a record that does not unseal holds its target back (kept: it may be money);
+- a coded refusal after the melt request still counts against the cap (core does not say
+  "not executed"; a locked-path change);
+- one unresolved journal entry at a mint not loaded, or two, pause PAYs there until the settle
+  loop clears them (fail-safe);
+- `resume()` on a `DesktopSigner` lock/unlock is not driven end to end in a host test.
+
 ## Proposed `docs/status.md` row
 
 | Lane | Branch | Status |
 |---|---|---|
-| PAY/melt gate (fund loss from the residuals round-3 verifier, ADR 0012 amendment) | `stage-3/int-pay-melt-gate` (on `9a20d30`) | **done** — a PAY queued behind a melt at its mint (melts may take 300 s since issue #8 fix round 3) was built after the worker's 300 s `pay.build` deadline, its P2PK proofs lost. The money plane's per-mint gate (`host/pay-melt-gate.ts`): a melt marks its mint, refuses waiting PAYs, waits for the one in flight, and clears however it settles; a PAY is refused at once (`rate-limited:`, nothing spent) while its mint is marked; PAY builds take turns and one not at the wallet 105.6 s after arriving is refused (the belt). Every desktop melt goes through it (`GatedCashuWallet`: the withdrawal, the auto top-up's funding melt; the host runs no earnings melt). Shared deadlines in `ipc/deadlines.ts` with a pinned model (worst PAY 194.4 s < 300 s). The worker's payer retries a `rate-limited` PAY on a 2 → 30 s backoff, so streaming pauses during a melt and resumes after it. Reproduced before the fix (two P2PK swaps at the deadline); 26 new tests, 17 mutations killed. Open: other operations at the same mint are not gated (R1: a core deadline at lock grant would close it) |
+| PAY/melt gate (fund loss from the residuals round-3 verifier, ADR 0012 amendment) + cross-lane review round 4 | `stage-3/int-pay-melt-gate` (on `9a20d30`, with lanes #2 and #8 merged) | **done** — a PAY queued behind a melt at its mint (melts may take 300 s since issue #8 fix round 3) was built after the worker's 300 s `pay.build` deadline, its P2PK proofs lost. The money plane's per-mint gate (`host/pay-melt-gate.ts`): a melt marks its mint, refuses waiting PAYs, waits for the one in flight, and clears however it settles; a PAY is refused at once (`rate-limited:`, nothing spent) while its mint is marked; PAY builds take turns and each must start within its own belt. Every desktop melt goes through it (`GatedCashuWallet`). Shared deadlines in `ipc/deadlines.ts`; round 4 made the belt per PAY (`payBuildStartByMs`: journal entries at the mint cost each send a restore and a check — 105.6 s with none, 15.6 s with one at a loaded mint, none otherwise). The worker's payer retries a `rate-limited` PAY on a 2 → 30 s backoff. Round 4 also fixed a HIGH in the auto top-up: a funding melt whose outcome was unclear dropped the target's quote, and a later paid settle left it unminted while a second top-up ran (reproduced: Lightning paid twice). The quote is now kept before the melt, sealed to the identity (NIP-44 via the signer) on the ledger entry, minted exactly once when PAID or released once the melt is settled unpaid, finished by any trigger, a restart, an unlock or a signer swap; no second top-up into a target with one open; the settled melt reads "top-up". Also: provable nothing-sent melt refusals settle `failed`, a run waits for the startup settle, a play at zero balance waits at most 15 s past the question. 58 new tests over both rounds, 37 mutations killed. Open: other operations at the same mint are not gated (R1); a coded refusal after the melt request still counts against the cap (core has no "not executed", R4-R3) |

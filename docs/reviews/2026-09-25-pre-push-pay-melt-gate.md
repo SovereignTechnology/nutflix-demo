@@ -215,3 +215,173 @@ afterwards, with a clean tree checked after every run.
 - `eslint` and `prettier --check` on every changed file: clean.
 - `npm run check:locked`: OK.
 - `npm run lint:electron`: OK (227 files, 0 violations).
+
+## Cross-lane review (round 4)
+
+Findings of the money-plane cross-lane review (lanes #2 auto top-up × #8 residuals) and of the
+I2 verifier, fixed on this branch with the top-up and residuals lanes merged into its base.
+Commits: `bc0e36d` (TestMint: `holdNextMelt`, `settleMelts`, `failNextMelt`), `c2f7312` (the
+fixes and their tests), `aecddbc` (a test race fixed, the review's scenario (c) added), then
+this record, ADR 0012's round-4 addendum and the lane report. Contracts and locked paths are
+untouched; no contract request.
+
+**Reproduced first.** A scratch test with the real `CashuWallet` over a `MemoryProofStore` and two
+TestMints joined by TestLightning (fund 20 000 at the source, `belowSats` 1 000, `amountSats`
+2 000): the funding melt answered PENDING, then settled paid, then the settle loop
+(`recoverPending`), then the next trigger. Pre-fix, for the target's invoice paid at the melt
+and at the settle alike: Lightning paid twice, the target at 2 000, the source 20 000 → 16 000,
+the ledger `[unknown 2 002, done 2 000]`, one paid quote never minted
+(`pendingMintQuotes().length === 1`). These are the reviewer's numbers.
+
+| # | Severity | Finding | Outcome |
+|---|---|---|---|
+| R4-1 | HIGH | `auto-topup.ts:342`: a funding melt whose outcome is unclear — answered PENDING (Lightning in flight), a lost answer or the 300 s timeout before any change is restorable, a result commit that throws after the mint paid (a signer timeout, a lock, a disk error) — settled the entry `unknown` and dropped the target's quote. The journal later settled the melt as paid, the quote was never minted, and the next PAY ran a second top-up (repeating with backoff up to the daily cap); the settled line was not labelled "top-up" | **fixed** (`c2f7312`). The target's quote is kept BEFORE the melt: sealed to the identity by the money plane (`MoneyPlane.topUpVault().seal`: NIP-44 to self through the signer) and written on the ledger entry (`TopUpLedger.attach`: `owner`, `open`) in a write that must succeed before the melt runs. It stays whenever the melt may have run: every throw except a provable nothing-sent (R4-6), and every not-paid. It is finished by the run's own retry, by every later trigger, and by `AutoTopUp.resume()`, which the host calls when a money plane opens (the start, an unlock, a signer swap). It is minted exactly once when the target says PAID, through core's journaled `pollQuote`, so a lost mint answer is restored, never minted twice. It is released only once the melt is settled as not paid — no journal entry left at the source, and the source mint's own quote state UNPAID, read after the target read UNPAID — and the entry then stays counted. No new top-up runs into a target whose earlier one is open (`unresolved`, paced to one retry a minute). When the journal settles the melt as paid, its history line is found by an anchor the record keeps (the source's history before the melt), recorded, and shown as "top-up" (core's settled memos, "(change recovered)" and "(settled after the answer, no change)", are recognised); the entry says `done` with what left the source. A top-up minted while its melt is still unresolved at the source stays open, marked `minted`, only to find that line; it holds nothing back. Only its owner identity finishes it |
+| R4-2 | MEDIUM (test-integrity lens; the same defect) | the melt ends unresolved, the paid NUT-20 quote lives only in `CashuWallet`'s in-memory map, and no test covers it (the old "melt throws / not paid" test stubs the melt without the mint paying) | **fixed** with R4-1; tests with the real wallet and mints below |
+| R4-3 | LOW | a paid-but-unminted top-up was retried only with the `CashuWallet` instance that paid, so a lock/unlock of the same identity (or `close()` during the target's mint) stranded it within the session | **fixed** (`c2f7312`): open top-ups are keyed on the identity and persisted; a new wallet unseals them again with its own plane. `MoneyPlane.close()` no longer matters to them |
+| R4-4 | LOW (test-integrity lens) | the retry ran only inside a due run, so a target that recovered another way (a deposit, a nutzap) never retried its paid quote | **fixed** (`c2f7312`): every trigger (`check`, `paymentAt`, a play) finishes open top-ups before its due check, paced to once per 30 s per wallet, never beside a run (a run finishes them first) — also with the top-up turned off since |
+| R4-5 | MEDIUM (I2 verifier) | the belt's 194.4 s worst case left out the journal settle inside each PAY send (a NUT-09 restore and a NUT-07 check per entry at the mint, twice per PAY), and the gated melt is what leaves such an entry. With one entry the real worst was 284.4 s (no mint load) and a PAY could start up to 105.6 s late, finishing past the worker's 300 s | **fixed** (`c2f7312`), as the verifier suggested and with its test. `ipc/deadlines.ts` models the worst per PAY, `payBuildWorstMs(entries, loaded)` = (1 load round trip unless loaded + 2 × (2 + 2 × entries)) × 30 s + 6 × 7.4 s, and the belt `payBuildStartByMs` = min(105.6 s, 300 s − worst). The money plane owns the store: at the PAY's turn it reads the entries at the mint, and whether it has loaded that mint (a wrapper over its `CashuMintConnections`), and passes that bound to `PayMeltGate.pay`, which refuses when it is past it (a NaN or throwing bound refuses). One entry at a loaded mint leaves 15.6 s; one at a mint not loaded, or two, leave none — every PAY there is refused (`rate-limited:`, retried) until the settle loop clears them. `payBuildWorstMs(0, false)` is the pinned 194.4 s; no PAY gets more time than before. `deadlines.ts`, `deadlines.test.ts` and ADR 0012 say so |
+| R4-6 | INFO | every `WalletError` but `insufficient-funds` settled `unknown`, also when no request reached the mint, keeping the whole reservation against the cap for 24 h | **fixed where provable** (`c2f7312`): `meltSentNothing` recognises, besides the gate and `insufficient-funds`, core's refusals thrown before its melt request — the melt quote could not be read, the mint changed the amount or raised the fee reserve, an earlier melt of the quote is unresolved — by code and message (a changed message reads as "may have run": fail closed). A coded refusal after the request, a failed `prepareMelt` and a failed journal begin share wording or error types with failures after the request, so they stay `unknown` (R4-R3) |
+| R4-7 | INFO | opening a play at zero balance awaited the whole top-up, up to ~5 minutes with 300 s melts | **fixed** (`c2f7312`), bound stated: `PLAY_TOP_UP_WAIT_MS` = 15 s. A play first lets open top-ups finish (at most 15 s), then waits for the run at most 15 s once it is past the first-funding question (the user's own interaction, bounded by the prompt's 5 minutes). Past that it fails `no-balance` ("a top-up is on its way to this mint: try again in a moment") and the top-up finishes in the background; a fast top-up (seconds) still lets the play go ahead |
+| R4-8 | INFO | right after a restart a top-up could read the target's balance before the startup settle restored an earlier top-up's minted proofs | **fixed** (`c2f7312`): a run, and a trigger's finishing of open top-ups, await the plane's `recovery` first. (The open top-up of R4-1 would also have caught this case.) |
+
+**Where the quote is kept, and why sealed** (the orchestrator's question). What a quote id alone
+lets someone do decides it:
+
+- for a quote the mint locked to the wallet key (NUT-20), the id is a read handle — state, amount
+  and invoice — and minting needs a signature by that key; the ledger already holds the same facts
+  (target, source, amount, time);
+- for an unlocked quote the id is bearer money once paid: whoever presents it first mints the
+  amount. The desktop takes unlocked quotes whenever the wallet key is held by the signer
+  (`signSecret`: cashu-ts needs the key as a string to sign NUT-20), and at any mint without
+  NUT-20. The host cannot tell from the contract's `MintQuote` which one it has.
+
+So every record is sealed to the identity, the way the NIP-60 proofs are, and another identity
+can neither open nor mint it (F5's concern). It lives on the ledger entry, not in the sealed wallet
+journal, for two reasons. The journal's body is core's exact format (`{v, ops, outbox}`, every
+entry a `PendingOp`, refused otherwise), so a record there needs a core change outside this lane.
+And the entry's state and the record must change together (`unknown` → `done`, the label). The
+ledger's open entries are never pruned by the 24-hour window, at most `MAX_OPEN_TOP_UPS` = 16 are
+kept, the record is read back strictly (`open-topup.ts`), and one that does not unseal, or names
+another entry's mints or amount, is kept — never minted, never released.
+
+**Tests** (new, all against the real `CashuWallet` and TestMints where money moves):
+
+- `auto-topup.test.ts`, +23:
+  - PENDING then settled paid, invoice paid at the melt or at the settle (2 cases): minted
+    exactly once, Lightning paid once, the entry `done` at 2 000, the settled line "top-up",
+    nothing unminted, nothing new moving while pending;
+  - the melt throws after the mint executed: a lost answer while in flight; without a journal
+    (no NUT-09); and the result commit failing after the mint paid (scenario (c));
+  - PENDING where core cannot journal: kept while the source says PENDING;
+  - a restart before and after the settle (2 cases);
+  - a lock/unlock before the settle;
+  - settled not paid: released, still counted, then a fresh top-up;
+  - another identity neither polls nor releases, and is not blocked;
+  - a record that does not unseal is kept;
+  - paid-not-minted then a lock/unlock;
+  - a not-due trigger finishes it;
+  - provable nothing-sent (3 of core's refusals), and the classifier over real core errors;
+  - a coded refusal after the request: counted, then released;
+  - the startup settle first;
+  - the play's bound past the question;
+  - the ledger's open entries (kept past the window, bounded, dropped by `failed` or
+    `open: null`) and a file with an out-of-shape one failing closed;
+  - the record's strict round trip, and its refusals.
+- `money.test.ts`, +3:
+  - the verifier's scenario: a melt timed out at the mint leaves its entry, and a PAY queued
+    behind another is refused before any swap past 15.6 s (well inside the old 105.6 s). Each of
+    the first PAY's sends did restore and checkstate before its swap;
+  - two entries: every PAY refused at once, nothing spent;
+  - `topUpVault`: NIP-44 through a real `LocalSigner`, another identity cannot unseal, the
+    largest record fits the ledger's bound, `meltPending` and `meltState` follow a PENDING melt
+    to PAID, a closed plane refuses.
+- `pay-melt-gate.test.ts`, +1: the per-PAY bound is read at the turn; shorter refuses, longer
+  never extends, and NaN, negative or throwing refuses.
+- `deadlines.test.ts`, +1: the per-PAY model pinned (194.4 s unchanged, 284.4 s for one entry at
+  a loaded mint, 15.6 s belt, none for a cold mint or two entries, never looser than 105.6 s, a
+  bad count refuses).
+- `topup-host.test.ts`, +2, the whole host:
+  - a PENDING melt with the target already paid: the quote is kept sealed (neither the file nor
+    the decoded blob holds the invoice), and the next play mints it once and goes ahead;
+  - a slow top-up fails the play `no-balance` in the bound, and the next play goes ahead once
+    it finishes in the background.
+- core `test-mint.test.ts`, +2: the new TestMint hooks behave like a mint.
+
+No test was deleted or weakened. The harness changes are a vault per test wallet (`testVault`, a
+reversible test double; the real sealing is `money.test.ts`'s) and the real-mint test's vault.
+
+**Mutation checks (round 4)**: each mutation applied alone to the committed fix, the relevant
+test files run, the file restored from a copy afterwards (the tree checked clean at the end).
+
+| # | Mutation | Killed by |
+|---|---|---|
+| M18a | an ambiguous melt throw drops the quote (pre-fix behaviour) | 3 (a lost answer, no journal, a coded refusal after the request); rerun with scenario (c) added: 4 |
+| M18b | a PENDING (not paid) melt drops the quote (pre-fix behaviour) | 8 |
+| M18c | a new top-up runs into a target with an open one | 4 |
+| M18d | a quote is released without the source mint saying UNPAID | 1 (PENDING without a journal) |
+| M18e | the retry stays with the wallet instance that paid (the LOW) | 2 (lock/unlock ×2) |
+| M18f | the ledger prunes open top-ups with the window | 1 |
+| M18g | core's refusals before the request read as `unknown` | 2 |
+| M18h | a run does not wait for the startup settle | 1 (the startup-settle test; the first pass also timed out the play-bound test — a race, fixed in `aecddbc`) |
+| M18i | a play waits for the whole top-up | 1 (timed out) |
+| M18j | only the exact melt memo is relabelled | 3 |
+| M18k | another identity finishes an open top-up | 2 |
+| M18l | minted while its melt is pending: closed at once, never labelled | 2 |
+| M18m | the quote is kept unsealed (plain base64) | 1 (whole host) |
+| M18n | a not-due trigger does not finish open top-ups | 1 |
+| M18o | `payBuild` passes no per-PAY bound (pre-fix behaviour) | 2 (money plane) |
+| M18p | journal entries cost the model nothing | 3 (deadlines, money plane) |
+| M18q | the gate ignores the per-PAY bound | 1 (gate unit) |
+| M18r | a NaN bound lets a PAY through | 1 (gate unit) |
+| M18s | a loaded mint still counts its load | 2 (money plane, incl. the verifier's round-3 scenario) |
+| M18t | a `failed` settle keeps the quote open | 1 |
+
+The pre-fix behaviour of each finding is itself one of these mutations (M18a, M18b, M18e, M18n,
+M18o, M18g, M18i, M18h), since the new tests need the new API (the vault) to run at all. The first
+pass of M18h also exposed a race in the play-bound test (a `release()` that could come before
+the melt installed it); fixed in `aecddbc`, the file passed three runs in a row.
+
+**Residuals (round 4)**:
+
+- **R4-R1: a record that does not unseal holds its target back.** A damaged or tampered ledger
+  entry is kept (it may be money) and keeps `unresolved` for that target and identity, with no
+  in-app way to clear it. The same stance as a wallet journal that does not open. A corrupt ledger
+  file is still replaced by the closed marker, so its open top-ups survive only in the
+  `.corrupt` copy.
+- **R4-R2: a melt request arriving late.** A quote is released when the source mint reads UNPAID
+  with nothing journaled. A melt request that the transport gave up on but that reaches the mint
+  after that read could still pay an unkept quote. The resolution runs at the next trigger, at
+  least seconds after the melt returned; noted, not closed.
+- **R4-R3: not provable, still counted.** A coded refusal after the melt request (nothing
+  executed), a failed `prepareMelt` and a journal begin that could not be written are
+  indistinguishable in core's errors from failures after the request. They stay `unknown` (their
+  quote is released once the source says UNPAID), so a flaky source can still use the day's cap
+  without moving anything. A "not executed" flag on core's error would let the host settle them
+  `failed`, but that is a locked-path change (`wallet/spend.ts`), not filed.
+- **R4-R4: availability under a stuck melt.** One unresolved entry at a loaded mint leaves PAYs
+  15.6 s to start. One at a mint not loaded, or two, refuses every PAY there until the settle loop
+  clears them: fail-safe, but streaming at that mint pauses meanwhile.
+- **R4-R5: host wiring of `resume()` on a signer swap** is covered at the `AutoTopUp` level
+  (`resume` after a new wallet of the same identity) and by the injected-signer start. A
+  lock/unlock through `DesktopSigner` is not driven end to end in a host test.
+- **R4-R6: labels.** The settled line is looked for in the source's newest 100 history lines,
+  for between the amount and the reservation. Input fees past the allowance, or a long busy
+  history, leave it labelled "melt to Lightning (…)". Only a label.
+- **R4-R7: core, seen here.** Against a mint without NUT-09, core's melt answered PENDING keeps
+  the pending inputs spendable in the store (its reconcile drops only SPENT ones), so the source's
+  balance over-reads until a later spend there reconciles them. This is core's locked path; the
+  top-up's quote handling is correct regardless (tested).
+- **R4-R8: invoice length.** A target invoice longer than 4 096 characters refuses the top-up
+  before anything moves. The bound keeps a sealed record inside the ledger's 16 KiB per record.
+
+**Checks (round 4)**, at `aecddbc` plus these docs:
+
+- the touched packages, `npx vitest run packages/app-desktop packages/core --maxWorkers=2`:
+  138 files passed, 2 skipped; 2227 tests passed, 17 skipped;
+- the whole suite, `npx vitest run --maxWorkers=2`: 206 files passed, 3 skipped; 3152 tests passed,
+  21 skipped (no timing failure; no timeout raised);
+- `npx tsc -b --force`: clean;
+- `eslint` and `prettier --check` on the 17 changed `.ts` files and the three docs: clean;
+- `npm run check:locked`: OK;
+- `npm run lint:electron`: OK (229 files, 0 violations);
+- the Electron e2e was not run (lane rule).

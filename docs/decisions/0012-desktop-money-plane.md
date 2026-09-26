@@ -179,7 +179,8 @@ above the manifest, so no block is ever paid at the wrong price.
     transport explicitly (the same values as core's defaults);
   - `PAY_BUILD_WORST_MS` = 5 mint round trips × 30 s + 6 relay publishes × 7.4 s = 194.4 s: the
     host's worst for one PAY build outside a melt, alone at its mint, with no journal entries
-    left there. The round trips are one mint load, then two sends, each a swap and one follow-up.
+    left there (the round-4 addendum below: entries left there lengthen it, so the belt is per
+    PAY). The round trips are one mint load, then two sends, each a swap and one follow-up.
     The publishes are each send's token, deletion and history events; 7.4 s is nostr-tools' 3 s
     to connect plus 4.4 s for the relay's answer, pinned against the library;
   - `PAY_BUILD_START_BY_MS` = 300 s − 194.4 s = 105.6 s.
@@ -201,6 +202,67 @@ above the manifest, so no block is ever paid at the wrong price.
   a deadline when it grants the turn (a locked path); see `docs/reviews/2026-09-25-pre-push-pay-melt-gate.md`.
   A withdrawal made while a PAY is in flight waits for that PAY, up to 300 s at the worst, with
   nothing on screen to say why.
+
+- Addendum 2026-09-25 (cross-lane review round 4; lanes I2-paygate × issue #2 auto top-up ×
+  issue #8 residuals): **the belt is per PAY, and an auto top-up whose melt may have paid keeps
+  its quote.**
+  - **The belt counts the journal entries at the mint** (the I2 verifier). Each of a PAY's two
+    P2PK sends first settles every journal entry at its mint (`Spender.settle`: a NUT-09
+    restore, then a NUT-07 check), and the gated melt is exactly what leaves one: a melt that
+    timed out, lost its answer or was answered PENDING stays journaled until the mint can say —
+    hours, for a stuck payment. Measured: every PAY after such a melt made 6 mint requests where
+    the model counted 4. The worst time is now `payBuildWorstMs(entries, loaded)`: the mint load
+    (1 round trip, none once the plane has loaded that mint), plus per send its swap and
+    follow-up (2) and `PAY_BUILD_SETTLE_ROUND_TRIPS_PER_ENTRY` (2) per entry, × 30 s, plus the
+    6 publishes. An entry the PAY's own settle resolves costs no more (restore, check and one
+    commit's three publishes, 82.2 s, under the 120 s it would otherwise cost). At its turn a
+    PAY reads the entries at its mint (the plane holds the store) and must start within
+    `payBuildStartByMs` = min(105.6 s, 300 s − that worst time): 15.6 s with one entry at a
+    loaded mint; none — every PAY there refused, `rate-limited:`, retried by the worker — with
+    one at a mint not loaded, or two. `payBuildWorstMs(0, false)` is still the pinned 194.4 s,
+    and no PAY gets longer than the old belt. `PayMeltGate.pay` takes the per-PAY bound as a
+    function read at the turn; a bound that is not a number, or throws, refuses.
+  - **An open top-up.** A funding melt that throws ambiguously (a lost answer, the 300 s
+    timeout, a 429, a result commit that failed after the mint paid, the plane closing mid-melt)
+    or answers PENDING may still pay the target's invoice after the run gave up — and the next
+    PAY then started a second top-up (reproduced: Lightning paid twice, one paid quote never
+    minted). Now the target's quote is kept BEFORE the melt, on the ledger entry
+    (`TopUpLedger.attach`: the entry's `owner` and `open`), and stays whenever the melt may have
+    run. The run's retry, every later trigger (also one that is not due, or with the top-up
+    turned off), and `AutoTopUp.resume()` — which the host calls when a money plane opens, so a
+    restart, an unlock or a signer swap back finishes it — mint it exactly once when the target
+    says PAID (core's journaled `pollQuote`), and release it only when the melt is settled as not
+    paid (no journal entry at the source, and the source mint's own quote state UNPAID) while the
+    quote is still UNPAID. The entry then stays counted: the melt did reach the mint. No new
+    top-up runs into a target whose earlier one is open (`unresolved`). When the journal settles
+    the melt as paid, its history line — found by an anchor the record keeps — is recorded and
+    reads "top-up" (core's settled memos are recognised), and the entry says `done`. A top-up
+    minted while its melt is still unresolved stays open (`minted`) only to find that line; it
+    no longer holds anything back. Only its own identity finishes an open top-up.
+  - **Where it is kept, and why sealed.** A quote id alone is a read handle for a quote the mint
+    locked to the wallet key (NUT-20: minting takes a signature by that key), but bearer money
+    for one it did not — whoever presents the id first mints the paid amount — and a signer-held
+    wallet key (`signSecret`) cannot lock one. So the record (the quote, the source's melt quote
+    id, the anchor) is sealed to the identity by the money plane (`MoneyPlane.topUpVault`:
+    NIP-44 to self through the signer, how the NIP-60 proofs themselves are kept) before it is
+    written. It lives on the ledger entry rather than in the sealed wallet journal: the journal's
+    body is core's exact format (every entry a `PendingOp`), so a record there needs a core
+    change, and the ledger entry must change together with it (`unknown` → `done`, the label).
+    The ledger never prunes an entry with an open top-up (it stops counting after 24 h), keeps at
+    most `MAX_OPEN_TOP_UPS` = 16, reads the record back strictly, and a record that does not
+    unseal is kept, never minted or released.
+  - **Provably nothing sent** is not `unknown`: besides `insufficient-funds` and the gate, core's
+    refusals before its melt request (the melt quote could not be read, the mint changed its
+    amount or raised its fee reserve, an earlier melt of the quote is unresolved) settle
+    `failed`, matched on core's code and message (a changed message reads "may have run"). A
+    coded refusal after the request is worded like a melt that may have run, so it stays
+    `unknown` — its quote is released once the source says UNPAID.
+  - **The startup settle first**: a run, and a trigger's finishing of open top-ups, wait for
+    the plane's `recovery` before reading a balance.
+  - **A play at zero balance waits a bounded time**: `PLAY_TOP_UP_WAIT_MS` = 15 s for open
+    top-ups to finish, then 15 s once past the first-funding question (the user's own, bounded by
+    the prompt's 5 minutes). A slower top-up (a melt may take 300 s) finishes in the background
+    and the play fails `no-balance` ("a top-up is on its way …"), to be retried.
 
 ## Consequences
 
