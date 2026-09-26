@@ -22,6 +22,7 @@
  */
 import type { Guard } from '../ipc/protocol.js';
 import { fromWireError, toWireError, wireError } from '../ipc/errors.js';
+import { WORKER_HOST_REQUEST_TIMEOUT_MS } from '../ipc/deadlines.js';
 import { FrameDecoder, FramingError, encodeFrame } from '../ipc/framing.js';
 import {
   isHostToWorker,
@@ -46,7 +47,11 @@ export interface WorkerRpcOptions {
   readonly onFatal: (err: FramingError) => void;
   /** Concurrent host requests in flight (default 64). */
   readonly maxInflight?: number;
-  /** Worker → host request deadline in ms (default 5 min: publishing goes to relays). */
+  /**
+   * Worker → host request deadline in ms (default `WORKER_HOST_REQUEST_TIMEOUT_MS`, 5 min:
+   * publishing goes to relays). The host cannot cancel a request, so a `pay.build` it finishes
+   * after this is lost: `ipc/deadlines.ts` has how the host keeps its PAY builds inside it.
+   */
   readonly requestTimeoutMs?: number;
 }
 
@@ -149,7 +154,7 @@ export class WorkerRpc {
       const timer = setTimeout(() => {
         if (this.pending.delete(id))
           reject(fromWireError(wireError('backend-down', `host did not answer ${m} in time`)));
-      }, this.o.requestTimeoutMs ?? 300_000);
+      }, this.o.requestTimeoutMs ?? WORKER_HOST_REQUEST_TIMEOUT_MS);
       this.pending.set(id, {
         m,
         resolve: resolve as (r: unknown) => void,

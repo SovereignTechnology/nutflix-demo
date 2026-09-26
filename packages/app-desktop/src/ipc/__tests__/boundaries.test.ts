@@ -27,9 +27,12 @@ describe('src/ipc boundaries', () => {
   it('has the expected modules', () => {
     // Issue #6 (ADR 0017) added `asar-path.ts`: a string-only helper main and the host share to
     // find the unpacked tree of a packaged build; it is held to the same rules as the rest.
+    // Lane I2-paygate (ADR 0012 amendment) added `deadlines.ts`: numbers the host and the worker
+    // share (the worker's `pay.build` deadline, the mint timeouts), held to the same rules.
     expect(sources.map((s) => s.f).sort()).toEqual([
       'asar-path.ts',
       'codec.ts',
+      'deadlines.ts',
       'errors.ts',
       'framing.ts',
       'guards.ts',

@@ -11,9 +11,14 @@
  *   - two plays at once: one question, one top-up;
  *   - review finding 1: the user's own withdrawal that empties an allowed mint moves nothing (a
  *     balance event never starts a top-up); a PAY for the open session (the worker's `pay.build`
- *     into the money plane) that leaves the mint below its threshold does.
+ *     into the money plane) that leaves the mint below its threshold does;
+ *   - lane I2-paygate (ADR 0012 amendment): both melts the desktop runs — the user's withdrawal
+ *     (the renderer's `wallet.melt`) and an auto top-up's funding melt — go through the money
+ *     plane's PAY/melt gate: each waits for the PAY in flight at its mint, and PAYs there are
+ *     refused (`rate-limited`, nothing spent) until it settles.
  */
 import { getPubKeyFromPrivKey } from '@cashu/cashu-ts';
+import type { RequestFn } from '@cashu/cashu-ts';
 import type {
   CashuP2pkPubkey,
   CoreKeyHex,
@@ -24,8 +29,10 @@ import type {
   VideoManifest,
   WalletHistoryEntry,
 } from '@sovit/core';
-import { mocks, nostr, signer as signerMod } from '@sovit/core';
-import { afterEach, describe, expect, it } from 'vitest';
+import { mocks, nostr, signer as signerMod, wallet as walletMod } from '@sovit/core';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { readFile } from 'node:fs/promises';
+import { join } from 'node:path';
 
 import { isHostOut } from '../../ipc/guards.js';
 import type { HostOut, PromptForm, ReplyMsg, SessionId } from '../../ipc/protocol.js';
@@ -33,6 +40,7 @@ import { IPC_V } from '../../ipc/protocol.js';
 import { SignerIdentity } from '../identity.js';
 import { memoryLogger } from '../log.js';
 import { MoneyPlane } from '../money.js';
+import { TOP_UP_LEDGER_FILE } from '../topup/ledger.js';
 import { seedVideos } from './support/catalog.js';
 import { coreTestKit } from './support/core-helpers.js';
 import type { Rig } from './support/rig.js';
@@ -77,15 +85,25 @@ interface World {
   readonly asked: PromptForm[];
   readonly lightning: mocks.TestLightning;
   readonly stranger: mocks.TestMint;
+  /** The top-up's source and target mints (round 4: a melt answered PENDING). */
+  readonly source: mocks.TestMint;
+  readonly target: mocks.TestMint;
   readonly trusted: VideoManifest;
   readonly foreign: VideoManifest;
   /** A video paid at two of the user's trusted mints. */
   readonly both: VideoManifest;
+  /** A video paid at the top-up's source mint (never topped up: it is the source). */
+  readonly atSource: VideoManifest;
   answer: boolean;
 }
 
 async function world(
-  o: { readonly hooks?: object; readonly tickMs?: number } = {},
+  o: {
+    readonly hooks?: object;
+    readonly tickMs?: number;
+    /** Wraps a mint's transport (lane I2-paygate: holding requests). */
+    readonly wrap?: (mint: MintUrl, request: RequestFn) => RequestFn;
+  } = {},
 ): Promise<World> {
   const lightning = new mocks.TestLightning();
   const target = new mocks.TestMint({
@@ -111,7 +129,10 @@ async function world(
     [SOURCE]: source,
     [STRANGER]: stranger,
   };
-  const mintRequest = (m: MintUrl) => byUrl[m]?.request;
+  const mintRequest = (m: MintUrl): RequestFn | undefined => {
+    const request = byUrl[m]?.request;
+    return request === undefined ? undefined : (o.wrap?.(m, request) ?? request);
+  };
   // The user's NIP-60 wallet already exists on their relays (created in an earlier session).
   const { signer } = await signerMod.LocalSigner.create({
     passphrase: Buffer.from('auto top-up host test passphrase'),
@@ -131,7 +152,7 @@ async function world(
   first.close();
 
   const asked: PromptForm[] = [];
-  const w = { asked, lightning, stranger, answer: true } as unknown as World;
+  const w = { asked, lightning, stranger, source, target, answer: true } as unknown as World;
   let t = 1_800_000_000_000;
   const rr = await rig({
     pool,
@@ -173,7 +194,7 @@ async function world(
     ...base,
     price: { ...base.price, satsPerBlock: 50 as Sats, creatorP2pk: CREATOR_P2PK },
   };
-  const [trusted, foreign, both] = await seedVideos(kit, rr.pool, new kit.TestSigner(), [
+  const [trusted, foreign, both, atSource] = await seedVideos(kit, rr.pool, new kit.TestSigner(), [
     { ...fixture, price: { ...fixture.price, mints: [TARGET] } },
     {
       ...fixture,
@@ -185,12 +206,18 @@ async function world(
       title: 'Two trusted mints',
       price: { ...fixture.price, mints: [TARGET, SECOND] },
     },
+    {
+      ...fixture,
+      title: 'Paid at the source mint',
+      price: { ...fixture.price, mints: [SOURCE] },
+    },
   ]);
   return Object.assign(w, {
     r: rr,
     trusted: trusted!.video,
     foreign: foreign!.video,
     both: both!.video,
+    atSource: atSource!.video,
   });
 }
 
@@ -341,5 +368,190 @@ describe('auto top-up follows payments, not balance events (issue #2, review fin
     expect(await balance(w.r, TARGET)).toBe(900 + 2_000);
     expect(await balance(w.r, SOURCE)).toBe(16_000);
     expect(w.asked).toHaveLength(1); // allowed at the play: no second question
+  }, 30_000);
+});
+
+/** A request the holding transport keeps from its mint until the test lets it go. */
+interface Held {
+  release(): void;
+}
+
+/** Mint transports that hold the requests `hold` picks (mint, `METHOD /path`). */
+function holding() {
+  let pick: ((mint: MintUrl, path: string) => boolean) | null = null;
+  const arrived: Held[] = [];
+  const waiting: ((h: Held) => void)[] = [];
+  const wrap =
+    (mint: MintUrl, inner: RequestFn): RequestFn =>
+    <T>(args: Parameters<RequestFn>[0]): Promise<T> => {
+      const path = `${(args.method ?? 'GET').toUpperCase()} ${new URL(args.endpoint).pathname}`;
+      if (pick?.(mint, path) !== true) return inner<T>(args);
+      return new Promise<T>((resolve, reject) => {
+        const h: Held = {
+          release: () => {
+            inner<T>(args).then(resolve, reject);
+          },
+        };
+        const w = waiting.shift();
+        if (w === undefined) arrived.push(h);
+        else w(h);
+      });
+    };
+  return {
+    wrap,
+    hold(p: ((mint: MintUrl, path: string) => boolean) | null): void {
+      pick = p;
+    },
+    next(): Promise<Held> {
+      const h = arrived.shift();
+      return h !== undefined ? Promise.resolve(h) : new Promise((r) => waiting.push(r));
+    },
+  };
+}
+
+interface PlayOpen {
+  readonly sid: SessionId;
+  readonly rendition: {
+    readonly hyper: { readonly core: CoreKeyHex; readonly blob: HyperblobId };
+  };
+}
+
+/** The worker's `pay.build` for the last session opened, two blocks at `mint`. */
+function payFor(w: World, video: VideoManifest, mint: MintUrl): Promise<unknown> {
+  const opens = w.r.worker().calls('play.open') as PlayOpen[];
+  const open = opens[opens.length - 1]!;
+  const { core, blob } = open.rendition.hyper;
+  return w.r.worker().request('pay.build', {
+    sid: open.sid,
+    range: { core, fromBlock: blob.blockOffset, toBlock: blob.blockOffset + 1 },
+    seeder: { pubkey: SEEDER, p2pk: SEEDER_P2PK, mint },
+    policy: video.price,
+    carryIn: 0,
+  });
+}
+
+describe('every desktop melt goes through the PAY/melt gate (lane I2-paygate, ADR 0012 amendment)', () => {
+  it("the user's withdrawal (the renderer's wallet.melt) waits for the PAY in flight at its mint; PAYs there are refused until it settles", async () => {
+    const t = holding();
+    const w = await world({ wrap: t.wrap });
+    r = w.r;
+    expect((await invoke(w.r, 'play', [w.trusted.id])).ok).toBe(true); // TARGET: 2 000 sats
+    const wallet = w.r.host.adapter.wallet;
+    const invoice = await wallet.mintQuote(SECOND, 500 as Sats);
+    const quoted = await invoke(w.r, 'wallet.meltQuote', [TARGET, invoice.bolt11]);
+    expect(quoted.ok).toBe(true);
+    const entered = vi.spyOn(wallet, 'melt'); // asked for (the gate's side)
+    const started = vi.spyOn(walletMod.CashuWallet.prototype, 'melt'); // past the gate, in core
+    try {
+      t.hold((mint, path) => mint === TARGET && path === 'POST /v1/swap');
+      const pay = payFor(w, w.trusted, TARGET);
+      const held = await t.next(); // the PAY's first send is at the mint
+      t.hold(null);
+      const withdrawal = invoke(w.r, 'wallet.melt', [quoted.ok ? quoted.result : null]);
+      await eventually(() => entered.mock.calls.length === 1, 'the withdrawal at the gate');
+      await new Promise((res) => setTimeout(res, 30));
+      expect(started).not.toHaveBeenCalled();
+      await expect(payFor(w, w.trusted, TARGET)).rejects.toMatchObject({ code: 'rate-limited' });
+      held.release();
+      await expect(pay).resolves.toMatchObject({ seederProofs: { mint: TARGET } });
+      const res = await withdrawal;
+      expect(res.ok && (res.result as { paid: boolean }).paid).toBe(true);
+      expect(started).toHaveBeenCalledTimes(1);
+      expect(await balance(w.r, TARGET)).toBe(2_000 - 100 - 500);
+    } finally {
+      entered.mockRestore();
+      started.mockRestore();
+    }
+  }, 30_000);
+
+  it("an auto top-up's funding melt waits for the PAY in flight at the source mint; PAYs there are refused until it settles", async () => {
+    const t = holding();
+    const w = await world({ wrap: t.wrap });
+    r = w.r;
+    // A video paid at SOURCE: the source is never topped up, nothing is asked.
+    expect((await invoke(w.r, 'play', [w.atSource.id])).ok).toBe(true);
+    expect(w.asked).toEqual([]);
+    const wallet = w.r.host.adapter.wallet;
+    const entered = vi.spyOn(wallet, 'melt');
+    const started = vi.spyOn(walletMod.CashuWallet.prototype, 'melt');
+    try {
+      t.hold((mint, path) => mint === SOURCE && path === 'POST /v1/swap');
+      const pay = payFor(w, w.atSource, SOURCE);
+      const held = await t.next();
+      t.hold(null);
+      // A play at TARGET (empty) starts the top-up TARGET ← SOURCE: its melt is at SOURCE.
+      const play = invoke(w.r, 'play', [w.trusted.id]);
+      await eventually(
+        () => entered.mock.calls.length === 1,
+        'the top-up melt at the gate',
+        10_000,
+      );
+      await new Promise((res) => setTimeout(res, 30));
+      expect(started).not.toHaveBeenCalled();
+      expect(w.lightning.paid).toEqual([]);
+      await expect(payFor(w, w.atSource, SOURCE)).rejects.toMatchObject({ code: 'rate-limited' });
+      held.release();
+      await expect(pay).resolves.toMatchObject({ seederProofs: { mint: SOURCE } });
+      expect((await play).ok).toBe(true);
+      expect(started).toHaveBeenCalledTimes(1);
+      expect(w.lightning.paid).toHaveLength(1);
+      expect(await balance(w.r, TARGET)).toBe(2_000);
+    } finally {
+      entered.mockRestore();
+      started.mockRestore();
+    }
+  }, 30_000);
+});
+
+describe('cross-lane review round 4 through the whole host', () => {
+  it('a funding melt answered PENDING while the target already has the payment: its quote is kept sealed to the identity, the next play mints it once and goes ahead — no second melt', async () => {
+    const w = await world();
+    r = w.r;
+    w.source.holdNextMelt(1, { lightning: 'now' });
+    const first = await invoke(w.r, 'play', [w.trusted.id]);
+    expect(!first.ok && first.error.code).toBe('no-balance');
+    expect(w.lightning.paid).toHaveLength(1);
+    // Kept on the ledger entry, sealed (NIP-44 to self through the signer): no invoice in the clear.
+    const file = await readFile(join(w.r.userData, TOP_UP_LEDGER_FILE), 'utf8');
+    const saved = JSON.parse(file) as {
+      entries: { state: string; owner?: string; open?: string }[];
+    };
+    expect(saved.entries).toMatchObject([{ state: 'unknown' }]);
+    expect(saved.entries[0]?.owner).toMatch(/^[0-9a-f]{64}$/);
+    expect(saved.entries[0]?.open).toMatch(/^[A-Za-z0-9+/=]+$/);
+    expect(file).not.toMatch(/lnbc/);
+    expect(Buffer.from(saved.entries[0]?.open ?? '', 'base64').toString('latin1')).not.toMatch(
+      /lnbc|quoteId/,
+    );
+
+    const second = await invoke(w.r, 'play', [w.trusted.id]);
+    expect(second.ok).toBe(true);
+    expect(await balance(w.r, TARGET)).toBe(2_000);
+    expect(w.lightning.paid).toHaveLength(1); // never paid twice
+    expect(w.asked).toHaveLength(1);
+    expect(JSON.stringify(w.r.log.lines)).not.toMatch(/topup-host\.test|lnbc/);
+  }, 30_000);
+
+  it('a play at zero balance waits for a slow top-up only playWaitMs past the question: no-balance at once, the top-up finishes in the background, the next play goes ahead', async () => {
+    const t = holding();
+    const w = await world({ wrap: t.wrap, hooks: { playWaitMs: 50 } });
+    r = w.r;
+    t.hold((mint, path) => mint === SOURCE && path === 'POST /v1/melt/bolt11');
+    const started = Date.now();
+    const first = await invoke(w.r, 'play', [w.trusted.id]);
+    expect(!first.ok && first.error.code).toBe('no-balance');
+    expect(!first.ok && first.error.message).toMatch(/a top-up is on its way/);
+    expect(Date.now() - started).toBeLessThan(10_000);
+    const melt = await t.next(); // the Lightning payment still in flight
+    t.hold(null);
+    melt.release();
+    await vi.waitFor(
+      async () => {
+        expect(await balance(w.r, TARGET)).toBe(2_000); // minted in the background
+      },
+      { timeout: 10_000 },
+    );
+    expect((await invoke(w.r, 'play', [w.trusted.id])).ok).toBe(true);
+    expect(w.lightning.paid).toHaveLength(1);
   }, 30_000);
 });

@@ -27,6 +27,14 @@
  *     terms (creator key, split, block size, mints; a price at most the manifest's), and only up
  *     to a block budget of twice the blob (headroom for the duplicate deliveries of F33). A
  *     compromised worker cannot pay a stranger, pay for another video, or drain the wallet.
+ *   - PAY builds and melts at one mint never overlap (`pay-melt-gate.ts`, ADR 0012 amendment
+ *     2026-09-25): every melt of this wallet — the user's withdrawal, an auto top-up's funding
+ *     melt — goes through the gate (`GatedCashuWallet.melt`), and a PAY is refused at once, with
+ *     nothing spent, while a melt is pending or in flight at its mint. A PAY queued behind a melt
+ *     could be built after the worker's deadline, its proofs lost. At its turn a PAY must still
+ *     have time for its worst case — which grows with the journal entries left at its mint (each
+ *     P2PK send settles every one first) and shrinks once the mint is loaded
+ *     (`payBuildStartByMs`, cross-lane review round 4).
  *   - `pay.hello` signs a kind-HELLO event over a `pay/1` challenge and nothing else.
  *   - `seller.*` act only at the wallet's own mints; `redeem` only takes proofs locked to the
  *     wallet key (the wallet refuses others); a nutzap goes only to a creator the host has seen in
@@ -36,6 +44,7 @@ import type {
   CashuP2pkPubkey,
   CoreKeyHex,
   HyperblobId,
+  MeltQuote,
   MintKeyset,
   MintUrl,
   NostrEvent,
@@ -45,6 +54,7 @@ import type {
   PricePolicy,
   RelayConfig,
   RelayUrl,
+  Sats,
   Signer,
   UnixSeconds,
 } from '@sovit/core';
@@ -56,11 +66,14 @@ import {
   wallet as walletMod,
 } from '@sovit/core';
 
+import { payBuildStartByMs } from '../ipc/deadlines.js';
 import type { SessionId } from '../ipc/protocol.js';
 import type { HostMethodTable, RedeemResult } from '../ipc/worker-protocol.js';
 import { hostError } from './errors.js';
 import type { Logger } from './log.js';
 import { hostMintRequest } from './mint-transport.js';
+import { PayMeltGate } from './pay-melt-gate.js';
+import type { TopUpVault } from './topup/auto-topup.js';
 import { openWalletJournal } from './wallet-journal.js';
 import type { HostRequestHandlers } from './worker/supervisor.js';
 
@@ -99,12 +112,37 @@ export interface MoneyPlaneOptions {
   /**
    * Issue #2: a PAY for an open play session drew (or, short, tried to draw) from `mint` — the
    * one trigger of an auto top-up outside a play opening. Called after the PAY's authorisation
-   * passed, never for a refused one; not awaited — its result is ignored, and a throw or a
-   * rejected promise is swallowed.
+   * passed and it reached the wallet, never for a refused one (by its terms, or by the PAY/melt
+   * gate); not awaited — its result is ignored, and a throw or a rejected promise is swallowed.
    */
   readonly onPayment?: (mint: MintUrl) => unknown;
   /** Tests: the journal settle loop's timer (default `setTimeout`, unref'd). */
   readonly settleTimer?: walletMod.SettleTimer;
+  /**
+   * Tests: the PAY/melt gate's monotonic clock in ms (default `performance.now`) — when a PAY
+   * request arrived and whether it may still reach the wallet (`PAY_BUILD_START_BY_MS`).
+   */
+  readonly clock?: () => number;
+}
+
+/**
+ * The money plane's wallet: core's `CashuWallet`, whose every melt goes through the plane's
+ * PAY/melt gate — whoever holds the wallet (the renderer's `wallet.melt` through the adapter, the
+ * auto top-up through `liveWallet`, a test) can only melt that way. `melt` is the one
+ * `CashuWallet` method that pays an invoice (`pay-melt-gate.test.ts` pins that core adds no other
+ * behind the gate's back).
+ */
+class GatedCashuWallet extends walletMod.CashuWallet {
+  constructor(
+    o: walletMod.CashuWalletOptions,
+    private readonly gate: PayMeltGate,
+  ) {
+    super(o);
+  }
+
+  override melt(quote: MeltQuote): Promise<{ paid: boolean; preimage?: string; change: Sats }> {
+    return this.gate.melt(quote.mint, () => super.melt(quote));
+  }
 }
 
 interface SessionBudget {
@@ -142,6 +180,14 @@ export class MoneyPlane {
   private readonly sessions = new Map<SessionId, SessionBudget>();
   private readonly creators = new Map<string, NostrPubkey>();
   private readonly viewer: payment.RealPaymentEngine;
+  /** PAY builds and melts at one mint never overlap (`pay-melt-gate.ts`). */
+  private readonly gate: PayMeltGate;
+  /** The wallet's store: its journal entries per mint (a PAY's belt, an open top-up's melt). */
+  private readonly store: walletMod.Nip60ProofStore;
+  /** The wallet's mint connections (a melt quote's state, read only). */
+  private readonly conns: walletMod.CashuMintConnections;
+  /** Mints whose wallet has loaded: a PAY there needs no load round trip (`payBuildWorstMs`). */
+  private readonly loaded: ReadonlySet<MintUrl>;
   private readonly keyset: (mint: MintUrl, id: string) => Promise<MintKeyset | undefined>;
   private readonly now: () => UnixSeconds;
   private readonly closeKey: () => void;
@@ -152,12 +198,20 @@ export class MoneyPlane {
     private readonly o: MoneyPlaneOptions,
     parts: {
       readonly wallet: walletMod.CashuWallet;
+      readonly gate: PayMeltGate;
+      readonly store: walletMod.Nip60ProofStore;
+      readonly conns: walletMod.CashuMintConnections;
+      readonly loaded: ReadonlySet<MintUrl>;
       readonly pubkey: NostrPubkey;
       readonly nip60: walletMod.Nip60Wallet;
       readonly journal: walletMod.SealedJournal | undefined;
     },
   ) {
     this.wallet = parts.wallet;
+    this.gate = parts.gate;
+    this.store = parts.store;
+    this.conns = parts.conns;
+    this.loaded = parts.loaded;
     this.pubkey = parts.pubkey;
     this.p2pk = parts.nip60.p2pk;
     this.mints = [...new Set([...parts.nip60.mints, ...o.defaultMints()])];
@@ -218,16 +272,40 @@ export class MoneyPlane {
       // One attempt per request (fix round 2): never cashu-ts's retrying fetch transport — not by
       // default, and not for a mint an injected (test) transport leaves out.
       const single = hostMintRequest();
-      const wallet = new walletMod.CashuWallet({
-        mints: new walletMod.CashuMintConnections({
-          request: (mint) => o.mintRequest?.(mint) ?? single,
-        }),
-        store,
-        key: nip60.key,
-        configuredMints: [...new Set([...nip60.mints, ...o.defaultMints()])],
-        ...(o.now === undefined ? {} : { now: o.now }),
+      const gate = new PayMeltGate(o.clock === undefined ? {} : { clock: o.clock });
+      const conns = new walletMod.CashuMintConnections({
+        request: (mint) => o.mintRequest?.(mint) ?? single,
       });
-      const plane = new MoneyPlane(o, { wallet, pubkey, nip60, journal });
+      // Which mints have loaded (cached by `conns` from then on): a PAY's belt counts no load
+      // round trip for them.
+      const loaded = new Set<MintUrl>();
+      const mints: walletMod.MintConnections = {
+        wallet: (mint) =>
+          conns.wallet(mint).then((w) => {
+            loaded.add(mint);
+            return w;
+          }),
+      };
+      const wallet = new GatedCashuWallet(
+        {
+          mints,
+          store,
+          key: nip60.key,
+          configuredMints: [...new Set([...nip60.mints, ...o.defaultMints()])],
+          ...(o.now === undefined ? {} : { now: o.now }),
+        },
+        gate,
+      );
+      const plane = new MoneyPlane(o, {
+        wallet,
+        gate,
+        store,
+        conns,
+        loaded,
+        pubkey,
+        nip60,
+        journal,
+      });
       // What a crash cut off (a request sent, its answer never seen) is settled now: NUT-09
       // restores what the mint signed; every operation at a mint settles it first anyway.
       if ((journal?.initial.ops.length ?? 0) > 0)
@@ -332,6 +410,40 @@ export class MoneyPlane {
   }
 
   /**
+   * What an auto top-up needs from this plane besides its wallet (cross-lane review round 4):
+   * the identity; sealing to it — NIP-44 to self through the signer, how the NIP-60 proofs are
+   * kept, for a target quote that is bearer money once paid unless the mint locked it; whether a
+   * melt is still journaled; the mint's own state of a melt quote (a read); the startup settle.
+   * Refused once the plane is closed (its signer is no longer the user's).
+   */
+  topUpVault(): TopUpVault {
+    return {
+      owner: this.pubkey,
+      seal: async (plain) => {
+        this.open();
+        return await this.o.signer.nip44Encrypt(this.pubkey, plain);
+      },
+      unseal: async (sealed) => {
+        this.open();
+        return await this.o.signer.nip44Decrypt(this.pubkey, sealed);
+      },
+      meltPending: async (mint, quoteId) =>
+        (await this.store.pending(mint)).some(
+          (op) => op.kind === 'melt' && op.key.includes(quoteId),
+        ),
+      meltState: async (mint, quoteId) => {
+        this.open();
+        const state: unknown = (await (await this.conns.wallet(mint)).checkMeltQuoteBolt11(quoteId))
+          .state;
+        if (state !== 'UNPAID' && state !== 'PENDING' && state !== 'PAID')
+          throw hostError('internal', 'the mint answered no melt quote state');
+        return state;
+      },
+      recovery: () => this.recovery,
+    };
+  }
+
+  /**
    * Wipe a wallet key held in memory and the journal key; later calls reject, and an operation
    * still in flight can journal nothing more (its entry, already on disk, is settled at the next
    * open).
@@ -348,6 +460,8 @@ export class MoneyPlane {
   // ---- viewer ----------------------------------------------------------------------------
 
   private async payBuild(a: HostMethodTable['pay.build'][0]): Promise<PayMessage> {
+    // The belt's clock starts when the request arrives (`PAY_BUILD_START_BY_MS`).
+    const arrived = this.gate.now();
     this.open();
     const s = this.sessions.get(a.sid);
     if (s === undefined) throw hostError('session-closed', 'no open play session for this PAY');
@@ -371,15 +485,34 @@ export class MoneyPlane {
       throw hostError('forbidden', 'the session has paid for its whole budget');
     s.paidBlocks += blocks;
     try {
-      return await this.viewer.pay(a.range, a.seeder, p, { carryIn: a.carryIn });
+      // Refused at once (`rate-limited:`, nothing spent) while a melt is pending or in flight at
+      // this mint, or once the PAY has waited too long for its turn there (the gate's rules):
+      // how long depends on the journal entries left at the mint, read at its turn (round 4).
+      const mint = a.seeder.mint;
+      const startBy = async (): Promise<number> =>
+        payBuildStartByMs((await this.store.pending(mint)).length, this.loaded.has(mint));
+      return await this.gate.pay(
+        mint,
+        arrived,
+        async () => {
+          // The turn may have come after a sign-out or the session's end: spend nothing then.
+          this.open();
+          if (this.sessions.get(a.sid) !== s)
+            throw hostError('session-closed', 'the play session closed before the PAY was built');
+          try {
+            return await this.viewer.pay(a.range, a.seeder, p, { carryIn: a.carryIn });
+          } finally {
+            // Issue #2: the mint the next PAY draws from (an auto top-up checks it; never awaited).
+            this.paidAt(a.seeder.mint);
+          }
+        },
+        startBy,
+      );
     } catch (err) {
       s.paidBlocks -= blocks;
       if (err instanceof walletMod.WalletError && err.code === 'insufficient-funds')
         throw hostError('no-balance', 'not enough sats at this mint to keep streaming');
       throw err;
-    } finally {
-      // Issue #2: the mint the next PAY draws from (an auto top-up checks it; never awaited).
-      this.paidAt(a.seeder.mint);
     }
   }
 

@@ -28,6 +28,14 @@
  *     two), and a seeder is asked only while its own window (HELLO `windowBlocks`, widened for
  *     the manifest's minimum PAY) has room. The `CreditPool` follows the sum of those windows and
  *     PAYs batch to half each seeder's window.
+ *   - **a PAY refused "for now"** (ADR 0012 amendment 2026-09-25): any failed PAY leaves its
+ *     blocks owed and is asked again at the payer's next trigger (a download, an ACK, credit
+ *     pressure, a tail) — the session stays up and nothing reaches the seeder, so its window is
+ *     never exceeded (no ban). The host answers `rate-limited:` while a melt runs at the PAY's
+ *     mint (nothing spent). With every credit unit held by those owed blocks no trigger may come,
+ *     so after that answer the payer asks again by itself — once per backoff
+ *     (`PAY_RETRY_LATER_MS`, doubling up to `PAY_RETRY_LATER_MAX_MS`), never in a loop: streaming
+ *     pauses during the melt and resumes after it.
  */
 import type {
   CoreKeyHex,
@@ -47,6 +55,24 @@ import type { Logger } from '@sovit/seeder';
 import type { CreditPool } from '../playback/credit.js';
 
 export type PayFn = PaymentEngineViewer['pay'];
+
+/**
+ * After a PAY the host refused "for now" (`rate-limited:`), what is owed is paid again after this
+ * long …
+ */
+export const PAY_RETRY_LATER_MS = 2_000;
+/** … doubling per refusal in a row, up to this. */
+export const PAY_RETRY_LATER_MAX_MS = 30_000;
+
+/** The host's "retry later" answer to a PAY (a melt at its mint, or a PAY that waited too long). */
+function retryLater(err: unknown): boolean {
+  if (typeof err !== 'object' || err === null) return false;
+  try {
+    return (err as { code?: unknown }).code === 'rate-limited';
+  } catch {
+    return false;
+  }
+}
 
 export interface PaidEvent {
   readonly core: CoreKeyHex;
@@ -84,13 +110,25 @@ export class ViewerPayer {
   private readonly settler: CreditSettler;
   /** Per-seeder credit and one-seeder-per-block routing (F33, issue #8). */
   readonly seeders: SeederCredit;
+  /** The one pending "pay again" after a `rate-limited:` refusal (never more than one). */
+  private retryTimer: ReturnType<typeof setTimeout> | null = null;
+  /** `rate-limited:` refusals in a row (the backoff's exponent). */
+  private refusals = 0;
+  private closed = false;
 
   constructor(o: ViewerPayerOptions) {
     this.o = o;
     this.log = o.logger.child({ component: 'viewer-payer' });
     const engine: PaymentEngineViewer = {
       pay: async (range, seeder, policy) => {
-        const msg = await o.pay(range, seeder, policy);
+        let msg: PayMessage;
+        try {
+          msg = await o.pay(range, seeder, policy);
+        } catch (err) {
+          if (retryLater(err)) this.retrySoon();
+          throw err;
+        }
+        this.refusals = 0;
         const amount = proofSum(msg);
         if (amount > 0)
           o.onPaid?.({
@@ -173,8 +211,31 @@ export class ViewerPayer {
 
   /** Stop routing and paying (shutdown, after `flush()`): timers and hooks go. */
   close(): void {
+    this.closed = true;
+    if (this.retryTimer !== null) clearTimeout(this.retryTimer);
+    this.retryTimer = null;
     this.seeders.dispose();
     this.upstream.dispose();
+  }
+
+  /**
+   * The host refused a PAY for now: pay what is owed again after the backoff (one timer at most;
+   * each refusal in a row doubles the wait). A PAY that goes through resets it.
+   */
+  private retrySoon(): void {
+    if (this.closed || this.retryTimer !== null) return;
+    const ms = Math.min(
+      PAY_RETRY_LATER_MS * 2 ** Math.min(this.refusals, 8),
+      PAY_RETRY_LATER_MAX_MS,
+    );
+    this.refusals++;
+    const t = setTimeout(() => {
+      this.retryTimer = null;
+      if (this.closed) return;
+      void this.upstream.flush().catch(() => undefined);
+    }, ms);
+    (t as { unref?: () => void }).unref?.();
+    this.retryTimer = t;
   }
 
   private resolvePolicy(core: CoreKeyHex, hello: HelloMessage): PricePolicy | null {

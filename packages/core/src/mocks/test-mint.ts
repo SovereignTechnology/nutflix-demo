@@ -13,7 +13,9 @@
  * with a shared `TestLightning`, a melt at one TestMint pays the other TestMint's invoice (the
  * desktop's auto top-up, issue #2: melt at the source, mint at the target).
  * Test hooks: `issue()` mints proofs directly (optionally P2PK-locked, with extra NUT-10 tags),
- * `markSpent()` spends proofs behind everyone's back, `failNext()` injects a mint outage.
+ * `markSpent()` spends proofs behind everyone's back, `failNext()` injects a mint outage,
+ * `holdNextMelt()` / `settleMelts()` answer a melt PENDING (its Lightning payment in flight) and
+ * settle it later, as cdk and Nutshell do, `failNextMelt()` refuses a melt request with a code.
  */
 import {
   Amount,
@@ -80,6 +82,12 @@ export interface TestMintOptions {
   /** Simulated Lightning shared with other TestMints: their melts pay this mint's invoices. */
   readonly lightning?: TestLightning;
   /**
+   * The expiry (unix seconds) its mint quotes carry (default 4 102 444 800, 2100-01-01): a test of
+   * what a wallet does once a quote's invoice has expired sets its own. Only the number the mint
+   * answers: the quote stays payable (simulated Lightning keeps no clock).
+   */
+  readonly quoteExpiry?: number;
+  /**
    * NUT-19 cached responses, advertised in `/v1/info` only (default off; cdk-mintd advertises it,
    * Nutshell does not by default). This mint caches nothing: the option exists so a test can show
    * what a client does when a mint advertises it — cashu-ts's own fetch transport then RETRIES a
@@ -134,6 +142,16 @@ interface MeltQuote {
   state: 'UNPAID' | 'PENDING' | 'PAID';
 }
 
+/** A melt answered PENDING (`holdNextMelt`): what `settleMelts` needs to finish it. */
+interface HeldMelt {
+  readonly inputs: { readonly ys: string[]; readonly witnesses: (string | undefined)[] };
+  readonly blanks: readonly SerializedBlindedMessage[];
+  /** The change due on the blanks once it is paid. */
+  readonly refund: number;
+  /** The linked invoice was paid when the melt was answered (`lightning: 'now'`). */
+  readonly paidNow: boolean;
+}
+
 export class TestMint {
   readonly url: MintUrl;
   readonly keysetId: string;
@@ -144,6 +162,7 @@ export class TestMint {
   private readonly nut20: boolean;
   private readonly nut09: boolean;
   private readonly nut19: TestMintOptions['nut19'];
+  private readonly quoteExpiry: number;
   /** B_ → the signature the mint gave it (NUT-09 restore; an output is never signed twice). */
   private readonly promises = new Map<string, SerializedBlindedSignature>();
   /** hex(Y) of every spent proof. */
@@ -155,6 +174,15 @@ export class TestMint {
   private readonly melts = new Map<string, MeltQuote>();
   private seq = 0;
   private failures = 0;
+  /** Melt requests still to be refused with a code (`failNextMelt`). */
+  private refuseMelts = 0;
+  /** Melts still to be answered PENDING (`holdNextMelt`), and how their invoice is paid. */
+  private holdMelts = 0;
+  private holdLightning: 'now' | 'later' = 'later';
+  /** Melts answered PENDING, by quote id, until `settleMelts`. */
+  private readonly held = new Map<string, HeldMelt>();
+  /** hex(Y) of every proof a PENDING melt holds (NUT-07 reads PENDING, a spend is refused). */
+  private readonly pendingYs = new Set<string>();
   private readonly lightning: TestLightning | undefined;
   private readonly invoiceTag: string;
   /** Requests served, by path — tests assert what the code under test actually did. */
@@ -169,6 +197,7 @@ export class TestMint {
     this.nut20 = o.nut20 ?? true;
     this.nut09 = o.nut09 ?? true;
     this.nut19 = o.nut19;
+    this.quoteExpiry = o.quoteExpiry ?? 4_102_444_800;
     const pair = createNewMintKeys(16, o.seed, { unit: 'sat', input_fee_ppk: this.inputFeePpk });
     this.keysetId = pair.keysetId;
     this.pub = pair.pubKeys;
@@ -216,6 +245,52 @@ export class TestMint {
    */
   dropNextResponse(n = 1): void {
     this.dropped += n;
+  }
+
+  /**
+   * The next `n` melt requests (`POST /v1/melt/bolt11`) are refused with a code, as a mint whose
+   * Lightning backend refused the payment up front: nothing is spent, the quote stays UNPAID.
+   */
+  failNextMelt(n = 1): void {
+    this.refuseMelts += n;
+  }
+
+  /**
+   * The next `n` melts are answered PENDING, as a mint does while its Lightning payment is still
+   * in flight: the quote reads PENDING, its inputs read PENDING (NUT-07) and cannot be spent, and
+   * no change is signed yet. `lightning: 'now'` pays the linked invoice at once (the receiver has
+   * settled, the paying node has not said so yet); `'later'` (default) pays it in `settleMelts`.
+   */
+  holdNextMelt(n = 1, o: { readonly lightning?: 'now' | 'later' } = {}): void {
+    this.holdMelts += n;
+    this.holdLightning = o.lightning ?? 'later';
+  }
+
+  /**
+   * Settle every melt answered PENDING. `'paid'`: the inputs are spent, the invoice is paid (if it
+   * was not already), the change is signed on the melt's blanks (so NUT-09 restores it) and the
+   * quote reads PAID. `'failed'`: the payment failed, the inputs are released and the quote reads
+   * UNPAID. Returns how many melts it settled.
+   */
+  settleMelts(outcome: 'paid' | 'failed' = 'paid'): number {
+    let n = 0;
+    for (const [quote, h] of [...this.held]) {
+      this.held.delete(quote);
+      for (const y of h.inputs.ys) this.pendingYs.delete(y);
+      const q = this.melts.get(quote);
+      if (q === undefined) continue;
+      n++;
+      if (outcome === 'failed') {
+        if (h.paidNow) throw new Error('test-mint: an invoice already paid cannot fail');
+        q.state = 'UNPAID';
+        continue;
+      }
+      this.spend(h.inputs);
+      q.state = 'PAID';
+      if (!h.paidNow) this.lightning?.pay(q.request);
+      this.signChange(h.blanks, h.refund);
+    }
+    return n;
   }
 
   /**
@@ -388,6 +463,7 @@ export class TestMint {
       const y = this.y(p.secret);
       if (this.spent.has(y) || ys.includes(y))
         throw new MintOperationError(11001, 'Token already spent');
+      if (this.pendingYs.has(y)) throw new MintOperationError(11002, 'Token is pending');
       ys.push(y);
       witnesses.push(typeof p.witness === 'string' ? p.witness : undefined);
       total += amount;
@@ -482,7 +558,7 @@ export class TestMint {
     return {
       states: (ys as string[]).map((Y) => ({
         Y,
-        state: this.spent.has(Y) ? 'SPENT' : 'UNSPENT',
+        state: this.spent.has(Y) ? 'SPENT' : this.pendingYs.has(Y) ? 'PENDING' : 'UNSPENT',
         witness: this.witnesses.get(Y) ?? null,
       })),
     };
@@ -522,7 +598,7 @@ export class TestMint {
       unit: 'sat',
       amount: q.amount,
       state: q.state,
-      expiry: 4_102_444_800,
+      expiry: this.quoteExpiry,
       ...(q.pubkey === undefined ? {} : { pubkey: q.pubkey }),
     };
   }
@@ -593,17 +669,40 @@ export class TestMint {
     const q = this.melts.get(quote);
     if (!q) throw new MintOperationError(20007, 'quote not found');
     if (q.state === 'PAID') throw new MintOperationError(20006, 'quote already paid');
+    if (q.state === 'PENDING') throw new MintOperationError(20005, 'quote is pending');
+    if (this.refuseMelts > 0) {
+      this.refuseMelts--;
+      throw new MintOperationError(20000, 'test mint: the payment was refused');
+    }
     const inputs = this.checkInputs(body['inputs']);
     const need = q.amount + this.feeReserve + this.fee((body['inputs'] as unknown[]).length);
     if (inputs.total < need) throw new MintOperationError(11002, 'Transaction is not balanced');
-    this.spend(inputs);
-    q.state = 'PAID';
-    this.lightning?.pay(q.request);
     // NUT-08: the unused fee reserve comes back as change on the blank outputs, if any.
     const blanks = Array.isArray(body['outputs'])
       ? (body['outputs'] as SerializedBlindedMessage[])
       : [];
     const refund = inputs.total - q.amount - this.fee((body['inputs'] as unknown[]).length);
+    if (this.holdMelts > 0) {
+      // The Lightning payment is in flight: PENDING, the inputs held, no change yet.
+      this.holdMelts--;
+      const paidNow = this.holdLightning === 'now';
+      for (const y of inputs.ys) this.pendingYs.add(y);
+      this.held.set(quote, { inputs, blanks: [...blanks], refund, paidNow });
+      q.state = 'PENDING';
+      if (paidNow) this.lightning?.pay(q.request);
+      return this.meltQuoteState(quote);
+    }
+    this.spend(inputs);
+    q.state = 'PAID';
+    this.lightning?.pay(q.request);
+    return this.meltQuoteState(quote, this.signChange(blanks, refund));
+  }
+
+  /** NUT-08 change of `refund` sats on `blanks` (remembered: NUT-09 restores it). */
+  private signChange(
+    blanks: readonly SerializedBlindedMessage[],
+    refund: number,
+  ): SerializedBlindedSignature[] {
     const change: SerializedBlindedSignature[] = [];
     let left = refund;
     for (const a of denominations(refund).reverse()) {
@@ -615,7 +714,7 @@ export class TestMint {
       change.push(...signed);
       left -= a;
     }
-    return this.meltQuoteState(quote, change);
+    return change;
   }
 }
 
