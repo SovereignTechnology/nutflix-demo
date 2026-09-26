@@ -29,11 +29,29 @@
  * after it disconnects (bounded): a seeder that reconnects still counts what we never paid it.
  * A seeder that comes back under a NEW Noise key but the same (signed) HELLO pubkey inherits what
  * its old connections left unpaid: its engine keeps our window per OUR pubkey, not per link.
+ *
+ * IMAGE CORES (fix round 4, ADR 0015 × F33): a core read for display (`attachImageCore`: a
+ * creator's profile core — never paid, browsing never spends sats) is routed too, because the core
+ * a thumbnail URL names may be a PAID one, whose honest seeders count every block they send us and
+ * ban us past their window. The viewer cannot know which from the URL; the seeder says so on the
+ * wire: a seeder that counts a core's blocks sends a `PRICE` for it before the first one
+ * (`announceCorePrices`, on for every seeder this repository builds), and a free core gets none.
+ * So, for a pay/1 seeder:
+ *   - its budget on an image core is its BARE window (`windowBlocks`, the smallest it counts
+ *     against) less what it may already count (owed, unpaid; the router subtracts what is in
+ *     flight): even if it counted every image block we ask, it stays within its window;
+ *   - until it has delivered one block of that core with no `PRICE` first, it is asked ONE block
+ *     at a time (`probing`); after that it serves the core free, and nothing it serves there is
+ *     ever counted against its credit (honest images never erode paid playback);
+ *   - once it sent a `PRICE` for the core it is never asked for it again (remembered per seeder,
+ *     across reconnects), and every block of it delivered after that PRICE is unpaid for good.
+ * `onImageVerdict` reports the first `free` / `priced` answer per core (the host refuses a core
+ * sold somewhere and served free nowhere, and stops its read).
  */
 import { DEFAULT_WINDOW_BLOCKS, payment } from '@sovit/core';
 import type { CoreKeyHex, HelloMessage, PayProtocol, PricePolicy } from '@sovit/core';
 import { OnePeerRouter, toHex } from '@sovit/seeder';
-import type { Logger, RoutableCore } from '@sovit/seeder';
+import type { DownloadPeer, Logger, RoutableCore } from '@sovit/seeder';
 
 import type { CreditPool } from './credit.js';
 import type { CreditSettler } from './settle.js';
@@ -46,6 +64,11 @@ export const MAX_POOL_CREDIT = 1024;
 export const NO_PAY_INFLIGHT = DEFAULT_WINDOW_BLOCKS;
 /** Seeders remembered after they disconnect (their unpaid blocks). */
 export const MAX_REMEMBERED_SEEDERS = 4096;
+/** Image cores remembered per seeder as sold (`PRICE`) or served free by it; oldest go first. */
+export const MAX_IMAGE_VERDICTS_PER_SEEDER = 256;
+
+/** What a seeder said about an image core (see the module comment). */
+export type ImageVerdict = 'free' | 'priced';
 
 /** Pools a live `SeederCredit` resizes. */
 const managed = new WeakSet<CreditPool>();
@@ -87,6 +110,10 @@ interface Seeder {
   conn: object;
   /** Blocks it delivered that were settled without a payment: still outstanding at the seeder. */
   unpaid: number;
+  /** Image cores it sent a `PRICE` for (never asked again; kept across reconnects). */
+  readonly priced: Set<string>;
+  /** Image cores it served free on its CURRENT connection (probing is over there). */
+  free: Set<string>;
 }
 
 export interface SeederCreditStats {
@@ -108,6 +135,11 @@ export class SeederCredit {
   private readonly byPubkey = new Map<string, Set<string>>();
   /** Routed cores (their policies size the pool and the batches). */
   private readonly cores = new Map<string, number>();
+  /** Image cores (fix round 4), reference counted. */
+  private readonly images = new Map<string, number>();
+  /** Image cores a verdict was reported for (the first `free` and the first `priced`). */
+  private readonly told = new Map<string, Set<ImageVerdict>>();
+  private readonly verdictListeners = new Set<(core: string, verdict: ImageVerdict) => void>();
   private readonly offSettler: () => void;
   private disposed = false;
 
@@ -119,6 +151,7 @@ export class SeederCredit {
     this.floor = o.pool.limit;
     this.router = new OnePeerRouter({
       budget: (remote, core) => this.budget(remote, core),
+      probe: (remote, core) => this.probing(remote, core),
       logger: o.logger,
       ...(o.stallMs !== undefined ? { stallMs: o.stallMs } : {}),
     });
@@ -143,17 +176,29 @@ export class SeederCredit {
       live: false,
       conn,
       unpaid: 0,
+      priced: new Set(),
+      free: new Set(),
     };
     // Most recently seen last: the eviction order.
     this.seeders.delete(noiseHex);
     this.seeders.set(noiseHex, seeder);
     this.evict();
     seeder.conn = conn;
+    // A new connection re-probes: the seeder announces its prices per connection.
+    seeder.free = new Set();
     this.setHello(noiseHex, seeder, protocol.peer);
     seeder.live = protocol.state !== 'closed';
     const offOpen = protocol.on('open', (hello) => {
       if (seeder.conn !== conn) return;
       this.setHello(noiseHex, seeder, hello);
+      this.changed();
+    });
+    // Fix round 4: a PRICE for a core being read as an image — this seeder counts its blocks.
+    const offPrice = protocol.on('price', (p) => {
+      if (seeder.conn !== conn || !this.images.has(p.core)) return;
+      remember(seeder.priced, p.core);
+      seeder.free.delete(p.core);
+      this.verdict(p.core, 'priced');
       this.changed();
     });
     const end = (): void => {
@@ -168,9 +213,53 @@ export class SeederCredit {
       if (done) return;
       done = true;
       offOpen();
+      offPrice();
       offClose();
       end();
     };
+  }
+
+  /**
+   * Route a core read for DISPLAY only (fix round 4: a profile core's image — never paid). See the
+   * module comment for the rules; blocks from a pay/1 seeder that priced the core are counted
+   * unpaid. The core must be open; throws `RoutingUnsupported` like `attachCore` (fail closed).
+   * Returns a detach function (reference counted).
+   */
+  attachImageCore(core: RoutableCore): () => void {
+    const detach = this.router.attachCore(core);
+    const key = toHex(core.key);
+    this.images.set(key, (this.images.get(key) ?? 0) + 1);
+    const onDownload = (_index: number, _bytes: number, peer: DownloadPeer): void => {
+      this.onImageBlock(key, toHex(peer.remotePublicKey));
+    };
+    core.on('download', onDownload);
+    this.changed();
+    let done = false;
+    return () => {
+      if (done) return;
+      done = true;
+      core.off('download', onDownload);
+      detach();
+      const n = (this.images.get(key) ?? 1) - 1;
+      if (n <= 0) this.images.delete(key);
+      else this.images.set(key, n);
+      this.changed();
+    };
+  }
+
+  /** The first `free` and the first `priced` verdict per image core. Returns an unsubscribe. */
+  onImageVerdict(cb: (core: string, verdict: ImageVerdict) => void): () => void {
+    this.verdictListeners.add(cb);
+    return () => this.verdictListeners.delete(cb);
+  }
+
+  /**
+   * Whether `remote` may be asked only ONE block of `core` at a time: an image core it has not yet
+   * served free on this connection (the router's `probe`).
+   */
+  probing(remote: string, core: string): boolean {
+    if (!this.images.has(core) || this.payable(core)) return false;
+    return this.seeders.get(remote)?.free.has(core) !== true;
   }
 
   /** Route a core's requests (one seeder per block, per-seeder caps). Returns a detach function. */
@@ -197,7 +286,15 @@ export class SeederCredit {
    */
   budget(remote: string, core: string): number {
     const s = this.seeders.get(remote);
-    if (s === undefined || !this.payable(core)) return NO_PAY_INFLIGHT;
+    if (s === undefined) return NO_PAY_INFLIGHT;
+    if (!this.payable(core)) {
+      if (!this.images.has(core)) return NO_PAY_INFLIGHT;
+      // Fix round 4: an image core — the seeder may count it (see the module comment).
+      if (!s.live || s.hello === null || !this.o.settler.linked(remote)) return 0;
+      if (s.priced.has(core)) return 0;
+      const bare = this.window(s.hello, null);
+      return Math.max(0, bare - this.o.settler.owedBy(remote) - this.lostTo(remote, s));
+    }
     if (!s.live || s.hello === null || !this.o.settler.linked(remote)) return 0;
     const win = this.window(s.hello, this.o.policyFor(core as CoreKeyHex));
     return Math.max(0, win - this.o.settler.owedBy(remote) - this.lostTo(remote, s));
@@ -250,6 +347,46 @@ export class SeederCredit {
   }
 
   // -------------------------------------------------------------- private
+
+  /** A verified block of image core `core` from `remote` (fix round 4). */
+  private onImageBlock(core: string, remote: string): void {
+    if (this.payable(core)) return; // a play session made it a paid core: the settler's now
+    const s = this.seeders.get(remote);
+    if (s === undefined || !s.live || s.hello === null) return; // no pay/1: nothing counts it
+    if (s.priced.has(core)) {
+      // Delivered after its PRICE: it counts the block, and we never pay for browsing.
+      s.unpaid++;
+      this.changed();
+      return;
+    }
+    if (s.free.has(core)) return;
+    // No PRICE before this block: it serves the core free. The probe is over.
+    remember(s.free, core);
+    this.verdict(core, 'free');
+    this.changed();
+  }
+
+  private verdict(core: string, v: ImageVerdict): void {
+    let said = this.told.get(core);
+    if (said?.has(v) === true) return;
+    if (said === undefined) {
+      said = new Set();
+      this.told.set(core, said);
+      while (this.told.size > MAX_REMEMBERED_SEEDERS) {
+        const oldest = this.told.keys().next();
+        if (oldest.done === true) break;
+        this.told.delete(oldest.value);
+      }
+    }
+    said.add(v);
+    for (const cb of [...this.verdictListeners]) {
+      try {
+        cb(core, v);
+      } catch {
+        // a listener's failure is its own
+      }
+    }
+  }
 
   /**
    * Blocks the seeder `remote` delivered that will never be paid: its own, plus — for its HELLO
@@ -331,6 +468,7 @@ export class SeederCredit {
     this.router.refresh();
   }
 
+  // (`remember` below keeps the per-seeder verdict sets bounded.)
   private evict(): void {
     for (const [remote, s] of this.seeders) {
       if (this.seeders.size <= MAX_REMEMBERED_SEEDERS) return;
@@ -338,5 +476,16 @@ export class SeederCredit {
       this.seeders.delete(remote);
       if (s.pubkey !== null) this.unindex(remote, s.pubkey);
     }
+  }
+}
+
+/** Add `core` to a per-seeder verdict set, dropping the oldest past the bound. */
+function remember(set: Set<string>, core: string): void {
+  set.delete(core);
+  set.add(core);
+  while (set.size > MAX_IMAGE_VERDICTS_PER_SEEDER) {
+    const oldest = set.values().next();
+    if (oldest.done === true) break;
+    set.delete(oldest.value);
   }
 }

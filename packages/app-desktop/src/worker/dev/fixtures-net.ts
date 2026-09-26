@@ -166,7 +166,16 @@ export async function createFixtureSeeder(o: FixtureSeederOptions): Promise<Fixt
   );
   const logger = o.logger.child({ fixture: o.name });
   const seeder = await Seeder.create(
-    { dataDir: o.dataDir, diskCapBytes: 4 * 1024 ** 3, swarm: null, policy: o.policy },
+    {
+      dataDir: o.dataDir,
+      diskCapBytes: 4 * 1024 ** 3,
+      swarm: null,
+      policy: o.policy,
+      // Like every seeder this repository builds (fix round 4): a core's PRICE precedes its first
+      // counted block, so a viewer reading an image learns the core is sold before our window
+      // would cut it.
+      announceCorePrices: true,
+    },
     { engine, fs: o.fs, crypto: o.crypto, logger },
   );
   const credit = new CreditPool(DEFAULT_WINDOW_BLOCKS);

@@ -6,22 +6,21 @@
  *     would refuse to start from one anyway);
  *   - main, the host and the renderer are PACKED (inside the archive, so on macOS/Windows the
  *     integrity fuse covers the code that holds the wallet and the signer);
- *   - the worker boot module and bundle, and bare-sidecar's runtime for this target, are
- *     UNPACKED real files, and the runtime is executable (the host refuses it otherwise);
+ *   - the worker boot module, its bundle and the DLEQ thread's entry (`UNPACKED_FILES`) are
+ *     UNPACKED regular files: never a symlink, nor under a symlinked directory, either of which
+ *     could lead Bare out of the app's own directory. A missing thread entry would not stop the
+ *     app (its worker would check every PAY's DLEQ proofs inline, on its event loop), so it is
+ *     refused here;
+ *   - bare-sidecar's runtime for this target is unpacked and executable (the host refuses it
+ *     otherwise);
  *   - no other platform's `bare` runtime was shipped.
  */
-import { accessSync, constants, existsSync, readdirSync } from 'node:fs';
+import { accessSync, constants, existsSync, lstatSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { statFile } from '@electron/asar';
 
-import {
-  PACKAGED_WORKER_BUNDLE,
-  PACKAGED_WORKER_ENTRY,
-  PRELOAD_FILES,
-  PROMPT_FILES,
-  RENDERER_FILES,
-} from './identity.ts';
+import { PRELOAD_FILES, PROMPT_FILES, RENDERER_FILES, UNPACKED_FILES } from './identity.ts';
 
 export function resourcesDir(outputDir: string, platform: string, productName: string): string {
   return platform === 'darwin' || platform === 'mas'
@@ -65,8 +64,34 @@ export function layoutProblems(
       problems.push(`${f} is not in app.asar`);
     }
   }
-  for (const f of [PACKAGED_WORKER_ENTRY, PACKAGED_WORKER_BUNDLE])
-    if (!existsSync(join(unpacked, f))) problems.push(`${f} is not unpacked`);
+  for (const f of UNPACKED_FILES) {
+    // Every directory on the way too (`worker/`, `worker/pay/`): a linked directory leads out as
+    // surely as a linked file.
+    const parts = f.split('/');
+    const linkedDir = parts
+      .slice(0, -1)
+      .map((_, i) => parts.slice(0, i + 1).join('/'))
+      .find((d) => {
+        try {
+          return lstatSync(join(unpacked, d)).isSymbolicLink();
+        } catch {
+          return false;
+        }
+      });
+    if (linkedDir !== undefined) {
+      problems.push(`${f}: ${linkedDir}/ is a symlink; it must be a real directory`);
+      continue;
+    }
+    let st: ReturnType<typeof lstatSync>;
+    try {
+      st = lstatSync(join(unpacked, f));
+    } catch {
+      problems.push(`${f} is not unpacked`);
+      continue;
+    }
+    if (st.isSymbolicLink()) problems.push(`${f} is a symlink; it must be a regular file`);
+    else if (!st.isFile()) problems.push(`${f} is not a regular file`);
+  }
   const prebuilds = join(unpacked, 'node_modules', 'bare-sidecar', 'prebuilds');
   const bin = join(prebuilds, `${platform}-${arch}`, platform === 'win32' ? 'bare.exe' : 'bare');
   if (!existsSync(bin)) problems.push(`the Bare runtime for ${platform}-${arch} is missing`);

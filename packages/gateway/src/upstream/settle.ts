@@ -16,6 +16,7 @@
  */
 import type {
   AckMessage,
+  BlockRange,
   CoreKeyHex,
   PayMessage,
   PayProtocol,
@@ -82,6 +83,24 @@ export class CreditSettler {
     if (l === undefined || l.closed) return 0;
     let n = 0;
     for (const s of l.owed.values()) n += s.size;
+    return n;
+  }
+
+  /**
+   * Blocks of `core` (of every core without one) downloaded on live `pay/1` links and not settled
+   * yet — owed until their PAY is ACKed (fix round 4: what a closing session waits for). With
+   * `range`, only blocks `fromBlock..toBlock` of `core` count (fix round 5: a closing session's
+   * own blocks — another session of the same core may be streaming beside it).
+   */
+  owedOn(core?: string, range?: { readonly fromBlock: number; readonly toBlock: number }): number {
+    let n = 0;
+    for (const l of this.links.values()) {
+      if (l.closed) continue;
+      if (core === undefined) for (const s of l.owed.values()) n += s.size;
+      else if (range === undefined) n += l.owed.get(core)?.size ?? 0;
+      else
+        for (const b of l.owed.get(core) ?? []) if (b >= range.fromBlock && b <= range.toBlock) n++;
+    }
     return n;
   }
 
@@ -186,6 +205,26 @@ export class CreditSettler {
     return () => {
       core.off('download', onDownload);
     };
+  }
+
+  /**
+   * Fix round 4: blocks of `range` downloaded from `noiseHex` will never be paid (their PAY could
+   * not be built — the desktop's play session is gone, the host refuses it). They settle now,
+   * reported as UNPAID (`onChange`), so the seeder's credit keeps them for good instead of holding
+   * pool units for ever. Blocks not owed on the live link are ignored. Returns how many settled.
+   */
+  settleUnpaid(noiseHex: string, range: BlockRange): number {
+    const link = this.links.get(noiseHex);
+    if (link === undefined || link.closed) return 0;
+    const owed = link.owed.get(range.core);
+    let n = 0;
+    for (let b = range.fromBlock; b <= range.toBlock; b++) {
+      if (owed?.delete(b) !== true) continue;
+      n++;
+      this.o.credit.settle(range.core, b);
+    }
+    if (n > 0) this.emit(noiseHex, n);
+    return n;
   }
 
   private onAck(link: Link, ack: AckMessage): void {

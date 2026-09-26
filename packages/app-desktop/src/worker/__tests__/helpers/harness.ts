@@ -23,7 +23,7 @@ import { nodeFsAdapter, nodeProcessRunner } from '@sovit/core/media/node';
 import { nodeFs } from '@sovit/seeder';
 
 import { FrameDecoder, encodeFrame } from '../../../ipc/framing.js';
-import { fromWireError } from '../../../ipc/errors.js';
+import { fromWireError, toWireError } from '../../../ipc/errors.js';
 import type { Guard } from '../../../ipc/protocol.js';
 import { isWorkerToHost, validateWorkerResult } from '../../../ipc/worker-guards.js';
 import type {
@@ -211,12 +211,10 @@ export function startWorker(
           reply({ op: 'res', id: m.id, ok: true, r });
         },
         (e: unknown) => {
-          reply({
-            op: 'res',
-            id: m.id,
-            ok: false,
-            e: { code: 'internal', message: `internal: ${e instanceof Error ? e.message : 'x'}` },
-          });
+          // As the host's supervisor answers (`onRequest`): a coded refusal keeps its code — the
+          // money plane's 'forbidden' / 'session-closed' decide whether the worker's payer gives
+          // blocks up (fix round 5: this harness used to turn every one into 'internal').
+          reply({ op: 'res', id: m.id, ok: false, e: toWireError(e) });
         },
       );
       return;

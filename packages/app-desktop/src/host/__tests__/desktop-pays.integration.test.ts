@@ -43,6 +43,7 @@ import type { DevTestnet } from '../../worker/dev/fixtures-net.js';
 import { startDevTestnet } from '../../worker/dev/fixtures-net.js';
 import type { WorkerClient } from '../../worker/__tests__/helpers/harness.js';
 import { httpGet, startWorker, tempDir } from '../../worker/__tests__/helpers/harness.js';
+import { CLOSE_DRAIN_MS } from '../../worker/host.js';
 import { memoryLogger } from '../log.js';
 import { MoneyPlane } from '../money.js';
 
@@ -85,6 +86,17 @@ describe('the desktop app pays a seeder daemon for real (ADR 0012)', () => {
   let core: CoreKeyHex;
   let blob: { blockOffset: number; blockLength: number; byteOffset: number; byteLength: number };
   let data: Uint8Array;
+  /** Fix round 4: two 7-block videos (a tail of one block below the seeder's batch of 2)… */
+  let tailA: { blob: typeof blob; data: Uint8Array };
+  let tailB: { blob: typeof blob; data: Uint8Array };
+  /** …and one more played by a fresh worker after a quit. */
+  let fresh: { blob: typeof blob; data: Uint8Array };
+  /** Fix round 5: two renditions of one video in the same core (a rendition switch). */
+  let switchA: { blob: typeof blob; data: Uint8Array };
+  let switchB: { blob: typeof blob; data: Uint8Array };
+  let switchC: { blob: typeof blob; data: Uint8Array };
+  let switchD: { blob: typeof blob; data: Uint8Array };
+  let wdirRoot: string;
 
   beforeAll(async () => {
     testnet = await startDevTestnet();
@@ -137,6 +149,19 @@ describe('the desktop app pays a seeder daemon for real (ADR 0012)', () => {
     if (!put.ok) throw new Error('put failed');
     core = put.entry.coreKey;
     blob = put.entry.blob;
+    const more = async (blocks: number, salt: number) => {
+      const d = new Uint8Array(BLOCK * blocks).map((_, i) => (i * 31 + salt) % 256);
+      const r = await upSeeder.putBytes(d, { mime: 'video/mp4' });
+      if (!r.ok || r.entry.coreKey !== core) throw new Error('put failed');
+      return { blob: r.entry.blob, data: d };
+    };
+    tailA = await more(7, 3);
+    tailB = await more(7, 5);
+    fresh = await more(8, 7);
+    switchA = await more(7, 9);
+    switchB = await more(24, 13);
+    switchC = await more(7, 17);
+    switchD = await more(8, 19);
     upRt.attach(upSeeder);
     upSeeder.start();
     await upSeeder.swarm!.flushedAll();
@@ -167,6 +192,7 @@ describe('the desktop app pays a seeder daemon for real (ADR 0012)', () => {
     // --- the desktop worker, real providers, every money step asked of the host above
     const wdir = await tempDir('nf-desk-worker-');
     teardown.push(wdir.rm);
+    wdirRoot = wdir.dir;
     worker = startWorker({
       handlers: {
         ...plane.handlers(),
@@ -248,4 +274,166 @@ describe('the desktop app pays a seeder daemon for real (ADR 0012)', () => {
     await worker.call('play.close', { sid });
     plane.revokeSession(sid);
   }, 120_000);
+
+  // ---- fix round 4 (cross-lane review, HIGH): owed blocks at play.close and at quit ----------
+  // `closeSession` deleted the worker's session before its flush, `close()` closed every session
+  // before its own, and the host revoked the session before the worker even heard `play.close` —
+  // so every PAY for a session's tail (blocks below a batch, behind an unACKed PAY, in flight)
+  // was refused 'session-closed'. The seeder kept counting them; after a restart (IR4) the viewer
+  // started from zero and the seeder's stuck count plus a fresh window cut and banned it.
+
+  const play = async (w: WorkerClient, v: { blob: typeof blob; data: Uint8Array }) => {
+    const sid = randomBytes(16).toString('hex') as SessionId;
+    plane.authorizeSession(sid, { core, blob: v.blob, policy: POLICY }, CREATOR);
+    const { link } = await w.call('play.open', {
+      sid,
+      videoId: 'ee'.repeat(32) as never,
+      rendition: {
+        label: '720p',
+        hyper: { core, blob: v.blob },
+        size: v.blob.byteLength,
+        bitrateKbps: 100_000,
+      },
+      policy: POLICY,
+      prefetchSeconds: 30,
+    });
+    const got = await httpGet(link);
+    expect(got.status).toBe(200);
+    expect(Buffer.compare(Buffer.from(got.body), Buffer.from(v.data))).toBe(0);
+    return sid;
+  };
+  const counted = () => upRt.engine.window(plane.pubkey)!;
+
+  it('a tail pending at play.close is paid before play.close answers — while the session still authorises it', async () => {
+    const sid = await play(worker, tailA);
+    // Straight away (the tail timer is 2 s): the last block is still below a batch of 2.
+    await worker.call('play.close', { sid });
+    // play.close answered: the tail was paid AND acknowledged — now the host may revoke.
+    expect(counted()).toMatchObject({ outstanding: 0, banned: false });
+    expect(counted().paid).toBe(counted().uploaded);
+    plane.revokeSession(sid);
+  }, 60_000);
+
+  // ---- fix round 5 (the verifier of fix round 4, HIGH + MEDIUM): a rendition switch ----------
+  // Every rendition of an upload lives in one core, and the switch opens the new session BEFORE it
+  // closes the old one. The worker named the session of a PAY by core alone, preferring the open
+  // one, so the old session's tail was asked of the NEW session; the host refused it as outside
+  // its video, and the payer gave the blocks up for good (reproduced 3/3: seeder outstanding 5,
+  // the new rendition then starved of that seeder's credit). And the old session's close drained
+  // the whole core, so the new rendition streaming beside it held `play.close` (the switch) up.
+  const unpayable = () => worker.host.internals.payer!.stats().unpayableBlocks;
+  const openRendition = async (v: { blob: typeof blob }) => {
+    // The adapter's reopen: the host authorises the new session, then the worker opens it.
+    const sid = randomBytes(16).toString('hex') as SessionId;
+    plane.authorizeSession(sid, { core, blob: v.blob, policy: POLICY }, CREATOR);
+    const { link } = await worker.call('play.open', {
+      sid,
+      videoId: 'ee'.repeat(32) as never,
+      rendition: {
+        label: '1080p',
+        hyper: { core, blob: v.blob },
+        size: v.blob.byteLength,
+        bitrateKbps: 100_000,
+      },
+      policy: POLICY,
+      prefetchSeconds: 30,
+    });
+    return { sid, link };
+  };
+
+  it("a rendition switch: A streams, pause A, open B on the same core, close A while B streams — A's tail is paid under A, the seeder is owed nothing, play.close answers promptly, B streams byte-exact", async () => {
+    const givenUpBefore = unpayable();
+    // Straight away after A played (the tail timer is 2 s): its last block is below a batch of 2.
+    const sidA = await play(worker, switchA);
+    await worker.call('play.pause', { sid: sidA });
+    const { sid: sidB, link: linkB } = await openRendition(switchB);
+    const streamB = httpGet(linkB); // B streams while A closes
+    const t0 = Date.now();
+    await worker.call('play.close', { sid: sidA });
+    const closeMs = Date.now() - t0;
+    // A's tail was paid under A — still authorised until play.close answered — and none of it was
+    // given up. (B may be mid-stream: its own blocks are its own business, checked below.)
+    expect(unpayable()).toBe(givenUpBefore);
+    expect(closeMs).toBeLessThan(CLOSE_DRAIN_MS);
+    plane.revokeSession(sidA);
+    const got = await streamB;
+    expect(got.status).toBe(200);
+    expect(Buffer.compare(Buffer.from(got.body), Buffer.from(switchB.data))).toBe(0);
+    await until(
+      () => counted().outstanding === 0 && counted().paid === counted().uploaded,
+      20_000,
+      'every block of both renditions paid',
+    );
+    await worker.call('play.close', { sid: sidB });
+    plane.revokeSession(sidB);
+    expect(unpayable()).toBe(givenUpBefore);
+    expect(counted()).toMatchObject({ outstanding: 0, banned: false });
+    expect(upSeeder.bans()).toEqual([]);
+  }, 90_000);
+
+  // The two renditions are stored side by side in the core, so the new one's first blocks follow
+  // the old one's last block: one run in the payer. No session covers such a run, so a PAY must
+  // stop at the old rendition's end — each session pays its own blocks.
+  it("renditions side by side: B's first blocks land while A's tail is still pending — no PAY crosses A's end, each session pays its own, nothing is given up", async () => {
+    const givenUpBefore = unpayable();
+    expect(switchD.blob.blockOffset).toBe(switchC.blob.blockOffset + switchC.blob.blockLength);
+    const sidA = await play(worker, switchC); // its last block pending (below a batch of 2)
+    await worker.call('play.pause', { sid: sidA });
+    const { sid: sidB, link: linkB } = await openRendition(switchD);
+    const got = await httpGet(linkB); // B streams to its end BEFORE A closes
+    expect(got.status).toBe(200);
+    expect(Buffer.compare(Buffer.from(got.body), Buffer.from(switchD.data))).toBe(0);
+    await until(
+      () => counted().outstanding === 0 && counted().paid === counted().uploaded,
+      20_000,
+      'every block of both renditions paid',
+    );
+    expect(unpayable()).toBe(givenUpBefore);
+    for (const sid of [sidA, sidB]) {
+      await worker.call('play.close', { sid });
+      plane.revokeSession(sid);
+    }
+    expect(counted()).toMatchObject({ outstanding: 0, banned: false });
+    expect(upSeeder.bans()).toEqual([]);
+  }, 90_000);
+
+  it('a quit mid-video pays its tail before the node is destroyed', async () => {
+    await play(worker, tailB);
+    // No play.close: the worker shuts down with the session open (the host still answering).
+    await worker.close();
+    expect(counted()).toMatchObject({ outstanding: 0, banned: false });
+    expect(counted().paid).toBe(counted().uploaded);
+  }, 60_000);
+
+  it('the next start does not overrun the seeder: a fresh worker streams from it at a full window, unbanned, every block paid', async () => {
+    const dir = path.join(wdirRoot, 'second-start');
+    await mkdir(dir, { recursive: true });
+    const second = startWorker({
+      handlers: {
+        ...plane.handlers(),
+        'studio.publish': () => Promise.reject(new Error('not in this test')),
+      },
+      testBootstrap: testnet.bootstrap,
+      logLevel: 'error',
+    });
+    teardown.push(() => second.close());
+    await second.call('init', {
+      v: 1,
+      storage: dir,
+      seeding: { enabled: false, diskCapBytes: 1024 ** 3 },
+      prefetchSeconds: 30,
+      payments: plane.payments(),
+    });
+    await second.event(
+      (e): e is Extract<WorkerEvent, { e: 'ready' }> => e.e === 'ready',
+      10_000,
+      'ready',
+    );
+    const sid = await play(second, fresh);
+    await second.call('play.close', { sid });
+    plane.revokeSession(sid);
+    expect(upRt.engine.isBanned(plane.pubkey)).toBe(false);
+    expect(upSeeder.bans()).toEqual([]);
+    expect(counted()).toMatchObject({ outstanding: 0, banned: false });
+  }, 90_000);
 });

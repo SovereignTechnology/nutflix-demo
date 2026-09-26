@@ -28,6 +28,8 @@
  *      hypercore's own cap; anything else that is not a finite number ≥ 1 asks nothing.
  *   3. `refresh()` re-runs hypercore's scheduler (`updateAll()`) after a budget grew (an ACK, a
  *      HELLO), and while a request is stalled a ticker runs `updatePeer()` so a failover can fire.
+ *   4. (fix round 4) with the `probe` option, a peer being probed on a core — a seeder not yet
+ *      known to serve an image core free — is asked one block of it at a time.
  *
  * A request has STALLED when it is at least `stallMs` old AND its peer has delivered no block on
  * that core for `stallMs` (measured from the later of the request and the peer's last block): a
@@ -120,6 +122,12 @@ export interface OnePeerRouterOptions {
   readonly stallMs?: number;
   /** A request was taken from a stalled peer (`remote`) and given to another one. */
   readonly onFailover?: (remote: string, core: string) => void;
+  /**
+   * Fix round 4: `true` = ask `remote` at most ONE block of `core` at a time (a seeder not yet
+   * known to serve an image core free — `SeederCredit.probing`), within its credit as always. A
+   * throw counts as `true` (the narrower cap).
+   */
+  readonly probe?: (remote: string, core: string) => boolean;
 }
 
 export interface OnePeerRouterStats {
@@ -349,6 +357,16 @@ class NoRaceQueue implements HotswapQueueLike {
     for (const block of this.tracked) if (stalled(block, now, this.host) !== null) return true;
     return false;
   }
+
+  /**
+   * Blocks `from..to` with a request out or being verified: hypercore adds a block here when it
+   * sends its request and removes it once it resolved, was dropped, or its requests all ended.
+   */
+  countIn(from: number, to: number): number {
+    let n = 0;
+    for (const block of this.tracked) if (block.index >= from && block.index <= to) n++;
+    return n;
+  }
 }
 
 // ---------------------------------------------------------------- parking (fail closed)
@@ -507,6 +525,27 @@ export class OnePeerRouter {
   inflight(remote: string): number {
     let n = 0;
     for (const p of this.byRemote.get(remote) ?? []) n += p.inflight + p.dataProcessing;
+    return n;
+  }
+
+  /**
+   * Requests in flight and blocks being verified on the routed core `core` (hex; every routed core
+   * without one), across its peers — what may still land there (fix round 4: a closing session
+   * waits for it before its tail is paid). With `range`, the BLOCKS `fromBlock..toBlock` of `core`
+   * requested and not landed yet, whichever peer has them (fix round 5: a closing session's own
+   * blocks, not those of another session streaming the same core).
+   */
+  inflightOn(
+    core?: string,
+    range?: { readonly fromBlock: number; readonly toBlock: number },
+  ): number {
+    let n = 0;
+    for (const route of this.routes.values()) {
+      if (core !== undefined && route.keyHex !== core) continue;
+      if (core !== undefined && range !== undefined)
+        n += route.queue.countIn(range.fromBlock, range.toBlock);
+      else for (const p of route.peers.keys()) n += p.inflight + p.dataProcessing;
+    }
     return n;
   }
 
@@ -719,7 +758,20 @@ export class OnePeerRouter {
       typeof budget === 'number' && Number.isFinite(budget) && budget >= 1 ? Math.floor(budget) : 0;
     let free = Math.max(0, credit - this.used(remote));
     if (this.stalled.has(remote)) free = Math.min(free, Math.max(0, 1 - this.inflight(remote)));
+    if (this.probing(remote, route.keyHex))
+      free = Math.min(free, Math.max(0, 1 - peer.inflight - peer.dataProcessing));
     return Math.min(base, peer.inflight + free);
+  }
+
+  /** The `probe` option (fix round 4); a throw is a probe. */
+  private probing(remote: string, core: string): boolean {
+    const probe = this.o.probe;
+    if (probe === undefined) return false;
+    try {
+      return probe(remote, core);
+    } catch {
+      return true;
+    }
   }
 
   /**

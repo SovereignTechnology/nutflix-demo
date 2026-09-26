@@ -13,7 +13,15 @@ import { mocks } from '@sovit/core';
 import type { CoreKeyHex, PayMessage, PricePolicy, Sats } from '@sovit/core';
 import { Seeder, nodeCrypto, nodeFs, toHex } from '@sovit/seeder';
 
-import { UpstreamPayer, manifestPolicyResolver } from '../upstream/payer.js';
+import {
+  MAX_PAY_FAILURES,
+  PAY_GIVE_UP_MS,
+  PAY_RETRY_BASE_MS,
+  PAY_RETRY_MAX_MS,
+  UpstreamPayer,
+  manifestPolicyResolver,
+} from '../upstream/payer.js';
+import type { UpstreamPayerOptions } from '../upstream/payer.js';
 import { FakePayProtocol, helloFrom } from './fake-pay-protocol.js';
 import {
   BLOCK,
@@ -517,5 +525,434 @@ describe('UpstreamPayer (integration): gateway pulls from a real upstream seeder
     expect(byCore.get(CORE_A)).toBe(creator);
     expect(byCore.has(CORE_B)).toBe(false);
     expect(payer.stats().skippedNoPolicy).toBeGreaterThanOrEqual(1);
+  });
+});
+
+// Cross-lane review, fix round 4 (HIGH, gateway payer): one core's PAY failure used to abort
+// `payPending` for the whole peer — `state.pending` is walked in insertion order and a stuck core
+// first in it threw before any later core was reached, so a seeder's other cores (the video
+// playing now) were never paid and its window filled for good. The reviewer's probe: an engine
+// rejecting CORE_A, one CORE_A block pending, then 4 CORE_B blocks under a per-seeder batch of 2
+// → 0 PAYs (the control run without the stuck block paid CORE_B [0..3]).
+describe('UpstreamPayer — a PAY that cannot be built (fix round 4)', () => {
+  function failing(
+    fail: (core: CoreKeyHex, range: { fromBlock: number; toBlock: number }) => Error | null,
+    opts: {
+      readonly batch?: number;
+      readonly atCap?: boolean;
+      readonly tailMs?: number;
+      readonly credit?: UpstreamPayerOptions['credit'];
+      readonly boundRange?: UpstreamPayerOptions['boundRange'];
+      readonly autoAck?: boolean;
+    } = {},
+  ) {
+    const engine = new mocks.MockPaymentEngine({ mode: 'honest' });
+    const log = capturedLogger();
+    const calls: CoreKeyHex[] = [];
+    const unpayable: { noise: string; core: CoreKeyHex; from: number; to: number }[] = [];
+    const perCore = new Map<CoreKeyHex, PricePolicy>([
+      [CORE_A, basePolicy(MANIFEST_PRICE)],
+      [CORE_B, basePolicy(MANIFEST_PRICE)],
+    ]);
+    const payer = new UpstreamPayer({
+      engine: {
+        pay: (range, seeder, policy, o) => {
+          calls.push(range.core);
+          const err = fail(range.core, range);
+          return err === null ? engine.pay(range, seeder, policy, o) : Promise.reject(err);
+        },
+        spent: () => engine.spent(),
+      },
+      logger: log.logger,
+      payEveryBlocks: 1,
+      tailMs: opts.tailMs ?? 0,
+      seederBatch: () => ({ batch: opts.batch ?? 2, atCap: opts.atCap ?? false }),
+      ...(opts.credit !== undefined ? { credit: opts.credit } : {}),
+      ...(opts.boundRange !== undefined ? { boundRange: opts.boundRange } : {}),
+      ownMints: [MINT_A, MINT_B],
+      policyFor: manifestPolicyResolver(() => perCore),
+      onUnpayable: (noise, range) => {
+        unpayable.push({ noise, core: range.core, from: range.fromBlock, to: range.toBlock });
+      },
+    });
+    const protocol = new FakePayProtocol({ autoAck: opts.autoAck ?? true });
+    const detach = payer.attachPeer(NOISE, protocol);
+    protocol.remoteHello(hello());
+    return { payer, protocol, log, calls, unpayable, detach };
+  }
+  const ranges = (p: FakePayProtocol): [CoreKeyHex, number, number][] =>
+    p.sentPays.map((m) => [m.range.core, m.range.fromBlock, m.range.toBlock]);
+
+  it("the reviewer's probe: a core whose session is gone does not keep the seeder's other cores unpaid, and its blocks are settled as unpaid, explicitly", async () => {
+    const r = failing((core) =>
+      core === CORE_A ? new Error('session-closed: no open play session for this core') : null,
+    );
+    r.payer.onDownload(CORE_A, 0, NOISE);
+    await r.payer.flush();
+    for (let i = 0; i < 4; i++) r.payer.onDownload(CORE_B, i, NOISE);
+    await r.payer.flush();
+    const b = ranges(r.protocol).filter(([c]) => c === CORE_B);
+    expect(b.flatMap(([, f, t]) => Array.from({ length: t - f + 1 }, (_, k) => f + k))).toEqual([
+      0, 1, 2, 3,
+    ]);
+    // CORE_A's block: reported once as never to be paid (the settler keeps it off the seeder's
+    // credit for good), never retried, never paid.
+    expect(r.unpayable).toEqual([{ noise: NOISE, core: CORE_A, from: 0, to: 0 }]);
+    expect(r.calls.filter((c) => c === CORE_A)).toHaveLength(1);
+    expect(r.payer.stats().unpayableBlocks).toBe(1);
+    r.payer.onDownload(CORE_A, 0, NOISE); // a re-download of an abandoned block owes nothing new
+    await r.payer.flush();
+    expect(r.calls.filter((c) => c === CORE_A)).toHaveLength(1);
+  });
+
+  // Fix round 5 changed WHEN a transient failure is retried: round 4 retried it at the very next
+  // flush, and a close drain (a flush every 25 ms) then used up MAX_PAY_FAILURES in ~75 ms and
+  // wrote a mint blip off for good (verifier, MEDIUM). It is now retried once its backoff is over
+  // (PAY_RETRY_BASE_MS, doubling), by any pass. This test used to flush twice back to back and
+  // expect the retry at the second; it now advances the clock past the backoff first, and also
+  // pins that a flush inside the backoff does NOT retry.
+  it('a transient failure keeps the blocks owed and is retried by the next pass once its backoff is over; the other cores are paid meanwhile', async () => {
+    vi.useFakeTimers();
+    try {
+      let down = true;
+      const r = failing((core) =>
+        core === CORE_A && down ? new Error('backend-down: the host is busy') : null,
+      );
+      r.payer.onDownload(CORE_A, 0, NOISE);
+      r.payer.onDownload(CORE_B, 0, NOISE);
+      await r.payer.flush();
+      expect(ranges(r.protocol)).toEqual([[CORE_B, 0, 0]]);
+      expect(r.unpayable).toEqual([]);
+      down = false;
+      await r.payer.flush(); // inside the backoff: not tried again yet
+      expect(r.calls.filter((c) => c === CORE_A)).toHaveLength(1);
+      await vi.advanceTimersByTimeAsync(PAY_RETRY_BASE_MS);
+      await r.payer.flush();
+      expect(ranges(r.protocol)).toEqual([
+        [CORE_B, 0, 0],
+        [CORE_A, 0, 0],
+      ]);
+      expect(r.unpayable).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // Fix round 5: the give-up is bounded in TIME as well as in attempts (see the test above). This
+  // test used to flush MAX_PAY_FAILURES + 2 times back to back and expect the give-up at the
+  // third; it now lets the clock run, and pins both halves: attempts alone never give up.
+  it('a core that keeps failing is given up only after MAX_PAY_FAILURES attempts over PAY_GIVE_UP_MS (settled as unpaid, not retried for ever)', async () => {
+    vi.useFakeTimers();
+    try {
+      const r = failing((core) => (core === CORE_A ? new Error('internal: boom') : null));
+      const t0 = Date.now();
+      r.payer.onDownload(CORE_A, 0, NOISE);
+      await r.payer.flush();
+      // Every attempt the backoff allows, for just under PAY_GIVE_UP_MS: never given up.
+      while (Date.now() - t0 < PAY_GIVE_UP_MS - PAY_RETRY_MAX_MS) {
+        await vi.advanceTimersByTimeAsync(25);
+        await r.payer.flush();
+      }
+      expect(r.calls.filter((c) => c === CORE_A).length).toBeGreaterThanOrEqual(MAX_PAY_FAILURES);
+      expect(r.unpayable).toEqual([]);
+      await vi.advanceTimersByTimeAsync(2 * PAY_RETRY_MAX_MS);
+      expect(r.unpayable).toEqual([{ noise: NOISE, core: CORE_A, from: 0, to: 0 }]);
+      const tries = r.calls.length;
+      await vi.advanceTimersByTimeAsync(4 * PAY_RETRY_MAX_MS);
+      await r.payer.flush();
+      expect(r.calls).toHaveLength(tries); // nothing left to try
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('the failure is logged by its outcome code only — no core, no peer, no message text', async () => {
+    const r = failing((core) =>
+      core === CORE_A ? new Error(`forbidden: the PAY covers ${'ab'.repeat(32)}`) : null,
+    );
+    r.payer.onDownload(CORE_A, 0, NOISE);
+    await r.payer.flush();
+    const rec = r.log.records.find((x) => x.msg.includes('could not be built'));
+    expect(rec).toBeDefined();
+    expect(JSON.stringify(rec)).not.toContain('ab'.repeat(32));
+    expect(JSON.stringify(rec)).not.toContain(NOISE);
+    expect(JSON.stringify(rec)).not.toContain(CORE_A);
+    expect(JSON.stringify(rec)).toContain('forbidden');
+    expect(r.unpayable).toEqual([{ noise: NOISE, core: CORE_A, from: 0, to: 0 }]);
+  });
+});
+
+// Fix round 5 (the verifier of fix round 4).
+describe('UpstreamPayer — transient failures back off in time; two sessions of one core; hurry (fix round 5)', () => {
+  /** A `CreditPool` stand-in whose pressure the test fires by hand. */
+  function pool() {
+    const listeners = new Set<() => void>();
+    return {
+      credit: {
+        limit: 8,
+        pressured: true,
+        onPressure: (cb: () => void) => {
+          listeners.add(cb);
+          return () => listeners.delete(cb);
+        },
+      },
+      pressure: () => {
+        for (const cb of listeners) cb();
+      },
+    };
+  }
+  function engineRig(
+    fail: (range: { core: CoreKeyHex; fromBlock: number; toBlock: number }) => Error | null,
+    opts: Partial<UpstreamPayerOptions> & {
+      readonly atCap?: boolean;
+      readonly batch?: number;
+    } = {},
+  ) {
+    const engine = new mocks.MockPaymentEngine({ mode: 'honest' });
+    const calls: [CoreKeyHex, number, number][] = [];
+    const unpayable: [CoreKeyHex, number, number][] = [];
+    const perCore = new Map<CoreKeyHex, PricePolicy>([
+      [CORE_A, basePolicy(MANIFEST_PRICE)],
+      [CORE_B, basePolicy(MANIFEST_PRICE)],
+    ]);
+    const payer = new UpstreamPayer({
+      engine: {
+        pay: (range, seeder, policy, o) => {
+          calls.push([range.core, range.fromBlock, range.toBlock]);
+          const err = fail(range);
+          return err === null ? engine.pay(range, seeder, policy, o) : Promise.reject(err);
+        },
+        spent: () => engine.spent(),
+      },
+      logger: capturedLogger().logger,
+      payEveryBlocks: 1,
+      tailMs: 0,
+      seederBatch: () => ({ batch: opts.batch ?? 4, atCap: opts.atCap ?? false }),
+      ownMints: [MINT_A, MINT_B],
+      policyFor: manifestPolicyResolver(() => perCore),
+      onUnpayable: (_noise, r) => {
+        unpayable.push([r.core, r.fromBlock, r.toBlock]);
+      },
+      ...opts,
+    });
+    const protocol = new FakePayProtocol({ autoAck: true });
+    payer.attachPeer(NOISE, protocol);
+    protocol.remoteHello(hello());
+    return { payer, protocol, calls, unpayable };
+  }
+  const sent = (p: FakePayProtocol): [CoreKeyHex, number, number][] =>
+    p.sentPays.map((m) => [m.range.core, m.range.fromBlock, m.range.toBlock]);
+
+  // The verifier's repro (MEDIUM, payer at-cap retry regression): a failed core was retried only
+  // by a FORCED pass in a NEW epoch, and the epoch moved only on flush() or the tail timer, which
+  // only a new block re-arms. A seeder at its cap sends no new block, so once the tail timer's
+  // retry had failed too, nothing ever retried: 2 calls, 0 PAYs, the stream frozen until close.
+  it("the verifier's repro: the engine refuses 'no-balance' for ~300 ms while the seeder is at its cap — once it clears the PAY goes out, no close needed", async () => {
+    vi.useFakeTimers();
+    try {
+      const t0 = Date.now();
+      const p = pool();
+      const r = engineRig(
+        () =>
+          Date.now() - t0 < 300
+            ? new Error('no-balance: not enough sats at this mint to keep streaming')
+            : null,
+        { atCap: true, tailMs: 30, credit: p.credit },
+      );
+      r.payer.onDownload(CORE_A, 0, NOISE); // at the cap: paid at once — and refused
+      await vi.advanceTimersByTimeAsync(0);
+      expect(r.calls).toHaveLength(1);
+      await vi.advanceTimersByTimeAsync(310); // the tail timer fired; the fault has cleared
+      // The player keeps pressuring the pool, as the gate does while it waits for credit.
+      for (let i = 0; i < 10; i++) {
+        p.pressure();
+        await vi.advanceTimersByTimeAsync(100);
+      }
+      expect(sent(r.protocol)).toEqual([[CORE_A, 0, 0]]);
+      expect(r.unpayable).toEqual([]);
+      expect(r.payer.stats()).toMatchObject({ pays: 1, unpayableBlocks: 0 });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('a failed PAY is retried after its backoff even when nothing else happens (no block, no ACK, no pressure, no tail timer)', async () => {
+    vi.useFakeTimers();
+    try {
+      let down = true;
+      const r = engineRig(() => (down ? new Error('backend-down: the host is busy') : null), {
+        atCap: true,
+      });
+      r.payer.onDownload(CORE_A, 0, NOISE);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(r.calls).toHaveLength(1);
+      down = false;
+      await vi.advanceTimersByTimeAsync(PAY_RETRY_BASE_MS - 10);
+      expect(r.calls).toHaveLength(1); // still backing off
+      await vi.advanceTimersByTimeAsync(20);
+      expect(sent(r.protocol)).toEqual([[CORE_A, 0, 0]]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('a short tail whose PAY failed is retried as a tail (however short) by its retry timer, not left for a full batch', async () => {
+    vi.useFakeTimers();
+    try {
+      let down = true;
+      const r = engineRig(() => (down ? new Error('backend-down: the host is busy') : null), {
+        batch: 4,
+        tailMs: 30,
+      });
+      r.payer.onDownload(CORE_A, 0, NOISE); // 1 < a batch of 4: waits for the tail timer
+      await vi.advanceTimersByTimeAsync(40);
+      expect(r.calls).toHaveLength(1);
+      down = false;
+      await vi.advanceTimersByTimeAsync(PAY_RETRY_BASE_MS + 10);
+      expect(sent(r.protocol)).toEqual([[CORE_A, 0, 0]]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("a failed run is due by its own streak: another core's block (which ends the peer's quiet spell) does not make its retry wait for a full batch or the next tail", async () => {
+    vi.useFakeTimers();
+    try {
+      let down = true;
+      const r = engineRig(
+        (range) =>
+          range.core === CORE_A && down ? new Error('backend-down: the host is busy') : null,
+        { batch: 4, tailMs: 1000 },
+      );
+      r.payer.onDownload(CORE_A, 0, NOISE);
+      await vi.advanceTimersByTimeAsync(1010); // the tail timer: CORE_A's PAY refused
+      expect(r.calls).toEqual([[CORE_A, 0, 0]]);
+      down = false;
+      r.payer.onDownload(CORE_B, 0, NOISE); // the peer is not quiet any more; next tail at +1 s
+      await vi.advanceTimersByTimeAsync(PAY_RETRY_BASE_MS + 10);
+      expect(sent(r.protocol)).toEqual([[CORE_A, 0, 0]]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // The verifier (MEDIUM): at close the drain's 25 ms flush loop bumped the epoch on every pass, so
+  // a fault still there was retried MAX_PAY_FAILURES times in well under a second and written off.
+  it('a burst of flushes (a close drain polls every 25 ms) never writes a transient failure off in under a second — it is paid once the fault clears', async () => {
+    vi.useFakeTimers();
+    try {
+      const t0 = Date.now();
+      const r = engineRig(() =>
+        Date.now() - t0 < 1500 ? new Error('internal: the mint is not answering') : null,
+      );
+      r.payer.onDownload(CORE_A, 0, NOISE);
+      while (Date.now() - t0 < 1200) {
+        await r.payer.flush();
+        await vi.advanceTimersByTimeAsync(25);
+      }
+      expect(r.unpayable).toEqual([]);
+      expect(r.calls.length).toBeLessThanOrEqual(4); // at 0, 250, 750 ms (the backoff), not per flush
+      await vi.advanceTimersByTimeAsync(2000);
+      expect(sent(r.protocol)).toEqual([[CORE_A, 0, 0]]);
+      expect(r.unpayable).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // The verifier (HIGH): after a rendition switch two play sessions share one core. Round 4 gave
+  // up EVERY pending block of the core on 'session-closed' — the new session's blocks too.
+  it("a range refused for good gives up THAT range only: another session's blocks of the same core are paid in the same pass", async () => {
+    // A batch of 8: the downloads below schedule passes that pay nothing, so the ONE forced pass of
+    // `flush()` has to give [0, 1] up and still reach [5, 6] (nothing else would run another pass).
+    const r = engineRig(
+      (range) =>
+        range.core === CORE_A && range.toBlock < 5
+          ? new Error('session-closed: no play session covers these blocks')
+          : null,
+      { batch: 8 },
+    );
+    for (const i of [0, 1, 5, 6]) r.payer.onDownload(CORE_A, i, NOISE);
+    await settle();
+    expect(r.calls).toEqual([]);
+    await r.payer.flush();
+    expect(r.unpayable).toEqual([[CORE_A, 0, 1]]);
+    expect(sent(r.protocol)).toEqual([[CORE_A, 5, 6]]);
+    // A 'forbidden' range the same way.
+    const f = engineRig(
+      (range) =>
+        range.toBlock < 5 ? new Error('forbidden: the PAY covers blocks outside the video') : null,
+      { batch: 8 },
+    );
+    for (const i of [0, 1, 5, 6]) f.payer.onDownload(CORE_A, i, NOISE);
+    await settle();
+    await f.payer.flush();
+    expect(f.unpayable).toEqual([[CORE_A, 0, 1]]);
+    expect(sent(f.protocol)).toEqual([[CORE_A, 5, 6]]);
+  });
+
+  it('boundRange: one PAY never crosses the bound (two renditions side by side in one core); a bad bound is ignored', async () => {
+    const r = engineRig(() => null, {
+      boundRange: (range) => (range.fromBlock <= 4 ? { ...range, toBlock: 4 } : range),
+    });
+    for (let i = 2; i <= 7; i++) r.payer.onDownload(CORE_A, i, NOISE);
+    await r.payer.flush();
+    expect(sent(r.protocol)).toEqual([
+      [CORE_A, 2, 4],
+      [CORE_A, 5, 7],
+    ]);
+    for (const bad of [
+      (x: { core: CoreKeyHex; fromBlock: number; toBlock: number }) => ({ ...x, core: CORE_B }),
+      (x: { core: CoreKeyHex; fromBlock: number; toBlock: number }) => ({
+        ...x,
+        toBlock: x.toBlock + 5,
+      }),
+      (x: { core: CoreKeyHex; fromBlock: number; toBlock: number }) => ({
+        ...x,
+        fromBlock: x.fromBlock + 1,
+      }),
+      (x: { core: CoreKeyHex; fromBlock: number; toBlock: number }) => ({
+        ...x,
+        toBlock: x.fromBlock - 1,
+      }),
+      () => {
+        throw new Error('boom');
+      },
+    ]) {
+      const b = engineRig(() => null, { boundRange: bad });
+      for (let i = 2; i <= 4; i++) b.payer.onDownload(CORE_A, i, NOISE);
+      await b.payer.flush();
+      expect(sent(b.protocol)).toEqual([[CORE_A, 2, 4]]);
+    }
+  });
+
+  it('hurry(range) pays that range at once however short, and a block of it that lands later; the rest keeps batching; released, it batches again', async () => {
+    const r = engineRig(() => null, { batch: 4 });
+    r.payer.onDownload(CORE_A, 2, NOISE);
+    r.payer.onDownload(CORE_A, 10, NOISE);
+    await settle();
+    expect(sent(r.protocol)).toEqual([]); // 2 < a batch of 4
+    const release = r.payer.hurry({ core: CORE_A, fromBlock: 0, toBlock: 5 });
+    await settle();
+    expect(sent(r.protocol)).toEqual([[CORE_A, 2, 2]]);
+    r.payer.onDownload(CORE_A, 4, NOISE); // in flight when the session closed: lands now
+    await settle();
+    expect(sent(r.protocol)).toEqual([
+      [CORE_A, 2, 2],
+      [CORE_A, 4, 4],
+    ]);
+    release();
+    r.payer.onDownload(CORE_A, 3, NOISE);
+    await settle();
+    expect(sent(r.protocol)).toHaveLength(2); // batching again: 3 and 10 wait
+    // The gateway pays every `payEveryBlocks` blocks: a single hurried block that lands is still
+    // paid at once (it schedules its own pass).
+    const g = engineRig(() => null, { batch: 4, payEveryBlocks: 4 });
+    const off = g.payer.hurry({ core: CORE_A, fromBlock: 0, toBlock: 5 });
+    await settle();
+    g.payer.onDownload(CORE_A, 4, NOISE);
+    await settle();
+    expect(sent(g.protocol)).toEqual([[CORE_A, 4, 4]]);
+    off();
   });
 });

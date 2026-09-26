@@ -168,6 +168,25 @@ export class Host {
     }
   }
 
+  /**
+   * Fix round 4 (quit): close every play session through the worker first — it pays each
+   * session's tail before it answers, and only then is the session revoked — bounded by `ms`;
+   * then `stop()`. What the SIGTERM of an app quit runs.
+   */
+  async shutdown(ms: number): Promise<void> {
+    if (!this.stopped) {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      await Promise.race([
+        this.adapter.closeAllSessions().catch(() => undefined),
+        new Promise<void>((resolve) => {
+          timer = setTimeout(resolve, Math.max(0, ms));
+        }),
+      ]);
+      clearTimeout(timer);
+    }
+    this.stop();
+  }
+
   stop(): void {
     this.bridge?.cancelAll();
     void this.signerFlow?.close();

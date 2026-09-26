@@ -46,6 +46,7 @@ import type {
 } from '../ipc/worker-protocol.js';
 import { WORKER_V } from '../ipc/worker-protocol.js';
 import { randomHex, sodiumCrypto, sodiumSha256 } from './crypto.js';
+import type { DleqSelfCheck } from './dev/dleq-selfcheck.js';
 import type { LoopbackPayHub } from './dev/loopback-pay.js';
 import type { DevTestnet, FixtureInput, FixtureNet } from './dev/fixtures-net.js';
 import { probeFfmpeg } from './ffmpeg.js';
@@ -53,7 +54,9 @@ import { createWorkerLogger } from './log.js';
 import type { LogEvent } from './log.js';
 import { PeerNode } from './net/peer-node.js';
 import type { BootstrapNode } from './net/peer-node.js';
-import type { PaidEvent } from './pay/viewer-payer.js';
+import type { SpawnDleqThread } from './pay/dleq-thread.js';
+import { boundToSessions, sessionsCovering } from './pay/session-ranges.js';
+import type { ImageVerdict, PaidEvent } from './pay/viewer-payer.js';
 import { ViewerPayer } from './pay/viewer-payer.js';
 import { CreditPool } from './playback/credit.js';
 import type { GateClock } from './playback/gate.js';
@@ -78,6 +81,14 @@ const STATUS_THROTTLE_MS = 1000;
 export const PROFILE_CORE_NAME = 'nutflix-profile';
 /** How long one image read may take over the swarm. */
 export const IMAGE_FETCH_TIMEOUT_MS = 15_000;
+/**
+ * Fix round 4: how long `play.close` (and shutdown) waits for the session's tail to be paid —
+ * PAYs built while the session still authorises them, ACKed, blocks in flight landed — before the
+ * session goes. The host revokes the session only after `play.close` answers.
+ */
+export const CLOSE_DRAIN_MS = 5000;
+/** Image cores remembered as sold / served free on the image path (fix round 4). */
+const MAX_IMAGE_VERDICTS = 4096;
 const ZERO_PUBKEY = '00'.repeat(32) as NostrPubkey;
 
 export type HostRequester = <M extends HostMethod>(
@@ -126,12 +137,37 @@ interface PeerTally {
 interface Session {
   readonly sid: SessionId;
   readonly core: CoreKeyHex;
+  /** Its rendition's blocks in `core`, first and last (fix round 5: whose PAYs are whose). */
+  readonly first: number;
+  readonly last: number;
   readonly gate: PlaybackGate;
   readonly openedAt: number;
   total: number;
   readonly recent: { at: number; amount: number }[];
   readonly peers: Map<NostrPubkey, PeerTally>;
   closed: boolean;
+  /** Its close in progress (the tail being paid): a second `play.close` waits for it. */
+  closing: Promise<void> | null;
+}
+
+/** A core the image path reads (ADR 0015). */
+interface ImageCore {
+  /** Reads in flight. */
+  refs: number;
+  /** The image path opened it: a replica read for display — free while open, closed if unserved. */
+  readonly opened: boolean;
+  /** Stop each read in flight (a seeder turned out to sell the core: fix round 4). */
+  readonly stops: Set<() => void>;
+}
+
+function rememberBounded<T>(set: Set<T>, v: T, max: number): void {
+  set.delete(v);
+  set.add(v);
+  while (set.size > max) {
+    const oldest = set.values().next();
+    if (oldest.done === true) break;
+    set.delete(oldest.value);
+  }
 }
 
 function fail(code: ErrorCode, detail: string): never {
@@ -173,6 +209,8 @@ export class WorkerHost {
   private hub: LoopbackPayHub | null = null;
   private fixtures: FixtureNet | null = null;
   private testnet: DevTestnet | null = null;
+  /** `--dev-fixtures`: the DLEQ self-check (`dev/dleq-selfcheck.ts`), once it is loaded. */
+  private devDleq: Promise<DleqSelfCheck | null> | null = null;
   private seeding: WorkerInit['seeding'] = { enabled: false, diskCapBytes: 0 };
   private readonly sessions = new Map<string, Session>();
   private readonly corePolicies = new Map<CoreKeyHex, PricePolicy>();
@@ -180,7 +218,13 @@ export class WorkerHost {
    * ADR 0015: profile cores the image path uses — `opened` when that path opened them (a replica
    * read for display, closed again when this node may not serve it), `refs` = reads in flight.
    */
-  private readonly imageCores = new Map<CoreKeyHex, { refs: number; opened: boolean }>();
+  private readonly imageCores = new Map<CoreKeyHex, ImageCore>();
+  /**
+   * Fix round 4: cores a seeder PRICEd on the image path (it sells them) and cores a seeder served
+   * free there. A core sold somewhere and served free nowhere is refused as an image.
+   */
+  private readonly imageSold = new Set<CoreKeyHex>();
+  private readonly imageFree = new Set<CoreKeyHex>();
   private readonly coresAttached = new Set<string>();
   private readonly lastSidForCore = new Map<string, Session>();
   private readonly uploads = new Set<string>();
@@ -249,7 +293,7 @@ export class WorkerHost {
         this.session(req.a.sid).gate.setPrefetchSeconds(req.a.seconds);
         return undefined;
       case 'play.close':
-        this.closeSession(req.a.sid);
+        await this.closeSession(req.a.sid);
         return undefined;
       case 'seeder.status':
         return this.seederStatus();
@@ -330,11 +374,11 @@ export class WorkerHost {
           state: runtime.stateFs,
           ...(runtime.dleqThread === undefined ? {} : { dleqThread: runtime.dleqThread }),
           request: this.o.request,
-          sidFor: (core) => {
-            let sid: SessionId | undefined;
-            for (const [id, s] of this.sessions) if (s.core === core) sid = id as SessionId;
-            return sid;
-          },
+          // Fix round 5: a PAY is built for a session whose blob covers its blocks (open ones
+          // first, then those closing — fix round 4 keeps a closing session until its tail is
+          // paid). By core alone, a rendition switch's NEW session was named for the old one's
+          // tail, the host refused it as outside its video, and the blocks were written off.
+          sidsFor: (range) => sessionsCovering(range, this.sessions.values()),
           priceCeiling: () => {
             let max = 0;
             for (const p of this.net?.seeder.corePolicyMap().values() ?? [])
@@ -370,7 +414,9 @@ export class WorkerHost {
         diskCapBytes: a.seeding.diskCapBytes,
         swarm: null,
         // Several videos at their own manifest prices: each core's PRICE precedes its first block.
-        announceCorePrices: a.payments !== undefined,
+        // Always on (fix round 4): a viewer reading an image learns from that PRICE that we sell
+        // the core — and stops before our window would cut it (dev mocks included).
+        announceCorePrices: true,
       },
       {
         engine: providers.seederEngine,
@@ -388,8 +434,12 @@ export class WorkerHost {
       credit,
       logger: log,
       policyFor: (core) => this.corePolicies.get(core) ?? null,
+      boundRange: (range) => boundToSessions(range, this.sessions.values()),
       onPaid: (e) => {
         this.onPaid(e);
+      },
+      onImageVerdict: (core, v) => {
+        this.onImageVerdict(core, v);
       },
     });
     const node = new PeerNode({
@@ -415,6 +465,25 @@ export class WorkerHost {
     log.info('worker initialised', { seeding: a.seeding.enabled, port: server.port });
 
     if (dev?.fixtures === true && bootstrap !== null) void this.startFixtures(bootstrap);
+    // ADR 0017: show whether this build's worker finds its DLEQ thread (only a runtime that has
+    // threads — Bare — can say; the check logs one line).
+    if (dev?.fixtures === true && runtime.dleqThread !== undefined)
+      this.devDleq = this.startDevDleqCheck(runtime.dleqThread, log);
+  }
+
+  private async startDevDleqCheck(
+    spawn: SpawnDleqThread,
+    log: Logger,
+  ): Promise<DleqSelfCheck | null> {
+    try {
+      const { startDleqSelfCheck } = await import('./dev/dleq-selfcheck.js');
+      // Closing meanwhile: never start a thread that `close` would not stop.
+      if (this.closing !== null) return null;
+      return startDleqSelfCheck({ spawn, logger: log });
+    } catch (err) {
+      log.error('the DLEQ self-check could not start', { error: err });
+      return null;
+    }
   }
 
   private async startFixtures(bootstrap: readonly BootstrapNode[]): Promise<void> {
@@ -515,7 +584,8 @@ export class WorkerHost {
 
   private session(sid: string): Session {
     const s = this.sessions.get(sid);
-    if (s === undefined) fail('session-closed', 'no such play session');
+    // A session closing (its tail being paid) is closed to the host already.
+    if (s === undefined || s.closed) fail('session-closed', 'no such play session');
     return s;
   }
 
@@ -529,6 +599,13 @@ export class WorkerHost {
     if (hyper.blob.blockLength < 1 || hyper.blob.byteLength !== size)
       fail('invalid-argument', 'rendition size does not match its blob');
     const core = hyper.core;
+    // Fix round 4: an image read of this very core in flight (a thumbnail URL naming a video)
+    // would go on under the paid route with blocks outside the video: refuse; a retry works.
+    if ((this.imageCores.get(core)?.refs ?? 0) > 0)
+      fail('rate-limited', 'this video is being read as an image; try again');
+    // Claimed before any await: from here the image path refuses the core, and
+    // `releaseImageCore` leaves it open (it checks the policy). The policy also ends any
+    // free-serving of it (`setCorePolicy` clears the mark).
     this.corePolicies.set(core, a.policy);
     net.seeder.setCorePolicy(core, a.policy);
     const sc = await net.seeder.blobs.openCoreByKey(fromHex(core));
@@ -559,12 +636,15 @@ export class WorkerHost {
     const s: Session = {
       sid: a.sid,
       core,
+      first: hyper.blob.blockOffset,
+      last: hyper.blob.blockOffset + hyper.blob.blockLength - 1,
       gate,
       openedAt: this.now(),
       total: 0,
       recent: [],
       peers: new Map(),
       closed: false,
+      closing: null,
     };
     this.sessions.set(a.sid, s);
     this.lastSidForCore.set(core, s);
@@ -572,15 +652,38 @@ export class WorkerHost {
     return { key: core, link };
   }
 
-  private closeSession(sid: string): void {
+  /**
+   * Close a play session. Its tail is paid FIRST (fix round 4): PAYs for blocks pending below a
+   * batch, waiting behind an unACKed PAY, or still in flight need the session — the host builds a
+   * PAY only for an open session it authorised, and it revokes it only after `play.close` answers
+   * — so the session stays (closed to the host, but a PAY can still name it: `sessionsCovering`)
+   * until the drain is done or `CLOSE_DRAIN_MS` passed. Blocks left owed after that are settled as
+   * unpaid by the payer. Fix round 5: the drain pays and waits for THIS session's blocks only —
+   * after a rendition switch the new session streams the same core, and its blocks must not hold
+   * the old one's `play.close` (and the switch) up.
+   */
+  private closeSession(sid: string): Promise<void> {
     const s = this.sessions.get(sid);
-    if (s === undefined) return;
-    this.sessions.delete(sid);
+    if (s === undefined) return Promise.resolve();
+    if (s.closing !== null) return s.closing;
     s.closed = true;
     s.gate.close();
     this.live?.server.unregister(sid);
-    // Pay whatever tail is pending now rather than at the next block.
-    void this.net?.payer.flush();
+    const payer = this.net?.payer;
+    s.closing = (async () => {
+      try {
+        await payer?.drain(CLOSE_DRAIN_MS, {
+          core: s.core,
+          fromBlock: s.first,
+          toBlock: s.last,
+        });
+      } catch {
+        // a drain never throws; nothing may keep the session from closing
+      } finally {
+        this.sessions.delete(sid);
+      }
+    })();
+    return s.closing;
   }
 
   /** One PAY went out: attribute it to the session playing that core (or the last one did). */
@@ -700,9 +803,40 @@ export class WorkerHost {
   }
 
   /**
+   * Fix round 4 (cross-lane review, HIGH): whether `core` is known to be SOLD — then it is never
+   * read as an image. A thumbnail URL can name any core; downloading a paid one would be counted by
+   * every honest seeder of it and get us banned past their window (and browsing never spends sats).
+   * Known sold: a manifest policy here (a video played or opening), a core the router pays for,
+   * one our own seeder prices (uploads, played cores), or one a seeder PRICEd on the image path
+   * while none served it free.
+   */
+  private soldCore(core: CoreKeyHex, net: Net): boolean {
+    return (
+      this.corePolicies.has(core) ||
+      this.coresAttached.has(core) ||
+      net.seeder.corePolicyMap().has(core) ||
+      (this.imageSold.has(core) && !this.imageFree.has(core))
+    );
+  }
+
+  /** A seeder said what an image core is (`SeederCredit.onImageVerdict`; fix round 4). */
+  private onImageVerdict(core: CoreKeyHex, v: ImageVerdict): void {
+    rememberBounded(v === 'free' ? this.imageFree : this.imageSold, core, MAX_IMAGE_VERDICTS);
+    // Sold, and nobody served it free: stop the reads now instead of at their deadline.
+    if (v === 'priced' && !this.imageFree.has(core))
+      for (const stop of [...(this.imageCores.get(core)?.stops ?? [])]) stop();
+  }
+
+  /**
    * `image.fetch`: one image from a creator's profile core, over Pear. Served on (free) only while
    * this node serves images; otherwise a replica opened here is closed once no read needs it, so
    * it is neither announced nor replicated.
+   *
+   * Fix round 4: a core known to be sold is refused (`soldCore`), and the read is ROUTED
+   * (`ViewerPayer.attachImageCore`): no pay/1 seeder is asked more than its window can hold, one
+   * block at a time until it has served the core free, never again once it PRICEd it — the read
+   * then stops. A replica this path opened is free on our own seeder while it is open, served or
+   * not (never counted against a peer); nothing else is ever marked free here.
    */
   private async imageFetch(a: {
     readonly url: string;
@@ -715,20 +849,40 @@ export class WorkerHost {
     if (!Number.isSafeInteger(a.size) || a.size < 1 || a.size > MAX_IMAGE_BYTES)
       fail('invalid-argument', 'image size out of range');
     const core = ref.core;
+    if (this.soldCore(core, net)) fail('forbidden', 'not an image core: that core is sold');
     let entry = this.imageCores.get(core);
     if (entry === undefined) {
-      entry = { refs: 0, opened: net.seeder.blobs.coreByKey(core) === undefined };
+      entry = { refs: 0, opened: net.seeder.blobs.coreByKey(core) === undefined, stops: new Set() };
       this.imageCores.set(core, entry);
     }
-    entry.refs++;
+    const e = entry;
+    e.refs++;
+    let detach: (() => void) | null = null;
+    // Stops this read when a seeder turns out to sell the core (`onImageVerdict`).
+    let rejectRead: (err: unknown) => void = () => undefined;
+    const stopped = new Promise<never>((_resolve, reject) => {
+      rejectRead = reject;
+    });
+    stopped.catch(() => undefined); // stopped after the read settled: nobody waits on it
+    const stop = (): void => {
+      rejectRead(new IpcError('forbidden', 'forbidden: not an image core: a seeder sells it'));
+    };
+    e.stops.add(stop);
     try {
       const sc = await net.seeder.blobs.openCoreByKey(fromHex(core));
-      const serve = this.servesImages();
-      // Free before it can be served: no block of a profile core is ever sold.
-      if (serve) net.seeder.setFreeCore(core, true);
-      net.node.join(sc.core.discoveryKey, { server: serve, client: true });
+      // A play open may have claimed it while the open was awaited.
+      if (this.soldCore(core, net)) fail('forbidden', 'not an image core: that core is sold');
+      // Our own profile core (a core we write): every block is local, nothing to ask anyone.
+      if (e.opened || !sc.core.writable) {
+        // Free while open, whatever the serving setting (ADR 0015 §5 "never counted"); refused
+        // for a core with a price (`setFreeCore`). Only a replica THIS path opened.
+        if (e.opened) net.seeder.setFreeCore(core, true);
+        // Throws RoutingUnsupported when hypercore is not the pinned release: nothing unrouted.
+        detach = net.payer.attachImageCore(sc.core);
+        net.node.join(sc.core.discoveryKey, { server: this.servesImages(), client: true });
+      }
       const bytes = await withDeadline(
-        sc.blobs.get(ref.blob, { timeout: IMAGE_FETCH_TIMEOUT_MS }),
+        Promise.race([sc.blobs.get(ref.blob, { timeout: IMAGE_FETCH_TIMEOUT_MS }), stopped]),
         IMAGE_FETCH_TIMEOUT_MS,
       );
       if (bytes === null) fail('not-found', 'image not found on the swarm');
@@ -741,8 +895,12 @@ export class WorkerHost {
       if (err instanceof IpcError) throw err;
       return fail('not-found', 'image could not be read from the swarm');
     } finally {
-      entry.refs--;
-      if (entry.refs === 0 && !this.servesImages()) void this.releaseImageCore(core);
+      e.stops.delete(stop);
+      detach?.();
+      e.refs--;
+      // Unserved — or found to be sold: the replica goes.
+      if (e.refs === 0 && (!this.servesImages() || this.soldCore(core, net)))
+        void this.releaseImageCore(core);
     }
   }
 
@@ -758,11 +916,11 @@ export class WorkerHost {
     if (e === undefined || e.refs > 0 || net === null) return;
     this.imageCores.delete(core);
     if (!e.opened) return; // a core we write to, or one a playback opened: not ours to close
-    net.seeder.setFreeCore(core, false);
-    // A playback attached it after the image path opened it: it is routed and paid for now, and
-    // closing its session would leave the router, settler and payer on a dead one (a reopened
-    // core would then download unrouted). Not ours to close either (F33 independent review).
-    if (this.coresAttached.has(core)) return;
+    // A playback claimed it (its policy is set before it awaits the open — fix round 4: this used
+    // to race a play open) or attached it: it is routed and paid for now, and closing its session
+    // would leave the router, settler and payer on a dead one. Not ours to close, and no longer
+    // free (`setCorePolicy` cleared the mark). F33 independent review.
+    if (this.corePolicies.has(core) || this.coresAttached.has(core)) return;
     const sc = net.seeder.blobs.coreByKey(core);
     if (sc !== undefined) net.node.leave(sc.core.discoveryKey);
     try {
@@ -770,6 +928,9 @@ export class WorkerHost {
     } catch {
       // already closed, or re-opened as a named core since: leave it
     }
+    // Free until closed (fix round 4): while it could serve a block, that block was never counted.
+    // A new image read that opened it again meanwhile owns the mark now.
+    if (!this.imageCores.has(core)) net.seeder.setFreeCore(core, false);
   }
 
   private configureSeeding(a: WorkerInit['seeding']): void {
@@ -857,7 +1018,11 @@ export class WorkerHost {
       if (this.statusTimer !== null) clearTimeout(this.statusTimer);
       this.statusTimer = null;
       await this.initialising?.catch(() => undefined);
-      for (const sid of [...this.sessions.keys()]) this.closeSession(sid);
+      // Its thread must be gone before the worker exits: a parked Bare thread holds `Bare.exit`.
+      await (await this.devDleq)?.close();
+      // Fix round 4: every session's tail is paid BEFORE its session goes and before the node is
+      // destroyed (a PAY needs both), bounded by CLOSE_DRAIN_MS per session, in parallel.
+      await Promise.all([...this.sessions.keys()].map((sid) => this.closeSession(sid)));
       await this.net?.payer.flush().catch(() => undefined);
       await this.live?.server.close();
       try {

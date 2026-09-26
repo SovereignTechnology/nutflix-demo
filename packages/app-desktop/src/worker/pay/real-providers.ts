@@ -2,8 +2,10 @@
  * The worker's REAL payment providers (Stage 3, ADR 0012), used when the host's money plane is
  * live (`WorkerInit.payments`). The worker never holds anything it can spend on its own:
  *
- *   viewer   every PAY is built by the host (`pay.build`) for the play session of its core — the
- *            host checks the session, the range, the manifest terms and the session's budget;
+ *   viewer   every PAY is built by the host (`pay.build`) for the play session whose blocks it
+ *            covers — the host checks the session, the range, the manifest terms and the
+ *            session's budget. Two sessions of one core (a rendition switch, two windows) each
+ *            pay their own blocks (fix round 5);
  *   HELLO    signed by the host over this connection's `pay/1` challenge (`pay.hello`); the price
  *            it states is a ceiling (the highest price among the cores we serve) and each core's
  *            own price follows as `PRICE` on its first block (`announceCorePrices`);
@@ -20,7 +22,7 @@
  *            (`dleq-thread.ts`), or inline in small chunks where there is none.
  */
 import type {
-  CoreKeyHex,
+  BlockRange,
   MintKeyset,
   MintUrl,
   NostrEvent,
@@ -60,8 +62,12 @@ export interface RealProviderOptions {
   readonly join: (...p: string[]) => string;
   readonly state: StateFs;
   readonly request: HostRequester;
-  /** The open play session downloading `core` (the host pays only for sessions). */
-  readonly sidFor: (core: CoreKeyHex) => SessionId | undefined;
+  /**
+   * Fix round 5: the play sessions whose blocks cover all of `range` — open ones first, then those
+   * closing (their tail being paid) — in the order to ask the host (it pays only for a session,
+   * and only within that session's blob). Empty: nothing may pay for these blocks.
+   */
+  readonly sidsFor: (range: BlockRange) => readonly SessionId[];
   /** The highest per-block price among the cores this node serves (HELLO's ceiling). */
   readonly priceCeiling: () => Sats;
   readonly logger: Logger;
@@ -260,17 +266,29 @@ export function realProviders(o: RealProviderOptions): RealProviders {
     dleq,
     seederEngine: engine,
     accepting: () => engine.pendingCount() < (o.maxPendingPays ?? WORKER_MAX_PENDING_PAYS),
-    pay: (range, seeder, policy: PricePolicy, opts) => {
-      const sid = o.sidFor(range.core);
-      if (sid === undefined)
-        return Promise.reject(new Error('session-closed: no open play session for this core'));
-      return request('pay.build', {
-        sid,
-        range,
-        seeder,
-        policy,
-        carryIn: opts?.carryIn ?? 0,
-      });
+    pay: async (range, seeder, policy: PricePolicy, opts) => {
+      const sids = o.sidsFor(range);
+      if (sids.length === 0) throw new Error('session-closed: no play session covers these blocks');
+      // Fix round 5: a session's refusal ('forbidden', 'session-closed') is not the last word
+      // while another session covering the same blocks may take the PAY. Anything else (no
+      // balance, the host busy) would fail alike for every session: it goes back to the payer.
+      let refusal: unknown;
+      for (const sid of sids) {
+        try {
+          return await request('pay.build', {
+            sid,
+            range,
+            seeder,
+            policy,
+            carryIn: opts?.carryIn ?? 0,
+          });
+        } catch (err) {
+          const code = (err as { code?: unknown } | null)?.code;
+          if (code !== 'forbidden' && code !== 'session-closed') throw err;
+          refusal = err;
+        }
+      }
+      throw refusal;
     },
     viewerMints: payments.mints,
     payWiring: {

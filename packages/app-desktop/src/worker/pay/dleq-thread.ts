@@ -107,6 +107,35 @@ type WaitAsync = (
   | { readonly async: false; readonly value: 'not-equal' | 'timed-out' }
   | { readonly async: true; readonly value: Promise<'ok' | 'timed-out'> };
 
+/**
+ * Every live thread's mailbox — started, and not yet joined or let go (fix round 4, I1 verifier).
+ * `Bare.exit` joins every live thread, and a thread parked in `Atomics.wait` never returns on its
+ * own, so an exit that skips `close()` (an uncaught exception, the shutdown force timer) would
+ * block for good. `quitDleqThreadsNow` tells each one to leave first.
+ */
+const liveMailboxes = new Set<SharedArrayBuffer>();
+
+/**
+ * SYNCHRONOUS: store QUIT in every live DLEQ thread's mailbox and wake it, so a parked thread
+ * returns and `Bare.exit` can join it (a thread busy with a job returns once the job ends: QUIT is
+ * never overwritten). For the exits that cannot wait for `close()`. Returns how many were told.
+ */
+export function quitDleqThreadsNow(): number {
+  let n = 0;
+  for (const box of liveMailboxes) {
+    const ctl = new Int32Array(box, 0, MAILBOX_WORDS);
+    Atomics.store(ctl, WORD.STATE, MAILBOX.QUIT);
+    Atomics.notify(ctl, WORD.STATE);
+    n++;
+  }
+  return n;
+}
+
+/** Live mailboxes (tests). */
+export function liveDleqMailboxes(): number {
+  return liveMailboxes.size;
+}
+
 /** Wait until control word `index` leaves `from`, or `ms` pass. `true` when it changed. */
 async function waitWord(
   ctl: Int32Array,
@@ -164,6 +193,11 @@ export class DleqThread {
   /** False once closed, or once the thread failed to start twice. */
   get usable(): boolean {
     return !this.closed && this.failedStarts < 2;
+  }
+
+  /** True once `close` was called (then `usable` is false for that reason alone). */
+  get isClosed(): boolean {
+    return this.closed;
   }
 
   /** True while a thread is up and serving (started, not retired). */
@@ -281,6 +315,7 @@ export class DleqThread {
     }
     this.handle = handle;
     this.mailbox = box;
+    liveMailboxes.add(box);
     const ready = await waitChange(ctl, MAILBOX.BOOT, this.startMs);
     if (!ready || Atomics.load(ctl, WORD.STATE) !== MAILBOX.IDLE) {
       this.failedStarts++;
@@ -302,10 +337,17 @@ export class DleqThread {
     const ctl = new Int32Array(box, 0, MAILBOX_WORDS);
     Atomics.store(ctl, WORD.STATE, MAILBOX.QUIT);
     Atomics.notify(ctl, WORD.STATE);
-    if (h === null) return;
+    if (h === null) {
+      liveMailboxes.delete(box);
+      return;
+    }
     const reap = this.reap(h, ctl);
     this.reaping.add(reap);
-    void reap.finally(() => this.reaping.delete(reap));
+    void reap.finally(() => {
+      this.reaping.delete(reap);
+      // Joined, or let go with QUIT stored (it leaves once its job ends): nothing left to tell.
+      liveMailboxes.delete(box);
+    });
   }
 
   /**
@@ -413,11 +455,21 @@ export async function chunkedDleq(
   return out;
 }
 
+/** How many checks each path has answered (a diagnostic: counts only, never a proof). */
+export interface DleqAnswered {
+  /** Answered by the thread. */
+  readonly thread: number;
+  /** Answered inline, in small chunks (while the thread starts, after it failed, or without one). */
+  readonly inline: number;
+}
+
 export interface DleqVerifier {
   /** `PaymentEngineDeps.dleq`. */
   readonly verify: (checks: readonly Check[]) => Promise<boolean[]>;
   /** Resolves once a thread start in progress is over: `true` when the thread is up (tests). */
   ready(): Promise<boolean>;
+  /** Checks answered so far, by path (ADR 0017: shows whether a build's thread is in use). */
+  answered(): DleqAnswered;
   /** Stop the thread; never blocks, resolves once it is joined or let go. */
   close(): Promise<void>;
 }
@@ -427,6 +479,10 @@ export interface DleqVerifier {
  * it fails, or where there is none) chunked inline checks. It never waits for a thread to start,
  * and never rejects for a thread failure, so the engine's own fallback — one synchronous pass over
  * every proof — does not run on this event loop.
+ *
+ * It says which path is in use, once each (ADR 0017: a packaged build whose thread entry was
+ * missing fell back in silence): `info` when the thread first answers, `warn` when this runtime
+ * has a thread but cannot start one (the entry file is missing), `warn` when a thread fails a job.
  */
 export function dleqVerifier(o: {
   readonly spawn: SpawnDleqThread | undefined;
@@ -447,22 +503,40 @@ export function dleqVerifier(o: {
           ...(o.reapMs === undefined ? {} : { reapMs: o.reapMs }),
         });
   let warned = false;
+  let saidUp = false;
+  let saidNone = false;
+  const count = { thread: 0, inline: 0 };
   return {
     verify: async (checks) => {
       const onThread = thread?.tryVerify(checks) ?? null;
       if (onThread !== null) {
         try {
-          return await onThread;
+          const out = await onThread;
+          count.thread += checks.length;
+          if (!saidUp) {
+            saidUp = true;
+            o.logger?.info('DLEQ checks run on their own thread');
+          }
+          return out;
         } catch {
           if (!warned) {
             warned = true;
             o.logger?.warn('the DLEQ thread failed: checks run inline, in small chunks');
           }
         }
+      } else if (thread !== null && !thread.usable && !thread.isClosed && !saidNone && !saidUp) {
+        // The runtime has threads, but none could start: the spawner said no (no entry file —
+        // the start is synchronous up to the spawn, so the first call already knows), or two
+        // starts failed. Said once; never after `close`, when "unusable" means only that.
+        saidNone = true;
+        o.logger?.warn('no DLEQ thread could start: checks run inline, in small chunks');
       }
-      return chunkedDleq(checks, o.verify, o.chunk);
+      const out = await chunkedDleq(checks, o.verify, o.chunk);
+      count.inline += checks.length;
+      return out;
     },
     ready: () => thread?.ready() ?? Promise.resolve(false),
+    answered: () => ({ ...count }),
     close: () => thread?.close() ?? Promise.resolve(),
   };
 }

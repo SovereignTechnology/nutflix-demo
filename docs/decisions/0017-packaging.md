@@ -78,6 +78,7 @@ main's path logic is unchanged.
 | `renderer/`, `prompt/`, `preload.cjs`, `prompt-preload.cjs` | copied from `scripts/bundle.ts` output | packed |
 | `worker/boot.mjs` | the **unbundled boot module**: `import 'bare-encoding/global'`, then `import('./worker.mjs')` (D6) | unpacked |
 | `worker/worker.mjs` | the worker bundle: our sources only. Every npm package stays an import that Bare resolves itself (export conditions, addons). This is the same shape the Stage 1 tests already ran under real Bare | unpacked |
+| `worker/pay/dleq-thread-entry.mjs` | the DLEQ thread's entry (issue #8 d; added by lane I1), a bundle of its own: `src/worker/pay` and `src/ipc` only, every import dynamic and inside its `try`, `@sovit/core` and `bare-encoding/global` resolved by Bare from `node_modules/`. The worker finds it at `./pay/` from its root module (`src/worker/worker-root.ts`, inlined at the bundle's root), so it resolves inside `worker/` in both layouts | unpacked |
 | `node_modules/` | the **lockfile runtime closure** (`packaging/closure.ts`), described below | unpacked |
 
 How `node_modules/` is built:
@@ -148,7 +149,10 @@ path) is still dropped.
   check (`layout.ts`):
   - main, the host, both preloads, and every file of the app window and the prompt window are
     packed (derived from the staging step's file lists, so a file added there is checked too);
-  - the worker and the runtime are unpacked;
+  - the worker and the runtime are unpacked, and the worker's three files (boot module,
+    bundle, DLEQ thread entry: `identity.ts` `UNPACKED_FILES`) are regular files, not symlinks
+    and not under a symlinked directory (lane I1). A package without the thread entry would
+    still start, but its worker would run every DLEQ check on its event loop;
   - the runtime is executable;
   - no other platform's runtime is present;
   - there is no `resources/app/` folder.

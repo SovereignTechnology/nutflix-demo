@@ -296,7 +296,9 @@ describe('ViewerPayer', () => {
     expect(r.proto.sent).toHaveLength(1);
   });
 
-  it('F5 batching: PAYs cover half the credit pool, not one block each', async () => {
+  // Fix round 4 (test lens): the title said "half the credit pool"; since issue #8 a PAY batches
+  // half the SEEDER's window (the body and its comment already said so).
+  it("F5 batching: PAYs cover half the seeder's window, not one block each", async () => {
     const r = rig(undefined, 8);
     // Issue #8: the batch is half the SEEDER's window (8 here), no longer half the pool.
     r.proto.hello({ windowBlocks: 8 });
@@ -324,6 +326,49 @@ describe('ViewerPayer', () => {
     r.proto.ack(0, 0);
     await w.promise; // block 0's unit came back and went to the waiter
     expect(r.credit.holds(r.key, 1)).toBe(true);
+  });
+
+  // Fix round 4 (cross-lane review, gateway payer): a core whose play session is gone could
+  // never be paid, and its blocks stayed owed for ever — holding pool units and the seeder's
+  // credit — while the PAY failure also stopped every other core of that seeder.
+  it("a core whose session is gone: its blocks settle as UNPAID, explicitly (the seeder's credit keeps them), and the seeder's other cores are still paid", async () => {
+    const engine = new mocks.MockPaymentEngine();
+    const credit = new CreditPool(8);
+    const gone = fakeCore(1);
+    const live = fakeCore(2);
+    const goneKey = toHex(gone.key);
+    const liveKey = toHex(live.key);
+    const payer = new ViewerPayer({
+      pay: (r, s, p) =>
+        r.core === goneKey
+          ? Promise.reject(new Error('session-closed: no open play session for this core'))
+          : engine.pay(r, s, p),
+      ownMints: [mocks.MINTS.a],
+      credit,
+      logger: silentLogger,
+      policyFor: () => policy,
+    });
+    payer.attachCore(gone);
+    payer.attachCore(live);
+    const proto = new FakeProto();
+    payer.attachPeer(NOISE, proto);
+    proto.hello({ windowBlocks: 8 });
+    credit.tryAcquire(goneKey, 0);
+    gone.emit('download', 0, 65_536, { remotePublicKey: peerKey });
+    await payer.flush();
+    // Settled (the pool unit is back), counted unpaid against that seeder for good.
+    expect(credit.holds(goneKey, 0)).toBe(false);
+    expect(payer.stats().owed).toBe(0);
+    expect(payer.seeders.stats().unpaid).toBe(1);
+    expect(payer.seeders.budget(NOISE, liveKey)).toBe(8 - 1);
+    for (const i of [0, 1, 2, 3]) {
+      credit.tryAcquire(liveKey, i);
+      live.emit('download', i, 65_536, { remotePublicKey: peerKey });
+    }
+    await payer.flush();
+    expect(proto.sent.map((m) => [m.range.core, m.range.fromBlock, m.range.toBlock])).toEqual([
+      [liveKey, 0, 3],
+    ]);
   });
 
   it("F5 batching counts a seeder's blocks across cores (its window does)", async () => {
@@ -472,5 +517,112 @@ describe('ViewerPayer: a PAY the host refuses for now (ADR 0012 amendment, lane 
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+// Fix round 5 (the verifier of fix round 4, MEDIUM): `drain` waited until NOTHING of the core was
+// owed or in flight. Every rendition of an upload lives in one core, so after a switch the new
+// session streams the same core, and the old session's `play.close` (and with it the switch) ran
+// to CLOSE_DRAIN_MS. It also flushed every tail of every core, unbatching the new session.
+describe('ViewerPayer.drain(ms, range) — a closing session drains its own blocks (fix round 5)', () => {
+  /** The seeder ACKs every PAY ok on a microtask, like an honest one. */
+  class AckingProto extends FakeProto {
+    override sendPay(m: PayMessage): void {
+      super.sendPay(m);
+      queueMicrotask(() => {
+        this.ack(m.range.fromBlock, m.range.toBlock, true, m.range.core);
+      });
+    }
+  }
+  function rig5(
+    fail: () => Error | null = () => null,
+    boundRange?: ConstructorParameters<typeof ViewerPayer>[0]['boundRange'],
+  ) {
+    const engine = new mocks.MockPaymentEngine();
+    const credit = new CreditPool(16);
+    const payer = new ViewerPayer({
+      pay: (r, s, p) => {
+        const err = fail();
+        return err === null ? engine.pay(r, s, p) : Promise.reject(err);
+      },
+      ownMints: [mocks.MINTS.a],
+      credit,
+      logger: silentLogger,
+      policyFor: () => policy,
+      ...(boundRange !== undefined ? { boundRange } : {}),
+    });
+    const core = fakeCore(1);
+    const key = toHex(core.key);
+    payer.attachCore(core);
+    const proto = new AckingProto();
+    payer.attachPeer(NOISE, proto);
+    // A window of 8: PAYs batch 4 blocks, so a short tail waits unless something hurries it.
+    proto.hello({ windowBlocks: 8 });
+    const download = (i: number): void => {
+      credit.tryAcquire(key, i);
+      core.emit('download', i, 65_536, { remotePublicKey: peerKey });
+    };
+    const paidRanges = (): [number, number][] =>
+      proto.sent.map((m) => [m.range.fromBlock, m.range.toBlock]);
+    return { payer, credit, key, proto, download, paidRanges };
+  }
+
+  it("returns as soon as ITS tail is paid while another session of the same core has blocks owed — and leaves that session's batching alone", async () => {
+    const r = rig5();
+    r.download(3); // session A (blocks 0..3): its tail, below a batch
+    r.download(5); // session B (blocks 4..9, the new rendition): below a batch too
+    await settle();
+    expect(r.paidRanges()).toEqual([]);
+    const t0 = Date.now();
+    const ok = await r.payer.drain(3000, { core: CORE_1, fromBlock: 0, toBlock: 3 });
+    expect(ok).toBe(true);
+    expect(Date.now() - t0).toBeLessThan(1500);
+    expect(r.paidRanges()).toEqual([[3, 3]]); // A's tail; B's block still batching
+    expect(r.payer.stats().owed).toBe(1); // B's, owed — it did not hold A's close up
+    expect(r.credit.holds(r.key, 5)).toBe(true);
+  });
+
+  it('a block of the closing range that lands during the drain is paid too, then the drain returns', async () => {
+    const r = rig5();
+    r.download(2);
+    const draining = r.payer.drain(3000, { core: CORE_1, fromBlock: 0, toBlock: 3 });
+    await settle();
+    r.download(3); // was in flight when the session closed
+    expect(await draining).toBe(true);
+    expect(r.paidRanges()).toEqual([
+      [2, 2],
+      [3, 3],
+    ]);
+  });
+
+  it('boundRange reaches the payer: a run across a rendition end is paid as two PAYs (the worker ends one where a session’s blob ends)', async () => {
+    const r = rig5(undefined, (range) =>
+      range.fromBlock <= 3 ? { ...range, toBlock: Math.min(range.toBlock, 3) } : range,
+    );
+    for (const i of [2, 3, 4, 5]) r.download(i);
+    await r.payer.flush();
+    await settle();
+    expect(r.paidRanges()).toEqual([
+      [2, 3],
+      [4, 5],
+    ]);
+  });
+
+  // The verifier (MEDIUM): the drain's 25 ms flush loop used MAX_PAY_FAILURES up in ~75 ms and
+  // wrote a transient failure off as unpaid — a next-start ban at the seeder.
+  it('a PAY refused for ~1 s (a mint blip, a top-up in flight) is retried within the drain and paid — never written off', async () => {
+    const t0 = Date.now();
+    const r = rig5(() =>
+      Date.now() - t0 < 1000
+        ? new Error('no-balance: not enough sats at this mint to keep streaming')
+        : null,
+    );
+    r.download(3);
+    await settle();
+    const ok = await r.payer.drain(5000, { core: CORE_1, fromBlock: 0, toBlock: 3 });
+    expect(ok).toBe(true);
+    expect(r.paidRanges()).toEqual([[3, 3]]);
+    expect(r.payer.stats()).toMatchObject({ unpayableBlocks: 0, owed: 0 });
+    expect(r.payer.seeders.stats().unpaid).toBe(0);
   });
 });

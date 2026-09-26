@@ -57,6 +57,11 @@ export interface BlobStoreOptions {
   readonly logger: Logger;
   /** Called for every core the store opens (the seeder attaches the upload gate + swarm join). */
   readonly onCoreOpened?: (c: SeedCore) => void;
+  /**
+   * Called when `closeCoreByKey` closes a core, before its session closes (the seeder detaches
+   * that session's upload gate; a reopen gets a new session and a new gate — fix round 4).
+   */
+  readonly onCoreClosed?: (c: SeedCore) => void;
 }
 
 export class BlobStore {
@@ -123,6 +128,7 @@ export class BlobStore {
     if (sc.name !== `key:${keyHex}`) throw new Error('refusing to close a core opened by name');
     this.byKey.delete(keyHex);
     this.cores.delete(sc.name);
+    this.opts.onCoreClosed?.(sc);
     await sc.core.close();
   }
 

@@ -15,6 +15,13 @@ import type { Logger } from './log.js';
 import { spawnBareSidecar } from './worker/sidecar.js';
 import type { SpawnWorker } from './worker/supervisor.js';
 
+/**
+ * Fix round 4: how long an app quit waits, at most, for the open play sessions' tails to be paid
+ * (the worker drains each session for up to its `CLOSE_DRAIN_MS`, 5 s, in parallel) before the
+ * worker is stopped. Main waits a little longer for this process to exit.
+ */
+export const QUIT_FLUSH_MS = 7000;
+
 /** Electron's `process.parentPort` in a utility process, structurally. */
 export interface ParentPortLike {
   on(event: 'message', listener: (e: { readonly data: unknown }) => void): unknown;
@@ -64,9 +71,15 @@ if (proc.parentPort !== undefined) {
   });
   runHost({ parentPort: port, argv: proc.argv.slice(2), log }).then(
     (host) => {
+      let quitting = false;
       proc.on('SIGTERM', () => {
-        host.stop();
-        proc.exit(0);
+        if (quitting) return;
+        quitting = true;
+        // Fix round 4: the open play sessions' tails are paid before the worker goes (bounded;
+        // main waits for this process a little longer, `QUIT_GRACE_MS`).
+        void host.shutdown(QUIT_FLUSH_MS).finally(() => {
+          proc.exit(0);
+        });
       });
     },
     (e: unknown) => {

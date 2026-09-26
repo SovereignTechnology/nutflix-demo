@@ -86,6 +86,41 @@ function releaseNoticeKind(): number {
   return Number(m[1]);
 }
 
+/**
+ * TMPDIR as this file found it (lane I1, packaging round-3 verifier). `makerNames` points TMPDIR
+ * into a test's own dir while the makers run. A test that times out leaves its maker promise
+ * running and TMPDIR pointed there; `afterEach` then deletes that dir, and every later
+ * `tempDir()` failed with ENOENT (10 misleading failures after the one real timeout). So
+ * `afterEach` puts this value back (or its absence) before anything else.
+ */
+const ORIGINAL_TMPDIR: { readonly set: boolean; readonly value: string | undefined } = {
+  set: Object.hasOwn(process.env, 'TMPDIR'),
+  value: process.env['TMPDIR'],
+};
+
+function restoreTmpdir(): void {
+  if (ORIGINAL_TMPDIR.set) process.env['TMPDIR'] = ORIGINAL_TMPDIR.value;
+  else delete process.env['TMPDIR'];
+}
+
+/**
+ * Point TMPDIR into `work/tmp` (the makers stage there, so `work`'s cleanup removes it). The
+ * returned restore puts back what was there, but only while TMPDIR is still ours: a maker run
+ * that outlived its test must not take TMPDIR away from the test running now.
+ */
+function tmpdirInto(work: string): () => void {
+  const saved = process.env['TMPDIR'];
+  const had = Object.hasOwn(process.env, 'TMPDIR');
+  const mine = join(work, 'tmp');
+  mkdirSync(mine, { recursive: true });
+  process.env['TMPDIR'] = mine;
+  return () => {
+    if (process.env['TMPDIR'] !== mine) return;
+    if (had) process.env['TMPDIR'] = saved;
+    else delete process.env['TMPDIR'];
+  };
+}
+
 let dir = '';
 let cleanup: () => void = () => undefined;
 let make = '';
@@ -121,6 +156,7 @@ beforeEach(() => {
   writeFileSync(join(make, 'squirrel.windows', 'x64', 'RELEASES'), 'x');
 });
 afterEach(() => {
+  restoreTmpdir();
   cleanup();
 });
 
@@ -470,14 +506,12 @@ async function makerNames(version: string, work: string, real: boolean): Promise
   // graceful-cleanup exit hook, which never runs in a vitest worker (verifier, round 3). tmp
   // reads os.tmpdir(), and so TMPDIR, on every call: point it into `work` while the makers run,
   // so the caller's cleanup of `work` removes the staging, then restore it (or its absence).
-  const savedTmpdir = process.env['TMPDIR'];
-  mkdirSync(join(work, 'tmp'), { recursive: true });
-  process.env['TMPDIR'] = join(work, 'tmp');
+  // A timeout skips that restore until the makers finish: afterEach restores TMPDIR too.
+  const restore = tmpdirInto(work);
   try {
     return await makeNames(version, work, real);
   } finally {
-    if (savedTmpdir === undefined) delete process.env['TMPDIR'];
-    else process.env['TMPDIR'] = savedTmpdir;
+    restore();
   }
 }
 
@@ -719,6 +753,38 @@ describe('scripts/release-manifest.mjs — exact maker names (verifier, round 2)
     },
     60_000,
   );
+});
+
+// Lane I1 (packaging round-3 verifier, Low): a real-maker test that timed out left TMPDIR in a
+// dir afterEach then deleted, and the 10 tests after it failed with ENOENT. Ordered on purpose:
+// the first test leaves exactly what such a timeout leaves; the second is the test after it.
+// (Manual check, recorded in docs/reviews/2026-09-25-pre-push-dleq-packaging.md: with that
+// test's timeout cut to 300 ms, the file now fails 1 test, the timeout, not 11.)
+describe('a maker run that outlives its test does not take TMPDIR with it (lane I1)', () => {
+  it('leaves TMPDIR pointed into its own dir, unrestored, as a timed-out makerNames does', () => {
+    tmpdirInto(dir); // the makers are still running: nothing restores it
+    expect(process.env['TMPDIR']).toBe(join(dir, 'tmp'));
+    expect(tmpdir()).toBe(join(dir, 'tmp'));
+  });
+
+  it('the next test finds TMPDIR as this file found it, and can make a temp dir', () => {
+    expect(Object.hasOwn(process.env, 'TMPDIR')).toBe(ORIGINAL_TMPDIR.set);
+    expect(process.env['TMPDIR']).toBe(ORIGINAL_TMPDIR.value);
+    const t = tempDir('release-after-timeout'); // ENOENT here before the fix
+    expect(existsSync(t.dir)).toBe(true);
+    t.cleanup();
+  });
+
+  it('when the old run finally settles, its restore leaves the current test’s TMPDIR alone', () => {
+    const late = tmpdirInto(join(dir, 'a')); // test A's makers, then A times out
+    restoreTmpdir(); // afterEach
+    const current = tmpdirInto(join(dir, 'b')); // test B's makers
+    late(); // A's makers settle at last
+    expect(process.env['TMPDIR']).toBe(join(dir, 'b', 'tmp'));
+    current();
+    expect(Object.hasOwn(process.env, 'TMPDIR')).toBe(ORIGINAL_TMPDIR.set);
+    expect(process.env['TMPDIR']).toBe(ORIGINAL_TMPDIR.value);
+  });
 });
 
 describe('scripts/release-verify.mjs', () => {

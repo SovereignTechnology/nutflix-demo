@@ -588,7 +588,9 @@ export class DesktopNetworkAdapter implements NetworkAdapter {
       },
     );
     this.sessions.add(session);
-    session.onClose(() => {
+    // Fix round 4: revoked once the worker has paid the session's tail (its answer to
+    // `play.close`), not when the renderer closes it — a PAY for those blocks needs it.
+    session.onSettled(() => {
       plane?.revokeSession(sid);
     });
     // Main learns the link BEFORE anyone learns the token (HostOut ordering, protocol.ts).
@@ -909,6 +911,11 @@ export class DesktopNetworkAdapter implements NetworkAdapter {
   /** The worker died: its sessions died with it (links revoked, nothing asked of it). */
   onWorkerDown(): void {
     this.sessions.dropAll();
+  }
+
+  /** Fix round 4 (quit): close every play session through the worker — each tail paid first. */
+  closeAllSessions(): Promise<void> {
+    return this.sessions.closeAll();
   }
 
   private onUploadEvent(uploadId: string, p: UploadProgress): void {

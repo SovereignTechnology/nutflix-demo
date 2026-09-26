@@ -15,11 +15,15 @@
  *   - an uncaught exception is logged (redacted) and exits 1 — the state is unknown and the
  *     host supervises; an unhandled rejection is logged and survives (Bare would otherwise
  *     abort the process on either).
+ *
+ * Every exit that does not follow `host.close()` goes through `exitWorker` (fix round 4): a DLEQ
+ * thread parked between jobs would otherwise hold `Bare.exit` for good (see `./exit.ts`).
  */
 import './bare-globals.js';
 
 import { toWireError } from '../ipc/errors.js';
 import { bareRuntime } from './adapters/bare.js';
+import { exitWorker } from './exit.js';
 import { WorkerHost } from './host.js';
 import { toLogEvent } from './log.js';
 import { WorkerRpc } from './rpc.js';
@@ -42,7 +46,7 @@ if (ipc === null) {
       readyEvent: () => host.readyEvent(),
     },
     onFatal: () => {
-      Bare.exit(EXIT_CORRUPT);
+      exitWorker(EXIT_CORRUPT);
     },
   });
   const host: WorkerHost = new WorkerHost({
@@ -64,7 +68,11 @@ if (ipc === null) {
   const shutdown = (code: number): void => {
     if (shuttingDown) return;
     shuttingDown = true;
-    const force = setTimeout(() => Bare.exit(code), SHUTDOWN_GRACE_MS);
+    // A close still running at the deadline has not reached `providers.close()`: its DLEQ thread
+    // may be parked, so the forced exit tells it to quit first.
+    const force = setTimeout(() => {
+      exitWorker(code);
+    }, SHUTDOWN_GRACE_MS);
     void host
       .close()
       .catch((err: unknown) => {
@@ -72,13 +80,13 @@ if (ipc === null) {
       })
       .finally(() => {
         clearTimeout(force);
-        Bare.exit(code);
+        exitWorker(code);
       });
   };
 
   Bare.on('uncaughtException', (err) => {
     report('uncaught exception', err);
-    Bare.exit(1);
+    exitWorker(1);
   });
   Bare.on('unhandledRejection', (reason) => {
     report('unhandled rejection', reason);

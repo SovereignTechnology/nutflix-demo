@@ -7,6 +7,8 @@
  * behaviour before), on the thread, and on the chunked fallback — with the same verdicts each way
  * (valid accepted, a bad DLEQ refused). It also proves the process survives a thread that cannot
  * load core, and a missing entry file (an exception escaping a Bare thread aborts the process).
+ * A symlink in the entry's place is refused like a missing file (lane I1: nothing resolved for
+ * the thread may lead out of the worker directory), even one pointing at the real entry.
  *
  * And retiring a thread never blocks the loop (issue #8 review, finding 2): under Bare,
  * `terminate()` stops neither a busy thread nor one parked in `Atomics.wait`, and `join()` blocks
@@ -16,7 +18,7 @@
  * `Bare.exit` from returning).
  */
 import { randomBytes } from 'node:crypto';
-import { copyFile, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { copyFile, mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -39,7 +41,13 @@ const built =
 const MINT = 'https://mint.bare-dleq.test' as MintUrl;
 
 /** The program Bare runs: measure, compare, report one JSON line over IPC. */
-const PROGRAM = (dist: string, broken: string, slowJob: string, slowStart: string): string => `
+const PROGRAM = (
+  dist: string,
+  broken: string,
+  slowJob: string,
+  slowStart: string,
+  linked: string,
+): string => `
 const { payment } = await import('@sovit/core');
 const { bareDleqThread } = await import(${JSON.stringify(pathToFileURL(join(dist, 'adapters', 'bare.js')).href)});
 const { DleqThread, chunkedDleq } = await import(${JSON.stringify(pathToFileURL(join(dist, 'pay', 'dleq-thread.js')).href)});
@@ -71,6 +79,10 @@ ipc.on('data', async (c) => {
   const chunked = await stall(() => chunkedDleq(checks, verify, 2));
   // A missing entry: no thread is started (a start from a missing file would abort Bare).
   const missing = bareDleqThread(new URL('file:///nonexistent/dleq-thread-entry.mjs'))(new SharedArrayBuffer(64));
+  // A symlink to the REAL entry: refused (lstat). Were it started, QUIT at once lets it leave.
+  const lbox = new SharedArrayBuffer(16 + 1024);
+  const lh = bareDleqThread(new URL(${JSON.stringify(pathToFileURL(linked).href)}))(lbox);
+  if (lh !== null) { const c = new Int32Array(lbox, 0, 3); Atomics.store(c, 0, 4); Atomics.notify(c, 0); }
   // An entry that cannot load core: it answers FAIL through the mailbox; the process lives on.
   let brokenOutcome = 'accepted?';
   const b = new DleqThread({ spawn: bareDleqThread(new URL(${JSON.stringify(pathToFileURL(broken).href)})), startMs: 5000, reapMs: 5000 });
@@ -98,6 +110,7 @@ ipc.on('data', async (c) => {
     thread: { startMs, total: thread.total, stall: thread.stall, verdicts: thread.value },
     chunked: { total: chunked.total, stall: chunked.stall, verdicts: chunked.value },
     missing: missing === null ? 'no-thread' : 'started',
+    linked: lh === null ? 'no-thread' : 'started',
     broken: brokenOutcome,
     brokenMs,
     brokenReaps,
@@ -111,6 +124,7 @@ ipc.on('data', async (c) => {
 
 let work = '';
 let brokenDir = '';
+let linked = '';
 
 beforeAll(async () => {
   if (!built) return;
@@ -158,7 +172,9 @@ void main().catch(() => undefined);
 void main().catch(() => undefined);
 `,
   );
-  await writeFile(join(work, 'main.mjs'), PROGRAM(DIST, broken, slowJob, slowStart));
+  linked = join(work, 'linked-entry.mjs');
+  await symlink(ENTRY, linked);
+  await writeFile(join(work, 'main.mjs'), PROGRAM(DIST, broken, slowJob, slowStart, linked));
 });
 
 afterAll(async () => {
@@ -201,6 +217,7 @@ interface Report {
   readonly thread: { startMs: number; total: number; stall: number; verdicts: boolean[] };
   readonly chunked: { total: number; stall: number; verdicts: boolean[] };
   readonly missing: string;
+  readonly linked: string;
   readonly broken: string;
   readonly brokenMs: number;
   readonly brokenReaps: { readonly joined: number; readonly abandoned: number };
@@ -267,6 +284,7 @@ describe('DLEQ off the Bare worker’s event loop (issue #8 d, F5)', () => {
       expect(report.chunked.stall).toBeLessThan(report.inline.stall / 4);
       // Failure is never acceptance, and never an abort.
       expect(report.missing).toBe('no-thread');
+      expect(report.linked).toBe('no-thread'); // lane I1: a symlinked entry is not followed
       expect(report.broken).toMatch(/did not start/);
       // …answered through the mailbox (FAIL) at once, not found out by the 5 s start timeout.
       expect(report.brokenMs).toBeLessThan(4000);

@@ -37,7 +37,7 @@ async function start(setup?: (dir: string) => Promise<void>, maxPendingPays?: nu
     join,
     state: nodeStateFs,
     request: () => Promise.reject(new Error('no host in this test')),
-    sidFor: () => undefined,
+    sidsFor: () => [],
     priceCeiling: () => 0 as never,
     logger: silentLogger,
     ...(maxPendingPays === undefined ? {} : { maxPendingPays }),

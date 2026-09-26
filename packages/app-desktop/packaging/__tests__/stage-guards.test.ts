@@ -5,6 +5,7 @@
  *
  *   - main's bundle may hold only src/main and src/ipc;
  *   - the worker's bundle only src/worker and src/ipc;
+ *   - the DLEQ thread entry's bundle only src/worker/pay and src/ipc, and it must exist (lane I1);
  *   - the host's bundle no worker/main/renderer code and no native package inlined;
  *   - every lockfile closure package must be installed;
  *   - every package a bundle imports must be shipped;
@@ -40,6 +41,8 @@ interface Fixture {
   noSidecar?: boolean;
   /** Source overrides, relative to packages/app/src. */
   src?: Record<string, string>;
+  /** Sources left out, relative to packages/app/src. */
+  omit?: readonly string[];
 }
 
 /** A synthetic repo whose app stages cleanly unless a case breaks one thing. */
@@ -57,10 +60,16 @@ function fixture(f: Fixture = {}): { pkg: string; root: string } {
     'host/main.ts': "import { x } from '../ipc/x.ts';\nexport const h = x;\n",
     'worker/entry.ts': "import 'bare-encoding/global';\nexport const w = 1;\n",
     'worker/other.ts': 'export const o = 1;\n',
+    // The DLEQ thread entry's shape (lane I1): every import dynamic, inside the try.
+    'worker/pay/dleq-thread-entry.mts':
+      "async function main() {\n  try {\n    await import('../bare-globals.js');\n    const { serve } = await import('./serve.ts');\n    serve();\n  } catch {\n    // FAIL\n  }\n}\nvoid main();\n",
+    'worker/pay/serve.ts':
+      "import { x } from '../../ipc/x.ts';\nexport const serve = (): number => x;\n",
     'renderer/r.ts': 'export const r = 1;\n',
     ...f.src,
   };
-  for (const [p, c] of Object.entries(src)) put(join(pkg, 'src', p), c);
+  for (const [p, c] of Object.entries(src))
+    if (!(f.omit ?? []).includes(p)) put(join(pkg, 'src', p), c);
 
   put(join(root, 'node_modules', 'electron', 'package.json'), '{"version":"44.2.0"}');
   const deps: Record<string, string> = {};
@@ -108,10 +117,42 @@ describe('stageApp guards (synthetic repo)', { timeout: 30_000 }, () => {
   it('the unbroken fixture stages (so each case below fails for its own reason)', async () => {
     const r = (await stage()) as {
       packages: { name: string }[];
-      externals: { worker: string[] };
+      externals: { worker: string[]; dleqThread: string[] };
     };
     expect(r.packages.map((p) => p.name).sort()).toEqual(['bare-encoding', 'bare-sidecar']);
     expect(r.externals.worker).toEqual(['bare-encoding']);
+    // bare-globals.js became `bare-encoding/global` (D6), as in the worker bundle.
+    expect(r.externals.dleqThread).toEqual(['bare-encoding']);
+  });
+
+  it('the DLEQ thread entry must exist (lane I1: without it every check runs on the loop)', async () => {
+    await expect(stage({ omit: ['worker/pay/dleq-thread-entry.mts'] })).rejects.toThrow(
+      /src\/worker\/pay\/dleq-thread-entry\.mts is missing/,
+    );
+  });
+
+  it('the DLEQ thread entry may bundle only src/worker/pay and src/ipc', async () => {
+    await expect(
+      stage({
+        src: {
+          'worker/pay/dleq-thread-entry.mts':
+            "async function main() {\n  try {\n    await import('../other.ts');\n  } catch {}\n}\nvoid main();\n",
+        },
+      }),
+    ).rejects.toThrow(
+      /DLEQ thread bundle may only contain src\/worker\/pay and src\/ipc:[\s\S]*worker[\\/]other\.ts/,
+    );
+  });
+
+  it('a package the DLEQ thread entry imports must be shipped', async () => {
+    await expect(
+      stage({
+        src: {
+          'worker/pay/dleq-thread-entry.mts':
+            "async function main() {\n  try {\n    await import('left-pad');\n  } catch {}\n}\nvoid main();\n",
+        },
+      }),
+    ).rejects.toThrow(/bundles import packages the closure does not ship: left-pad/);
   });
 
   it('main may bundle only src/main and src/ipc', async () => {

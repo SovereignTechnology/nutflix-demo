@@ -127,6 +127,30 @@ describe('HostLink', () => {
     expect(t.children).toHaveLength(2);
   });
 
+  // Fix round 4: an app quit lets the host pay the open sessions' tails (SIGTERM → shutdown).
+  it('stopAndWait kills the host and resolves when it exits — or after the bound, whichever is first', async () => {
+    const t = link();
+    t.l.start();
+    let done = false;
+    const p = t.l.stopAndWait(10_000).then(() => {
+      done = true;
+    });
+    expect(t.children[0]!.killed).toBe(true);
+    await Promise.resolve();
+    expect(done).toBe(false);
+    t.children[0]!.emit('exit', 0);
+    await p;
+    expect(done).toBe(true);
+    expect(t.children).toHaveLength(1); // no respawn after a quit
+    const hung = link();
+    hung.l.start();
+    const t0 = Date.now();
+    await hung.l.stopAndWait(50); // never exits: the bound
+    expect(Date.now() - t0).toBeGreaterThanOrEqual(40);
+    const none = link();
+    await none.l.stopAndWait(10_000); // nothing running: at once
+  });
+
   it('stop kills the host and never respawns it', () => {
     const t = link();
     t.l.start();
