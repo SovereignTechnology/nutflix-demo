@@ -82,6 +82,12 @@ export interface TestMintOptions {
   /** Simulated Lightning shared with other TestMints: their melts pay this mint's invoices. */
   readonly lightning?: TestLightning;
   /**
+   * The expiry (unix seconds) its mint quotes carry (default 4 102 444 800, 2100-01-01): a test of
+   * what a wallet does once a quote's invoice has expired sets its own. Only the number the mint
+   * answers: the quote stays payable (simulated Lightning keeps no clock).
+   */
+  readonly quoteExpiry?: number;
+  /**
    * NUT-19 cached responses, advertised in `/v1/info` only (default off; cdk-mintd advertises it,
    * Nutshell does not by default). This mint caches nothing: the option exists so a test can show
    * what a client does when a mint advertises it — cashu-ts's own fetch transport then RETRIES a
@@ -156,6 +162,7 @@ export class TestMint {
   private readonly nut20: boolean;
   private readonly nut09: boolean;
   private readonly nut19: TestMintOptions['nut19'];
+  private readonly quoteExpiry: number;
   /** B_ → the signature the mint gave it (NUT-09 restore; an output is never signed twice). */
   private readonly promises = new Map<string, SerializedBlindedSignature>();
   /** hex(Y) of every spent proof. */
@@ -190,6 +197,7 @@ export class TestMint {
     this.nut20 = o.nut20 ?? true;
     this.nut09 = o.nut09 ?? true;
     this.nut19 = o.nut19;
+    this.quoteExpiry = o.quoteExpiry ?? 4_102_444_800;
     const pair = createNewMintKeys(16, o.seed, { unit: 'sat', input_fee_ppk: this.inputFeePpk });
     this.keysetId = pair.keysetId;
     this.pub = pair.pubKeys;
@@ -590,7 +598,7 @@ export class TestMint {
       unit: 'sat',
       amount: q.amount,
       state: q.state,
-      expiry: 4_102_444_800,
+      expiry: this.quoteExpiry,
       ...(q.pubkey === undefined ? {} : { pubkey: q.pubkey }),
     };
   }

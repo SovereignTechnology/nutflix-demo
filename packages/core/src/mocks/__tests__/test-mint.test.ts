@@ -152,4 +152,20 @@ describe('TestMint: a melt answered PENDING, settled later (the auto top-up’s 
     expect(await refused.wallet.balance(URL_)).toBe(500);
     expect(refused.lightning.paid).toEqual([]);
   });
+
+  it('a mint quote carries the expiry the test set (round 5), 2100-01-01 by default', async () => {
+    const wallet = (tm: TestMint): CashuWallet =>
+      new CashuWallet({
+        mints: new CashuMintConnections({ request: () => tm.request }),
+        store: new MemoryProofStore(),
+      });
+    const plain = new TestMint({ url: URL_ });
+    expect((await wallet(plain).mintQuote(URL_, 10 as Sats)).expiry).toBe(4_102_444_800);
+    const soon = new TestMint({ url: URL_, quoteExpiry: 1_800_000_600 });
+    const w = wallet(soon);
+    const q = await w.mintQuote(URL_, 10 as Sats);
+    expect(q.expiry).toBe(1_800_000_600);
+    soon.payQuote(q.quoteId); // still payable: the number only
+    expect(await w.pollQuote(q)).toEqual({ state: 'ISSUED', minted: 10 });
+  });
 });
