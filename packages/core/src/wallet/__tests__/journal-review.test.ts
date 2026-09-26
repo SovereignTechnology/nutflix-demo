@@ -2,9 +2,11 @@
  * Issue #8 review, findings 4 and 5 (core), against the in-process TestMint with NUT-09:
  *
  *   finding 4  a refusal cashu-ts wraps is still a refusal. A keyset refusal (12xxx) comes back
- *              as a `StaleKeysetError` whose `cause` carries the code, and a 429 as a
- *              `RateLimitError`: both drop the journal entry at once — melt and send — so the
- *              inputs are not held and the quote is not locked for `PENDING_SETTLE_AFTER_S`;
+ *              as a `StaleKeysetError` whose `cause` carries the code: it drops the journal entry
+ *              at once — melt and send — so the inputs are not held and the quote is not locked
+ *              for `PENDING_SETTLE_AFTER_S`. A 429 (`RateLimitError`) was treated the same way
+ *              until fix round 2, which made it ambiguous again (a retrying transport can meet it
+ *              after its first attempt executed; `journal-retry.test.ts`);
  *   finding 5  a retry of a melt an earlier settle already recovered (the startup one) answers
  *              "paid" with no request, never "melt failed"; and a recovered entry answers only for
  *              its own kind (a top-up recovered by the settle never passes for a melt).
@@ -19,8 +21,9 @@ import {
 } from '@cashu/cashu-ts';
 import { describe, expect, it } from 'vitest';
 
-import type { CashuP2pkPubkey, MintUrl, Sats } from '../../contracts/index.js';
+import type { CashuP2pkPubkey, MintUrl, Sats, UnixSeconds } from '../../contracts/index.js';
 import { TestMint } from '../../mocks/test-mint.js';
+import { PENDING_SETTLE_AFTER_S } from '../spend.js';
 import { MemoryProofStore } from '../store.js';
 import { CashuMintConnections, CashuWallet } from '../wallet.js';
 
@@ -88,7 +91,13 @@ function transport(inner: RequestFn) {
   return { st, request };
 }
 
-function rig(o: { readonly mint?: TestMint; readonly store?: MemoryProofStore } = {}) {
+function rig(
+  o: {
+    readonly mint?: TestMint;
+    readonly store?: MemoryProofStore;
+    readonly now?: () => UnixSeconds;
+  } = {},
+) {
   const mint =
     o.mint ?? new TestMint({ url: MINT, seed: new Uint8Array(32).fill(0x61), feeReserve: 4 });
   const net = transport(mint.request);
@@ -96,6 +105,7 @@ function rig(o: { readonly mint?: TestMint; readonly store?: MemoryProofStore } 
   const wallet = new CashuWallet({
     mints: new CashuMintConnections({ request: () => net.request }),
     store,
+    ...(o.now === undefined ? {} : { now: o.now }),
   });
   return { mint, net, store, wallet };
 }
@@ -129,18 +139,31 @@ describe('issue #8 review, finding 4: a refusal cashu-ts wraps is still a refusa
     expect(meltCalls(mint)).toBe(1);
   });
 
-  it('a melt answered 429 (RateLimitError) was refused before it ran: dropped at once', async () => {
-    const { mint, net, store, wallet } = rig();
+  it('a melt answered 429 (RateLimitError) is not a refusal: held until the mint can say, then payable (fix round 2)', async () => {
+    // Fix round 2 (independent verifier, HIGH): this test used to expect the entry dropped at
+    // once. That rule lost funds when a RETRYING transport met the 429 after its first attempt
+    // had executed (`journal-retry.test.ts`), and the wallet cannot tell that 429 from this one
+    // (refused before the mint saw anything). So both stay ambiguous: the inputs are held, the
+    // quote is not sent again meanwhile, and after the wait NUT-07 (inputs unspent) gives them
+    // back and the quote is payable.
+    const clock = { t: 1_900_000_000 };
+    const { mint, net, store, wallet } = rig({ now: () => clock.t as UnixSeconds });
     await fund(wallet, mint, 64);
     const q = await wallet.meltQuote(MINT, INVOICE_20);
     net.st.fail = {
       path: '/v1/melt/bolt11',
       err: () => new RateLimitError('429 Too Many Requests', 1000),
     };
-    await expect(wallet.melt(q)).rejects.toMatchObject({ code: 'mint-error' });
-    expect(await store.pending(MINT)).toEqual([]);
+    await expect(wallet.melt(q)).rejects.toThrow(/outcome unknown/);
+    expect((await store.pending(MINT)).map((o) => o.kind)).toEqual(['melt']);
+    expect(await wallet.balance(MINT)).toBe(0);
+    await expect(wallet.melt(q)).rejects.toThrow(/still unresolved/);
+    expect(meltCalls(mint)).toBe(0);
+    clock.t += PENDING_SETTLE_AFTER_S;
+    expect(await wallet.recoverPending()).toEqual({ recovered: 0, left: 0 });
     expect(await wallet.balance(MINT)).toBe(64);
     expect(await wallet.melt(q)).toMatchObject({ paid: true, change: 44 });
+    expect(meltCalls(mint)).toBe(1);
   });
 
   it('a send refused with a keyset code does not hold its input', async () => {

@@ -37,7 +37,6 @@ import {
   getP2PKExpectedWitnessPubkeys,
   hasValidDleq,
   OutputData,
-  RateLimitError,
   schnorrVerifyMessage,
   StaleKeysetError,
   type MeltPreview,
@@ -1057,14 +1056,24 @@ function supports(w: CashuTsWallet, nut: 9 | 12): boolean {
 /**
  * The mint refused the request; nothing executed: it answered with an error code; or cashu-ts
  * wrapped that coded answer — a keyset refusal (12xxx) comes back as a `StaleKeysetError` whose
- * `cause` is the coded error; or it said 429 (`RateLimitError`: refused before it was processed).
- * Only these wrappers: a coded `cause` under any other error is NOT a refusal (cashu-ts's
- * `MeltChangeError` means the melt completed).
+ * `cause` is the coded error. Only that wrapper: a coded `cause` under any other error is NOT a
+ * refusal (cashu-ts's `MeltChangeError` means the melt completed).
+ *
+ * A coded answer is the mint's answer to OUR request only when the transport sends each request
+ * once. Every production transport does (issue #8, fix round 2): the desktop money plane's and the
+ * daemons' are `cashuRequestFn` over Node http(s), which never retries, and cashu-ts itself sends a
+ * swap, melt or mint once over a custom transport (`withStaleKeysetRepair` does not resend; the
+ * NUT-20 legacy fallback resends only after a coded 20008 refusal). cashu-ts's OWN fetch transport
+ * retries NUT-19 cached endpoints, and a retry's answer says nothing about the first attempt — it
+ * is used by no production wallet.
+ *
+ * A 429 (`RateLimitError`) is NOT a refusal: a rate limiter may answer the retry of a request that
+ * executed, its answer lost (fix round 2: funds lost on cdk-mintd, where a retrying transport met a
+ * 429 after the swap had run). It is resolved like any lost answer — held, then NUT-09 / NUT-07.
  */
 function isDefinitive(e: unknown): boolean {
   if (hasCode(e)) return true;
-  if (e instanceof StaleKeysetError) return hasCode(e.cause);
-  return e instanceof RateLimitError;
+  return e instanceof StaleKeysetError && hasCode(e.cause);
 }
 
 function hasCode(e: unknown): boolean {
