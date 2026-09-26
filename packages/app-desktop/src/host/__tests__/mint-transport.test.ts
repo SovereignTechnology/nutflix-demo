@@ -53,12 +53,27 @@ afterEach(async () => {
 async function httpMint(): Promise<{
   url: MintUrl;
   mint: mocks.TestMint;
-  st: { loseFirstSwap: boolean; swapPosts: number; served429: number };
+  st: {
+    loseFirstSwap: boolean;
+    swapPosts: number;
+    served429: number;
+    /** Every request's `Accept` and `User-Agent` (cashu-ts's fetch transport sends both). */
+    headers: { accept?: string; ua?: string }[];
+  };
 }> {
-  const st = { loseFirstSwap: false, swapPosts: 0, served429: 0 };
+  const st = {
+    loseFirstSwap: false,
+    swapPosts: 0,
+    served429: 0,
+    headers: [] as { accept?: string; ua?: string }[],
+  };
   // Set once the server listens (the mint's URL is the server's).
   const at: { mint?: mocks.TestMint; base: string } = { base: '' };
   const answer = async (req: IncomingMessage, res: ServerResponse, text: string): Promise<void> => {
+    st.headers.push({
+      ...(req.headers.accept === undefined ? {} : { accept: req.headers.accept }),
+      ...(req.headers['user-agent'] === undefined ? {} : { ua: req.headers['user-agent'] }),
+    });
     const method = (req.method ?? 'GET').toUpperCase();
     const path = req.url ?? '/';
     const isSwap = method === 'POST' && path === '/v1/swap';
@@ -161,6 +176,40 @@ describe('the money plane’s default mint transport sends each request once (fi
       expect(st.served429).toBe(0);
       expect(await plane.wallet.balance(url)).toBe(28);
       expect(mint.calls.filter((c) => c === 'POST /v1/restore').length).toBeGreaterThan(0);
+      expect(st.headers.every((h) => h.accept === 'application/json' && h.ua === undefined)).toBe(
+        true,
+      );
+    } finally {
+      plane.close();
+    }
+  });
+
+  it('a mint an injected (test) transport leaves out gets the host transport too, never cashu-ts’s fetch', async () => {
+    const { url, st } = await httpMint();
+    const signer = (
+      await signerMod.LocalSigner.create({
+        passphrase: Buffer.from('mint transport passphrase'),
+        cost: signerMod.minimumCost(),
+      })
+    ).signer;
+    const plane = await MoneyPlane.open({
+      signer,
+      pool: new nostr.FakeRelayPool(),
+      relays: () => [{ url: RELAY, read: true, write: true }],
+      defaultMints: () => [url],
+      log: memoryLogger('warn'),
+      journalDir: join(dir, WALLET_DIR),
+      createWallet: true,
+      mintRequest: () => undefined,
+    });
+    try {
+      expect(await plane.wallet.inputFeePpk(url)).toBe(0);
+      // cashu-ts's fetch transport sends `Accept: application/json, text/plain, */*` and a
+      // User-Agent; the host's (`cashuRequestFn`) sends `Accept: application/json` and none.
+      expect(st.headers.length).toBeGreaterThan(0);
+      expect(st.headers.every((h) => h.accept === 'application/json' && h.ua === undefined)).toBe(
+        true,
+      );
     } finally {
       plane.close();
     }
