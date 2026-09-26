@@ -19,7 +19,7 @@ import {
 } from './controls.js';
 import {
   AUTO_TOP_UP_AMOUNT_MAX_SATS,
-  AUTO_TOP_UP_DEFAULT_SATS,
+  AUTO_TOP_UP_THRESHOLD_DEFAULT_SATS,
   AUTO_TOP_UP_PER_DAY_SATS,
   autoTopUpAmount,
   autoTopUpEnabled,
@@ -169,7 +169,9 @@ export function WalletSection({
           ? undefined
           : { belowSats: 0 as Sats, fromMint, ...keepAmount(base) };
       return {
-        belowSats: (autoTopUpEnabled(cur) ? cur.belowSats : AUTO_TOP_UP_DEFAULT_SATS) as Sats,
+        belowSats: (autoTopUpEnabled(cur)
+          ? cur.belowSats
+          : AUTO_TOP_UP_THRESHOLD_DEFAULT_SATS) as Sats,
         fromMint,
         ...keepAmount(base),
       };
@@ -230,7 +232,7 @@ export function WalletSection({
 
   const chooseMint = (fromMint: MintUrl): void => {
     void saveTopUp((base) => ({
-      belowSats: (base.autoTopUp?.belowSats ?? AUTO_TOP_UP_DEFAULT_SATS) as Sats,
+      belowSats: (base.autoTopUp?.belowSats ?? AUTO_TOP_UP_THRESHOLD_DEFAULT_SATS) as Sats,
       fromMint,
       ...keepAmount(base),
     }));

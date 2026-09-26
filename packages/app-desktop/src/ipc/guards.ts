@@ -423,7 +423,7 @@ const isSettingsPatch = obj(
     // the defaults: auto top-up off).
     autoTopUp: obj(
       {
-        belowSats: int(0, LIMITS.maxAutoTopUpSats) as Guard<Sats>,
+        belowSats: int(0, LIMITS.maxAutoTopUpThresholdSats) as Guard<Sats>,
         fromMint: isMintUrl,
       },
       { amountSats: int(1, LIMITS.maxAutoTopUpAmountSats) as Guard<Sats> },

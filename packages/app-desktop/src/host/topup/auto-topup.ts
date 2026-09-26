@@ -4,6 +4,12 @@
  * from `fromMint` over Lightning — `mintQuote` at the target, `meltQuote` + `melt` at the source,
  * then `pollQuote` mints at the target.
  *
+ * Triggers: ONLY the payment path — a play about to open (`DesktopNetworkAdapter.checkBalance`)
+ * and the money plane paying for an open play session (`pay.build` → `paymentAt`). A wallet
+ * balance event never starts one: it is also the user's own withdrawal, send or nutzap, or a
+ * seeder melt (independent review, finding 1: the contract compares `belowSats` at "the mint a
+ * payment is about to draw from").
+ *
  * Guards, in the order they run (every one refuses before anything moves):
  *   1. due — `autoTopUpDue`: on (`belowSats > 0`), the target on the user's OWN list
  *      (`defaultMints`, never a mint first seen in a manifest), never `fromMint` itself;
@@ -21,9 +27,14 @@
  *   6. the quotes — the source mint's melt quote must be for exactly the amount the target
  *      invoiced (a target cannot invoice more than asked), with fees (Lightning reserve + an
  *      input-fee allowance) of at most `maxFeeReserve(amount)`; the source must hold all of it;
- *   7. the reservation is persisted BEFORE the melt; a melt that throws or is not paid stays
+ *   7. still wanted — right before the reservation and again right before the melt: the same
+ *      wallet (no sign-out or signer switch meanwhile; a closed plane reads as none) and the same
+ *      settings (still on and due, the same source and amount, the target still on the list);
+ *   8. the reservation is persisted BEFORE the melt; a melt that throws or is not paid stays
  *      counted (its sats may have left) — except core's `insufficient-funds`, refused before the
- *      mint is asked.
+ *      mint is asked. What a paid melt moved is read from its own history line; without one, the
+ *      whole reservation counts, or the source's balance drop when that is larger (input fees past
+ *      the allowance — core does not say up front how many inputs it will spend).
  *
  * History (NIP-60 kind 7376): minting at the target already writes `in … "top-up"` and the melt
  * writes `out … "melt to Lightning"` at the source — nothing more is written (no double entry).
@@ -94,7 +105,10 @@ export function topUpAmount(a: NonNullable<Settings['autoTopUp']>): number | nul
 }
 
 export type TopUpOutcome =
-  /** Not due: off, balance high enough, not a trusted mint, the source itself, or no wallet. */
+  /**
+   * Not due: off, balance high enough, not a trusted mint, the source itself, or no wallet — or no
+   * longer wanted mid-run (the settings or the wallet changed; nothing moved).
+   */
   | 'not-due'
   /** Another top-up (for another mint) is in flight. */
   | 'busy'
@@ -190,8 +204,9 @@ export class AutoTopUp {
   }
 
   /**
-   * A payment is about to draw from `mint` (a balance change, a play): run its top-up if one is
-   * due. `balance`, when known, spares a wallet read for the common not-due case. Never rejects.
+   * A payment is about to draw from `mint` (a play opening, a PAY for an open session): run its
+   * top-up if one is due. `balance`, when known, spares a wallet read for the common not-due case.
+   * Never rejects. Never called for a mere balance change (see the header).
    */
   check(mint: MintUrl, balance?: Sats): Promise<TopUpOutcome> {
     try {
@@ -217,6 +232,21 @@ export class AutoTopUp {
       return done;
     } catch {
       return Promise.resolve('failed');
+    }
+  }
+
+  /**
+   * The money plane just paid (or failed to pay, short) for an open play session at `mint`: the
+   * mint the next PAY draws from. Reads its balance first, so a not-due PAY never holds the single
+   * flight another mint's top-up may need. Never rejects.
+   */
+  async paymentAt(mint: MintUrl): Promise<TopUpOutcome> {
+    try {
+      const w = this.o.wallet();
+      if (w === undefined || !autoTopUpDue(this.o.settings(), mint, 0 as Sats)) return 'not-due';
+      return await this.check(mint, await w.balance(mint));
+    } catch {
+      return 'failed';
     }
   }
 
@@ -250,28 +280,29 @@ export class AutoTopUp {
     if (!autoTopUpDue(s, target, await w.balance(target))) return 'not-due';
     const amount = topUpAmount(a);
     if (amount === null) return 'refused';
+    const from = a.fromMint;
     // Every attempt from here on spaces the next one.
     this.notBefore = this.now() + TOP_UP_MIN_INTERVAL_MS;
     if (!this.o.ledger.fits(amount)) return 'cap';
 
     if (!this.o.ledger.isAllowed(target)) {
-      const yes = await this.ask({ target, source: a.fromMint, amount: amount as Sats });
+      const yes = await this.ask({ target, source: from, amount: amount as Sats });
       if (!yes) {
         this.declined.set(target, this.now() + TOP_UP_DECLINED_BACKOFF_MS);
         return 'declined';
       }
-      await this.o.ledger.allow(target); // rejects: not remembered, nothing moves
-      // The question took a while: go on only if the settings still ask for this top-up.
-      const cur = this.o.settings();
-      if (
-        cur.autoTopUp?.fromMint !== a.fromMint ||
-        topUpAmount(cur.autoTopUp) !== amount ||
-        !autoTopUpDue(cur, target, await w.balance(target))
-      )
-        return 'not-due';
+      try {
+        await this.o.ledger.allow(target);
+      } catch {
+        // Not remembered, nothing moves — and, like a decline, not asked again for the hour (a
+        // ledger that cannot be written would otherwise re-ask after every failure backoff).
+        this.declined.set(target, this.now() + TOP_UP_DECLINED_BACKOFF_MS);
+        return 'failed';
+      }
+      // The question may have stayed open for minutes: go on only if it is still wanted.
+      if (!(await this.stillWanted(w, target, from, amount))) return 'not-due';
     }
 
-    const from = a.fromMint;
     const quote = await w.mintQuote(target, amount as Sats);
     const melt = await w.meltQuote(from, quote.bolt11);
     if (melt.mint !== from || melt.amount !== amount) return 'refused';
@@ -283,10 +314,19 @@ export class AutoTopUp {
     // Counted toward the daily cap until the melt answers: the amount and every fee it may cost.
     const reserved = amount + melt.feeReserve + inputAllowance;
     if ((await w.balance(from)) < reserved) return 'source-short';
+    // The quotes took seconds: the user may have turned it off, changed the source or the amount,
+    // taken the target off the list, or signed out meanwhile.
+    if (!(await this.stillWanted(w, target, from, amount))) return 'not-due';
     if (!this.o.ledger.fits(reserved)) return 'cap';
     const entry = await this.o.ledger.reserve({ amount, sats: reserved, target, from });
 
     const before = await this.historyBefore(w, from, amount, reserved);
+    const sourceBefore = await balanceOrNull(w, from);
+    // The last look, right before the melt (the reservation's write and the reads awaited).
+    if (!(await this.stillWanted(w, target, from, amount))) {
+      await this.o.ledger.settle(entry, { state: 'failed' }); // nothing moved
+      return 'not-due';
+    }
     this.meltInFlight = before;
     let paid: { paid: boolean; change: Sats };
     try {
@@ -306,12 +346,17 @@ export class AutoTopUp {
     }
     const line = await this.findMelt(w, before);
     this.meltInFlight = null;
-    // What left the source: core's history line says (amount + Lightning fee + input fees);
-    // without it, the reservation less the change (every allowed input fee assumed spent).
-    const moved = Math.max(
-      amount,
-      line?.amount ?? reserved - Math.max(0, Math.min(paid.change, reserved)),
-    );
+    // What left the source: core's history line says (amount + Lightning fee + input fees).
+    // Without it, fail safe: the whole reservation, or the source's balance drop when larger
+    // (input fees past the allowance; a concurrent spend there over-counts, never under).
+    let moved: number;
+    if (line !== undefined) moved = Math.max(amount, line.amount);
+    else {
+      const sourceAfter = await balanceOrNull(w, from);
+      const drop =
+        sourceBefore !== null && sourceAfter !== null ? sourceBefore - sourceAfter : reserved;
+      moved = Math.max(reserved, drop);
+    }
     await this.o.ledger.settle(entry, {
       state: 'done',
       sats: moved,
@@ -322,6 +367,25 @@ export class AutoTopUp {
     this.unissued.push({ quote, wallet: w });
     this.log.warn('auto top-up paid but not yet minted at the target; retried later');
     return 'failed';
+  }
+
+  /**
+   * Whether the top-up the run started is still wanted: the same wallet (no sign-out or signer
+   * switch — the host reads a closed money plane as no wallet) and the same settings (on, due at
+   * `target`, the target on the list, the same source and amount).
+   */
+  private async stillWanted(
+    w: Wallet,
+    target: MintUrl,
+    from: MintUrl,
+    amount: number,
+  ): Promise<boolean> {
+    if (this.o.wallet() !== w) return false;
+    const cur = this.o.settings();
+    const a = cur.autoTopUp;
+    if (a?.fromMint !== from || topUpAmount(a) !== amount) return false;
+    const due = autoTopUpDue(cur, target, await w.balance(target));
+    return due && this.o.wallet() === w;
   }
 
   private async ask(q: FirstFundingQuestion): Promise<boolean> {
@@ -421,6 +485,16 @@ export class AutoTopUp {
     if (last > 0 && now - last < TOP_UP_REFUSAL_LOG_EVERY_MS) return;
     this.lastRefusalLog.set(out, now);
     this.log.warn('auto top-up not done', { outcome: out });
+  }
+}
+
+/** `w.balance(mint)`, or `null` when it cannot be read. */
+async function balanceOrNull(w: Wallet, mint: MintUrl): Promise<number | null> {
+  try {
+    const b = await w.balance(mint);
+    return Number.isSafeInteger(b) ? b : null;
+  } catch {
+    return null;
   }
 }
 

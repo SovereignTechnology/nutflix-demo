@@ -105,8 +105,11 @@ export const LIMITS = {
   maxSats: 2_100_000_000_000_000,
   /** `Settings.seeding.diskCapBytes` ceiling: 10 000 GiB (Settings' `DISK_CAP_MAX_GB`). */
   maxDiskCapBytes: 10_000 * 1024 ** 3,
-  /** `Settings.autoTopUp.belowSats` ceiling (the Settings screen's threshold maximum). */
-  maxAutoTopUpSats: 10_000_000,
+  /**
+   * `Settings.autoTopUp.belowSats` ceiling (the Settings screen's threshold maximum) — a
+   * threshold, not an amount (was `maxAutoTopUpSats`; renamed in issue #2's independent review).
+   */
+  maxAutoTopUpThresholdSats: 10_000_000,
   /**
    * Issue #2: `Settings.autoTopUp.amountSats` ceiling and the most one auto top-up moves — core's
    * `AUTO_TOP_UP_MAX_SATS` (pinned below; this module imports no core runtime code).

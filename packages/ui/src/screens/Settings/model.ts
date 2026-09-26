@@ -176,9 +176,13 @@ export function clampPrefetch(sec: number): number {
 
 // ---- auto top-up ----------------------------------------------------------------------
 
-export const AUTO_TOP_UP_DEFAULT_SATS = 1_000;
-/** The threshold's ceiling (`Settings.autoTopUp.belowSats`). */
-export const AUTO_TOP_UP_MAX_SATS = 10_000_000;
+/**
+ * The THRESHOLD's default and ceiling (`Settings.autoTopUp.belowSats`) — not an amount. Named so
+ * since issue #2's independent review: the ceiling used to be `AUTO_TOP_UP_MAX_SATS`, which in
+ * core is the most one top-up MOVES (10 000), a thousand times less.
+ */
+export const AUTO_TOP_UP_THRESHOLD_DEFAULT_SATS = 1_000;
+export const AUTO_TOP_UP_THRESHOLD_MAX_SATS = 10_000_000;
 /**
  * Issue #2: the most one auto top-up moves, and its default — core's `AUTO_TOP_UP_MAX_SATS`
  * (a local copy pinned by a test: the screens import no core runtime code).
@@ -204,8 +208,10 @@ export function parseThresholdSats(text: string): Validation<number> {
   if (t === '') return fail('Enter an amount in sats.');
   if (!/^\d+$/.test(t)) return fail('Sats are whole numbers, like 1000.');
   const n = Number(t);
-  if (n < 1 || n > AUTO_TOP_UP_MAX_SATS)
-    return fail(`Choose between 1 and ${AUTO_TOP_UP_MAX_SATS.toLocaleString('en-US')} sats.`);
+  if (n < 1 || n > AUTO_TOP_UP_THRESHOLD_MAX_SATS)
+    return fail(
+      `Choose between 1 and ${AUTO_TOP_UP_THRESHOLD_MAX_SATS.toLocaleString('en-US')} sats.`,
+    );
   return ok(n);
 }
 

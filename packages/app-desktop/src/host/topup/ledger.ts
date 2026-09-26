@@ -18,6 +18,10 @@
  *   - an entry dated in the future (clock set back) still counts; more than
  *     `MAX_LEDGER_ENTRIES` entries in the window reads as the cap reached.
  *
+ * The funding melts' wallet-history ids (the "top-up" label, `isTopUpMelt`) are kept in a list of
+ * their own, bounded to the newest `MAX_TOP_UP_MELTS` and never pruned by the 24-hour window, so
+ * this device keeps showing yesterday's top-up as one (independent review, finding 2).
+ *
  * Nothing here logs a mint URL, an amount beyond the numbers, or anything secret.
  */
 import { randomBytes } from 'node:crypto';
@@ -46,6 +50,11 @@ export const MAX_LEDGER_ENTRIES = 2000;
 const MAX_ENTRY_SATS = AUTO_TOP_UP_MAX_SATS_PER_DAY * 2;
 /** Most mints remembered as allowed (the Settings mint list has the same cap). */
 const MAX_ALLOWED = LIMITS.maxArray;
+/**
+ * Funding-melt history ids remembered for the "top-up" label, newest last; the oldest drops out
+ * beyond this (a label, not a cap: losing one only shows an old top-up as "melt to Lightning").
+ */
+export const MAX_TOP_UP_MELTS = 256;
 
 /**
  * `pending`  reserved, the melt not yet answered (counts its reservation);
@@ -72,11 +81,21 @@ export interface LedgerEntry {
   readonly melt?: NostrEventId;
 }
 
-interface LedgerFile {
+interface LedgerRequired {
   readonly v: typeof FILE_V;
   readonly allowed: readonly MintUrl[];
   readonly entries: readonly LedgerEntry[];
 }
+
+interface LedgerOptional {
+  /**
+   * The funding melts' history ids, newest last, at most `MAX_TOP_UP_MELTS`, outside the rolling
+   * window. Always written; optional on read (a file from before the list existed has none).
+   */
+  readonly melts: readonly NostrEventId[];
+}
+
+type LedgerFile = LedgerRequired & Partial<LedgerOptional>;
 
 /**
  * A mint URL the ledger will store: printable ASCII `http(s)://…`, bounded. Looser than the
@@ -110,11 +129,14 @@ const isEntry: Guard<LedgerEntry> = obj(
   },
 );
 
-const isLedgerFile: Guard<LedgerFile> = obj({
-  v: literal(FILE_V),
-  allowed: arrayOf(isLedgerMint, MAX_ALLOWED),
-  entries: arrayOf(isEntry, MAX_LEDGER_ENTRIES),
-});
+const isLedgerFile: Guard<LedgerFile> = obj<LedgerRequired, LedgerOptional>(
+  {
+    v: literal(FILE_V),
+    allowed: arrayOf(isLedgerMint, MAX_ALLOWED),
+    entries: arrayOf(isEntry, MAX_LEDGER_ENTRIES),
+  },
+  { melts: arrayOf(isHistoryId, MAX_TOP_UP_MELTS) },
+);
 
 /** The numbers of a reservation fit the file's own bounds (so writing it cannot corrupt it). */
 function isEntryAmount(e: { readonly amount: number; readonly sats: number }): boolean {
@@ -148,6 +170,8 @@ export class TopUpLedger {
   private readonly now: () => number;
   private allowed: readonly MintUrl[] = [];
   private entries: readonly LedgerEntry[] = [];
+  /** Funding-melt history ids, newest last (never pruned by the window; bounded). */
+  private melts: readonly NostrEventId[] = [];
   /** The corrupt-ledger marker could not be written: refuse everything this run. */
   private hardClosed = false;
 
@@ -181,6 +205,7 @@ export class TopUpLedger {
     if (r.kind === 'ok') {
       this.allowed = r.value.allowed;
       this.entries = r.value.entries;
+      this.melts = r.value.melts ?? [];
       return;
     }
     // Fail closed: the cap reads as reached for 24 h, and nothing is remembered as allowed.
@@ -199,8 +224,9 @@ export class TopUpLedger {
     };
     this.allowed = [];
     this.entries = [marker];
+    this.melts = [];
     try {
-      await this.file.save({ v: FILE_V, allowed: [], entries: [marker] });
+      await this.file.save({ v: FILE_V, allowed: [], entries: [marker], melts: [] });
     } catch {
       this.hardClosed = true;
       this.log.error('the auto top-up ledger cannot be replaced: auto top-ups stay off this run');
@@ -274,6 +300,9 @@ export class TopUpLedger {
       readonly melt?: NostrEventId;
     },
   ): Promise<void> {
+    const melt = patch.melt !== undefined && isHistoryId(patch.melt) ? patch.melt : undefined;
+    if (melt !== undefined && !this.melts.includes(melt))
+      this.melts = [...this.melts, melt].slice(-MAX_TOP_UP_MELTS);
     this.entries = this.entries.map((e) => {
       if (e.id !== id) return e;
       // Never lower a count below the amount that reached (or may have reached) the target, and
@@ -285,7 +314,7 @@ export class TopUpLedger {
         ...e,
         state: patch.state,
         sats,
-        ...(patch.melt !== undefined && isHistoryId(patch.melt) ? { melt: patch.melt } : {}),
+        ...(melt === undefined ? {} : { melt }),
       };
     });
     try {
@@ -295,25 +324,39 @@ export class TopUpLedger {
     }
   }
 
-  /** Whether `historyId` is the melt that funded an auto top-up. */
+  /**
+   * Whether `historyId` is the melt that funded an auto top-up — also after its entry left the
+   * rolling window (the bounded `melts` list).
+   */
   isTopUpMelt(historyId: string): boolean {
-    return this.entries.some((e) => e.melt === historyId);
+    return (
+      this.melts.includes(historyId as NostrEventId) ||
+      this.entries.some((e) => e.melt === historyId)
+    );
   }
 
-  /** Writes the ledger, keeping only the rolling window; resolves what was written. */
+  /**
+   * Writes the ledger, keeping only the rolling window of entries (the bounded melt-id list is
+   * written whole); resolves the entries written.
+   */
   private async persist(
     allowed: readonly MintUrl[],
     entries: readonly LedgerEntry[],
   ): Promise<readonly LedgerEntry[]> {
     const now = this.now();
     const kept = entries.filter((e) => e.at > now - DAY_MS);
-    await this.file.save({ v: FILE_V, allowed, entries: kept });
+    await this.file.save({ v: FILE_V, allowed, entries: kept, melts: this.melts });
     return kept;
   }
 
   /** Tests: the in-memory entries. */
   snapshot(): { readonly allowed: readonly MintUrl[]; readonly entries: readonly LedgerEntry[] } {
     return { allowed: this.allowed, entries: this.entries };
+  }
+
+  /** Tests: the funding-melt ids kept for the "top-up" label. */
+  topUpMelts(): readonly NostrEventId[] {
+    return this.melts;
   }
 }
 

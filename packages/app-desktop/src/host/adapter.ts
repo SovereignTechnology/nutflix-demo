@@ -11,7 +11,8 @@
  *   money     `MockWallet` behind `--dev-mocks`, debited from the worker's `spend` events
  *             (an auto top-up is only logged there); with the user's real wallet an auto
  *             top-up EXECUTES behind its caps and first-funding confirm (issue #2,
- *             `./topup/auto-topup.ts`)
+ *             `./topup/auto-topup.ts`) — only from the payment path (a play opening here,
+ *             a PAY in the money plane), never from a wallet balance event
  *   settings  atomic JSON in userData
  *   images    `./images/images.ts` (T16)
  *
@@ -80,7 +81,7 @@ import type { WorkerCall } from './sessions.js';
 import { HostPlaySession, SessionRegistry } from './sessions.js';
 import { buildUnreactDeletion, fetchReactionSummary, ownReactionIds } from './social/reactions.js';
 import type { MoneyPlane } from './money.js';
-import type { AutoTopUp } from './topup/auto-topup.js';
+import type { AutoTopUp, TopUpOutcome } from './topup/auto-topup.js';
 import type { WalletProvider } from './wallet.js';
 import { DEV_BALANCE_SATS, SwitchingWallet } from './wallet.js';
 
@@ -180,7 +181,7 @@ export class DesktopNetworkAdapter implements NetworkAdapter {
     this.wallet = opts.wallet.wallet;
     this.nostrCatalog = new NostrCatalog(() => this.client());
     this.wallet.onChange((e) => {
-      if (e.type === 'balance') this.checkAutoTopUp(e.mint, e.balance);
+      if (e.type === 'balance') this.logAutoTopUpDue(e.mint, e.balance);
     });
   }
 
@@ -640,6 +641,11 @@ export class DesktopNetworkAdapter implements NetworkAdapter {
     return this.o.autoTopUp?.relabelChange(e) ?? e;
   }
 
+  /** The auto top-up in flight, if any (tests, shutdown). */
+  topUpInFlight(): Promise<TopUpOutcome> | null {
+    return this.o.autoTopUp?.inFlight ?? null;
+  }
+
   image(url: string, sha256?: Sha256Hex, size?: number): Promise<NfMediaImgUrl> {
     return this.o.images.image(url, sha256, size);
   }
@@ -941,15 +947,15 @@ export class DesktopNetworkAdapter implements NetworkAdapter {
   }
 
   /**
-   * A balance changed. Issue #2: with the user's real wallet a due top-up EXECUTES (`AutoTopUp`:
-   * single-flight, capped, confirmed the first time a mint is funded). With `--dev-mocks` (fake
-   * sats, no prompt window) it is evaluated and logged only, as in Stage 1 (SE-4).
+   * A balance changed. It NEVER starts a top-up (issue #2, independent review finding 1): a
+   * balance event is also the user's own withdrawal, send or nutzap, or a seeder melt, and the
+   * contract compares `belowSats` at the mint a payment is about to draw from — so a real-wallet
+   * top-up starts only from the payment path (`checkBalance` at a play, the money plane's PAY
+   * via `AutoTopUp.paymentAt`). With `--dev-mocks` (fake sats, where the worker's spends debit
+   * the mock wallet) a due top-up is logged, as in Stage 1 (SE-4).
    */
-  private checkAutoTopUp(mint: MintUrl, balance: Sats): void {
-    if (this.o.wallet.kind === 'real') {
-      void this.o.autoTopUp?.check(mint, balance);
-      return;
-    }
+  private logAutoTopUpDue(mint: MintUrl, balance: Sats): void {
+    if (this.o.wallet.kind !== 'mock') return;
     if (!autoTopUpDue(this.o.settings.get(), mint, balance)) return;
     const t = Date.now();
     const last = this.topUpLogged.get(mint) ?? 0;

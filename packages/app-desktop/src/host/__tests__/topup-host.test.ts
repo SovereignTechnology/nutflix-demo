@@ -8,14 +8,27 @@
  *   - a trusted mint with nothing in it: the host asks main (target, amount, source), tops up
  *     within the cap, and the play goes ahead; both sides are in the wallet history as "top-up";
  *   - declined: nothing moves, play `no-balance`, and the next play does not ask again;
- *   - two plays at once: one question, one top-up.
+ *   - two plays at once: one question, one top-up;
+ *   - review finding 1: the user's own withdrawal that empties an allowed mint moves nothing (a
+ *     balance event never starts a top-up); a PAY for the open session (the worker's `pay.build`
+ *     into the money plane) that leaves the mint below its threshold does.
  */
-import type { MintUrl, Sats, VideoManifest, WalletHistoryEntry } from '@sovit/core';
+import { getPubKeyFromPrivKey } from '@cashu/cashu-ts';
+import type {
+  CashuP2pkPubkey,
+  CoreKeyHex,
+  HyperblobId,
+  MintUrl,
+  NostrPubkey,
+  Sats,
+  VideoManifest,
+  WalletHistoryEntry,
+} from '@sovit/core';
 import { mocks, nostr, signer as signerMod } from '@sovit/core';
 import { afterEach, describe, expect, it } from 'vitest';
 
 import { isHostOut } from '../../ipc/guards.js';
-import type { HostOut, PromptForm, ReplyMsg } from '../../ipc/protocol.js';
+import type { HostOut, PromptForm, ReplyMsg, SessionId } from '../../ipc/protocol.js';
 import { IPC_V } from '../../ipc/protocol.js';
 import { SignerIdentity } from '../identity.js';
 import { memoryLogger } from '../log.js';
@@ -23,7 +36,7 @@ import { MoneyPlane } from '../money.js';
 import { seedVideos } from './support/catalog.js';
 import { coreTestKit } from './support/core-helpers.js';
 import type { Rig } from './support/rig.js';
-import { RELAY_A, rig } from './support/rig.js';
+import { RELAY_A, eventually, rig } from './support/rig.js';
 
 const kit = await coreTestKit();
 
@@ -31,6 +44,14 @@ const TARGET = 'https://mint-target.topup-host.test' as MintUrl;
 const SOURCE = 'https://mint-source.topup-host.test' as MintUrl;
 const STRANGER = 'https://creator-mint.topup-host.test' as MintUrl;
 const SECOND = 'https://mint-second.topup-host.test' as MintUrl;
+/** Real curve points: the PAY locks proofs to them. */
+const p2pkOf = (fill: number): CashuP2pkPubkey =>
+  Buffer.from(getPubKeyFromPrivKey(new Uint8Array(32).fill(fill))).toString(
+    'hex',
+  ) as CashuP2pkPubkey;
+const CREATOR_P2PK = p2pkOf(0x5a);
+const SEEDER_P2PK = p2pkOf(0x5b);
+const SEEDER = 'd5'.repeat(32) as NostrPubkey;
 
 let r: Rig | undefined;
 afterEach(async () => {
@@ -146,7 +167,11 @@ async function world(
   const q = await wallet.mintQuote(SOURCE, 20_000 as Sats);
   source.payQuote(q.quoteId);
   await wallet.pollQuote(q);
-  const fixture = mocks.VIDEOS[0]!;
+  const base = mocks.VIDEOS[0]!;
+  const fixture = {
+    ...base,
+    price: { ...base.price, satsPerBlock: 50 as Sats, creatorP2pk: CREATOR_P2PK },
+  };
   const [trusted, foreign, both] = await seedVideos(kit, rr.pool, new kit.TestSigner(), [
     { ...fixture, price: { ...fixture.price, mints: [TARGET] } },
     {
@@ -256,5 +281,64 @@ describe('auto top-up through the host (issue #2)', () => {
     expect(w.asked).toHaveLength(1);
     expect(w.lightning.paid).toHaveLength(1);
     expect(await balance(w.r, TARGET)).toBe(2_000);
+  }, 30_000);
+});
+
+/** The user's own withdrawal from `mint` to a Lightning invoice (Wallet → Withdraw). */
+async function withdraw(rr: Rig, mint: MintUrl, amount: number): Promise<void> {
+  const wallet = rr.host.adapter.wallet;
+  const invoice = await wallet.mintQuote(SECOND, amount as Sats);
+  const q = await wallet.meltQuote(mint, invoice.bolt11);
+  expect((await wallet.melt(q)).paid).toBe(true);
+}
+
+/** Whatever a balance event may have started has finished. */
+async function settled(rr: Rig): Promise<void> {
+  await new Promise((res) => setTimeout(res, 50));
+  await rr.host.adapter.topUpInFlight();
+}
+
+describe('auto top-up follows payments, not balance events (issue #2, review finding 1)', () => {
+  it('the user withdrawing an allowed trusted mint to zero: nothing moves', async () => {
+    // A clock past the minute between attempts at every read: only the trigger can stop it.
+    const w = await world({ tickMs: 61_000 });
+    r = w.r;
+    expect((await invoke(w.r, 'play', [w.trusted.id])).ok).toBe(true);
+    expect(w.lightning.paid).toHaveLength(1); // TARGET allowed and topped up to 2 000
+    await withdraw(w.r, TARGET, 2_000);
+    await settled(w.r);
+    expect(await balance(w.r, TARGET)).toBe(0);
+    expect(w.lightning.paid).toHaveLength(2); // the withdrawal itself, nothing more
+    expect(await balance(w.r, SOURCE)).toBe(18_000);
+    expect(w.asked).toHaveLength(1);
+  }, 30_000);
+
+  it('a PAY for the open session leaves the mint below its threshold: topped up, unattended', async () => {
+    const w = await world({ tickMs: 61_000 });
+    r = w.r;
+    expect((await invoke(w.r, 'play', [w.trusted.id])).ok).toBe(true);
+    await withdraw(w.r, TARGET, 1_000); // 1 000 left: at the threshold, not below it
+    await settled(w.r);
+    expect(w.lightning.paid).toHaveLength(2);
+    const open = w.r.worker().calls('play.open')[0] as {
+      readonly sid: SessionId;
+      readonly rendition: {
+        readonly hyper: { readonly core: CoreKeyHex; readonly blob: HyperblobId };
+      };
+    };
+    const { core, blob } = open.rendition.hyper;
+    // The worker pays for two blocks at TARGET: 100 sats drawn, 900 left — below 1 000.
+    await w.r.worker().request('pay.build', {
+      sid: open.sid,
+      range: { core, fromBlock: blob.blockOffset, toBlock: blob.blockOffset + 1 },
+      seeder: { pubkey: SEEDER, p2pk: SEEDER_P2PK, mint: TARGET },
+      policy: w.trusted.price,
+      carryIn: 0,
+    });
+    await eventually(() => w.lightning.paid.length === 3, 'the auto top-up', 10_000);
+    await w.r.host.adapter.topUpInFlight();
+    expect(await balance(w.r, TARGET)).toBe(900 + 2_000);
+    expect(await balance(w.r, SOURCE)).toBe(16_000);
+    expect(w.asked).toHaveLength(1); // allowed at the play: no second question
   }, 30_000);
 });

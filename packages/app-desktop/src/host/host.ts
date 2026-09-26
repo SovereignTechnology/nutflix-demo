@@ -288,6 +288,7 @@ export async function createHost(o: HostOptions): Promise<Host> {
     adapter?: DesktopNetworkAdapter;
     post?: (out: HostOut) => void;
     worker?: WorkerSupervisor;
+    autoTopUp?: AutoTopUp;
   } = {};
   const openMoney = (signer: Signer, create: boolean): Promise<MoneyPlane> =>
     MoneyPlane.open({
@@ -299,6 +300,11 @@ export async function createHost(o: HostOptions): Promise<Host> {
       ...(create ? { createWallet: true } : {}),
       ...(o.mintRequest === undefined ? {} : { mintRequest: o.mintRequest }),
       ...(o.now === undefined ? {} : { now: o.now }),
+      // Issue #2: a PAY for an open play session is what an auto top-up follows (never a mere
+      // balance change — independent review, finding 1).
+      onPayment: (mint) => {
+        void late.autoTopUp?.paymentAt(mint);
+      },
     });
 
   // ADR 0013: without an injected signer and without --dev-mocks, the user connects one through
@@ -370,8 +376,9 @@ export async function createHost(o: HostOptions): Promise<Host> {
       ? new AutoTopUp({
           settings: () => settings.get(),
           // The money plane's own wallet (per signer), never the switching facade: a run, and a
-          // paid-but-unminted retry, stay with the wallet that paid.
-          wallet: () => money()?.wallet,
+          // paid-but-unminted retry, stay with the wallet that paid. A closed plane (signed out,
+          // locked) is no wallet: a run in flight then stops before the melt.
+          wallet: () => money()?.liveWallet,
           ledger: await TopUpLedger.open(o.userData, log, topUpNow),
           ...(bridge === undefined
             ? {}
@@ -392,6 +399,7 @@ export async function createHost(o: HostOptions): Promise<Host> {
             : { pollIntervalMs: o.topUp.pollIntervalMs }),
         })
       : undefined;
+  if (autoTopUp !== undefined) late.autoTopUp = autoTopUp;
   const images = new ImageService({
     transport: o.imageTransport ?? httpsTransport(),
     log,

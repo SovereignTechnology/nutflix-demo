@@ -49,7 +49,13 @@ const POLICY: PricePolicy = {
   creatorP2pk: CREATOR_P2PK,
 };
 
-async function rig(o: { fund?: number; pool?: nostr.FakeRelayPool } = {}) {
+async function rig(
+  o: {
+    fund?: number;
+    pool?: nostr.FakeRelayPool;
+    onPayment?: (mint: MintUrl) => unknown;
+  } = {},
+) {
   const mint = new mocks.TestMint({ url: MINT, seed: new Uint8Array(32).fill(0x61) });
   const pool = o.pool ?? new nostr.FakeRelayPool();
   const { signer } = await signerMod.LocalSigner.create({
@@ -66,6 +72,7 @@ async function rig(o: { fund?: number; pool?: nostr.FakeRelayPool } = {}) {
     mintRequest: () => mint.request,
     createWallet: true,
     now: () => t++ as UnixSeconds,
+    ...(o.onPayment === undefined ? {} : { onPayment: o.onPayment }),
   });
   if ((o.fund ?? 0) > 0) {
     const q = await plane.wallet.mintQuote(MINT, o.fund as Sats);
@@ -216,6 +223,59 @@ describe('MoneyPlane: pay.build is authorised', () => {
     expect(await code(h['pay.build']!(build()))).toBe('no-balance');
     plane.close();
     expect(await code(h['pay.build']!(build()))).toBe('payments-unavailable');
+  });
+});
+
+describe('MoneyPlane: the auto top-up trigger (issue #2, review finding 1)', () => {
+  it('onPayment names the mint of every authorised PAY — paid or short — never of a refused one; a throw never breaks the PAY', async () => {
+    const seen: MintUrl[] = [];
+    const { plane, h } = await rig({ fund: 6, onPayment: (m) => seen.push(m) });
+    // Refused before anything is drawn: no session, then terms that are not the video's.
+    expect(await code(h['pay.build']!(build()))).toBe('session-closed');
+    plane.authorizeSession(SID, { core: CORE, blob: BLOB, policy: POLICY }, CREATOR);
+    expect(await code(h['pay.build']!(build({ mint: OTHER_MINT })))).toBe('forbidden');
+    expect(seen).toEqual([]);
+    // Paid (4 sats of 6), then short (2 left): both name the mint the PAY drew from.
+    await h['pay.build']!(build());
+    expect(seen).toEqual([MINT]);
+    expect(
+      await code(h['pay.build']!(build({ range: { core: CORE, fromBlock: 12, toBlock: 13 } }))),
+    ).toBe('no-balance');
+    expect(seen).toEqual([MINT, MINT]);
+    // A hook that throws is swallowed: the PAY still answers.
+    const boom = await rig({
+      fund: 200,
+      onPayment: () => {
+        throw new Error('top-up check failed');
+      },
+    });
+    boom.plane.authorizeSession(SID, { core: CORE, blob: BLOB, policy: POLICY }, CREATOR);
+    expect(await code(boom.h['pay.build']!(build()))).toBe('resolved');
+    // Nor does an async hook that rejects: no unhandled rejection reaches the host process.
+    const unhandled: unknown[] = [];
+    const onUnhandled = (e: unknown): void => {
+      unhandled.push(e);
+    };
+    process.on('unhandledRejection', onUnhandled);
+    try {
+      const rejecting = await rig({
+        fund: 200,
+        onPayment: () => Promise.reject(new Error('top-up check failed')),
+      });
+      rejecting.plane.authorizeSession(SID, { core: CORE, blob: BLOB, policy: POLICY }, CREATOR);
+      expect(await code(rejecting.h['pay.build']!(build()))).toBe('resolved');
+      await new Promise((r) => setTimeout(r, 20));
+      expect(unhandled).toEqual([]);
+    } finally {
+      process.off('unhandledRejection', onUnhandled);
+    }
+  });
+
+  it('liveWallet is the wallet while the plane is open, and nothing once it is closed', async () => {
+    const { plane } = await rig();
+    expect(plane.liveWallet).toBe(plane.wallet);
+    plane.close();
+    expect(plane.liveWallet).toBeUndefined();
   });
 });
 
