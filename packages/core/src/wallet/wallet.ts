@@ -276,21 +276,30 @@ export class CashuWallet implements Wallet {
    * ADR 0014: settle the journal at every mint this wallet holds proofs or journaled operations
    * at — recover what a mint signed for an operation whose answer was lost. Run once at startup.
    * A mint that cannot be asked keeps its journal for the next operation there. Returns counts
-   * of operations recovered and still journaled.
+   * of operations recovered and still journaled — `left` counts every entry still in the journal,
+   * a skipped mint's too (one whose wallet does not load, or that no longer offers NUT-09): the
+   * settle loop reads `left < before` as progress (issue #8 fix round 2).
    */
   async recoverPending(): Promise<{ recovered: number; left: number }> {
     let recovered = 0;
     let left = 0;
+    const pendingAt = async (mint: MintUrl): Promise<number> =>
+      (await this.o.store.pending?.(mint))?.length ?? 0;
     for (const mint of await this.o.store.mints()) {
+      let before = 0;
+      let counted = false;
       try {
-        const before = (await this.o.store.pending?.(mint))?.length ?? 0;
+        before = await pendingAt(mint);
         const r = await this.spender.recover(mint);
         recovered += r.recovered;
-        left += r.left;
+        const after = await pendingAt(mint);
+        left += after;
+        counted = true;
         // Held inputs come back (or leave) as entries settle: the balance moves either way.
-        if (r.recovered > 0 || r.left !== before) await this.emitBalance(mint);
+        if (r.recovered > 0 || after !== before) await this.emitBalance(mint);
       } catch {
-        // unreachable now; every operation at this mint settles it first
+        // unreachable now (every operation at this mint settles it first): still journaled
+        if (!counted) left += before;
       }
     }
     return { recovered, left };

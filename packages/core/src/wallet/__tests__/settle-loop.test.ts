@@ -30,6 +30,7 @@ import {
   type SettleLoopWallet,
 } from '../settle-loop.js';
 import { PENDING_SETTLE_AFTER_S } from '../spend.js';
+import type { MintConnections } from '../spend.js';
 import { MemoryProofStore, type ProofStore } from '../store.js';
 import { CashuMintConnections, CashuWallet } from '../wallet.js';
 
@@ -410,5 +411,93 @@ describe('CashuWallet.settleSchedule + SettleLoop (issue #8 review, finding 1)',
     await wallet.send(16 as Sats, { p2pk: pub(9), mint: MINT });
     expect(await wallet.balance(MINT)).toBe(0);
     loop.stop();
+  });
+});
+
+describe('SettleLoop over the real wallet: a mint it cannot decide backs off (fix round 2, LOW 2)', () => {
+  // Fix round 2 (independent verifier, LOW 2): `recoverPending` skipped a mint whose wallet does
+  // not load (or that stopped advertising NUT-09) without counting its entries in `left`, so
+  // `left < before` read as progress and the retry stayed at 30 s for ever.
+
+  /** A wallet with one send entry at MINT, overdue: its swap never reached the mint. */
+  async function heldEntry(mints?: (inner: MintConnections) => MintConnections) {
+    const clock = { t: T0 };
+    const mint = new TestMint({ url: MINT, seed: new Uint8Array(32).fill(0x73) });
+    const net = refusing(mint.request);
+    const store = new MemoryProofStore();
+    const inner = new CashuMintConnections({ request: () => net.request });
+    const now = (): UnixSeconds => clock.t as UnixSeconds;
+    const wallet = new CashuWallet({ mints: mints?.(inner) ?? inner, store, now });
+    const q = await wallet.mintQuote(MINT, 16 as Sats);
+    mint.payQuote(q.quoteId);
+    await wallet.pollQuote(q);
+    net.st.refuseSwap = 1;
+    await expect(wallet.send(4 as Sats, { p2pk: pub(9), mint: MINT })).rejects.toMatchObject({
+      code: 'mint-error',
+    });
+    expect(await store.pending(MINT)).toHaveLength(1);
+    clock.t = T0 + PENDING_SETTLE_AFTER_S + 60; // overdue
+    return { clock, mint, store, wallet, now };
+  }
+
+  async function delays(
+    wallet: CashuWallet,
+    clock: { t: number },
+    now: () => UnixSeconds,
+    n: number,
+  ): Promise<number[]> {
+    const tm = manualTimer();
+    const loop = new SettleLoop({ wallet, now, timer: tm.timer });
+    loop.start();
+    await loop.idle();
+    const out: number[] = [];
+    for (let i = 0; i < n; i++) {
+      out.push((loop.plannedAt ?? 0) - clock.t);
+      clock.t = loop.plannedAt ?? clock.t;
+      tm.fire();
+      await loop.idle();
+    }
+    loop.stop();
+    return out;
+  }
+
+  it('a mint whose wallet cannot be loaded (connection refused): its entries count as left, and the delay doubles to the cap', async () => {
+    const down = { on: false };
+    const { clock, store, wallet, now } = await heldEntry((inner) => ({
+      wallet: (m) =>
+        down.on ? Promise.reject(new Error('connect ECONNREFUSED')) : inner.wallet(m),
+    }));
+    down.on = true;
+    expect(await wallet.recoverPending()).toEqual({ recovered: 0, left: 1 });
+    expect(await delays(wallet, clock, now, 8)).toEqual([
+      30,
+      30,
+      60,
+      120,
+      240,
+      480,
+      SETTLE_RETRY_MAX_S,
+      SETTLE_RETRY_MAX_S,
+    ]);
+    expect(await store.pending(MINT)).toHaveLength(1); // kept: it may be money
+    // The mint comes back: the next settle decides it (the swap never ran: the input is back).
+    down.on = false;
+    expect(await wallet.recoverPending()).toEqual({ recovered: 0, left: 0 });
+    expect(await wallet.balance(MINT)).toBe(16);
+  });
+
+  it('a mint that stopped advertising NUT-09: its entry is left, not "progress", and the delay grows', async () => {
+    const { clock, mint, store } = await heldEntry();
+    // The same mint (same keys), now without NUT-09: this wallet cannot journal or restore there.
+    const again = new TestMint({ url: MINT, seed: new Uint8Array(32).fill(0x73), nut09: false });
+    const now = (): UnixSeconds => clock.t as UnixSeconds;
+    const w = new CashuWallet({
+      mints: new CashuMintConnections({ request: () => again.request }),
+      store,
+      now,
+    });
+    expect(await w.recoverPending()).toEqual({ recovered: 0, left: 1 });
+    expect(await delays(w, clock, now, 4)).toEqual([30, 30, 60, 120]);
+    expect(mint.calls.filter((c) => c === 'POST /v1/swap')).toHaveLength(0);
   });
 });
