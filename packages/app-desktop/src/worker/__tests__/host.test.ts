@@ -237,6 +237,25 @@ describe('play sessions (dev mocks on a local testnet)', () => {
     }
   });
 
+  it('F33: the image path never closes a core a playback attached after it opened it (routed and paid for)', async () => {
+    // White-box (the ADR 0015 image path needs a 15 s fetch timeout to reach this order): the image
+    // path opened the core first — a profile core read for display — and a playback attached it
+    // while the read was in flight. Closing it then left the router, settler and payer on a dead
+    // session, and the reopened core downloaded unrouted (independent review 2026-09-25).
+    const host = w.host as unknown as {
+      imageCores: Map<string, { refs: number; opened: boolean }>;
+      releaseImageCore(core: string): Promise<void>;
+    };
+    const core = randomBytes(32).toString('hex') as never;
+    host.imageCores.set(core, { refs: 0, opened: true });
+    const s = sid();
+    await w.call('play.open', open(s, core));
+    await host.releaseImageCore(core);
+    expect(w.host.internals.seeder!.blobs.coreByKey(core)).toBeDefined();
+    expect(host.imageCores.has(core)).toBe(false);
+    await w.call('play.close', { sid: s });
+  });
+
   it('reports a valid seeder status and pushes it after changes', async () => {
     const s = await w.call('seeder.status', {});
     expect(isStatus(s)).toBe(true);
@@ -252,4 +271,41 @@ describe('play sessions (dev mocks on a local testnet)', () => {
     expect(isStatus(ev.status)).toBe(true);
     expect(w.invalid).toEqual([]);
   });
+});
+
+describe('shutdown (F33 independent review)', () => {
+  it('closes the payer (its routed cores) only after the swarm connections are destroyed', async () => {
+    const testnet = await startDevTestnet();
+    cleanups.push(() => testnet.destroy());
+    const r = await worker();
+    await r.w.call('init', {
+      v: 1,
+      storage: r.storage,
+      seeding,
+      prefetchSeconds: 30,
+      dev: {
+        mocks: true,
+        fixtures: false,
+        bootstrap: testnet.bootstrap.map((b) => ({ host: '127.0.0.1' as const, port: b.port })),
+      },
+    });
+    const order: string[] = [];
+    const node = r.w.host.internals.node!;
+    const payer = r.w.host.internals.payer!;
+    const destroy = node.destroy.bind(node);
+    node.destroy = async () => {
+      order.push('node.destroy');
+      await destroy();
+      order.push('node.destroyed');
+    };
+    const close = payer.close.bind(payer);
+    payer.close = () => {
+      order.push('payer.close');
+      close();
+    };
+    // Released while connections are open, a routed core would get hypercore's own cap back and
+    // the next block landing would send every held-back request to one seeder (window-cut, ban).
+    await r.w.host.close();
+    expect(order).toEqual(['node.destroy', 'node.destroyed', 'payer.close']);
+  }, 30_000);
 });

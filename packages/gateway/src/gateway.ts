@@ -334,10 +334,16 @@ export class Gateway {
     });
     for (const off of this.detachers.values()) off();
     this.detachers.clear();
-    for (const off of this.coreDetachers.values()) off();
-    this.coreDetachers.clear();
-    this.seeders.dispose();
-    await this.seeder.close();
+    try {
+      await this.seeder.close();
+    } finally {
+      // After the connections are gone (F33 independent review): releasing a routed core while it
+      // still replicates would hand it back to hypercore's own scheduler. The router parks it
+      // either way (fail closed); closing first means there is nothing left to park.
+      for (const off of this.coreDetachers.values()) off();
+      this.coreDetachers.clear();
+      this.seeders.dispose();
+    }
     await Promise.all([this.owners.flushed(), this.reports.flushed()]);
     this.address = null;
     this.log.info('gateway closed');
@@ -384,8 +390,11 @@ export class Gateway {
     const core = sc.core;
     const hex = sc.keyHex;
     const timeout = opts.timeoutMs ?? 30_000;
-    // The pool grows with the upstream seeders' windows (issue #8): re-read it per block.
-    const lookahead = (): number => Math.max(0, opts.lookahead ?? this.credit.limit - 1);
+    // A FIXED default, below the pool's floor: the pool follows the windows every connected
+    // `pay/1` peer announces — downstream browsers included — up to 1024, and a lookahead that
+    // followed it would buy up to 1023 blocks ahead of a reader that may stop (F33 independent
+    // review). Each upstream seeder's own window is enforced where requests are routed.
+    const lookahead = Math.max(0, opts.lookahead ?? this.config.upstream.creditBlocks - 1);
     const first = blob.blockOffset;
     const last = blob.blockOffset + blob.blockLength - 1;
     /** `held`: a unit was taken for this block already (lookahead's `tryAcquire`). */
@@ -415,7 +424,7 @@ export class Gateway {
       let p = ahead.get(i);
       ahead.delete(i);
       p ??= fetchBlock(i, false);
-      for (let j = i + 1; j <= last && ahead.size < lookahead(); j++) {
+      for (let j = i + 1; j <= last && ahead.size < lookahead; j++) {
         if (ahead.has(j)) continue;
         if (!this.credit.tryAcquire(hex, j)) break;
         const q = fetchBlock(j, true);

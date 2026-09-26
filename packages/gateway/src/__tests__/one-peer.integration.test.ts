@@ -190,3 +190,49 @@ describe('F33 / issue #8 — the gateway reads upstream from three seeders, one 
     expect(r.engine.spent().total).toBe(N * POLICY.satsPerBlock);
   });
 });
+
+describe('Gateway.close() (F33 independent review)', () => {
+  it('releases the routed upstream cores only after the seeder and its connections closed', async () => {
+    const r = await rig();
+    const order: string[] = [];
+    const close = r.gateway.seeder.close.bind(r.gateway.seeder);
+    r.gateway.seeder.close = async () => {
+      order.push('seeder.close');
+      await close();
+      order.push('seeder.closed');
+    };
+    const dispose = r.gateway.seeders.dispose.bind(r.gateway.seeders);
+    r.gateway.seeders.dispose = () => {
+      order.push('seeders.dispose');
+      dispose();
+    };
+    await r.gateway.close();
+    expect(order).toEqual(['seeder.close', 'seeder.closed', 'seeders.dispose']);
+  });
+});
+
+describe('readUpstreamBlob lookahead (F33 independent review)', () => {
+  it('stays at the configured floor − 1 however large the pool grows: a downstream HELLO cannot make the gateway buy far ahead', async () => {
+    const r = await rig({ raw: { upstream: { creditBlocks: 4 } } });
+    const BLOCKS = 40;
+    const data = new Uint8Array(1024 * BLOCKS).map((_, i) => i % 251);
+    const put = await r.gateway.seeder.putBytes(data, { mime: 'video/mp4' });
+    if (!put.ok) throw new Error(put.error.code);
+    const core = put.entry.coreKey;
+    await r.gateway.openUpstreamCore(core);
+    // The pool follows every connected pay/1 peer's window — a browser's HELLO of 65 535 (clamped
+    // to 1024) included. Before this fix the default lookahead followed it: 1023 blocks ahead.
+    r.gateway.credit.setLimit(1024);
+    let asked = 0;
+    const tryAcquire = r.gateway.credit.tryAcquire.bind(r.gateway.credit);
+    r.gateway.credit.tryAcquire = (c: string, i: number): boolean => {
+      asked++;
+      return tryAcquire(c, i);
+    };
+    const it = r.gateway.readUpstreamBlob(core, put.entry.blob);
+    const first = await it.next();
+    expect(first.done).toBe(false);
+    expect(asked, 'blocks fetched ahead of the first one').toBe(3);
+    await it.return(undefined);
+  });
+});

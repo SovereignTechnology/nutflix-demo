@@ -74,7 +74,13 @@ export interface SeederBatch {
 }
 
 interface Seeder {
+  /** The current connection's HELLO (`null` until it arrives: nothing is asked before it). */
   hello: HelloMessage | null;
+  /**
+   * The pubkey its latest HELLO announced, kept across reconnects (what we never paid it follows
+   * the pubkey, whose engine counts it); its `byPubkey` entry.
+   */
+  pubkey: string | null;
   /** Its current `pay/1` link is attached and open. */
   live: boolean;
   /** The current connection (a reconnect replaces it; the old one's events are ignored). */
@@ -89,6 +95,8 @@ export interface SeederCreditStats {
   readonly unpaid: number;
   readonly failovers: number;
   readonly poolLimit: number;
+  /** HELLO pubkeys indexed (at most one per seeder record). */
+  readonly pubkeys: number;
 }
 
 export class SeederCredit {
@@ -131,6 +139,7 @@ export class SeederCredit {
     const conn = {};
     const seeder: Seeder = this.seeders.get(noiseHex) ?? {
       hello: null,
+      pubkey: null,
       live: false,
       conn,
       unpaid: 0,
@@ -140,13 +149,11 @@ export class SeederCredit {
     this.seeders.set(noiseHex, seeder);
     this.evict();
     seeder.conn = conn;
-    seeder.hello = protocol.peer;
-    if (seeder.hello !== null) this.index(noiseHex, seeder.hello);
+    this.setHello(noiseHex, seeder, protocol.peer);
     seeder.live = protocol.state !== 'closed';
     const offOpen = protocol.on('open', (hello) => {
       if (seeder.conn !== conn) return;
-      seeder.hello = hello;
-      this.index(noiseHex, hello);
+      this.setHello(noiseHex, seeder, hello);
       this.changed();
     });
     const end = (): void => {
@@ -229,6 +236,7 @@ export class SeederCredit {
       unpaid,
       failovers: this.router.stats().failovers,
       poolLimit: this.o.pool.limit,
+      pubkeys: this.byPubkey.size,
     };
   }
 
@@ -249,23 +257,40 @@ export class SeederCredit {
    */
   private lostTo(remote: string, s: Seeder): number {
     let n = s.unpaid;
-    const pk = s.hello?.pubkey;
-    if (pk === undefined) return n;
+    const pk = s.pubkey;
+    if (pk === null) return n;
     for (const other of this.byPubkey.get(pk) ?? []) {
       const o = this.seeders.get(other);
-      if (other !== remote && o !== undefined && !o.live && o.hello?.pubkey === pk)
+      if (other !== remote && o !== undefined && !o.live && o.pubkey === pk)
         n += o.unpaid + this.router.debt(other);
     }
     return n;
   }
 
-  private index(noiseHex: string, hello: HelloMessage): void {
+  /**
+   * `seeder`'s current HELLO is now `hello`. When it announces a pubkey other than the last one,
+   * `byPubkey` follows: the Noise key leaves the old pubkey's set (the set goes when empty) and
+   * joins the new one's. So `byPubkey` never holds more than one entry per seeder record — a peer
+   * re-announcing fresh pubkeys under one Noise key cannot grow it (independent review
+   * 2026-09-25). A connection without a HELLO yet keeps the last pubkey (and what it inherits).
+   */
+  private setHello(noiseHex: string, seeder: Seeder, hello: HelloMessage | null): void {
+    seeder.hello = hello;
+    if (hello === null || hello.pubkey === seeder.pubkey) return;
+    if (seeder.pubkey !== null) this.unindex(noiseHex, seeder.pubkey);
+    seeder.pubkey = hello.pubkey;
     let set = this.byPubkey.get(hello.pubkey);
     if (set === undefined) {
       set = new Set();
       this.byPubkey.set(hello.pubkey, set);
     }
     set.add(noiseHex);
+  }
+
+  private unindex(noiseHex: string, pubkey: string): void {
+    const set = this.byPubkey.get(pubkey);
+    set?.delete(noiseHex);
+    if (set?.size === 0) this.byPubkey.delete(pubkey);
   }
 
   private payable(core: string): boolean {
@@ -311,10 +336,7 @@ export class SeederCredit {
       if (this.seeders.size <= MAX_REMEMBERED_SEEDERS) return;
       if (s.live) continue;
       this.seeders.delete(remote);
-      const pk = s.hello?.pubkey;
-      const set = pk === undefined ? undefined : this.byPubkey.get(pk);
-      set?.delete(remote);
-      if (pk !== undefined && set?.size === 0) this.byPubkey.delete(pk);
+      if (s.pubkey !== null) this.unindex(remote, s.pubkey);
     }
   }
 }

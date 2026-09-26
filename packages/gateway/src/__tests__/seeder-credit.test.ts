@@ -214,6 +214,29 @@ describe('SeederCredit — the budget per seeder (issue #8)', () => {
     expect(r.credit.budget('c3'.repeat(32), CORE)).toBe(4);
   });
 
+  it('one Noise key re-announcing fresh HELLO pubkeys does not grow the pubkey index; a reconnect before its HELLO keeps what it inherits', () => {
+    const r = rig();
+    // Independent review 2026-09-25: each reconnect with a new (validly signed) pubkey left an
+    // entry behind for the life of the process.
+    for (let i = 0; i < 50; i++) {
+      const l = r.link(A);
+      l.proto.remoteHello(helloFrom(pubkey(`fresh-${String(i)}`), { windowBlocks: 2 }));
+      l.proto.remoteClose('remote');
+    }
+    expect(r.credit.stats()).toMatchObject({ seeders: 1, pubkeys: 1 });
+    // A's last pubkey still carries what A left unpaid to a NEW Noise key announcing it, even
+    // after A reconnected and dropped again before sending its HELLO.
+    const a = r.link(A);
+    a.proto.remoteHello(helloFrom(pubkey('a'), { windowBlocks: 4 }));
+    r.download(0, A);
+    a.proto.remoteClose('remote'); // owed at the drop: unpaid for good
+    r.link(A).proto.remoteClose('remote'); // back without a HELLO, and gone again
+    const b = r.link(B);
+    b.proto.remoteHello(helloFrom(pubkey('a'), { windowBlocks: 4 }));
+    expect(r.credit.budget(B, CORE)).toBe(3);
+    expect(r.credit.stats().pubkeys).toBe(1);
+  });
+
   it('the pool follows the sum of the seeders’ windows, never below its floor nor above the cap', () => {
     const r = rig({ floor: 4 });
     expect(r.pool.limit).toBe(4);
