@@ -358,14 +358,24 @@ describe('issue #8 (b): melt change outputs are journaled (NUT-08 blanks, NUT-09
   });
 
   it('a melt the mint refuses (an error code) drops its entry at once; the inputs stay', async () => {
-    const { mint, store, wallet } = rig();
+    // This test used to melt the same quote twice and let the mint refuse the second ("quote
+    // already paid"). Since the issue #8 review (finding 5) a quote the mint reports PAID is
+    // answered "paid" without a request, so the refusal is made another way: the request reaches
+    // the mint without its inputs, and the mint refuses it (11002).
+    const n = net();
+    const { mint, store, wallet } = rig({ wrap: n.wrap });
     await fund(wallet, mint, 64);
     const q = await wallet.meltQuote(MINT, INVOICE_20);
-    await wallet.melt(q);
-    // The same quote again: the mint refuses ("quote already paid", a definitive answer).
+    n.st.before = (path, body) => {
+      if (path.endsWith('/v1/melt/bolt11')) body['inputs'] = [];
+    };
     await expect(wallet.melt(q)).rejects.toBeInstanceOf(WalletError);
+    n.st.before = null;
+    expect(mint.calls.filter((c) => c === 'POST /v1/melt/bolt11')).toHaveLength(1);
     expect(await store.pending(MINT)).toEqual([]);
-    expect(await wallet.balance(MINT)).toBe(44);
+    expect(await wallet.balance(MINT)).toBe(64);
+    // Nothing is held: the same quote can be paid right away.
+    expect(await wallet.melt(q)).toMatchObject({ paid: true, change: 44 });
   });
 
   it('a restored change signature without its DLEQ (NUT-12 mint) is refused: nothing committed, the entry stays', async () => {

@@ -20,8 +20,11 @@
  * unpublished) and the entry's removal land in the SAME write. After a crash, `load` re-reads
  * both: the entries are settled by `Wallet.recoverPending` (NUT-09), the unpublished events are
  * merged into what the relays hold and published again. Superseded unpublished token events are
- * dropped from the outbox as it grows (the newer token carries their proofs). Without a journal
- * the entries and the outbox stay in memory, as before.
+ * dropped from the outbox as it grows (the newer token carries their proofs, and takes the first
+ * one's place, ahead of every deletion it covers: `compactOutbox`). Without a journal the entries
+ * and the outbox stay in memory, as before. The outbox is otherwise unbounded: a long relay outage
+ * grows the journal by about 3 KB an operation, every save rewrites it, and at
+ * `MAX_JOURNAL_BYTES` commits fail closed until the relays take the events (review finding 6).
  *
  * Everything is encrypted to self with the signer's NIP-44; nothing is logged.
  */
@@ -99,6 +102,39 @@ function cleanProof(p: CashuProof): CashuProof {
       : { dleq: { s: d.s, e: d.e, ...(d.r === undefined ? {} : { r: d.r }) } }),
     ...(p.witness === undefined ? {} : { witness: p.witness }),
   };
+}
+
+/**
+ * The outbox after a transition whose events are `out` (its token event, then its deletion and
+ * history). An unpublished token event the new one supersedes need never leave: the new token
+ * carries its unspent proofs, and the deletion still names it (NIP-60 `del`, kind 5).
+ *
+ * The new token event then takes the place of the FIRST token it replaced (issue #8 review,
+ * finding 3). Every deletion in the outbox follows the token that carries the deleted event's
+ * unspent proofs; appended at the end, the new carrier would follow the earlier deletions its
+ * predecessor preceded. A drain that published those and then failed on the token (a relay error,
+ * a size limit) would leave the relays with the old token deleted and no token holding its
+ * proofs.
+ */
+export function compactOutbox(
+  outbox: readonly NostrEvent[],
+  affected: readonly { readonly id: string }[],
+  out: readonly NostrEvent[],
+): NostrEvent[] {
+  const superseded = new Set<string>(affected.map((t) => t.id));
+  const kept: NostrEvent[] = [];
+  let slot = -1;
+  for (const ev of outbox) {
+    if (ev.kind === NostrKind.WalletToken && superseded.has(ev.id)) {
+      if (slot < 0) slot = kept.length;
+      continue;
+    }
+    kept.push(ev);
+  }
+  if (slot < 0) return [...kept, ...out];
+  const token = out.filter((ev) => ev.kind === NostrKind.WalletToken);
+  const rest = out.filter((ev) => ev.kind !== NostrKind.WalletToken);
+  return [...kept.slice(0, slot), ...token, ...kept.slice(slot), ...rest];
 }
 
 export class Nip60ProofStore implements ProofStore {
@@ -412,15 +448,7 @@ export class Nip60ProofStore implements ProofStore {
       const ops = new Map(this.ops);
       for (const id of tx.settle ?? []) ops.delete(id);
       if (tx.begin !== undefined) ops.set(tx.begin.id, cloneOp(tx.begin));
-      // An unpublished token event the new one supersedes need never leave: the new token
-      // carries its unspent proofs, and the deletion still names it (NIP-60 `del`, kind 5).
-      const superseded = new Set<string>(c.affected.map((t) => t.id));
-      const outbox = [
-        ...this.outbox.filter(
-          (ev) => !(ev.kind === NostrKind.WalletToken && superseded.has(ev.id)),
-        ),
-        ...c.out,
-      ];
+      const outbox = compactOutbox(this.outbox, c.affected, c.out);
       if (this.journal !== undefined) {
         await this.journal.save({ ops: [...ops.values()], outbox });
         this.journalStale = false;

@@ -8,7 +8,10 @@
  *     mint remember the change signatures under the blanks' `B_`, with the amounts IT assigned?
  *   - the desktop's sealed journal (NIP-60 store + `SealedJournal`) holding a real mint's
  *     outputs (v2 keyset ids, real blinding factors) across a "crash", and recovering from it;
- *   - held inputs out of the balance while the mint's answer is unknown, and spent exactly once.
+ *   - held inputs out of the balance while the mint's answer is unknown, and spent exactly once;
+ *   - (issue #8 review) held inputs come back by themselves once the wait is over (`SettleLoop`,
+ *     the mint's own NUT-07 answer), and a retry of a melt whose change an earlier settle restored
+ *     answers "paid" from the mint's quote state, without a second melt request.
  */
 import { getPubKeyFromPrivKey } from '@cashu/cashu-ts';
 import { describe, expect, it, vi } from 'vitest';
@@ -19,11 +22,14 @@ import type {
   NostrEvent,
   NostrFilter,
   Sats,
+  UnixSeconds,
 } from '../../contracts/index.js';
 import { minimumCost } from '../../signer/keyfile.js';
 import { LocalSigner } from '../../signer/local.js';
 import { Nip60ProofStore, type Nip60Relays } from '../nip60.js';
 import { SealedJournal, type JournalFile } from '../nip60-journal.js';
+import { SettleLoop } from '../settle-loop.js';
+import { PENDING_SETTLE_AFTER_S } from '../spend.js';
 import { MemoryProofStore, type ProofStore } from '../store.js';
 import type { RawHttp } from '../transport.js';
 import { cashuRequestFn } from '../transport.js';
@@ -38,11 +44,18 @@ const TO = Buffer.from(getPubKeyFromPrivKey(new Uint8Array(32).fill(0x61))).toSt
   'hex',
 ) as CashuP2pkPubkey;
 
-/** Real HTTP that can lose the answer to the next POST on a path, or refuse restores. */
+/**
+ * Real HTTP that can lose the answer to the next POST on a path, refuse the next POST on a path
+ * before it is sent (connection refused), or refuse restores.
+ */
 function lossy() {
-  const st = { drop: null as string | null, restoreDown: false };
+  const st = { drop: null as string | null, refuse: null as string | null, restoreDown: false };
   const http: RawHttp = async (req) => {
     if (st.restoreDown && req.url.endsWith('/v1/restore')) throw new Error('connect ETIMEDOUT');
+    if (st.refuse !== null && req.method === 'POST' && req.url.endsWith(st.refuse)) {
+      st.refuse = null;
+      throw new Error('connect ECONNREFUSED');
+    }
     const res = await fetch(req.url, {
       method: req.method,
       headers: req.headers,
@@ -62,10 +75,15 @@ function lossy() {
   return { st, request: cashuRequestFn(http) };
 }
 
-function walletOver(store: ProofStore, request?: ReturnType<typeof cashuRequestFn>): CashuWallet {
+function walletOver(
+  store: ProofStore,
+  request?: ReturnType<typeof cashuRequestFn>,
+  now?: () => UnixSeconds,
+): CashuWallet {
   return new CashuWallet({
     mints: new CashuMintConnections(request === undefined ? {} : { request: () => request }),
     store,
+    ...(now === undefined ? {} : { now }),
   });
 }
 
@@ -174,6 +192,64 @@ describe.skipIf(MINT_URL === undefined)(
         true,
       );
     });
+
+    it('held inputs come back by themselves after the wait (SettleLoop; the mint’s NUT-07 answer)', async () => {
+      const net = lossy();
+      const store = new MemoryProofStore();
+      let t = Math.floor(Date.now() / 1000);
+      const now = (): UnixSeconds => t as UnixSeconds;
+      const w = walletOver(store, net.request, now);
+      await fund(w, mint, 32);
+      const before = await w.balance(mint);
+      const planned: (() => void)[] = [];
+      const loop = new SettleLoop({
+        wallet: w,
+        now,
+        timer: (fn) => {
+          planned.push(fn);
+          return () => undefined;
+        },
+      });
+      loop.start();
+      net.st.refuse = '/v1/swap'; // never reaches the mint
+      await expect(w.send(4 as Sats, { p2pk: TO, mint })).rejects.toThrow(/mint-error/);
+      expect(await w.balance(mint)).toBeLessThan(before);
+      await loop.idle();
+      expect(planned.length).toBeGreaterThan(0);
+      t += PENDING_SETTLE_AFTER_S + 60;
+      planned.at(-1)?.();
+      await loop.idle();
+      expect(await store.pending(mint)).toEqual([]);
+      expect(await w.balance(mint)).toBe(before);
+      expect(await w.checkSpent({ mint, proofs: await store.proofs(mint) })).not.toContain(true);
+      loop.stop();
+    });
+
+    it.skipIf(MINT_URL_2 === undefined)(
+      'a retry of a melt whose change the startup settle restored answers paid — from the mint’s quote state, no second request',
+      async () => {
+        const net = lossy();
+        const store = new MemoryProofStore();
+        const w = walletOver(store, net.request);
+        await fund(w, mint, 100);
+        const invoice = await walletOver(new MemoryProofStore()).mintQuote(MINT_URL_2!, 13 as Sats);
+        const q = await w.meltQuote(mint, invoice.bolt11);
+        net.st.drop = '/v1/melt/bolt11';
+        net.st.restoreDown = true;
+        await expect(w.melt(q)).rejects.toThrow(/mint-error/);
+        net.st.restoreDown = false;
+        // A restart: the startup settle restores the change.
+        const after = walletOver(store, net.request);
+        expect(await after.recoverPending()).toEqual({ recovered: 1, left: 0 });
+        const balance = await after.balance(mint);
+        const history = (await after.history({ mint })).length;
+        const r = await after.melt(q);
+        expect(r).toMatchObject({ paid: true, change: 0 });
+        expect(await after.balance(mint)).toBe(balance); // nothing spent again
+        expect((await after.history({ mint })).length).toBe(history); // no second line
+        expect(await store.pending(mint)).toEqual([]);
+      },
+    );
 
     it.skipIf(MINT_URL_2 === undefined)(
       'melt change on NUT-08 blanks is restored by NUT-09 when the melt’s answer is lost',

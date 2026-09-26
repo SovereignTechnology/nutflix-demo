@@ -37,7 +37,9 @@ import {
   getP2PKExpectedWitnessPubkeys,
   hasValidDleq,
   OutputData,
+  RateLimitError,
   schnorrVerifyMessage,
+  StaleKeysetError,
   type MeltPreview,
   type MeltQuoteBolt11Response,
   type MintQuoteBolt11Response,
@@ -386,7 +388,7 @@ export class Spender {
       // the same outputs.
       const key = inputs.map((p) => p.secret);
       const { left, recovered } = await this.settle(set.mint, w);
-      const done = recovered.get(keyOf(key));
+      const done = recovered.get(opKey('receive', key));
       if (done !== undefined) return done as Sats;
       const prior = left.find((o) => o.kind === 'receive' && keyOf(o.key) === keyOf(key));
       let preview: Awaited<ReturnType<CashuTsWallet['prepareSwapToReceive']>>;
@@ -445,8 +447,9 @@ export class Spender {
       let busy = new Set<string>();
       if (journal) {
         const { left, recovered } = await this.settle(quote.mint, w);
-        // An earlier melt of this quote whose answer was lost, recovered by this settle.
-        const done = recovered.get(keyOf([quote.quoteId]));
+        // An earlier melt of this quote whose answer was lost, recovered by this settle (a melt
+        // entry only: another kind's key never answers for a melt).
+        const done = recovered.get(opKey('melt', [quote.quoteId]));
         if (done !== undefined) return { paid: true, change: done as Sats };
         if (left.some((o) => o.kind === 'melt' && keyOf(o.key) === keyOf([quote.quoteId])))
           throw new WalletError(
@@ -454,6 +457,17 @@ export class Spender {
             'an earlier melt of this quote is still unresolved at the mint',
           );
         busy = heldSecrets(left);
+      }
+      // Already paid (by an earlier melt of ours whose change an earlier settle restored, e.g.
+      // the startup one): the invoice IS paid — say so, never "melt failed", and send nothing.
+      // Its change, if any, is already in the wallet; the history has its line.
+      if (q.state === 'PAID') {
+        const preimage = q.payment_preimage;
+        return {
+          paid: true,
+          ...(typeof preimage === 'string' && preimage.length > 0 ? { preimage } : {}),
+          change: 0 as Sats,
+        };
       }
       const held = (await this.ctx.store.proofs(quote.mint))
         .filter((p) => !busy.has(p.secret))
@@ -573,7 +587,7 @@ export class Spender {
       if (journal) {
         // A quote whose mint answer was lost is recovered, or minted again with the same outputs.
         const { left, recovered } = await this.settle(quote.mint, w);
-        const done = recovered.get(keyOf([quote.quoteId]));
+        const done = recovered.get(opKey('mint', [quote.quoteId]));
         if (done !== undefined) return done as Sats;
         prior = left.find((o) => o.kind === 'mint' && keyOf(o.key) === keyOf([quote.quoteId]));
       }
@@ -695,7 +709,7 @@ export class Spender {
     return this.exclusive(quote.mint, async () => {
       const w = await this.ctx.mints.wallet(quote.mint);
       if (!this.journaling(w)) return null;
-      const got = (await this.settle(quote.mint, w)).recovered.get(keyOf([quote.quoteId]));
+      const got = (await this.settle(quote.mint, w)).recovered.get(opKey('mint', [quote.quoteId]));
       return got === undefined ? null : (got as Sats);
     });
   }
@@ -780,7 +794,8 @@ export class Spender {
     const ops = this.ctx.store.pending === undefined ? [] : await this.ctx.store.pending(mint);
     for (const op of ops) {
       const r = await this.resolveSafe(w, op, false);
-      if (r.state === 'executed') recovered.set(keyOf(op.key), proofTotal(r.keep.map(fromCashu)));
+      if (r.state === 'executed')
+        recovered.set(opKey(op.kind, op.key), proofTotal(r.keep.map(fromCashu)));
       else if (r.state !== 'absent') left.push(op);
     }
     return { left, recovered };
@@ -992,6 +1007,11 @@ function keyOf(key: readonly string[]): string {
   return JSON.stringify([...key].sort());
 }
 
+/** A recovered operation's identity: its kind and its keys (a mint quote never answers a melt). */
+function opKey(kind: PendingOp['kind'], key: readonly string[]): string {
+  return `${kind}:${keyOf(key)}`;
+}
+
 function fromPending(o: PendingOutput): OutputData {
   return OutputData.deserialize({ ...o, blindedMessage: { ...o.blindedMessage } });
 }
@@ -1034,8 +1054,20 @@ function supports(w: CashuTsWallet, nut: 9 | 12): boolean {
   }
 }
 
-/** The mint answered with an error code: it refused the request, nothing executed. */
+/**
+ * The mint refused the request; nothing executed: it answered with an error code; or cashu-ts
+ * wrapped that coded answer — a keyset refusal (12xxx) comes back as a `StaleKeysetError` whose
+ * `cause` is the coded error; or it said 429 (`RateLimitError`: refused before it was processed).
+ * Only these wrappers: a coded `cause` under any other error is NOT a refusal (cashu-ts's
+ * `MeltChangeError` means the melt completed).
+ */
 function isDefinitive(e: unknown): boolean {
+  if (hasCode(e)) return true;
+  if (e instanceof StaleKeysetError) return hasCode(e.cause);
+  return e instanceof RateLimitError;
+}
+
+function hasCode(e: unknown): boolean {
   return typeof e === 'object' && e !== null && typeof (e as { code?: unknown }).code === 'number';
 }
 

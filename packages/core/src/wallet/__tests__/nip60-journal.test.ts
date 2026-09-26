@@ -25,7 +25,12 @@ import type {
 } from '../../contracts/index.js';
 import { minimumCost } from '../../signer/keyfile.js';
 import { LocalSigner } from '../../signer/local.js';
-import { Nip60ProofStore, type Nip60JournalState, type Nip60Relays } from '../nip60.js';
+import {
+  Nip60ProofStore,
+  compactOutbox,
+  type Nip60JournalState,
+  type Nip60Relays,
+} from '../nip60.js';
 import {
   JOURNAL_FORMAT,
   JournalError,
@@ -90,12 +95,19 @@ function memFile(initial: string | null = null): JournalFile & {
   return f;
 }
 
-function relay(): Nip60Relays & { events: NostrEvent[]; down: boolean } {
+function relay(): Nip60Relays & {
+  events: NostrEvent[];
+  down: boolean;
+  reject: ((e: NostrEvent) => boolean) | null;
+} {
   const r = {
     events: [] as NostrEvent[],
     down: false,
+    /** Refuse some events while up (a size limit, a policy). */
+    reject: null as ((e: NostrEvent) => boolean) | null,
     publish: (e: NostrEvent) => {
       if (r.down) return Promise.reject(new Error('relay down'));
+      if (r.reject?.(e) === true) return Promise.reject(new Error('blocked: event too large'));
       r.events.push(e);
       return Promise.resolve();
     },
@@ -393,6 +405,89 @@ describe('Nip60ProofStore with a journal (durable entries and outbox)', () => {
     expect((await plain.proofs(MINT)).map((p) => p.secret).sort()).toEqual(
       ['secret-1', 'secret-7'].sort(),
     );
+  });
+
+  it('a drain that fails on the compacted token has sent no deletion ahead of it: the relays never lose its proofs (review finding 3)', async () => {
+    const s = await signer();
+    const r = relay();
+    const st = await Nip60ProofStore.load({
+      signer: s,
+      relays: r,
+      journal: await opened(s, memFile()),
+    });
+    // T1 reaches the relays.
+    await st.commit({
+      mint: MINT,
+      spent: [],
+      added: [proof(1, 8), proof(2, 4)],
+      history: { direction: 'in', amount: 12 as Sats },
+    });
+    expect(r.events.filter((e) => e.kind === 7375)).toHaveLength(1);
+    r.down = true;
+    // B spends from T1 (published): [T2, K5(T1), H]. C spends from T2 (never published): T2 is
+    // compacted into T3, which carries T1's unspent proof.
+    await st.commit({
+      mint: MINT,
+      spent: [proof(2, 4)],
+      added: [proof(3, 2)],
+      history: { direction: 'out', amount: 2 as Sats },
+    });
+    await st.commit({
+      mint: MINT,
+      spent: [proof(3, 2)],
+      added: [proof(4, 1)],
+      history: { direction: 'out', amount: 1 as Sats },
+    });
+    // The relays are back, but refuse token events for now.
+    r.down = false;
+    r.reject = (e) => e.kind === 7375;
+    await st.sync();
+    // T1 is not deleted on the relays while no published token carries secret-1.
+    const plain = await Nip60ProofStore.load({ signer: s, relays: r });
+    expect((await plain.proofs(MINT)).map((p) => p.secret)).toContain('secret-1');
+    // Once the relays take everything, the state is exact.
+    r.reject = null;
+    await st.sync();
+    expect(st.unsynced()).toBe(0);
+    const after = await Nip60ProofStore.load({ signer: s, relays: r });
+    expect((await after.proofs(MINT)).map((p) => p.secret).sort()).toEqual([
+      'secret-1',
+      'secret-4',
+    ]);
+  });
+
+  it('compactOutbox: the new token takes the first replaced token’s place; nothing else moves', () => {
+    const ev = (id: string, kind: number): NostrEvent =>
+      ({ id, kind, pubkey: '', created_at: 0, tags: [], content: '', sig: '' }) as never;
+    const T2 = ev('t2', 7375);
+    const K1 = ev('k1', 5);
+    const H1 = ev('h1', 7376);
+    const X = ev('x', 7375); // another mint's token, not replaced
+    const T3 = ev('t3', 7375);
+    const K2 = ev('k2', 5);
+    const H2 = ev('h2', 7376);
+    expect(compactOutbox([X, T2, K1, H1], [{ id: 't2' }], [T3, K2, H2]).map((e) => e.id)).toEqual([
+      'x',
+      't3',
+      'k1',
+      'h1',
+      'k2',
+      'h2',
+    ]);
+    // Nothing replaced in the outbox: appended, as before.
+    expect(compactOutbox([X], [{ id: 'published' }], [T3, K2, H2]).map((e) => e.id)).toEqual([
+      'x',
+      't3',
+      'k2',
+      'h2',
+    ]);
+    // Everything spent (no new token): the rest follow what is left.
+    expect(compactOutbox([T2, K1, H1], [{ id: 't2' }], [K2, H2]).map((e) => e.id)).toEqual([
+      'k1',
+      'h1',
+      'k2',
+      'h2',
+    ]);
   });
 
   it('proofs listed by two token events count once', async () => {
