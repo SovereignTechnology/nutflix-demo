@@ -50,7 +50,8 @@
  *     connections after the payer), and hypercore's cap (≥ 16) plus its racing hotswap would
  *     overrun every seeder the moment a block landed. Parked, every peer — and every peer that
  *     joins — is capped at 0 new requests and the no-race queue stays; blocks already in flight
- *     still land. The next `attachCore` of that core, by any router, takes it over.
+ *     still land. The next `attachCore` of that core, by any router, takes it over, and a block
+ *     still in flight there fails over as any other (the ticker restarts with the queue).
  *
  * Runtime-neutral (Node and Bare): no Node imports, timers only.
  */
@@ -568,6 +569,10 @@ export class OnePeerRouter {
     // Peers already there. A new one is added in the same tick as `_addPeer` puts it in
     // `replicator.peers`, before its first sync, so it cannot have asked for a block yet.
     for (const p of replicator.peers) this.addPeer(route, p);
+    // A parked queue taken over may still track blocks in flight, and the ticker otherwise
+    // starts only from the queue's `add()`: without it, a block its peer withholds would never
+    // fail over when nothing new is queued (fix round 2, 2026-09-25).
+    if (queue.size > 0) this.armTicker();
     return route;
   }
 

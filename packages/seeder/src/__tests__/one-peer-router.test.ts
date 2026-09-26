@@ -690,6 +690,61 @@ describe('OnePeerRouter', () => {
     expect(gets).toHaveLength(5); // still pending: the stores' close rejects them
   });
 
+  // Fix round 2 (independent verifier, 2026-09-25): a parked core taken over kept its queue and
+  // the blocks it tracks, but the failover ticker starts only from the queue's `add()` — nothing
+  // new is queued here, so a block withheld across the park never failed over.
+  it.each(['the same router', 'another router'] as const)(
+    'a core parked with a block in flight and taken over by %s: the withheld block still fails over',
+    async (who) => {
+      const STALL = 300;
+      const w = await world(4, 2);
+      const [s0, s1] = w.remotes as [string, string];
+      let s1Budget = 0;
+      const failovers: string[] = [];
+      const make = (): OnePeerRouter => {
+        const router = new OnePeerRouter({
+          budget: (remote) => (remote === s0 ? 1 : s1Budget),
+          logger: silentLogger,
+          stallMs: STALL,
+          onFailover: (remote) => failovers.push(remote),
+        });
+        cleanups.push(() => {
+          router.close();
+          return Promise.resolve();
+        });
+        return router;
+      };
+      const first = make();
+      const detach = first.attachCore(w.viewer);
+      // Seeder 0 takes block 2 (its whole budget) and withholds it.
+      w.links[0]!.hold();
+      const got = w.viewer.get(2);
+      await until(() => w.uploads[0] === 1, 5000, 'seeder 0 to take block 2');
+      // Detached with block 2 in flight: parked, its queue still tracks block 2.
+      detach();
+      expect(first.stats().cores).toBe(0);
+      // Long enough for the first router's ticker to find no route and stop, and for block 2's
+      // request to be older than stallMs.
+      await sleep(STALL);
+      expect(w.uploads).toEqual([1, 0]);
+      // Taken over, seeder 1 may take block 2: seeder 0 is at its cap and nothing new is queued,
+      // so only the failover ticker can move it (`refresh()` runs no hotswap step).
+      s1Budget = 4;
+      const second = who === 'the same router' ? first : make();
+      second.attachCore(w.viewer);
+      second.refresh();
+      expect(await within(got, STALL * 10)).not.toBeNull();
+      expect(second.stats().failovers).toBe(1);
+      expect(failovers).toEqual([s0]);
+      expect(w.downloads).toEqual([{ index: 2, from: s1 }]);
+      expect(w.uploads).toEqual([1, 1]);
+      // Cancelled after sending: seeder 0 counts it for good. The same router counts it twice —
+      // once remembered at the detach (in flight then), once as the cancel — the conservative
+      // double count the review's self-review records for a detach followed by a re-attach.
+      expect(second.debt(s0)).toBe(who === 'the same router' ? 2 : 1);
+    },
+  );
+
   it('a seeder still delivering is never failed over, however old its last request — only a silent one is', async () => {
     const STALL = 1000;
     let open = new Set<string>();
