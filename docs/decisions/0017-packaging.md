@@ -202,9 +202,12 @@ Why the in-repo makers:
   `fs-xattr`) built by hand. A compressed image holding the app and an `/Applications` link is
   all the release needs.
 
-Every artifact name carries the version (`nutflix_<v>_amd64.deb`, `Nutflix-<v>-x64.AppImage`,
-`Nutflix-<v>-arm64.dmg`, `Nutflix-<v>-Setup.exe`). The release manifest refuses any other name
-(§8), so a stale artifact of an older build cannot be signed by accident.
+Every artifact name carries the version, in one fixed shape per maker:
+`nutflix_<v>_<amd64|arm64>.deb`, `Nutflix-<v>-<x64|arm64>.AppImage`,
+`Nutflix-<v>-<x64|arm64>.dmg` and `Nutflix-<v>-Setup.exe`. The release manifest accepts exactly
+these names and refuses any other (§8). So a stale artifact of **another version**, a
+prerelease one included, cannot be signed by accident. A name cannot tell two builds of the
+**same** version apart; only `--made` keeps an older same-version build out (§8).
 
 **Deviation from "Pear makers".** Cameron's decision named Pear makers. None is used:
 
@@ -352,8 +355,25 @@ Inputs and rules:
   produced, relative to `out/make`, with the version. `--made` reads these lists. A list made
   for another version is refused, and so is any path in it that is absolute, uses backslashes or
   climbs out with `..`. Positional files and directories are still accepted for ad-hoc use.
-- **Every artifact name carries the version** as a whole field. Anything else (a stale
-  `Nutflix-0.0.9-x64.AppImage` left in `out/make`) is refused.
+- **Every artifact name is exactly one that a maker writes for this version:**
+  `Nutflix-<v>-<x64|arm64>.AppImage`, `Nutflix-<v>-<x64|arm64>.dmg`,
+  `nutflix_<v>_<amd64|arm64>.deb` or `Nutflix-<v>-Setup.exe`. The script's `ARTIFACT_SHAPES`
+  is pinned by a test to the Forge config, to `BUILD_ARCHES` (the arches `cli.ts` builds) and
+  to what the real deb and AppImage makers write. No prefix starts another and no tail ends
+  another, so a name matches only an artifact made for exactly this version. Anything else is
+  refused, in every mode. For release 0.1.0 that includes an older
+  `Nutflix-0.0.9-x64.AppImage` left in `out/make`, a prerelease
+  `Nutflix-0.1.0-rc.1-x64.AppImage` or `nutflix_0.1.0-rc1_amd64.deb`,
+  `Nutflix-0.1.0.1-x64.AppImage`, and Squirrel's `nutflix-0.1.0-full.nupkg`. The first rule
+  took the version followed by any `-`, `_` or `.`, so it accepted the last four (verifier,
+  round 2).
+- **What a name cannot show.**
+  - A name cannot tell two builds of the *same* version apart. In positional mode, a stale
+    artifact of the same version is still accepted. `--made` is the safe path, and the only
+    one CI uses.
+  - A prerelease cannot ship its `.deb` yet. electron-installer-debian writes the Debian form
+    (`nutflix_0.1.0~rc.1_amd64.deb`), and `~` is not allowed in an artifact name, so the
+    manifest refuses that file (fails closed).
 - **`created_at` is the time the manifest is made**, never the commit time (`SOURCE_DATE_EPOCH`).
   A corrected manifest for the same commit must be newer than the event it replaces on the
   relays. `--created-at` overrides it.
@@ -374,7 +394,8 @@ event that passes all of these:
 - every named file is listed, and its size and sha256 match.
 
 Artifact names may not contain path separators or whitespace. The event file is read through
-one descriptor: a regular file of at most 256 KiB, counted in bytes actually read. A download
+one descriptor: a regular file of at most 256 KiB, counted in bytes actually read. It is opened
+non-blocking, so a FIFO is refused at once instead of waiting for a writer (verifier, round 2). A download
 that is a symlink is refused. The verifier also prints the release's version, commit and
 **creation** date (`created_at`: when the manifest was made, before signing). An **older**
 genuine release verifies as well, so these should be compared with the current notice on the

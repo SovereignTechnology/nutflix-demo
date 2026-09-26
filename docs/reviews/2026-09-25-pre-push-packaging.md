@@ -336,3 +336,71 @@ redundant and was removed (R30 then targets the remaining step).
 - **R9.** The Squirrel lifecycle has run only in unit tests (no Windows build).
 - **R10.** Pear makers were replaced by in-repo makers, and `pear://` has no job yet. Both wait
   on Cameron (open questions 3 and 9).
+
+## Fix round 2 (verifier, 2026-09-25)
+
+An independent verifier checked the fix pass (`c9fa673`, `163d6c8`). It found one Low and one
+Info finding. Both were reproduced before any fix: new tests failed on the old code. The 0.1.0
+manifest took a stale `Nutflix-0.1.0-rc.1-x64.AppImage` from `out/make` and exited 0. The
+verifier CLI blocked on a FIFO until the test's 8 s bound killed it (`SIGTERM`). The same
+`differential-review` and `sharp-edges` pass then ran on this diff. Fixes: commit `00221a0`.
+
+| # | Sev | Finding | Outcome |
+|---|---|---|---|
+| V1 | Low | `release-manifest.mjs` `nameCarriesVersion` took the version followed by any `-`, `_` or `.`. For 0.1.0 it accepted `Nutflix-0.1.0-rc.1-x64.AppImage`, `nutflix_0.1.0-rc1_amd64.deb`, `Nutflix-0.1.0.1-x64.AppImage` and `nutflix-0.1.0-full.nupkg`. In positional mode, a stale rc artifact left in `out/make` could be signed into the 0.1.0 manifest, though ADR §5 and §8 said it could not | **Fixed.** A name must be exactly one a maker writes for this version: `<prefix><version><tail>`, with the tails fixed per maker in `ARTIFACT_SHAPES`. These are `Nutflix-<v>-<x64\|arm64>.AppImage`, `Nutflix-<v>-<x64\|arm64>.dmg`, `nutflix_<v>_<amd64\|arm64>.deb` and `Nutflix-<v>-Setup.exe`. The check is string equality; no regex is built from the version. No prefix starts another and no tail ends another, so a name matches only an artifact made for exactly this version (a test asserts both properties). The shapes are pinned to the makers. The prefixes come from `APP`. The arches are `identity.ts` `BUILD_ARCHES`, now also `cli.ts`'s list, and equal the AppImage runtime pins. The deb arches are maker-deb's own `debianArch`, and Squirrel's name is the Forge config's `setupExe`. The set of accepted names is also compared, as an exact set, with what the real makers write: the dmg maker with hdiutil stubbed, and the real deb maker (electron-installer-debian, dpkg + fakeroot) and AppImage maker (mksquashfs, fixture runtime) where the box has them. ADR §5 and §8 are corrected: they now say "another version", and state the two limits (residuals R8, R11). Tests: the verifier's four examples plus 19 more refused; each real maker name accepted; positional mode and a direct file argument refuse the stale names. Mutations R34–R36, R38, R39 |
+| V2 | Info | `release-verify.mjs` `readEventFile` said a FIFO is refused, but `openSync(path, 'r')` blocks on a FIFO until a writer appears, so the `fstat` check never ran | **Fixed.** The file is opened `O_RDONLY \| O_NONBLOCK` (Windows has no such flag, so `0`). A FIFO opens at once and `fstat` refuses it. Nothing changes for a regular file. The test makes a FIFO with `mkfifo` and runs the CLI under a bounded spawn: `runNode` gained a `timeout` option and returns the `signal`. A regression therefore fails instead of hanging the suite; `spawnSync` blocks the event loop, so vitest's own timeout could not fire. Mutations R37, R40 |
+
+Found by this round's own review:
+
+| # | Sev | Finding | Outcome |
+|---|---|---|---|
+| S3 | Info | Deriving the names from the real deb maker showed that electron-installer-debian writes a prerelease in Debian form (`0.1.0-rc.1` → `nutflix_0.1.0~rc.1_amd64.deb`). `SAFE_NAME` does not allow `~`, so a prerelease release cannot carry its `.deb`. The manifest refuses it as an unsafe name, which fails closed | **Documented, not changed.** Allowing `~` would widen the name rule that the verifier also applies, just to support a prerelease channel that nobody has asked for. The limit is recorded in ADR §8 and pinned by the real-maker test (the rc `.deb` names fail `SAFE_NAME`). Residual R11 |
+
+Sharp edges checked and left as is (this round):
+
+- `RELEASE_EXTENSIONS` still lists `.msix`, `.zip` and `.rpm`, which no configured maker
+  writes. In a directory, such a file is now collected and then refused by the name rule, a
+  hard error, where before a versioned one would have been signed. It fails closed. A stray
+  file stops the run so someone looks at it, instead of being skipped with a note.
+- Both scripts `lstat` a downloaded or collected artifact and then open it again by path to
+  hash it. Someone who can write that directory could swap in a FIFO between the two calls and
+  make the run hang. They could not change a verdict: a swapped-in file is hashed and compared
+  with the signed sum. The event file, which the verifier reads first, has no such gap.
+- The tails name only the arches `cli.ts` builds (`x64`, `arm64`). Adding an arch means
+  changing `BUILD_ARCHES`, and the pin test then fails until `ARTIFACT_SHAPES` and the AppImage
+  runtime pins agree (mutation R38).
+
+### Mutation checks (each guard broken, at least one test failed, guard restored)
+
+R34 the old whole-field regex back (4 fail) · R35 an extra `-universal.dmg` tail (3) · R36 a
+tail that ends another (`.AppImage`) (2) · R37 the blocking open back (1: the FIFO test,
+killed by its 8 s bound, not hung) · R38 `BUILD_ARCHES` drifts from the runtime pins (3) · R39
+a deb tail with the Forge arch (`_x64.deb`) (18) · R40 the `fstat` refusal dropped, the
+non-blocking open kept (2: the FIFO and `/dev/zero` cases).
+
+Before the fix, six of the new tests failed. The refusal list failed at
+`Nutflix-0.1.0-rc.1-x64.AppImage: expected true to be false`. Positional mode exited 0. The
+FIFO case was killed with `SIGTERM`. The three shape tests failed because `ARTIFACT_SHAPES`,
+`BUILD_ARCHES` and `releaseArtifactNames` did not exist yet.
+
+### Tests and evidence
+
+- `release.test.ts` went from 21 to 27 tests. No existing test changed. The whole-field test
+  still passes as written, since the new rule is stricter.
+- `npx vitest run scripts/__tests__ packages/app-desktop`: 83 files, 1458 tests, all passing.
+  `npx tsc -b --force` is clean; `tsconfig.scripts.json` typechecks the scripts' tests.
+  eslint and `prettier --check` are clean on the changed files. `npm run check:locked` and
+  `npm run lint:electron` report OK (207 files, 0 violations).
+- The real-maker test ran here: dpkg, fakeroot and mksquashfs are present. It takes 0.8 s and
+  skips itself where those tools are missing; the pure pins still run there.
+- `release-manifest.mjs --made` over this box's real `out/make/linux-x64.artifacts.json`
+  (`nutflix_0.0.0_amd64.deb`, sha256 `c0099eec…d42a`, the local build recorded above) still
+  passes, with output to a scratch directory.
+
+### Residuals (additions and changes)
+
+- **R8 (changed).** The name rule is now exact, so positional mode refuses artifacts of every
+  other version. It still cannot tell two builds of the same version apart. `--made` is the
+  safe path, and the only one CI uses.
+- **R11 (new).** A prerelease cannot release its `.deb`: the Debian-form name contains `~`, and
+  the manifest refuses it (fails closed; ADR §8).

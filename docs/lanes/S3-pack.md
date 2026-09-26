@@ -5,6 +5,32 @@ ADR 0017 (`docs/decisions/0017-packaging.md`). Review: `docs/reviews/2026-09-25-
 There is no contract request, and no file under `packages/core/src/contracts/`, the locked
 paths, `docs/status.md` or `docs/security-review.md` changed.
 
+## Fix round 2 (verifier, 2026-09-25)
+
+An independent verifier checked the fix pass and found one Low and one Info finding. Both
+were reproduced by failing tests first, then fixed in commit `00221a0`. Details, mutations
+R34–R40 and evidence: the review record, "Fix round 2".
+
+- **Exact artifact names (Low).** `release-manifest.mjs` accepted the version followed by any
+  `-`, `_` or `.`. A stale `Nutflix-0.1.0-rc.1-x64.AppImage` in `out/make` was signed into the
+  0.1.0 manifest in positional mode (exit 0). A name must now be exactly one a maker writes for
+  this version (`ARTIFACT_SHAPES`). The check is a string comparison with fixed tails per
+  maker. A test pins the shapes to the Forge config, to `identity.ts` `BUILD_ARCHES` (now
+  `cli.ts`'s arch list), to the AppImage runtime pins and to maker-deb's `debianArch`. Another
+  compares them, as an exact set, with the real deb and AppImage makers' output. ADR 0017 §5
+  and §8 now say "another version", and state the two limits: same-version builds (use
+  `--made`), and a prerelease `.deb` (`~` in its Debian name, refused).
+- **FIFO event file (Info).** `release-verify.mjs` opens the event file `O_NONBLOCK`, so
+  `fstat` refuses a FIFO at once instead of blocking in `open`. The test runs the CLI under a
+  bounded spawn (`runNode` `timeout`), so a regression fails instead of hanging.
+- Files: `scripts/release-{manifest,verify}.mjs`, `scripts/__tests__/{release.test,helpers}.ts`,
+  `packaging/{identity,cli}.ts`, a comment in `packaging/ci/release.gitlab-ci.yml`, ADR 0017,
+  the review record and this file. No contract, locked path, `docs/status.md` or
+  `docs/security-review.md` changed, and no dependency changed.
+- Gates: `npx vitest run scripts/__tests__ packages/app-desktop` gave 1458 passing tests.
+  `tsc -b --force`, eslint and prettier on the changed files, `check:locked` and
+  `lint:electron` are all clean. The Electron e2e was not run.
+
 ## Independent review round (2026-09-25)
 
 An independent reviewer returned "ship" with 7 low/info findings. The orchestrator raised two
@@ -208,8 +234,11 @@ redundant, and it was removed.
 - The Squirrel lifecycle has run only in unit tests (no Windows build).
 - Pear makers were replaced by in-repo makers, and `pear://` has no job yet (open questions 3
   and 9).
-- `release-manifest.mjs` still accepts positional directories. `--made` is the safe path, and
-  the only one CI uses.
+- `release-manifest.mjs` still accepts positional directories. The name rule is exact, so it
+  refuses artifacts of every other version, but it cannot tell two builds of the same version
+  apart. `--made` is the safe path, and the only one CI uses.
+- A prerelease cannot release its `.deb`: electron-installer-debian's `~rc` name is refused
+  (fails closed; ADR 0017 §8).
 - Unpacked files, and all of Linux, are outside asar integrity.
 - No platform code signing yet (accepted).
 - Downgrade: authenticity is shown, not freshness.
@@ -218,11 +247,11 @@ redundant, and it was removed.
 - Squirrel installs to a user-writable directory.
 - The AppImage runtime pin should be confirmed against its `.sig`.
 
-Details: the review record, R1–R10.
+Details: the review record, R1–R11.
 
 ## Proposed `docs/status.md` row (Stage 3 table)
 
-| Packaging (issue #6, F21, ADR 0017) | `stage-3/packaging` | **done (Linux built; Windows/macOS configured; independent review addressed)** — Electron Forge 8.0.0-alpha.10 (7.x fails the advisory gate) drives a staged app: main + host bundled into `app.asar`, the Bare worker as an unbundled boot module (`bare-encoding/global` first) + bundle, unpacked with the lockfile runtime closure (target prebuilds only, no pear-runtime), located through the app's own archive (`realpath(resourcesPath)/app.asar`). Fuses set (RunAsNode, NODE_OPTIONS, --inspect off; asar integrity, only-from-asar on) and read back from every binary, plus a layout gate covering every packed file; packaged builds also refuse Chromium's remote-debugging switches. Makers: Squirrel `.exe` (main handles the Squirrel lifecycle first, packaged win32 only), `.deb`, in-repo `.dmg` (hdiutil) and AppImage (pinned runtime; no `--no-sandbox`); in-repo makers instead of Pear makers await Cameron (ADR Q9). The host never chmods bare-sidecar's runtime (fails closed on a read-only install). `scripts/release-manifest.mjs` makes ONE UNSIGNED kind-30071 event per release for the SovTech npub (signed via Bunker46) from each make's own artifact list (versioned names only, created_at = now), `release-verify.mjs` checks it (SovTech key only; files/size/commit tags). Built here: package + `.deb`; the packaged binary needs the D4 profile extended to start (ADR 0017 §7); AppImage on Ubuntu ≥ 24.04: use the `.deb` |
+| Packaging (issue #6, F21, ADR 0017) | `stage-3/packaging` | **done (Linux built; Windows/macOS configured; independent review addressed)** — Electron Forge 8.0.0-alpha.10 (7.x fails the advisory gate) drives a staged app: main + host bundled into `app.asar`, the Bare worker as an unbundled boot module (`bare-encoding/global` first) + bundle, unpacked with the lockfile runtime closure (target prebuilds only, no pear-runtime), located through the app's own archive (`realpath(resourcesPath)/app.asar`). Fuses set (RunAsNode, NODE_OPTIONS, --inspect off; asar integrity, only-from-asar on) and read back from every binary, plus a layout gate covering every packed file; packaged builds also refuse Chromium's remote-debugging switches. Makers: Squirrel `.exe` (main handles the Squirrel lifecycle first, packaged win32 only), `.deb`, in-repo `.dmg` (hdiutil) and AppImage (pinned runtime; no `--no-sandbox`); in-repo makers instead of Pear makers await Cameron (ADR Q9). The host never chmods bare-sidecar's runtime (fails closed on a read-only install). `scripts/release-manifest.mjs` makes ONE UNSIGNED kind-30071 event per release for the SovTech npub (signed via Bunker46) from each make's own artifact list (exact maker names for the version only, created_at = now), `release-verify.mjs` checks it (SovTech key only; files/size/commit tags; a FIFO or device event file refused). Built here: package + `.deb`; the packaged binary needs the D4 profile extended to start (ADR 0017 §7); AppImage on Ubuntu ≥ 24.04: use the `.deb` |
 
 ## Proposed `docs/security-review.md` text
 
