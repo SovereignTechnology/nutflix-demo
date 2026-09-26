@@ -17,6 +17,10 @@ Accepted for Stage 3 (issue #6, security review F21). Cameron's decisions, 2026-
 Implemented on `stage-3/packaging`. On Linux, this lane built the package and the `.deb`. The
 AppImage, `.exe` and `.dmg` are configured but were not built (§7).
 
+One part of the decision is **not** implemented as stated and waits for Cameron's sign-off: no
+Pear maker is used. The makers are Forge's own plus two in-repo ones, because Holepunch's
+AppImage maker adds `--no-sandbox` (§5, open question 9).
+
 ## Context
 
 Nothing packaged the app before this. The dev build runs `dist/` through the `electron` npm
@@ -109,6 +113,15 @@ installs 405 MiB, most of it Electron itself.
 `resources/app.asar.unpacked/worker/boot.mjs`. A dev build still spawns the `tsc` output
 `dist/worker/entry.js`. `src/ipc/asar-path.ts` holds the shared string mapping.
 
+The mapping is keyed on the app's **own** archive: `appArchive(process.resourcesPath,
+realpathSync)`, which main and the host utilityProcess both compute (Electron gives the utility
+process `resourcesPath` too; checked on Electron 44.2.0). Only a path that is that archive or
+lies inside it is mapped. The archive path is resolved through symlinks, because the module
+loader has already resolved `import.meta.url`: a symlinked install, or macOS app translocation
+under `/var` → `/private/var`, would otherwise never match. It used to key on the first `*.asar`
+segment of the path, so an install under any directory named `x.asar` mapped into the wrong tree
+(independent review).
+
 **bare-sidecar.** In a packaged build, `loadSidecar` in `src/host/worker/sidecar.ts`:
 
 - loads bare-sidecar from `app.asar.unpacked/node_modules`, so the binary it resolves is a real
@@ -119,7 +132,9 @@ installs 405 MiB, most of it Electron itself.
 
 So bare-sidecar's `chmod` never runs: a read-only `.deb`, AppImage or signed bundle is never
 modified. The build keeps the binary's mode, and `layout.ts` checks that it is executable. A dev
-build keeps upstream behaviour.
+build keeps upstream behaviour. The supervisor logs a `WorkerRuntimeError`'s reason when a spawn
+fails, so "reinstall the app" reaches the log; any other spawn error's text (which could name a
+path) is still dropped.
 
 ### 4. Fuses
 
@@ -131,13 +146,20 @@ build keeps upstream behaviour.
   used: 7.11.2 pins `@electron/fuses` ^1.
 - They are **read back from every packaged binary** in `postPackage`, together with a layout
   check (`layout.ts`):
-  - main, host and renderer are packed;
+  - main, the host, both preloads, and every file of the app window and the prompt window are
+    packed (derived from the staging step's file lists, so a file added there is checked too);
   - the worker and the runtime are unpacked;
   - the runtime is executable;
   - no other platform's runtime is present;
   - there is no `resources/app/` folder.
 
   Any mismatch fails the build.
+- **Chromium's DevTools protocol.** The fuses close Node's `--inspect` and `NODE_OPTIONS`, but
+  not `--remote-debugging-port` or `--remote-debugging-pipe`. With either, a wrapper script or
+  an edited `.desktop` line exposes CDP, which drives the renderer holding the preload API and
+  the prompt window. A packaged build refuses both (exit 78, `security.ts`); main runs before
+  the DevTools server starts. A dev build keeps them, because the e2e harness attaches through
+  them (independent review).
 - Platform notes:
   - Electron implements `EnableEmbeddedAsarIntegrityValidation` on **macOS and Windows only**.
     On Linux the fuse is set but has no effect.
@@ -150,8 +172,8 @@ build keeps upstream behaviour.
 
 | Target | Maker | Build host |
 |---|---|---|
-| Windows `.exe` | `@electron-forge/maker-squirrel` (Squirrel.Windows `Nutflix-Setup.exe`, `noMsi`) | Windows (or wine + mono) |
-| macOS `.dmg` | **in-repo** `packaging/maker-dmg.ts`: `ditto` the `.app`, add an `/Applications` link, `hdiutil create -format UDZO`. The argv is built without a shell | macOS |
+| Windows `.exe` | `@electron-forge/maker-squirrel` (Squirrel.Windows `Nutflix-<version>-Setup.exe`, `noMsi`) | Windows (or wine + mono) |
+| macOS `.dmg` | **in-repo** `packaging/maker-dmg.ts`: empty `out/make/dmg/<arch>`, `ditto` the `.app`, add an `/Applications` link, `hdiutil create -format UDZO`. The argv is built without a shell | macOS |
 | Linux `.deb` | `@electron-forge/maker-deb` (electron-installer-debian) | Linux with `dpkg` and `fakeroot` |
 | Linux AppImage | **in-repo** `packaging/maker-appimage.ts` | Linux with `mksquashfs` |
 | `pear://` | the Pear CLI, from the artifacts above (§6) | any |
@@ -180,6 +202,44 @@ Why the in-repo makers:
   `fs-xattr`) built by hand. A compressed image holding the app and an `/Applications` link is
   all the release needs.
 
+Every artifact name carries the version (`nutflix_<v>_amd64.deb`, `Nutflix-<v>-x64.AppImage`,
+`Nutflix-<v>-arm64.dmg`, `Nutflix-<v>-Setup.exe`). The release manifest refuses any other name
+(§8), so a stale artifact of an older build cannot be signed by accident.
+
+**Deviation from "Pear makers".** Cameron's decision named Pear makers. None is used:
+
+- Holepunch's `pear-electron-forge-maker-appimage` writes an `AppRun` that adds `--no-sandbox`
+  on Ubuntu ≥ 24. Main refuses that switch (D4), so the app would not start there, and the
+  sandbox is not negotiable.
+- Pear's Windows format is `.msix`, and Cameron asked for an `.exe` (Squirrel).
+
+The in-repo makers above take their place. This is put to Cameron as open question 9 rather
+than decided here.
+
+**Squirrel.Windows lifecycle** (`src/main/squirrel.ts`). Squirrel starts the installed app
+with `--squirrel-install`, `--squirrel-updated`, `--squirrel-uninstall` or
+`--squirrel-obsolete` as its first argument and expects it to do its part and exit. Without
+handling, the installer would start the whole app (window, host, worker, DHT), create no
+shortcut, and uninstall would launch the app instead of cleaning up (independent review). Main
+now handles these **first**, before the sandbox and dev-flag refusals and before any window,
+host or worker exists, on packaged win32 builds only:
+
+| Argument | Action |
+|---|---|
+| `--squirrel-install`, `--squirrel-updated` | `..\Update.exe --createShortcut=nutflix.exe`, then exit 0 |
+| `--squirrel-uninstall` | `..\Update.exe --removeShortcut=nutflix.exe`, then exit 0 |
+| `--squirrel-obsolete` | exit 0 |
+| `--squirrel-firstrun` | start normally |
+
+- Update.exe runs through `execFileSync` with a fixed argv, no shell, hidden, and a 10 s bound
+  (Squirrel kills a hook after 15 s). If it fails, main still exits.
+- It runs only when the executable sits in Squirrel's `app-<version>` directory: a copied or
+  unzipped build never runs whatever `Update.exe` might sit in the folder above it.
+- The module is pure (the runner is injected), so it is unit-tested on Linux; the wiring is
+  tested against the fake `electron` in `main-wiring.test.ts`. It has not run on Windows.
+- `scripts/electron-security-lint.mjs` does not restrict `child_process`, so nothing there
+  needed an exception.
+
 ### 6. `pear://`
 
 The Pear flow for Electron apps today (`hello-pear-electron`, docs.pears.com "Ship your app"):
@@ -202,31 +262,51 @@ Decided here:
   if an msix maker is added (open question).
 - Not done here: `pear touch/stage/seed` need the Pear CLI and write keys, and they contact the
   DHT. This lane contacts nothing outside the npm registry.
+- No CI job yet. What `pear build` is given depends on open questions 3 and 9, the Pear CLI
+  would need an exact pin reviewed like any other dependency, and the link's write key stays on
+  Cameron's machine, never on a runner. The commands above are the recipe.
 
 ### 7. The Chromium sandbox on Linux (never `--no-sandbox`)
 
-- **`.deb`.** electron-installer-common installs `/usr/lib/nutflix/chrome-sandbox` **setuid
-  root (4755)**. This is Chromium's audited helper and the standard Electron/Chrome `.deb`
-  layout, so the sandbox starts on Ubuntu 24 without an AppArmor profile. There are no
-  maintainer scripts.
+- **`.deb`.** electron-installer-common makes `/usr/lib/nutflix/chrome-sandbox` **setuid root
+  (4755)** while staging, and dpkg installs it that way. No maintainer script is involved. This
+  is Chromium's audited helper and the standard Electron/Chrome `.deb` layout, so the sandbox
+  starts on Ubuntu 24.04 without an AppArmor profile. A setuid-root binary is still a choice
+  worth Cameron's explicit yes (open question 10).
 - **AppImage.** FUSE mounts the image `nosuid`, so the SUID helper cannot work. The sandbox then
   needs unprivileged user namespaces:
   - Debian, Fedora and Arch allow them;
-  - Ubuntu ≥ 24 restricts them (`kernel.apparmor_restrict_unprivileged_userns=1`), and there
-    the AppImage refuses to start (Chromium aborts, and main would refuse `--no-sandbox` anyway)
-    unless the user installs a profile. The profile needs the same shape as the dev box's D4
-    profile:
+  - Ubuntu ≥ 24.04 restricts them (`kernel.apparmor_restrict_unprivileged_userns=1`). There the
+    AppImage refuses to start: Chromium aborts, and main would refuse `--no-sandbox` anyway.
+- **Recommendation for Ubuntu ≥ 24.04: install the `.deb`.**
+- **Never attach a userns profile to the AppImage's mount point.** The runtime mounts the image
+  under `/tmp/.mount_<name><random>`, and `/tmp` is writable by every local user. A userns
+  profile attached to a pattern under that mount point lets **any** local user create a
+  matching path, copy any binary there and get unprivileged user namespaces. That defeats
+  `apparmor_restrict_unprivileged_userns` for the whole machine. The mount name also follows
+  the AppImage's *file* name, so a renamed download would not even match. (An earlier draft of
+  this ADR proposed exactly that profile; independent review.)
+- **If the AppImage route is kept on Ubuntu ≥ 24.04**, it goes through a root-owned copy with a
+  profile on that exact path:
+
+  ```
+  ./Nutflix-<v>-x64.AppImage --appimage-extract          # after release-verify.mjs on the file
+  sudo mv squashfs-root /opt/nutflix
+  sudo chown -R root:root /opt/nutflix
+  sudo chmod -R go-w /opt/nutflix
+  ```
 
   ```
   abi <abi/4.0>,
   include <tunables/global>
-  profile nutflix-appimage /tmp/.mount_Nutfli*/usr/lib/nutflix/nutflix flags=(unconfined) {
+  profile nutflix-opt /opt/nutflix/usr/lib/nutflix/nutflix flags=(unconfined) {
     userns,
   }
   ```
 
-  The AppImage runtime's mount point is `/tmp/.mount_<first 6 letters of the name><random>`.
-  The `.deb` is the recommended Linux format on Ubuntu.
+  Only root can put a binary at that path, so the profile grants nothing to other users. At that
+  point the extracted tree is a manual install, and the `.deb` does the same job with updates
+  and removal handled by dpkg. Open question 4 asks whether to document this route at all.
 - **The packaged binary on this dev box.** The D4 profile `/etc/apparmor.d/nutflix-electron`
   names only `…/node_modules/electron/dist/electron`, and the packaged `chrome-sandbox` is not
   root-owned. So `out/Nutflix-linux-x64/nutflix` aborts before any JavaScript runs:
@@ -239,11 +319,15 @@ Decided here:
   ```
 
   The alternative is the SUID route (`chown root:root` + `chmod 4755` on
-  `out/Nutflix-linux-x64/chrome-sandbox`), redone after every build.
+  `out/Nutflix-linux-x64/chrome-sandbox`), redone after every build. Like the D4 line it
+  extends, that attachment is a developer-box grant: it lets whoever can write under
+  `/home/<you>/nutflix` (its owner alone) run a binary there with user namespaces. It
+  is never a pattern to ship to users (see the AppImage bullet above).
 
 ### 8. Release signing: a Nostr-signed manifest of sha256 sums
 
-`scripts/release-manifest.mjs <out/make> --out <dir>` writes three files:
+`scripts/release-manifest.mjs --made out/make/<platform>-<arch>.artifacts.json …` writes three
+files to `packages/app-desktop/out/release/` (gitignored; `--out` overrides it):
 
 - `SHA256SUMS`, in `sha256sum -c` format;
 - `release-manifest.json`, with name, bytes and sha256 per artifact, plus version and commit;
@@ -257,6 +341,23 @@ Decided here:
 | `content` | the `SHA256SUMS` text |
 | `id`, `sig` | empty |
 
+Inputs and rules:
+
+- **One manifest per release.** Kind 30071 is addressable: relays keep one event per key, kind
+  and `d`. Per-platform events would overwrite each other, and a Linux user comparing a download
+  with "the current notice" would find no `.deb` in it (independent review). So the manifest is
+  made once over every platform's artifacts (§9).
+- **Only what the make produced.** `packaging/cli.ts make` writes
+  `out/make/<platform>-<arch>.artifacts.json`: Forge's own list of the artifacts that make
+  produced, relative to `out/make`, with the version. `--made` reads these lists. A list made
+  for another version is refused, and so is any path in it that is absolute, uses backslashes or
+  climbs out with `..`. Positional files and directories are still accepted for ad-hoc use.
+- **Every artifact name carries the version** as a whole field. Anything else (a stale
+  `Nutflix-0.0.9-x64.AppImage` left in `out/make`) is refused.
+- **`created_at` is the time the manifest is made**, never the commit time (`SOURCE_DATE_EPOCH`).
+  A corrected manifest for the same commit must be newer than the event it replaces on the
+  relays. `--created-at` overrides it.
+
 Nothing in the repo signs. Cameron signs the event with the SovTech key through Bunker46, using
 NIP-46 `sign_event` in his signer. The nsec never leaves the bunker, and no job, script or
 agent holds it.
@@ -268,19 +369,28 @@ event that passes all of these:
   plain JSON, because nostr-tools trusts a cached "verified" symbol that object spread copies;
 - its pubkey **is the SovTech key**. There is no option to trust any other key;
 - it is kind 30071 with `d` = `nutflix-desktop`;
-- its artifact tags, content, `x` and `files` tags agree with each other;
+- its artifact tags, content, `x`, `files` (the count) and `size` (the total) tags agree with
+  each other, and a `commit` tag, when present, is a full 40-hex sha;
 - every named file is listed, and its size and sha256 match.
 
-Artifact names may not contain path separators or whitespace. The verifier also prints the
-release's version and signing date: an **older** genuine release verifies as well, so the
-version and date should be compared with the current notice on the relays.
+Artifact names may not contain path separators or whitespace. The event file is read through
+one descriptor: a regular file of at most 256 KiB, counted in bytes actually read. A download
+that is a symlink is refused. The verifier also prints the release's version, commit and
+**creation** date (`created_at`: when the manifest was made, before signing). An **older**
+genuine release verifies as well, so these should be compared with the current notice on the
+relays.
 
 ### 9. CI
 
 `packages/app-desktop/packaging/ci/release.gitlab-ci.yml` defines manual jobs that run on
-`desktop-v*` tags: Linux (deb and AppImage), macOS (runner tag `macos`, dmg for arm64 and x64)
-and Windows (runner tag `windows`, Squirrel). Each job publishes the artifacts, SHA256SUMS and
-the unsigned event.
+`desktop-v*` tags:
+
+- `desktop-linux` (deb and AppImage), `desktop-macos` (runner tag `macos`, dmg for arm64 and
+  x64) and `desktop-windows` (runner tag `windows`, Squirrel) only build. Each publishes
+  `out/make/`, which includes its `<platform>-<arch>.artifacts.json`.
+- `desktop-release-manifest` needs all three, receives their `out/make/` trees, and runs
+  `release-manifest.mjs` **once** with the four lists. It publishes the artifacts, SHA256SUMS,
+  the manifest and the one unsigned event.
 
 The file is **not active**. `ci/gitlab-ci.yml` is parked (no runner yet) and is outside this
 lane's allowlist. Enabling it takes one `include:` line, proposed in `docs/lanes/S3-pack.md`.
@@ -299,22 +409,40 @@ lane's allowlist. Enabling it takes one `include:` line, proposed in `docs/lanes
   still runs the dev layout.
 - Builds are not claimed reproducible. The staged tree is deterministic; the packager, asar
   and deb outputs were not checked.
+- A Squirrel-installed Windows build makes and removes its own shortcuts; that path has only
+  been exercised in unit tests.
+- `app.isPackaged` keys on the executable's name. A same-user copy of the install renamed to
+  `electron` counts as a dev build, which lifts the dev-flag and remote-debugging refusals. That
+  copy is user-writable anyway (its `app.asar` can simply be edited), so this gives nothing
+  beyond what the copy already allows.
 
 ## Open questions (Cameron)
 
 1. App id `xyz.sovit.nutflix` and the `.deb` maintainer `SovTech <git@sovit.xyz>`. Keep them?
 2. Brand icons: none exist in the repo. The installers currently show Electron's default icon.
 3. `pear://` for Windows: add an msix maker (Pear's Windows format), or keep Windows
-   `.exe`-only?
-4. AppImage on Ubuntu ≥ 24: document the AppArmor profile (§7) and recommend the `.deb`, or drop
-   the AppImage there?
+   `.exe`-only (then Windows is not on `pear://`)?
+4. AppImage on Ubuntu ≥ 24.04: it cannot start there without a user-namespace grant, and a
+   profile on its `/tmp` mount point would open user namespaces to every local user (§7). The
+   recommendation is the `.deb`. Should the extract-to-root-owned-`/opt` route be documented for
+   users, or should the AppImage simply be marked "not for Ubuntu ≥ 24.04"?
 5. Should the host check the digests of the unpacked files it loads (bare-sidecar's JS,
    sodium-native's `.node`, the worker tree) against a list inside the asar before spawning, or
    is waiting for code signing enough?
-6. `d` = `nutflix-desktop` keeps one replaceable "latest release" notice on relays. Use a
-   per-version `d` instead, to keep history?
+6. `d` = `nutflix-desktop` keeps one replaceable "latest release" notice on relays, now one per
+   release covering every platform. Use a per-version `d` instead, to keep history?
 7. Confirm the pinned AppImage runtime digests, for example with
    `gh release view 20251108 -R AppImage/type2-runtime` or by checking the `.sig` files. They
    were read from GitHub's release listing. A wrong pin fails closed.
 8. `GrantFileProtocolExtraPrivileges` (the app uses no `file://`) and `EnableCookieEncryption`
-   keep their defaults because only five fuses were asked for. Flip them too?
+   keep their defaults because only five fuses were asked for. Flip them too? (Chromium's
+   remote-debugging switches are now refused in packaged builds, §4.)
+9. **The makers.** The decision said "Electron Forge plus Pear makers". This lane uses Forge's
+   Squirrel and deb makers plus two in-repo makers (AppImage, dmg) instead, because Holepunch's
+   AppImage maker adds `--no-sandbox` on Ubuntu ≥ 24 (main refuses it, D4) and pulls
+   electron-builder's `app-builder-lib`, and the maintained dmg maker brings a high advisory.
+   Approve the substitution, or name the Pear makers to use and accept what they bring?
+10. **The setuid-root `chrome-sandbox` in the `.deb`** (§7). It is Chromium's standard Linux
+    sandbox helper and what makes the sandbox start on Ubuntu 24.04 without a profile. Accept
+    it, or ship an AppArmor userns profile for `/usr/lib/nutflix/nutflix` instead (a maintainer
+    script that runs as root at install)?

@@ -223,3 +223,116 @@ trusted key accepted (1) · M19 fuses not flipped after copy (1) · M20 version 
 - **R7.** The pinned AppImage runtime digests were read from GitHub's release listing. Cameron
   should confirm them against the release's `.sig` files before the first AppImage release (a
   wrong pin fails closed).
+
+## Independent review (2026-09-25)
+
+An independent reviewer examined the lane (verdict: ship; every finding low or info) and the
+orchestrator ruled on each finding, raising two to Medium. Each finding was first checked
+against the code. All were real. Every fix has a test that fails without it (mutation checks
+R1–R33 below). The same `differential-review` and `sharp-edges` pass then ran on the fix diff,
+and two more defects were found (S1, S2). Fixes: commit `c9fa673`. Commands, counts and
+evidence are at the end.
+
+| # | Sev (ruling) | Finding | Outcome |
+|---|---|---|---|
+| IR1 | Low | `ci/release.gitlab-ci.yml`: the Linux, macOS and Windows jobs each made a kind-30071 event with `d` = `nutflix-desktop`. The event is addressable, so relays would keep one of the three, and a Linux user comparing a download with "the current notice" would get `… is not part of this release`. `created_at` defaulted to `SOURCE_DATE_EPOCH`, so a corrected manifest for the same commit could lose to the stale one, and the verifier printed that commit time as "signed" | **Fixed.** Platform jobs only build. `cli.ts make` writes `out/make/<platform>-<arch>.artifacts.json`, and one final `desktop-release-manifest` job (`needs` all three) runs `release-manifest.mjs` once with the four lists. `created_at` is now the time the manifest is made (`--created-at` overrides), and the verifier prints "created". Tests: "the CI makes ONE release event…", "created_at is NOW by default…". Mutations R14, R32 |
+| IR2 | Medium | ADR §7 told Ubuntu ≥ 24 AppImage users to install a userns profile on `/tmp/.mount_Nutfli*/…`. `/tmp` is world-writable, so any local user could create that path and get unprivileged user namespaces. The pattern also misses a renamed download | **Fixed (docs).** §7 now says plainly that no profile may attach to the mount point, and why. It recommends the `.deb` on Ubuntu ≥ 24.04. If the AppImage route is kept, it goes through `--appimage-extract` into a root-owned `/opt/nutflix`, with a profile on that exact path. The bad profile line is gone from the ADR, and no copy-pasteable form remains. Open question 4 was rewritten. No code involved |
+| IR3 | Medium | Squirrel `.exe` configured, but main ignored `--squirrel-*`: the installer would start the full app (host, worker, DHT) and make no shortcut, and uninstall would launch the app | **Fixed.** `src/main/squirrel.ts` is pure, with an injected runner. Main runs it first, before the sandbox and dev-flag refusals and before any window, host or worker, on packaged win32 only. install/updated run `..\Update.exe --createShortcut=nutflix.exe`, uninstall runs `--removeShortcut`, and obsolete just exits; each then exits 0. `--squirrel-firstrun` starts normally. Update.exe runs through `execFileSync` with a fixed argv, no shell, `windowsHide` and a 10 s bound. The electron security lint does not restrict `child_process`, so no exception was needed. Tests: `squirrel.test.ts` (10), `main-wiring.test.ts` (+6). Mutations R3, R4, R5, R29 |
+| IR4 | Low | The ADR presented "Forge + Pear makers" as decided although no Pear maker is used, and never asked Cameron; `pear://` had no configuration at all | **Fixed (docs)** for the sign-off: a Status note, a "Deviation" paragraph in §5 (Holepunch's AppImage maker adds `--no-sandbox`; Pear wants msix, not the `.exe` Cameron asked for), and open question 9. §6 records why there is no job. **Deferred (Low):** the optional inactive `pear build` job. Its inputs depend on open questions 3 and 9, the Pear CLI would need an exact pin reviewed like any dependency, and a draft built on unverified flags would mislead. One was drafted and dropped for those reasons |
+| IR5 | Info | `supervisor.ts`: the spawn `catch` had no binding, so `WorkerRuntimeError`'s "reinstall the app" never reached the log | **Fixed.** `WorkerRuntimeError` now lives in `supervisor.ts` (re-exported by `sidecar.ts`). The catch logs `error` and `reason` for that class only. Any other error's text, which could hold a path, is still dropped. Test: "a spawn refused as a WorkerRuntimeError logs its reason; any other error text is dropped". Mutation R7 |
+| IR6 | Info | `release-verify.mjs`: the `files`-tag check and the regular-file refusal survived mutation. `MAX_EVENT_BYTES` had no test and used `lstat`, which measures a symlink, not its target | **Fixed.** Added tests for a wrong `files` tag, a symlinked download and an oversized event (directly and through a symlink), plus `/dev/zero`. The event file is now read through one descriptor: `fstat` must say regular file, and at most 256 KiB is read, counted in bytes actually read. Mutations R17, R20, R21, R22 |
+| IR7 | Info | A packaged build did not refuse `--remote-debugging-port` / `--remote-debugging-pipe` (CDP on the renderer and the prompt window), which the fuses do not cover | **Fixed.** `REMOTE_DEBUGGING_SWITCHES` in `security.ts`. A packaged build refuses them (exit 78, `app.debug-switch-refused`) before Chromium starts its DevTools server. A dev build keeps them for the e2e harness. Tests in `security.test.ts` and `main-wiring.test.ts`. Mutation R6 |
+| IR8 | Low | `runtimeClosure` mapped a copy nested under the app workspace itself (`packages/app-desktop/node_modules/x`) through the workspace link to `node_modules/@sovit/app-desktop/node_modules/x`, where nothing resolves it, so the hoisted version would load silently | **Fixed.** `ClosureError` (fail closed; "hoist it"). Today's lockfile has no such entry, and the real-lockfile test still passes. Mutation R8 |
+| IR9 | Low | `release-manifest.mjs` took everything with a release extension under `out/make`, so a stale artifact from an older make could be signed. `Nutflix-Setup.exe` carried no version, and the dmg maker never cleared its output dir | **Fixed.** `--made` lists hold exactly Forge's own artifact list. A list made for another version, and any absolute, backslashed or `..` path in one, is refused. Every artifact name must carry the version as a whole field, in every mode. The setup exe is now `Nutflix-<v>-Setup.exe` (`ForgeConfigOptions.version`, validated). The dmg maker empties `out/make/dmg/<arch>` first (`ensureDirectory`, as Forge's own makers do). Mutations R10–R13, R15, R16 |
+| IR10 | Low | Negative tests missing: the stage host-bundle input check, a missing closure package, the main and worker bundle allow-lists, bare-sidecar not shipped; also the verifier's files tag and oversized event | **Fixed.** New `packaging/__tests__/stage-guards.test.ts` (8) drives `stageApp` over a synthetic repo, breaking one rule per case. It covers: main importing renderer code; the worker importing host code; the host importing worker, main or renderer code; the host inlining a native package through a relative path; a lockfile package not installed; a bundle import the closure does not ship; no bare-sidecar. The verifier cases are under IR6. Mutations R23–R28 |
+| IR11 | Low | The layout gate's `PACKED` list omitted the prompt window's files, `prompt-preload.cjs` and `renderer/index.html` | **Fixed.** `PACKED` is derived from `PRELOAD_FILES`, `RENDERER_FILES` and `PROMPT_FILES`, the lists the staging step copies. The real `make` passed the stricter gate. Mutation R9 |
+| IR12 | Info | The `maker-deb` comment and test name said the sandbox setup was left to a decision. In fact the package ships `chrome-sandbox` setuid root through its file modes | **Fixed.** The comment is corrected, and the test is renamed; it now also pins that electron-installer-common sets 4755 on the staged helper. ADR §7 is corrected, and open question 10 asks Cameron to accept the SUID helper |
+| IR13 | Info | Verifier: the `size` tag was not checked against the artifact total, and a present `commit` tag was not checked | **Fixed.** The `size` tag is required and equals the total. At most one `commit` tag, which must be 40 hex; it is returned and printed. Mutations R18, R19 |
+| IR14 | Info | `--out` defaulted to the working directory | **Fixed.** The default is `packages/app-desktop/out/release` (under the existing gitignored `packages/app-desktop/out/`). The CI job uses that default, so no root `release/` entry was needed. Mutation R33 |
+| IR15 | Info | `asarUnpacked` keyed on the first `*.asar` path segment, not the app's own archive | **Fixed.** `asarUnpacked(p, archive)` maps only the archive itself or paths inside it, case-insensitively for Windows paths. `appArchive(process.resourcesPath, realpathSync)` names the archive in main and in the host (a probe confirmed Electron 44.2.0 gives the utility process `resourcesPath`). Mutations R1, R2; see S2 |
+| IR16 | Info | No ADR question put the in-repo-makers substitution to Cameron | **Fixed:** open question 9 (see IR4) |
+
+Found by this round's own review:
+
+| # | Sev | Finding | Outcome |
+|---|---|---|---|
+| S1 | Low | `squirrelStartup` would run `..\Update.exe` from whatever directory sits above the exe. A copied or unzipped build (in `Downloads\Nutflix\`) launched with `--squirrel-install` would run a `Downloads\Update.exe`. Anyone able to launch it with arguments could run that file directly, so this is no privilege gain; it was still a needless footgun | **Fixed.** Update.exe runs only when the exe's directory is Squirrel's `app-<version>`; otherwise main exits without running anything. Mutation R29 |
+| S2 | Low | Keying on the raw `resourcesPath` breaks when the install path involves a symlink. The module loader resolves `import.meta.url` through symlinks, and `resourcesPath` need not be resolved. Found by the smoke run: with `app.asar` symlinked into the dev Electron's resources, the worker failed six times ("could not spawn"), then `failed`. Real cases include a symlinked install and macOS app translocation (`/var` → `/private/var`). Fail closed (no worker), but fatal | **Fixed.** `appArchive` resolves the archive path with the caller's `realpathSync`, falling back to the path as given when it does not resolve. The same smoke then reached `ready` with live fixtures. Mutations R30, R31 |
+
+Sharp edges checked and left as is (this round):
+
+- `loadSidecar`'s `appArchive` is a required key (it may be `undefined`), so a caller has to
+  decide. A packaged host that passed `undefined` would take the dev path, and spawning a
+  binary inside an archive fails: fail closed.
+- `MakerDmg`'s `exec` option exists for tests, and `forge-config.ts` never sets it. This is the
+  same shape as the AppImage maker's `runtimes` (Low).
+- Positional directories are still accepted by `release-manifest.mjs` for ad-hoc use. A
+  same-version artifact from another commit could slip in that way. `--made` is the documented
+  path and the only one the CI uses (residual R8).
+- `app.isPackaged` keys on the executable's name. A same-user copy renamed `electron` is a dev
+  build, but that copy is user-writable anyway (ADR Consequences).
+
+### Mutation checks (each guard broken, at least one test failed, guard restored)
+
+R1 `asarUnpacked` ignores the archive prefix (3 fail) · R2 old first-`*.asar`-segment rule (3)
+· R3 Squirrel handled in a dev build (1) · R4 a Squirrel launch continues into the app (4) · R5
+exe-name check dropped (1) · R6 packaged build accepts remote debugging (2) · R7 supervisor
+logs any spawn error's text (1) · R8 closure accepts a copy nested under the app (1) · R9
+`PACKED` without the prompt window (2) · R10 Setup.exe without the version (1) · R11 made list
+accepts a path outside `out/make` (1) · R12 dmg maker keeps old output (1) · R13 manifest
+accepts a name without the version (1) · R14 `created_at` from `SOURCE_DATE_EPOCH` (1) · R15
+made list for another version accepted (1) · R16 made-list path escape accepted (1) · R17
+verifier `files` check off (1) · R18 `size` check off (1) · R19 `commit` check off (1) · R20
+symlinked download followed (1) · R21 event size limit off (1) · R22 event regular-file check
+off (1) · R23 stage main allow-list off (1) · R24 worker allow-list off (1) · R25 host input
+check off (2) · R26 uninstalled closure package accepted (1) · R27 unshipped bundle import
+accepted (1) · R28 bare-sidecar not required (1) · R29 Update.exe run outside `app-<version>`
+(1) · R30 archive not resolved through symlinks (1) · R31 unresolvable archive dropped instead
+of used as given (1) · R32 CI back to a manifest per platform job (1) · R33 `--out` defaults to
+the working directory (1).
+
+One first draft survived: resolving the resources *directory* before the archive. The archive's
+own resolution already covered every case the test could build, so the directory step was
+redundant and was removed (R30 then targets the remaining step).
+
+### Tests and evidence
+
+- New or changed in this round, +50 tests: `squirrel.test.ts` (10, new), `stage-guards.test.ts`
+  (8, new), `release.test.ts` (11 → 21), `forge-config.test.ts` (12 → 17), `main-wiring.test.ts`
+  (23 → 31), `asar-path.test.ts` (5 → 9), and one each in `closure`, `makers`, `supervisor`,
+  `security` and `worker-entry`. The 16 lane-touched files hold 212 tests, all passing.
+- Existing tests that changed meaning, each with a comment citing this review:
+  - `asar-path.test.ts`: the "first segment" case now asserts the archive-keyed rule;
+  - `worker-entry.test.ts` and `sidecar-loader.test.ts` pass the archive;
+  - `release.test.ts`: the Setup.exe fixture is versioned, and the duplicate-name case passes
+    `--version`;
+  - `forge-config.test.ts`: `fakeOutput` writes every `PACKED` file, and the deb test is
+    renamed.
+- `stage-guards.test.ts` has a 30 s describe timeout. The cases run up to three esbuild builds;
+  the first was measured at 6.8 s in a full parallel run (5 s default). `stage.test.ts` gives the
+  real staging 120 s.
+- **Rebuilt on the dev laptop:** `npm run build`, then `make --targets deb`. `postPackage`
+  passed the stricter layout gate. `@electron/fuses read` showed the five settings unchanged.
+  `out/make/linux-x64.artifacts.json` listed the `.deb` (`nutflix_0.0.0_amd64.deb`,
+  120,621,266 bytes, sha256 `c0099eecc65792fefc5755558e9ae86f017f9cf7a6ff8fb36e7bc1b7f9f4d42a`,
+  a local build, not a release; all entries root/root, 0644/0755 plus the one setuid
+  `chrome-sandbox`). `release-manifest.mjs --made …` wrote `packages/app-desktop/out/release/`,
+  and `release-verify.mjs` refused that unsigned event.
+- **Smoke run of the final code:** the packaged `app.asar`, symlinked into the dev Electron's
+  own `resources/` (so `process.resourcesPath` is the archive's directory, as when packaged), ran
+  with `--dev-mocks --dev-fixtures`. The host spawned, `media worker state` went `starting` →
+  `ready`, and "live manifests from the worker" followed. Before S2 the same setup failed six
+  spawns. The link was removed afterwards (`resources/` again holds only `default_app.asar`).
+- Still not verified: the Squirrel path on Windows; the remote-debugging and dev-flag refusals
+  on the packaged binary itself, which aborts at the sandbox on this box (unchanged, §7).
+
+### Residuals (additions and changes)
+
+- **R4 (changed).** The AppImage cannot start on Ubuntu ≥ 24.04 without a user-namespace grant.
+  The only acceptable grant is a profile on a root-owned extracted copy. Recommend the `.deb`
+  there (ADR §7, open question 4).
+- **R8.** `release-manifest.mjs` still accepts positional directories. `--made` is the safe
+  path, and the CI uses only it.
+- **R9.** The Squirrel lifecycle has run only in unit tests (no Windows build).
+- **R10.** Pear makers were replaced by in-repo makers, and `pear://` has no job yet. Both wait
+  on Cameron (open questions 3 and 9).
