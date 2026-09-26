@@ -22,7 +22,10 @@
     "lint": "eslint src",
     "bundle": "node scripts/bundle.ts",
     "start": "npm run bundle && electron dist/main/main.js --dev-mocks --dev-fixtures",
-    "test:e2e": "NUTFLIX_E2E=1 node --test --test-concurrency=1 e2e/fidelity.e2e.ts e2e/stage1.e2e.ts e2e/signer.e2e.ts"
+    "test:e2e": "NUTFLIX_E2E=1 node --test --test-concurrency=1 e2e/fidelity.e2e.ts e2e/stage1.e2e.ts e2e/signer.e2e.ts",
+    "stage": "node packaging/cli.ts stage",
+    "package": "node packaging/cli.ts package",
+    "make": "node packaging/cli.ts make"
   },
   "dependencies": {
     "@sovit/core": "0.0.0",
@@ -47,6 +50,13 @@
     "sodium-native": "5.1.0"
   },
   "devDependencies": {
+    "@electron-forge/core": "8.0.0-alpha.10",
+    "@electron-forge/maker-base": "8.0.0-alpha.10",
+    "@electron-forge/maker-deb": "8.0.0-alpha.10",
+    "@electron-forge/maker-squirrel": "8.0.0-alpha.10",
+    "@electron-forge/shared-types": "8.0.0-alpha.10",
+    "@electron/asar": "4.3.0",
+    "@electron/fuses": "2.1.3",
     "electron": "44.2.0",
     "esbuild": "0.28.2",
     "hyperdht": "6.34.0",

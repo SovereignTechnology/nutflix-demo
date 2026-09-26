@@ -12,7 +12,7 @@ import type { PublishDraft, WorkerEvent, WorkerInit } from '../../ipc/worker-pro
 import { WORKER_V } from '../../ipc/worker-protocol.js';
 import { memoryLogger } from '../log.js';
 import type { RestartPolicy, Timers, WorkerState } from '../worker/supervisor.js';
-import { WorkerSupervisor } from '../worker/supervisor.js';
+import { WorkerRuntimeError, WorkerSupervisor } from '../worker/supervisor.js';
 import type { FakeWorkerOptions } from './support/fake-worker.js';
 import { FakeWorker, fakeSpawner } from './support/fake-worker.js';
 import { eventually } from './support/rig.js';
@@ -525,5 +525,43 @@ describe('WorkerSupervisor', () => {
       code: 'relay-down',
     });
     sup.stop();
+  });
+  it('issue #6: a spawn refused as a WorkerRuntimeError logs its reason; any other error text is dropped', () => {
+    const run = (err: Error): ReturnType<typeof memoryLogger> => {
+      const clock = new ManualClock();
+      const log = memoryLogger('debug');
+      const sup = new WorkerSupervisor({
+        spawn: () => {
+          throw err;
+        },
+        entry: '/w.js',
+        init: () => INIT,
+        log,
+        onEvent: () => undefined,
+        handlers: { 'studio.publish': () => Promise.reject(new Error('no-signer: none')) },
+        restart: POLICY,
+        timers: clock,
+        now: () => clock.now,
+      });
+      sup.start();
+      sup.stop();
+      return log;
+    };
+    // What loadSidecar throws on a read-only install whose runtime is not executable.
+    const refused = run(
+      new WorkerRuntimeError('the bundled Bare runtime is not executable; reinstall the app'),
+    );
+    expect(refused.lines.find((l) => l.msg === 'could not spawn the media worker')).toMatchObject({
+      level: 'error',
+      error: 'WorkerRuntimeError',
+      reason: 'the bundled Bare runtime is not executable; reinstall the app',
+    });
+    // Anything else (an fs error names paths) keeps the generic line only.
+    const other = run(new Error('EACCES: permission denied, open /home/alice/secret/bare'));
+    const line = other.lines.find((l) => l.msg === 'could not spawn the media worker');
+    expect(line).toBeDefined();
+    expect(line).not.toHaveProperty('reason');
+    expect(line).not.toHaveProperty('error');
+    expect(JSON.stringify(other.lines)).not.toMatch(/alice|EACCES/);
   });
 });

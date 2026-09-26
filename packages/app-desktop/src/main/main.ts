@@ -10,8 +10,12 @@
  *   dist/renderer/            index.html, app.js, ui.css, shell.css (served by `app:`)
  *   dist/host/main.js         the host utilityProcess entry (lane L6-B)
  *   dist/worker/entry.js      the Bare worker entry the host spawns (lane L6-C; tsc output)
+ * A packaged build (issue #6, ADR 0017) has the same layout inside `resources/app.asar`, except
+ * the worker: it is unpacked beside the archive (`workerEntryFor`, packaging/stage.ts).
  */
+import { execFileSync } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
+import { realpathSync } from 'node:fs';
 import * as fsp from 'node:fs/promises';
 import { lstat, readFile, realpath } from 'node:fs/promises';
 import { basename, dirname, join } from 'node:path';
@@ -32,11 +36,12 @@ import {
   type MessageBoxOptions,
   type WebContents,
 } from 'electron';
+import { appArchive } from '../ipc/asar-path.js';
 import { isPromptForm } from '../ipc/guards.js';
 import type { HostIn, HostOut, PromptAnswer } from '../ipc/protocol.js';
 import { CHANNEL } from '../ipc/protocol.js';
 import { PROMPT_FILES, createAppProtocolHandler } from './app-protocol.js';
-import { HOST_ENTRY, WORKER_ENTRY, devFlagIn, hostArgs, parseMainArgs } from './args.js';
+import { HOST_ENTRY, devFlagIn, hostArgs, parseMainArgs, workerEntryFor } from './args.js';
 import { FileTokenRegistry } from './file-tokens.js';
 import { HostLink } from './host-link.js';
 import { IpcGate } from './ipc-gate.js';
@@ -54,7 +59,13 @@ import {
   privilegedSchemes,
 } from './schemes.js';
 import { ExternalLinks } from './external-links.js';
-import { hardenWebContents, installSessionPolicy, sandboxBypassSwitch } from './security.js';
+import {
+  hardenWebContents,
+  installSessionPolicy,
+  remoteDebuggingSwitch,
+  sandboxBypassSwitch,
+} from './security.js';
+import { SQUIRREL_UPDATE_TIMEOUT_MS, squirrelStartup } from './squirrel.js';
 import { createMainWindow, createPromptWindow } from './window.js';
 
 const log = createLogger((line) => {
@@ -65,6 +76,29 @@ const distDir = dirname(dirname(fileURLToPath(import.meta.url)));
 
 // ---- before ready ------------------------------------------------------------------------
 
+// Issue #6 (ADR 0017 §5): Squirrel.Windows launches the installed app for its lifecycle events
+// (install, update, uninstall, obsolete) and expects shortcuts made or removed and a quick exit.
+// Handled FIRST — packaged win32 only — so such a launch never opens a window or starts the
+// host or the worker. Update.exe runs with a fixed argv, no shell, bounded in time.
+const squirrel = squirrelStartup({
+  platform: process.platform,
+  packaged: app.isPackaged,
+  argv: process.argv.slice(1),
+  execPath: process.execPath,
+  run: (file, args) => {
+    execFileSync(file, [...args], {
+      stdio: 'ignore',
+      windowsHide: true,
+      timeout: SQUIRREL_UPDATE_TIMEOUT_MS,
+    });
+  },
+});
+if (squirrel.exit) {
+  if (squirrel.ok) log('info', 'app.squirrel-event');
+  else log('warn', 'app.squirrel-update-failed');
+  app.exit(0);
+  throw new Error('Squirrel.Windows lifecycle launch handled');
+}
 // D4: never run without the Chromium sandbox. Refuse, loudly, instead of degrading.
 if (sandboxBypassSwitch(app.commandLine) !== undefined) {
   log('error', 'app.sandbox-bypass-refused');
@@ -76,6 +110,13 @@ if (app.isPackaged && devFlagIn(process.argv.slice(1)) !== undefined) {
   log('error', 'app.dev-flag-refused');
   app.exit(78);
   throw new Error('dev flags are refused in a packaged build');
+}
+// Issue #6: nor a debugging target — Chromium's DevTools-protocol switches are refused too (the
+// fuses already close Node's --inspect). The dev build keeps them for the e2e harness.
+if (app.isPackaged && remoteDebuggingSwitch(app.commandLine) !== undefined) {
+  log('error', 'app.debug-switch-refused');
+  app.exit(78);
+  throw new Error('remote debugging is refused in a packaged build');
 }
 app.enableSandbox();
 if (opts.userDataDir !== undefined) app.setPath('userData', opts.userDataDir);
@@ -377,7 +418,7 @@ function start(): void {
         join(distDir, HOST_ENTRY),
         hostArgs(opts, {
           userData: app.getPath('userData'),
-          workerEntry: join(distDir, WORKER_ENTRY),
+          workerEntry: workerEntryFor(distDir, appArchive(process.resourcesPath, realpathSync)),
           keychain: keychainOk,
         }),
         { serviceName: 'nutflix-host', stdio: 'inherit' },

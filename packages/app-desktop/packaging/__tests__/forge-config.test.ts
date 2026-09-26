@@ -1,0 +1,384 @@
+/**
+ * Issue #6 (ADR 0017): the Forge config, its two hooks (flip fuses + strip the staging-only
+ * devDependencies after copy; read the fuses back + check the layout after packaging), the
+ * layout rules, the CLI's argument parser, and the constants that must agree with the app.
+ */
+import {
+  chmodSync,
+  copyFileSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from 'node:fs';
+import { createRequire } from 'node:module';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { createPackageWithOptions } from '@electron/asar';
+import type { ResolvedForgeConfig } from '@electron-forge/shared-types';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+
+import { madeList, parseCli, writeMadeList } from '../cli.ts';
+import { TARGETS, forgeConfig, makers } from '../forge-config.ts';
+import { assertAppFuses } from '../fuses.ts';
+import {
+  MADE_LIST_SCHEMA,
+  MADE_LIST_SUFFIX,
+  NOT_SHIPPED,
+  PACKAGED_WORKER_ENTRY,
+  PRELOAD_FILES,
+  PROMPT_FILES,
+  RENDERER_FILES,
+  UNPACKED_DIRS,
+} from '../identity.ts';
+import { PACKED, layoutProblems } from '../layout.ts';
+import { PKG_DIR } from '../stage.ts';
+
+const SENTINEL = 'dL7pKGdnNz796PbbjQWNKmHXBZaB9tsX';
+const fakeElectron = (): Buffer =>
+  Buffer.concat([
+    Buffer.alloc(64),
+    Buffer.from(SENTINEL),
+    Buffer.from([1, 9, 49, 48, 49, 49, 48, 48, 48, 49, 49]),
+    Buffer.alloc(64),
+  ]);
+
+const cfg = forgeConfig({
+  version: '0.1.0',
+  electronChecksums: { 'electron-v44.2.0-linux-x64.zip': 'ab'.repeat(32) },
+  appImageRuntimeDir: '/rt',
+});
+const resolved = cfg as unknown as ResolvedForgeConfig;
+
+let root = '';
+beforeEach(() => {
+  root = mkdtempSync(join(tmpdir(), 'nf-forge-'));
+});
+afterEach(() => {
+  rmSync(root, { recursive: true, force: true });
+});
+
+describe('forgeConfig', () => {
+  it('packages from app.asar with the worker and node_modules unpacked, unsigned, nothing rebuilt', () => {
+    const p = cfg.packagerConfig ?? {};
+    expect(p.asar).toEqual({ unpackDir: '{worker,node_modules}' });
+    expect(UNPACKED_DIRS).toEqual(['worker', 'node_modules']);
+    expect(p.prune).toBe(false);
+    expect(p.executableName).toBe('nutflix');
+    expect(p.name).toBe('Nutflix');
+    // Every Electron zip checked against the lockfile-pinned electron package's sha256 list.
+    expect(p.download).toEqual({
+      checksums: { 'electron-v44.2.0-linux-x64.zip': 'ab'.repeat(32) },
+    });
+    // Platform signing is deliberately absent (ADR 0017): releases are Nostr-signed instead.
+    for (const k of ['osxSign', 'osxNotarize', 'windowsSign']) expect(p).not.toHaveProperty(k);
+    expect(cfg.rebuildConfig).toEqual({ onlyModules: [] });
+    expect(cfg.plugins).toEqual([]);
+  });
+
+  it('has one maker per target, each on its own platform', () => {
+    const m = makers({
+      version: '0.1.0',
+      electronChecksums: {},
+      appImageRuntimeDir: '/rt',
+    }) as unknown as {
+      name: string;
+      platforms: string[];
+    }[];
+    expect(m.map((x) => [x.name, x.platforms])).toEqual([
+      ['squirrel', ['win32']],
+      ['dmg', ['darwin']],
+      ['deb', ['linux']],
+      ['appimage', ['linux']],
+    ]);
+    expect(TARGETS).toEqual(['squirrel', 'dmg', 'deb', 'appimage']);
+    const only = makers({
+      version: '0.1.0',
+      electronChecksums: {},
+      appImageRuntimeDir: '/rt',
+      targets: ['deb'],
+    }) as unknown as { name: string }[];
+    expect(only.map((x) => x.name)).toEqual(['deb']);
+  });
+
+  it('the Squirrel Setup.exe carries the version (a stale one of another version is refused by the manifest)', async () => {
+    const [sq] = makers({
+      version: '0.1.0',
+      electronChecksums: {},
+      appImageRuntimeDir: '/rt',
+      targets: ['squirrel'],
+    }) as unknown as {
+      config: { setupExe: string; exe: string; noMsi: boolean };
+      prepareConfig(a: string): Promise<void>;
+    }[];
+    await sq?.prepareConfig('x64');
+    expect(sq?.config).toMatchObject({
+      setupExe: 'Nutflix-0.1.0-Setup.exe',
+      exe: 'nutflix.exe',
+      noMsi: true,
+    });
+    for (const bad of ['', '0.1.0 beta', '../1', '1/2'])
+      expect(() =>
+        makers({ version: bad, electronChecksums: {}, appImageRuntimeDir: '/rt' }),
+      ).toThrow(/not a plain version/);
+  });
+
+  // Independent review: the old name said the sandbox setup was left to a decision; in fact the
+  // package ships chrome-sandbox setuid root through its file modes (no maintainer script).
+  it('the .deb has no maintainer scripts; its chrome-sandbox is setuid root by file mode (ADR 0017 §7)', async () => {
+    const deb = makers({
+      version: '0.1.0',
+      electronChecksums: {},
+      appImageRuntimeDir: '/rt',
+      targets: ['deb'],
+    })[0] as unknown as {
+      config: { options: Record<string, unknown> };
+    };
+    await (deb as unknown as { prepareConfig(a: string): Promise<void> }).prepareConfig('x64');
+    expect(deb.config.options).not.toHaveProperty('scripts');
+    expect(deb.config.options['bin']).toBe('nutflix');
+    // What electron-installer-debian does to the staged helper (via electron-installer-common):
+    // 4755. dpkg then installs it root-owned with that mode — the Linux sandbox's SUID route.
+    const common = createRequire(
+      createRequire(import.meta.url).resolve('electron-installer-debian'),
+    )('electron-installer-common') as {
+      updateSandboxHelperPermissions(dir: string): Promise<unknown>;
+    };
+    writeFileSync(join(root, 'chrome-sandbox'), 'helper');
+    chmodSync(join(root, 'chrome-sandbox'), 0o755);
+    await common.updateSandboxHelperPermissions(root);
+    expect(statSync(join(root, 'chrome-sandbox')).mode & 0o7777).toBe(0o4755);
+  });
+
+  it('packageAfterCopy flips the five fuses and drops the staging-only devDependencies', async () => {
+    const app = join(root, 'Nutflix-linux-x64');
+    const buildPath = join(app, 'resources', 'app');
+    mkdirSync(buildPath, { recursive: true });
+    writeFileSync(join(app, 'electron'), fakeElectron());
+    writeFileSync(
+      join(buildPath, 'package.json'),
+      JSON.stringify({
+        name: 'nutflix',
+        main: 'main/main.js',
+        devDependencies: { electron: '44.2.0' },
+      }),
+    );
+    const hook = cfg.hooks?.packageAfterCopy;
+    await hook?.(resolved, buildPath, '44.2.0', 'linux', 'x64');
+    expect(JSON.parse(readFileSync(join(buildPath, 'package.json'), 'utf8'))).toEqual({
+      name: 'nutflix',
+      main: 'main/main.js',
+    });
+    await expect(assertAppFuses(join(app, 'electron'))).resolves.toBeUndefined();
+    // …and postPackage accepts that binary in a correctly laid-out package.
+    const out = await fakeOutput();
+    copyFileSync(join(app, 'electron'), join(out, 'nutflix'));
+    await expect(
+      cfg.hooks?.postPackage?.(resolved, { platform: 'linux', arch: 'x64', outputPaths: [out] }),
+    ).resolves.toBeUndefined();
+  });
+
+  it('postPackage refuses a binary whose fuses were never flipped', async () => {
+    const out = join(root, 'Nutflix-linux-x64');
+    mkdirSync(out, { recursive: true });
+    writeFileSync(join(out, 'nutflix'), fakeElectron());
+    await expect(
+      cfg.hooks?.postPackage?.(resolved, { platform: 'linux', arch: 'x64', outputPaths: [out] }),
+    ).rejects.toThrow(/fuses wrong/);
+  });
+});
+
+/**
+ * A small packaged output: app.asar (+ .unpacked) laid out the way the real one is. Every
+ * `PACKED` file is written (independent review: the list now covers the prompt window, both
+ * preloads and renderer/index.html, so the fixture follows it instead of a fixed five).
+ */
+async function fakeOutput(
+  mutate: (src: string) => void = () => undefined,
+  name = 'Nutflix-linux-x64',
+): Promise<string> {
+  const src = join(root, 'src');
+  for (const f of [...PACKED, 'worker/boot.mjs', 'worker/worker.mjs']) {
+    mkdirSync(join(src, f, '..'), { recursive: true });
+    writeFileSync(join(src, f), f);
+  }
+  const bin = join(src, 'node_modules', 'bare-sidecar', 'prebuilds', 'linux-x64');
+  mkdirSync(bin, { recursive: true });
+  writeFileSync(join(bin, 'bare'), '#!/bin/sh\n');
+  chmodSync(join(bin, 'bare'), 0o755);
+  mutate(src);
+  const out = join(root, 'packaged', name);
+  mkdirSync(join(out, 'resources'), { recursive: true });
+  await createPackageWithOptions(src, join(out, 'resources', 'app.asar'), {
+    unpackDir: '{worker,node_modules}',
+  });
+  return out;
+}
+
+describe('layoutProblems', () => {
+  it('accepts code packed, worker + runtime unpacked and executable', async () => {
+    expect(layoutProblems(await fakeOutput(), 'linux', 'x64', 'Nutflix')).toEqual([]);
+  });
+
+  it('flags a non-executable runtime, another platform’s runtime, a missing boot module, an app/ folder', async () => {
+    const out = await fakeOutput((src) => {
+      chmodSync(join(src, 'node_modules', 'bare-sidecar', 'prebuilds', 'linux-x64', 'bare'), 0o644);
+      mkdirSync(join(src, 'node_modules', 'bare-sidecar', 'prebuilds', 'win32-x64'));
+      writeFileSync(
+        join(src, 'node_modules', 'bare-sidecar', 'prebuilds', 'win32-x64', 'bare.exe'),
+        'x',
+      );
+      rmSync(join(src, 'worker', 'boot.mjs'));
+    });
+    mkdirSync(join(out, 'resources', 'app'));
+    const p = layoutProblems(out, 'linux', 'x64', 'Nutflix').join('\n');
+    expect(p).toMatch(/not executable/);
+    expect(p).toMatch(/other platforms' Bare runtimes shipped: win32-x64/);
+    expect(p).toMatch(/worker\/boot\.mjs is not unpacked/);
+    expect(p).toMatch(/resources[\\/]app exists/);
+  });
+
+  it('PACKED covers main, host, both preloads, and every app-window and prompt-window file', () => {
+    expect([...PACKED].sort()).toEqual(
+      [
+        'package.json',
+        'main/main.js',
+        'host/main.js',
+        ...PRELOAD_FILES,
+        ...RENDERER_FILES.map((f) => `renderer/${f}`),
+        ...PROMPT_FILES.map((f) => `prompt/${f}`),
+      ].sort(),
+    );
+    for (const f of ['renderer/index.html', 'prompt/prompt.html', 'prompt-preload.cjs'])
+      expect(PACKED).toContain(f);
+  });
+
+  it('flags a prompt-window or app-window file missing from the archive', async () => {
+    const out = await fakeOutput((src) => {
+      rmSync(join(src, 'prompt', 'prompt.html'));
+      rmSync(join(src, 'renderer', 'index.html'));
+      rmSync(join(src, 'prompt-preload.cjs'));
+    });
+    const p = layoutProblems(out, 'linux', 'x64', 'Nutflix').join('\n');
+    expect(p).toMatch(/prompt\/prompt\.html is not in app\.asar/);
+    expect(p).toMatch(/renderer\/index\.html is not in app\.asar/);
+    expect(p).toMatch(/prompt-preload\.cjs is not in app\.asar/);
+  });
+
+  it('flags host code outside the archive', async () => {
+    const src = join(root, 'src2');
+    mkdirSync(join(src, 'host'), { recursive: true });
+    writeFileSync(join(src, 'host', 'main.js'), 'x');
+    const out = join(root, 'Out');
+    mkdirSync(join(out, 'resources'), { recursive: true });
+    await createPackageWithOptions(src, join(out, 'resources', 'app.asar'), { unpackDir: 'host' });
+    const p = layoutProblems(out, 'linux', 'x64', 'Nutflix').join('\n');
+    expect(p).toMatch(/host\/main\.js is unpacked; it must be inside app\.asar/);
+    expect(p).toMatch(/main\/main\.js is not in app\.asar/);
+    expect(layoutProblems(join(root, 'none'), 'linux', 'x64', 'Nutflix')[0]).toMatch(
+      /app\.asar is missing/,
+    );
+  });
+});
+
+describe('parseCli', () => {
+  it('parses the three commands and defaults to this machine', () => {
+    const o = parseCli([
+      'make',
+      '--targets',
+      'deb,appimage',
+      '--platform',
+      'linux',
+      '--arch',
+      'x64',
+    ]);
+    expect(o).toMatchObject({
+      command: 'make',
+      platform: 'linux',
+      arch: 'x64',
+      targets: ['deb', 'appimage'],
+    });
+    expect(o.out).toBe(join(PKG_DIR, 'out'));
+    expect(o.appImageRuntimeDir).toBe(join(PKG_DIR, 'out', 'appimage-runtime'));
+    expect(parseCli(['stage']).targets).toBeUndefined();
+  });
+
+  it('refuses unknown commands, options, platforms, arches and targets', () => {
+    expect(() => parseCli([])).toThrow(/usage/);
+    expect(() => parseCli(['publish'])).toThrow(/usage/);
+    expect(() => parseCli(['make', '--sign', 'yes'])).toThrow(
+      /unknown or incomplete option --sign/,
+    );
+    expect(() => parseCli(['make', '--platform'])).toThrow(/incomplete/);
+    expect(() => parseCli(['make', '--platform', 'freebsd'])).toThrow(/--platform/);
+    expect(() => parseCli(['make', '--arch', 'ia32'])).toThrow(/--arch/);
+    expect(() => parseCli(['make', '--targets', 'deb,snap'])).toThrow(/unknown target snap/);
+  });
+});
+
+describe('madeList / writeMadeList (what one make produced, for release-manifest --made)', () => {
+  it('lists the artifacts relative to out/make, sorted, with platform, arch and version', () => {
+    const make = join(root, 'out', 'make');
+    const list = madeList(make, 'linux', 'x64', '0.1.0', [
+      join(make, 'deb', 'x64', 'nutflix_0.1.0_amd64.deb'),
+      join(make, 'appimage', 'x64', 'Nutflix-0.1.0-x64.AppImage'),
+    ]);
+    expect(list).toEqual({
+      schema: MADE_LIST_SCHEMA,
+      platform: 'linux',
+      arch: 'x64',
+      version: '0.1.0',
+      artifacts: ['appimage/x64/Nutflix-0.1.0-x64.AppImage', 'deb/x64/nutflix_0.1.0_amd64.deb'],
+    });
+    mkdirSync(make, { recursive: true });
+    const file = writeMadeList(make, list);
+    expect(file).toBe(join(make, `linux-x64${MADE_LIST_SUFFIX}`));
+    expect(JSON.parse(readFileSync(file, 'utf8'))).toEqual(list);
+  });
+
+  it('refuses an artifact outside out/make', () => {
+    const make = join(root, 'out', 'make');
+    for (const bad of [join(root, 'elsewhere.deb'), make, join(make, '..', 'x.deb')])
+      expect(() => madeList(make, 'linux', 'x64', '0.1.0', [bad]), bad).toThrow(/outside/);
+  });
+});
+
+describe('constants that must agree with the app (this code cannot import it at runtime)', () => {
+  it('the packaged worker entry, the renderer/prompt file lists', async () => {
+    const argsPath = join(PKG_DIR, 'src', 'main', 'args.ts');
+    const args = (await import(/* @vite-ignore */ argsPath)) as { PACKAGED_WORKER_ENTRY: string };
+    expect(PACKAGED_WORKER_ENTRY).toBe(args.PACKAGED_WORKER_ENTRY);
+    const protoPath = join(PKG_DIR, 'src', 'main', 'app-protocol.ts');
+    const proto = (await import(/* @vite-ignore */ protoPath)) as {
+      APP_FILES: readonly string[];
+      PROMPT_FILES: readonly string[];
+    };
+    expect([...RENDERER_FILES]).toEqual([...proto.APP_FILES]);
+    expect([...PROMPT_FILES]).toEqual([...proto.PROMPT_FILES]);
+    expect(PRELOAD_FILES).toEqual(['preload.cjs', 'prompt-preload.cjs']);
+  });
+
+  it('NOT_SHIPPED names real dependencies, and no runtime source imports pear-runtime', () => {
+    const pj = JSON.parse(readFileSync(join(PKG_DIR, 'package.json'), 'utf8')) as {
+      dependencies: Record<string, string>;
+    };
+    for (const n of Object.keys(NOT_SHIPPED)) expect(pj.dependencies, n).toHaveProperty([n]);
+    const offenders: string[] = [];
+    const walk = (d: string): void => {
+      for (const e of readdirSync(d, { withFileTypes: true })) {
+        const p = join(d, e.name);
+        if (e.isDirectory()) {
+          if (e.name !== '__tests__') walk(p);
+        } else if (/\.tsx?$/.test(e.name) && !e.name.endsWith('.d.ts')) {
+          if (/(?:from|import\(|require\()\s*['"]pear-runtime['"]/.test(readFileSync(p, 'utf8')))
+            offenders.push(p);
+        }
+      }
+    };
+    walk(join(PKG_DIR, 'src'));
+    expect(offenders).toEqual([]);
+  });
+});

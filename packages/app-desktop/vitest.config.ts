@@ -4,7 +4,12 @@ export default defineProject({
   test: {
     name: 'app-desktop',
     // Only `*.test.ts(x)` under `__tests__/` are suites; helpers beside them are not.
-    include: ['src/**/__tests__/**/*.test.ts', 'src/**/__tests__/**/*.test.tsx'],
+    include: [
+      'src/**/__tests__/**/*.test.ts',
+      'src/**/__tests__/**/*.test.tsx',
+      // Packaging (issue #6, ADR 0017): build-time code, tested like the app.
+      'packaging/__tests__/**/*.test.ts',
+    ],
     // `e2e/` is the Electron end-to-end suite (NUTFLIX_E2E=1, playwright-core) — never here.
     exclude: ['e2e/**', '**/node_modules/**', '**/dist/**'],
     // Main, host and worker code is Node/Bare; renderer tests opt in per file with a

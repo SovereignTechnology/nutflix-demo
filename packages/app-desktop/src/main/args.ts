@@ -1,3 +1,7 @@
+import { join } from 'node:path';
+
+import { asarUnpacked } from '../ipc/asar-path.js';
+
 /**
  * Main's command line. Only these flags mean anything; everything else is ignored (Chromium
  * switches are Electron's business — except the sandbox bypasses, which `security.ts` refuses).
@@ -64,6 +68,28 @@ export const HOST_ENTRY = 'host/main.js';
  * worker dies at load (D6, docs/lanes/L6-C.md).
  */
 export const WORKER_ENTRY = 'worker/entry.js';
+
+/**
+ * Relative to `app.asar.unpacked/`: the PACKAGED worker's entry (issue #6, ADR 0017). The
+ * packaged worker is a bundle (`worker/worker.mjs`, our sources only; npm packages stay imports
+ * Bare resolves from `app.asar.unpacked/node_modules`), so it is started by an unbundled boot
+ * module whose first import is `bare-encoding/global` (D6) and whose second loads the bundle.
+ */
+export const PACKAGED_WORKER_ENTRY = 'worker/boot.mjs';
+
+/**
+ * The worker entry main hands the host, from main's own `dist/` directory. In a dev build that
+ * is the `tsc` output next to main. In a packaged build `distDir` IS the app's archive
+ * (`resources/app.asar`), which Bare cannot read, so the entry is the boot module in the
+ * unpacked tree beside it. `archive` is the app's own archive (`appArchive(process.resourcesPath)`),
+ * `undefined` outside Electron.
+ */
+export function workerEntryFor(distDir: string, archive: string | undefined): string {
+  const unpacked = asarUnpacked(distDir, archive);
+  return unpacked === undefined
+    ? join(distDir, WORKER_ENTRY)
+    : join(unpacked, PACKAGED_WORKER_ENTRY);
+}
 
 /** The absolute paths main hands the host. */
 export interface HostPaths {

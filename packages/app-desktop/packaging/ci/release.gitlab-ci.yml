@@ -1,0 +1,89 @@
+# Desktop release jobs (issue #6, ADR 0017). NOT ACTIVE: ci/gitlab-ci.yml is itself inactive
+# (no runner yet) and does not include this file. To enable, add to ci/gitlab-ci.yml:
+#
+#   include:
+#     - local: packages/app-desktop/packaging/ci/release.gitlab-ci.yml
+#
+# Runners: the default Linux image, one tagged `macos` (hdiutil/ditto; builds the .dmg and
+# writes the asar integrity digest, which only a macOS host can) and one tagged `windows`
+# (Squirrel.Windows). Manual, and only on `desktop-v*` tags: a person cuts a release.
+#
+# Each platform job only BUILDS. `packaging/cli.ts make` also writes
+# out/make/<platform>-<arch>.artifacts.json, the list of exactly what that make produced. The
+# final `desktop-release-manifest` job then runs scripts/release-manifest.mjs ONCE over every
+# platform's lists: the release notice is kind 30071, an addressable event (relays keep one per
+# key + kind + d), so three per-platform events would overwrite each other and a Linux user
+# checking "the current notice" would find no .deb in it (independent review of the packaging
+# lane).
+#
+# Nothing here signs anything, and no job holds a key. `desktop-release-manifest` publishes
+# the artifacts, SHA256SUMS and the UNSIGNED Nostr event; Cameron signs that event with the
+# SovTech key through Bunker46, and anyone checks downloads with scripts/release-verify.mjs.
+# Gatekeeper / SmartScreen warnings are accepted for now (no platform code signing).
+#
+# No pear:// job yet (ADR 0017 §6): what `pear build` is given depends on Cameron's open
+# questions (in-repo makers instead of Pear's; msix for Windows), the Pear CLI would need an
+# exact pin reviewed like any dependency, and `pear stage/provision/seed` need the link's write
+# key, which stays on Cameron's machine, never on a runner.
+
+.desktop-release:
+  stage: build
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^desktop-v/'
+      when: manual
+  artifacts:
+    paths: [packages/app-desktop/out/make/]
+    expire_in: 3 months
+
+desktop-linux:
+  extends: .desktop-release
+  script:
+    # Fixed squashfs timestamps in the AppImage (maker-appimage.ts). The release event's
+    # created_at does NOT come from here (it is when desktop-release-manifest runs).
+    - export SOURCE_DATE_EPOCH="$(git log -1 --format=%ct HEAD)"
+    - apt-get update && apt-get install -y --no-install-recommends fakeroot squashfs-tools
+    - npm run build
+    # The AppImage runtime is NOT an npm package: fetch the pinned dated release. The maker
+    # refuses it unless its sha256 equals the pin in packaging/maker-appimage.ts.
+    - mkdir -p packages/app-desktop/out/appimage-runtime
+    - curl -fsSLo packages/app-desktop/out/appimage-runtime/runtime-x86_64 https://github.com/AppImage/type2-runtime/releases/download/20251108/runtime-x86_64
+    - npm run -w packages/app-desktop make -- --platform linux --arch x64 --targets deb,appimage
+
+desktop-macos:
+  extends: .desktop-release
+  tags: [macos]
+  script:
+    - npm run build
+    - npm run -w packages/app-desktop make -- --platform darwin --arch arm64 --targets dmg
+    - npm run -w packages/app-desktop make -- --platform darwin --arch x64 --targets dmg
+
+desktop-windows:
+  extends: .desktop-release
+  tags: [windows]
+  script:
+    # electron-winstaller's install script (skipped by --ignore-scripts, reviewed in
+    # docs/lanes/S3-pack.md) only copies vendor/7z-<arch>.exe/.dll to vendor/7z.exe/.dll. It
+    # uses paths relative to its package directory. One command per line: works in any shell.
+    - cd node_modules/electron-winstaller
+    - node script/select-7z-arch.js
+    - cd ../..
+    - npm run build
+    - npm run -w packages/app-desktop make -- --platform win32 --arch x64 --targets squirrel
+
+# ONE manifest and ONE unsigned event for the whole release, from the lists the platform jobs
+# wrote (their out/make/ artifacts are merged here by `needs`). A missing or stale list, a list
+# for another version, or an artifact name that is not exactly a maker's name for this version
+# fails the job.
+desktop-release-manifest:
+  extends: .desktop-release
+  needs: [desktop-linux, desktop-macos, desktop-windows]
+  script:
+    - >-
+      node scripts/release-manifest.mjs
+      --made packages/app-desktop/out/make/linux-x64.artifacts.json
+      --made packages/app-desktop/out/make/darwin-arm64.artifacts.json
+      --made packages/app-desktop/out/make/darwin-x64.artifacts.json
+      --made packages/app-desktop/out/make/win32-x64.artifacts.json
+  artifacts:
+    paths: [packages/app-desktop/out/make/, packages/app-desktop/out/release/]
+    expire_in: 3 months

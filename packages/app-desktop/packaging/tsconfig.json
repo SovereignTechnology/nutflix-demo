@@ -1,0 +1,16 @@
+{
+  // Packaging (issue #6, ADR 0017): build-time code for `node packaging/cli.ts` (Node's type
+  // stripping — erasable syntax only, `.ts` import specifiers). Type-checked by `tsc -b`, never
+  // emitted; nothing here ships inside the app.
+  "extends": "../../../tsconfig.base.json",
+  "compilerOptions": {
+    "composite": true,
+    "noEmit": true,
+    "rootDir": ".",
+    "allowImportingTsExtensions": true,
+    "erasableSyntaxOnly": true,
+    "lib": ["ES2023"],
+    "types": ["node"]
+  },
+  "include": ["**/*.ts"]
+}

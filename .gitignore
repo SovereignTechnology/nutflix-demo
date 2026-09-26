@@ -70,6 +70,8 @@ artifacts/**/*.webm
 artifacts/**/*.json
 storybook-static/
 .worktrees/
+# Electron Forge output: staged app, packaged builds, installers, release manifests (issue #6)
+packages/app-desktop/out/
 
 # --- Media (large binaries do not belong in git) ----------------------------
 *.mp4

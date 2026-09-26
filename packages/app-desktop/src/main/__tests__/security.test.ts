@@ -11,11 +11,13 @@ import type { BrowserWindowConstructorOptions } from 'electron';
 import { describe, expect, it } from 'vitest';
 import {
   ALLOWED_PERMISSIONS,
+  REMOTE_DEBUGGING_SWITCHES,
   SANDBOX_BYPASS_SWITCHES,
   allowPermissionCheck,
   allowPermissionRequest,
   hardenWebContents,
   installSessionPolicy,
+  remoteDebuggingSwitch,
   sandboxBypassSwitch,
   type HardenableWebContents,
   type PolicySession,
@@ -280,5 +282,17 @@ describe('never --no-sandbox (D4)', () => {
       expect(sandboxBypassSwitch({ hasSwitch: (n) => n === s })).toBe(s);
     }
     expect(sandboxBypassSwitch({ hasSwitch: () => false })).toBeUndefined();
+  });
+});
+
+describe('no DevTools protocol in a packaged build (issue #6, independent review)', () => {
+  it('detects both remote-debugging switches (main refuses them when packaged)', () => {
+    expect([...REMOTE_DEBUGGING_SWITCHES]).toEqual([
+      'remote-debugging-port',
+      'remote-debugging-pipe',
+    ]);
+    for (const s of REMOTE_DEBUGGING_SWITCHES)
+      expect(remoteDebuggingSwitch({ hasSwitch: (n) => n === s })).toBe(s);
+    expect(remoteDebuggingSwitch({ hasSwitch: () => false })).toBeUndefined();
   });
 });

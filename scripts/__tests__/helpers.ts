@@ -11,20 +11,26 @@ export interface RunResult {
   status: number | null;
   stdout: string;
   stderr: string;
+  /** The signal that ended the child: `SIGTERM` when `timeout` killed it, else null. */
+  signal?: NodeJS.Signals | null;
 }
 
-/** Run a script in scripts/ black-box, the way `npm run ci` and CI do. */
+/**
+ * Run a script in scripts/ black-box, the way `npm run ci` and CI do. `timeout` (ms) bounds a
+ * child that could block: spawnSync holds the event loop, so vitest's own timeout cannot fire.
+ */
 export function runNode(
   script: string,
   args: string[],
-  opts: { cwd?: string; env?: NodeJS.ProcessEnv } = {},
+  opts: { cwd?: string; env?: NodeJS.ProcessEnv; timeout?: number } = {},
 ): RunResult {
   const r = spawnSync(process.execPath, [join(scriptsDir, script), ...args], {
     cwd: opts.cwd ?? repoRoot,
     env: { ...process.env, ...opts.env },
     encoding: 'utf8',
+    ...(opts.timeout === undefined ? {} : { timeout: opts.timeout }),
   });
-  return { status: r.status, stdout: r.stdout, stderr: r.stderr };
+  return { status: r.status, stdout: r.stdout, stderr: r.stderr, signal: r.signal };
 }
 
 export function runBash(
