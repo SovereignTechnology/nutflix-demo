@@ -14,7 +14,11 @@
  * What cashu-ts's fetch transport gave, and what this keeps:
  *
  *   timeout     none by default (undici's 300 s header and body timeouts) → 30 s for the whole
- *               exchange, connect to last byte (cashu-ts's `requestTimeout` when it passes one);
+ *               exchange, connect to last byte, except a melt (`POST …/v1/melt/{method}`), where
+ *               the mint pays the invoice before it answers: 300 s, as before (fix round 3; a
+ *               Lightning payment can take a minute or more, and a melt cut off early reads as
+ *               unknown, or as failed with no change blanks, for an invoice that then gets paid);
+ *               cashu-ts's `requestTimeout` wins when it passes one (it passes none for these);
  *   redirects   followed (fetch's default; refused only with auth headers) → never followed: a
  *               3xx is an error, so a mint cannot point the wallet at another host;
  *   size        unbounded → 4 MiB per response;

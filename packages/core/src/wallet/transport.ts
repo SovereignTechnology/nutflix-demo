@@ -17,6 +17,15 @@
  * Redirects are never followed (a 3xx is an `HttpResponseError`): a mint URL is exact, and
  * following one would let a mint point this node at any other host.
  *
+ * Timeouts, when cashu-ts passes no `requestTimeout` (it passes none for any NUT-03/04/05 call):
+ * 30 s for the whole exchange, connect to last byte — except `POST …/v1/melt/{method}` (NUT-05),
+ * where the mint PAYS the invoice before it answers: a Lightning payment can take a minute or more
+ * (Nutshell's LND backends allow 60 s), so that request gets 300 s, what undici's header and body
+ * timeouts gave cashu-ts's fetch transport (issue #8 fix round 3). Cut off early, a melt that is
+ * about to succeed reads as unknown and holds its inputs until the settle loop decides it — or,
+ * with no change blanks, tells the user it failed for an invoice that then gets paid. Quotes
+ * (`…/v1/melt/quote/…`), swaps and mints keep 30 s.
+ *
  * Portable: no `node:` import. Nothing here logs.
  */
 import {
@@ -52,6 +61,11 @@ export type RawHttp = (req: RawHttpRequest) => Promise<RawHttpResponse>;
 export interface CashuRequestOptions {
   /** Default per-request timeout when cashu-ts gives none. Default 30 s. */
   readonly timeoutMs?: number;
+  /**
+   * The timeout of a melt (`POST …/v1/melt/{method}`, the mint pays before it answers) when
+   * cashu-ts gives none. Default 300 s.
+   */
+  readonly meltTimeoutMs?: number;
   /** Largest response body accepted. Default 4 MiB (a mint's keysets are tens of KiB). */
   readonly maxBytes?: number;
 }
@@ -62,6 +76,21 @@ function retryAfterMs(v: string | undefined): number | undefined {
   if (/^\d+$/.test(v.trim())) return Number(v.trim()) * 1000;
   const at = Date.parse(v);
   return Number.isNaN(at) ? undefined : Math.max(0, at - Date.now());
+}
+
+/**
+ * `POST …/v1/melt/{method}` (NUT-05 `bolt11`, NUT-25 `bolt12`, …): the request on which the mint
+ * pays the invoice before it answers. A melt quote (`…/v1/melt/quote/{method}[/{id}]`) has more
+ * path segments and does not match. The mint URL may carry a path prefix, so only the tail of the
+ * path is matched.
+ */
+function isMeltPayment(endpoint: string, method: string): boolean {
+  if (method !== 'POST') return false;
+  try {
+    return /\/v1\/melt\/[^/]+$/.test(new URL(endpoint).pathname);
+  } catch {
+    return false;
+  }
 }
 
 function parseErrorBody(body: string): Record<string, unknown> {
@@ -76,6 +105,7 @@ function parseErrorBody(body: string): Record<string, unknown> {
 
 export function cashuRequestFn(http: RawHttp, o: CashuRequestOptions = {}): RequestFn {
   const defaultTimeout = o.timeoutMs ?? 30_000;
+  const meltTimeout = o.meltTimeoutMs ?? 300_000;
   const maxBytes = o.maxBytes ?? 4 * 1024 * 1024;
   const request = async (args: Parameters<RequestFn>[0]): Promise<unknown> => {
     const body = args.requestBody === undefined ? undefined : JSONInt.stringify(args.requestBody);
@@ -94,7 +124,9 @@ export function cashuRequestFn(http: RawHttp, o: CashuRequestOptions = {}): Requ
         method,
         headers,
         ...(body === undefined ? {} : { body }),
-        timeoutMs: args.requestTimeout ?? defaultTimeout,
+        timeoutMs:
+          args.requestTimeout ??
+          (isMeltPayment(args.endpoint, method) ? meltTimeout : defaultTimeout),
         maxBytes,
         ...(args.signal ? { signal: args.signal } : {}),
       });

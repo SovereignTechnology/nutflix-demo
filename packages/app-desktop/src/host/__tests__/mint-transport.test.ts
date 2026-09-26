@@ -12,6 +12,11 @@
  * like cdk-mintd. The first POST /v1/swap executes and its connection drops before the answer; any
  * later one is answered 429. One attempt reaches the mint, never a retry, and the send completes
  * from the journal (NUT-09) — nothing lost.
+ *
+ * Fix round 3 (verifier, LOW): that transport's 30 s whole-exchange timeout also cut off a melt,
+ * where the mint pays the invoice before it answers (a Lightning payment can take a minute or
+ * more). Over a local mint that holds its answers and fake timers: a melt answered after 45 s
+ * succeeds and gives up only at 300 s; quotes, swaps and quote checks still time out at 30 s.
  */
 import { mkdtemp, readdir, readFile, rm } from 'node:fs/promises';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
@@ -23,7 +28,7 @@ import { fileURLToPath } from 'node:url';
 import { getPubKeyFromPrivKey, MintOperationError } from '@cashu/cashu-ts';
 import type { CashuP2pkPubkey, MintUrl, RelayUrl, Sats } from '@sovit/core';
 import { mocks, nostr, signer as signerMod } from '@sovit/core';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { memoryLogger } from '../log.js';
 import { MoneyPlane } from '../money.js';
@@ -258,5 +263,151 @@ describe('the money plane’s default mint transport sends each request once (fi
     expect(money).toMatch(
       /new walletMod\.CashuMintConnections\(\{\s*request: \(mint\) => o\.mintRequest\?\.\(mint\) \?\? single,/,
     );
+  });
+});
+
+/** A request the slow mint holds: `METHOD /path`, and how to answer it. */
+interface Held {
+  readonly path: string;
+  answer(status: number, body: unknown): void;
+}
+
+/**
+ * A local mint that holds every request until the test answers it (a slow Lightning backend: the
+ * mint pays the invoice before it answers `POST /v1/melt/bolt11`). `next()` resolves when the next
+ * request has fully arrived.
+ */
+async function slowMint(): Promise<{ url: string; next: () => Promise<Held> }> {
+  const arrived: Held[] = [];
+  const waiting: ((h: Held) => void)[] = [];
+  const srv = createServer((req, res) => {
+    req.resume();
+    req.on('end', () => {
+      const h: Held = {
+        path: `${(req.method ?? 'GET').toUpperCase()} ${req.url ?? '/'}`,
+        answer: (status, body) => {
+          res.writeHead(status, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify(body));
+        },
+      };
+      const w = waiting.shift();
+      if (w === undefined) arrived.push(h);
+      else w(h);
+    });
+  });
+  await new Promise<void>((r) => srv.listen(0, '127.0.0.1', r));
+  cleanups.push(
+    () =>
+      new Promise<void>((r) => {
+        srv.closeAllConnections();
+        srv.close(() => {
+          r();
+        });
+      }),
+  );
+  return {
+    url: `http://127.0.0.1:${String((srv.address() as AddressInfo).port)}`,
+    next: () => {
+      const h = arrived.shift();
+      return h === undefined ? new Promise<Held>((r) => waiting.push(r)) : Promise.resolve(h);
+    },
+  };
+}
+
+/** A request's outcome, observed from the start (no unhandled rejection while time is moved). */
+function observe(p: Promise<unknown>): {
+  readonly done: boolean;
+  readonly result: Promise<unknown>;
+} {
+  const st = { done: false };
+  const result = p.then(
+    (v) => {
+      st.done = true;
+      return { ok: v };
+    },
+    (e: unknown) => {
+      st.done = true;
+      return { err: e };
+    },
+  );
+  return {
+    get done() {
+      return st.done;
+    },
+    result,
+  };
+}
+
+describe('fix round 3: a melt waits for its Lightning payment; every other mint request keeps 30 s', () => {
+  it('hostMintRequest: a melt answered after 45 s succeeds (the mint paid the invoice); one with no answer gives up at 300 s', async () => {
+    const m = await slowMint();
+    const request = hostMintRequest();
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      const melt = observe(
+        request({
+          endpoint: `${m.url}/v1/melt/bolt11`,
+          method: 'POST',
+          requestBody: { quote: 'q1', inputs: [] },
+        }),
+      );
+      const held = await m.next();
+      expect(held.path).toBe('POST /v1/melt/bolt11');
+      await vi.advanceTimersByTimeAsync(45_000);
+      expect(melt.done).toBe(false); // still waiting for the payment, not cut off at 30 s
+      held.answer(200, { quote: 'q1', state: 'PAID', payment_preimage: null, change: [] });
+      expect(await melt.result).toEqual({
+        ok: { quote: 'q1', state: 'PAID', payment_preimage: null, change: [] },
+      });
+
+      // Bounded all the same: a melt whose answer never comes is a NetworkError at 300 s.
+      const stuck = observe(
+        request({
+          endpoint: `${m.url}/v1/melt/bolt11`,
+          method: 'POST',
+          requestBody: { quote: 'q2', inputs: [] },
+        }),
+      );
+      await m.next();
+      await vi.advanceTimersByTimeAsync(299_999);
+      expect(stuck.done).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(await stuck.result).toMatchObject({
+        err: { name: 'NetworkError', message: 'timed out after 300000 ms' },
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('hostMintRequest: a mint quote, a melt quote, a swap and a quote check still time out at 30 s', async () => {
+    const m = await slowMint();
+    const request = hostMintRequest();
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      for (const [method, path] of [
+        ['POST', '/v1/mint/quote/bolt11'],
+        ['POST', '/v1/melt/quote/bolt11'],
+        ['POST', '/v1/swap'],
+        ['GET', '/v1/melt/quote/bolt11/q1'],
+      ] as const) {
+        const r = observe(
+          request({
+            endpoint: `${m.url}${path}`,
+            method,
+            ...(method === 'POST' ? { requestBody: { amount: 21, unit: 'sat' } } : {}),
+          }),
+        );
+        expect((await m.next()).path).toBe(`${method} ${path}`);
+        await vi.advanceTimersByTimeAsync(29_999);
+        expect(r.done, path).toBe(false);
+        await vi.advanceTimersByTimeAsync(1);
+        expect(await r.result, path).toMatchObject({
+          err: { name: 'NetworkError', message: 'timed out after 30000 ms' },
+        });
+      }
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
