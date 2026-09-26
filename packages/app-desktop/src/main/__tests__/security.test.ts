@@ -11,12 +11,14 @@ import type { BrowserWindowConstructorOptions } from 'electron';
 import { describe, expect, it } from 'vitest';
 import {
   ALLOWED_PERMISSIONS,
+  PACKAGED_REFUSED_SWITCHES,
   REMOTE_DEBUGGING_SWITCHES,
   SANDBOX_BYPASS_SWITCHES,
   allowPermissionCheck,
   allowPermissionRequest,
   hardenWebContents,
   installSessionPolicy,
+  packagedRefusedSwitch,
   remoteDebuggingSwitch,
   sandboxBypassSwitch,
   type HardenableWebContents,
@@ -282,6 +284,61 @@ describe('never --no-sandbox (D4)', () => {
       expect(sandboxBypassSwitch({ hasSwitch: (n) => n === s })).toBe(s);
     }
     expect(sandboxBypassSwitch({ hasSwitch: () => false })).toBeUndefined();
+  });
+
+  // Cross-lane review (round 4, LOW): D4's three plus the rest of Chromium's sandbox-off and
+  // in-process switches. Written out here so dropping one from security.ts fails this test.
+  it.each([
+    'no-sandbox',
+    'disable-gpu-sandbox',
+    'no-zygote',
+    'no-zygote-sandbox',
+    'disable-seccomp-filter-sandbox',
+    'disable-namespace-sandbox',
+    'disable-setuid-sandbox',
+    'disable-landlock-sandbox',
+    'allow-sandbox-debugging',
+    'gpu-sandbox-allow-sysv-shm',
+    'disable-webnn-compiler-sandbox',
+    'single-process',
+    'in-process-gpu',
+  ])('--%s is a sandbox bypass (refused in every build)', (sw) => {
+    expect(SANDBOX_BYPASS_SWITCHES).toContain(sw);
+    expect(sandboxBypassSwitch({ hasSwitch: (n) => n === sw })).toBe(sw);
+  });
+
+  it('the sandbox list is exactly those thirteen', () => {
+    expect(SANDBOX_BYPASS_SWITCHES).toHaveLength(13);
+    expect(new Set(SANDBOX_BYPASS_SWITCHES).size).toBe(13);
+  });
+});
+
+describe('no process wrappers, V8 flags or isolation overrides in a packaged build (round 4)', () => {
+  it.each([
+    'renderer-cmd-prefix',
+    'utility-cmd-prefix',
+    'gpu-launcher',
+    'zygote-cmd-prefix',
+    'browser-subprocess-path',
+    'js-flags',
+    'disable-site-isolation-trials',
+    'disable-web-security',
+  ])('--%s is refused when packaged', (sw) => {
+    expect(PACKAGED_REFUSED_SWITCHES).toContain(sw);
+    expect(packagedRefusedSwitch({ hasSwitch: (n) => n === sw })).toBe(sw);
+  });
+
+  it('exactly those eight; none absent is reported; no switch sits in two lists', () => {
+    expect(PACKAGED_REFUSED_SWITCHES).toHaveLength(8);
+    expect(packagedRefusedSwitch({ hasSwitch: () => false })).toBeUndefined();
+    const all = [
+      ...SANDBOX_BYPASS_SWITCHES,
+      ...REMOTE_DEBUGGING_SWITCHES,
+      ...PACKAGED_REFUSED_SWITCHES,
+    ];
+    expect(new Set(all).size).toBe(all.length);
+    // Chromium's own switch names: lower-case words joined by `-`, no `--` or `=value`.
+    for (const s of all) expect(s).toMatch(/^[a-z0-9]+(?:-[a-z0-9]+)*$/);
   });
 });
 

@@ -62,6 +62,7 @@ import { ExternalLinks } from './external-links.js';
 import {
   hardenWebContents,
   installSessionPolicy,
+  packagedRefusedSwitch,
   remoteDebuggingSwitch,
   sandboxBypassSwitch,
 } from './security.js';
@@ -117,6 +118,13 @@ if (app.isPackaged && remoteDebuggingSwitch(app.commandLine) !== undefined) {
   log('error', 'app.debug-switch-refused');
   app.exit(78);
   throw new Error('remote debugging is refused in a packaged build');
+}
+// Cross-lane review (round 4): nor wrapped — process-wrapper, V8 and isolation switches are
+// refused too (security.ts PACKAGED_REFUSED_SWITCHES). The dev build keeps them for debugging.
+if (app.isPackaged && packagedRefusedSwitch(app.commandLine) !== undefined) {
+  log('error', 'app.process-switch-refused');
+  app.exit(78);
+  throw new Error('process-wrapper and engine switches are refused in a packaged build');
 }
 app.enableSandbox();
 if (opts.userDataDir !== undefined) app.setPath('userData', opts.userDataDir);
