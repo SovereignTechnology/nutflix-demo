@@ -257,3 +257,27 @@ the entry and reconciled the inputs away, and the outputs the mint had signed we
   counts every entry still journaled, a skipped mint's included. Before, a mint whose wallet did
   not load (or that stopped offering NUT-09) read as progress, and the loop retried every 30 s
   for ever.
+
+### Fix round 3 (same day): no retrying default, and a melt gets time to pay
+
+The verifier of fix round 2 found one low and one info finding. Both are fixed.
+
+- **`CashuMintConnections` has no retrying default any more.** With no request function, or one
+  answering `undefined` for a mint, it used to build a cashu-ts `Mint` with no custom transport,
+  so cashu-ts's retrying fetch transport was one omission away. A coded answer to a retry drops
+  the entry: the verifier lost 64 sat to an 11001 on a retried swap. The default is now
+  `cashuRequestFn` over `fetch` (`fetchRawHttp`), one attempt per request. It has the same bounds
+  as the Node transport. It works in Node and in browsers, so no caller can reach the retrying
+  transport through this class. The Node wallets still pass `node:http(s)`: the daemons run
+  `--jitless`, where `fetch` (undici's WebAssembly parser) crashes. This replaces round 2's "so
+  cashu-ts's retrying transport is reachable only from opt-in real-mint tests": it is reachable
+  from none.
+- **A melt gets 300 s.** Round 2's transport gave every request 30 s for the whole exchange.
+  cashu-ts passes no timeout for `POST /v1/melt/bolt11`, where the mint pays the invoice before
+  it answers. A Lightning payment of 30 to 60 s or more (Nutshell's LND backends allow 60 s) was
+  cut off. Such a melt read as unknown and was held until the settle loop decided it. With no
+  change blanks (a fee reserve of 0), the user was told "melt failed" for an invoice that then
+  got paid. `cashuRequestFn`
+  now gives `POST …/v1/melt/{method}` 300 s, what undici gave cashu-ts's transport before round 2.
+  Quotes, quote checks, swaps and mints keep 30 s. The daemons get the same, through the shared
+  `cashuRequestFn`.
