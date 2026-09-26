@@ -370,6 +370,12 @@ describe('dleqVerifier — failure is never acceptance', () => {
     const t = new DleqThread({ spawn, startMs: 200, reapMs: 200 });
     await expect(t.verify(cs)).rejects.toThrow(/did not start/);
     expect(t.usable).toBe(true);
+    // Fix round 2 (LOW 1): no second start while the first thread is still leaving — this test
+    // used to try again at once, beside it. The job goes to the chunked path instead; the second
+    // start comes once the first thread is let go (this stand-in never says it is leaving).
+    await expect(t.verify(cs)).rejects.toThrow(/still leaving/);
+    expect(spawn.spawned).toBe(1);
+    await until(() => t.reaps.abandoned === 1);
     await expect(t.verify(cs)).rejects.toThrow(/did not start/);
     expect(t.usable).toBe(false);
     await expect(t.verify(cs)).rejects.toThrow(/unavailable/);
@@ -466,6 +472,36 @@ describe('retiring a thread never blocks the event loop (issue #8 review, findin
     expect(t.tryVerify(cs)).toBeNull();
     expect(spawn.spawned).toBe(2);
     await t.close();
+  });
+
+  it('jobs queued while the thread was up do not start threads beside a leaving one: they fail at once, to the chunked path (fix round 2)', async () => {
+    // Fix round 2 (independent verifier, LOW 1): the guard was only in `tryVerify`. Three PAYs
+    // queued on a thread that boots but never answers each reached `run()` → `ensureStarted()`
+    // after the one before timed out, and spawned a new thread while the retired one was still
+    // leaving: three threads.
+    const spawn = nodeSpawner('HANG');
+    const t = new DleqThread({ spawn, jobMs: 200, reapMs: 1000 });
+    expect(t.tryVerify(cs)).toBeNull(); // begins the start
+    expect(await t.ready()).toBe(true);
+    const queued = [t.tryVerify(cs), t.tryVerify(cs), t.tryVerify(cs)];
+    expect(queued.every((p) => p !== null)).toBe(true);
+    const outcomes = await Promise.allSettled(queued as Promise<boolean[]>[]);
+    const reasons = outcomes.map((o) => (o.status === 'rejected' ? String(o.reason) : 'answered'));
+    expect(reasons[0]).toMatch(/timed out/);
+    expect(reasons[1]).toMatch(/still leaving/);
+    expect(reasons[2]).toMatch(/still leaving/);
+    expect(spawn.spawned).toBe(1);
+    // Through the verifier: the verdicts come from the chunked path, still one thread.
+    const v = dleqVerifier({ spawn, verify, jobMs: 200, reapMs: 1000 });
+    expect(await v.verify(cs)).toEqual(inline(cs)); // begins its own start
+    expect(await v.ready()).toBe(true);
+    const spawned = spawn.spawned;
+    const many = await Promise.all([v.verify(cs), v.verify(cs), v.verify(cs)]);
+    expect(many).toEqual([inline(cs), inline(cs), inline(cs)]);
+    expect(spawn.spawned).toBe(spawned);
+    await v.close();
+    await t.close();
+    expect(t.reaps).toEqual({ joined: 0, abandoned: 1 });
   });
 
   it('a timeout option that is not a finite number ≥ 0 means the default (NaN would wait for ever)', async () => {

@@ -223,6 +223,11 @@ export class DleqThread {
       const half = Math.ceil(checks.length / 2);
       return [...(await this.run(checks.slice(0, half))), ...(await this.run(checks.slice(half)))];
     }
+    // A retired thread is still leaving and none is up: no new one beside it — here too, not only
+    // in `tryVerify`, since jobs queued while a thread was up reach this after it was retired (fix
+    // round 2). The caller checks this job on the chunked path.
+    if (this.handle === null && this.reaping.size > 0)
+      throw new Error('DLEQ thread unavailable: a retired thread is still leaving');
     await this.ensureStarted();
     const box = this.mailbox;
     if (box === null) throw new Error('DLEQ thread unavailable');
