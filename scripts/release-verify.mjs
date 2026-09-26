@@ -22,7 +22,7 @@
 //
 // It reads the files and the event; it contacts nothing.
 import { createHash } from 'node:crypto';
-import { closeSync, fstatSync, lstatSync, openSync, readSync } from 'node:fs';
+import { closeSync, constants, fstatSync, lstatSync, openSync, readSync } from 'node:fs';
 import { basename, join } from 'node:path';
 import process from 'node:process';
 import { pathToFileURL } from 'node:url';
@@ -121,9 +121,11 @@ export function checkEvent(input, trustedPubkey) {
  * The event file's text, read through one descriptor: it must be a regular file (a FIFO or a
  * device such as /dev/zero would never end) of at most MAX_EVENT_BYTES — bytes actually read,
  * so a symlink is measured by its target and a growing file cannot slip past the limit.
+ * Opened O_NONBLOCK: a plain open of a FIFO waits for a writer, so fstat never got to refuse it
+ * (verifier, round 2). The flag changes nothing for a regular file; Windows has none (0).
  */
 export function readEventFile(path) {
-  const fd = openSync(path, 'r');
+  const fd = openSync(path, constants.O_RDONLY | (constants.O_NONBLOCK ?? 0));
   try {
     if (!fstatSync(fd).isFile()) refuse('the event file is not a regular file');
     const buf = Buffer.alloc(MAX_EVENT_BYTES + 1);

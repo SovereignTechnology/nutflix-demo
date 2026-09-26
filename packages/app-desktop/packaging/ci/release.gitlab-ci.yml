@@ -72,7 +72,8 @@ desktop-windows:
 
 # ONE manifest and ONE unsigned event for the whole release, from the lists the platform jobs
 # wrote (their out/make/ artifacts are merged here by `needs`). A missing or stale list, a list
-# for another version, or an artifact name without the version fails the job.
+# for another version, or an artifact name that is not exactly a maker's name for this version
+# fails the job.
 desktop-release-manifest:
   extends: .desktop-release
   needs: [desktop-linux, desktop-macos, desktop-windows]

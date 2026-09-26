@@ -17,6 +17,13 @@ export const APP = {
   license: 'AGPL-3.0-or-later',
 } as const;
 
+/**
+ * The only architectures `cli.ts` builds (each has a pinned AppImage runtime). Every artifact
+ * name carries one of them, so scripts/release-manifest.mjs accepts exactly these (its
+ * `ARTIFACT_SHAPES`, pinned to this list and to the makers by a test).
+ */
+export const BUILD_ARCHES = ['x64', 'arm64'] as const;
+
 /** The Nostr `d` tag of the desktop release notice (kind 30071, `NostrKind.ReleaseNotice`). */
 export const RELEASE_D_TAG = 'nutflix-desktop';
 

@@ -24,12 +24,12 @@ import { api, utils } from '@electron-forge/core';
 import type { ForgeArch, ForgePlatform } from '@electron-forge/shared-types';
 
 import { TARGETS, forgeConfig, type Target } from './forge-config.ts';
-import { MADE_LIST_SCHEMA, MADE_LIST_SUFFIX } from './identity.ts';
+import { BUILD_ARCHES, MADE_LIST_SCHEMA, MADE_LIST_SUFFIX } from './identity.ts';
 import { pinnedRuntime } from './maker-appimage.ts';
 import { PKG_DIR, REPO_ROOT, stageApp } from './stage.ts';
 
 const PLATFORMS: readonly ForgePlatform[] = ['linux', 'win32', 'darwin'];
-const ARCHES: readonly ForgeArch[] = ['x64', 'arm64'];
+const ARCHES: readonly ForgeArch[] = BUILD_ARCHES;
 
 export interface CliOptions {
   readonly command: 'stage' | 'package' | 'make';

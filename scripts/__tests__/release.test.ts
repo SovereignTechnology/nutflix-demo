@@ -9,9 +9,17 @@
  * never written anywhere: the verifier CLI must refuse its events (not the SovTech key), and the
  * library entry point is called with that throwaway key only to reach the file checks.
  */
+import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs';
+import { basename, join } from 'node:path';
 import { finalizeEvent, generateSecretKey, getPublicKey } from 'nostr-tools/pure';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
@@ -47,6 +55,9 @@ interface ManifestLib {
   DEFAULT_OUT: string;
   parseArgs(argv: string[]): { out: string };
   nameCarriesVersion(name: string, version: string): boolean;
+  releaseArtifactNames(version: string): string[];
+  ARTIFACT_SHAPES: readonly { maker: string; prefix: string; tails: readonly string[] }[];
+  SAFE_NAME: RegExp;
 }
 
 const SOVTECH_HEX = '83d8bce2f7d6966f306e6f1a712497cf0a2c77d073923136a0e2bb54963b3434';
@@ -56,6 +67,14 @@ async function lib<T>(file: string): Promise<T> {
   const path = join(scriptsDir, file);
   return (await import(/* @vite-ignore */ path)) as T;
 }
+
+/** A module of packages/app-desktop/packaging (the makers and their config). */
+async function packaging<T>(file: string): Promise<T> {
+  const path = join(repoRoot, 'packages', 'app-desktop', 'packaging', file);
+  return (await import(/* @vite-ignore */ path)) as T;
+}
+
+const hasBin = (bin: string): boolean => spawnSync('which', [bin]).status === 0;
 
 /** NostrKind.ReleaseNotice from the contracts SOURCE (scripts cannot import packages/core). */
 function releaseNoticeKind(): number {
@@ -409,6 +428,259 @@ describe('scripts/release-manifest.mjs — one release, only this make (independ
   });
 });
 
+/** A Forge maker as the tests drive it (the config is resolved by prepareConfig). */
+interface MakerLike {
+  name: string;
+  config: Record<string, unknown>;
+  prepareConfig(arch: string): Promise<void>;
+  make(o: Record<string, unknown>): Promise<string[]>;
+}
+interface IdentityLib {
+  APP: { name: string; productName: string };
+  BUILD_ARCHES: readonly string[];
+}
+interface ForgeConfigLib {
+  TARGETS: readonly string[];
+  makers: (o: {
+    version: string;
+    electronChecksums: Record<string, string>;
+    appImageRuntimeDir: string;
+    targets?: readonly string[];
+  }) => unknown[];
+}
+type MakerCtor = new (config: Record<string, unknown>) => MakerLike;
+
+const byteOrder = (a: string, b: string): number => Buffer.compare(Buffer.from(a), Buffer.from(b));
+
+/**
+ * The file names the four configured makers write for `version` on every build arch: Squirrel's
+ * `setupExe` from the Forge config, the dmg maker with hdiutil stubbed, and — when `real` — the
+ * real deb maker (electron-installer-debian, dpkg + fakeroot) and the real AppImage maker
+ * (mksquashfs, a fixture runtime) run over a minimal packaged tree with the staged package.json's
+ * fields (stage.ts: no Debian `revision`).
+ */
+async function makerNames(version: string, work: string, real: boolean): Promise<string[]> {
+  const { APP, BUILD_ARCHES } = await packaging<IdentityLib>('identity.ts');
+  const { makers } = await packaging<ForgeConfigLib>('forge-config.ts');
+  const { MakerDmg } = await packaging<{ MakerDmg: MakerCtor }>('maker-dmg.ts');
+  const { MakerAppImage } = await packaging<{ MakerAppImage: MakerCtor }>('maker-appimage.ts');
+  const app = join(work, `app-${version}`);
+  mkdirSync(join(app, 'resources', 'app'), { recursive: true });
+  writeFileSync(join(app, APP.name), '#!/bin/sh\n');
+  chmodSync(join(app, APP.name), 0o755);
+  writeFileSync(join(app, 'version'), '44.2.0');
+  writeFileSync(join(app, 'LICENSE'), 'license');
+  writeFileSync(join(app, 'LICENSES.chromium.html'), 'licenses');
+  writeFileSync(
+    join(app, 'resources', 'app', 'package.json'),
+    JSON.stringify({
+      name: APP.name,
+      productName: APP.productName,
+      version,
+      description: 'd',
+      author: 'SovTech',
+      license: 'AGPL-3.0-or-later',
+      main: 'main/main.js',
+      type: 'module',
+    }),
+  );
+  const runtime = Buffer.from('#fixture-runtime#'.repeat(8));
+  writeFileSync(join(work, 'rt'), runtime);
+  const names = new Set<string>();
+  for (const arch of BUILD_ARCHES) {
+    const [sq, dmg, deb, appimage] = makers({
+      version,
+      electronChecksums: {},
+      appImageRuntimeDir: work,
+    }) as MakerLike[];
+    for (const mk of [sq, dmg, deb, appimage]) await mk!.prepareConfig(arch);
+    names.add(String(sq!.config['setupExe']));
+    const make = (mk: MakerLike, targetPlatform: string): Promise<string[]> =>
+      mk.make({
+        dir: app,
+        makeDir: join(work, `make-${version}`),
+        appName: APP.productName,
+        targetPlatform,
+        targetArch: arch,
+        forgeConfig: {},
+        packageJSON: { version },
+      });
+    const stubbedDmg = new MakerDmg({ ...dmg!.config, exec: () => Promise.resolve() });
+    await stubbedDmg.prepareConfig(arch);
+    for (const out of await make(stubbedDmg, 'darwin')) names.add(basename(out));
+    if (!real) continue;
+    for (const out of await make(deb!, 'linux')) names.add(basename(out));
+    const fixtureAppImage = new MakerAppImage({
+      ...appimage!.config,
+      runtimes: {
+        [arch]: { asset: 'rt', sha256: createHash('sha256').update(runtime).digest('hex') },
+      },
+    });
+    await fixtureAppImage.prepareConfig(arch);
+    for (const out of await make(fixtureAppImage, 'linux')) names.add(basename(out));
+  }
+  return [...names].sort(byteOrder);
+}
+
+// Verifier, round 2: `nameCarriesVersion` took the version followed by ANY `-`, `_` or `.`, so
+// for 0.1.0 it accepted a stale prerelease or extended build (`Nutflix-0.1.0-rc.1-x64.AppImage`,
+// `Nutflix-0.1.0.1-x64.AppImage`) and positional mode would have signed it into 0.1.0.
+describe('scripts/release-manifest.mjs — exact maker names (verifier, round 2)', () => {
+  it('refuses a prerelease, an extended version, another maker shape or arch, for version 0.1.0', async () => {
+    const m = await lib<ManifestLib>('release-manifest.mjs');
+    for (const n of [
+      // The verifier's four examples.
+      'Nutflix-0.1.0-rc.1-x64.AppImage',
+      'nutflix_0.1.0-rc1_amd64.deb',
+      'Nutflix-0.1.0.1-x64.AppImage',
+      'nutflix-0.1.0-full.nupkg',
+      // More of the same shape.
+      'Nutflix-0.1.0-rc.1-Setup.exe',
+      'Nutflix-0.1.0-beta-arm64.dmg',
+      'nutflix_0.1.0+b1_amd64.deb',
+      'nutflix_0.1.0~rc.1_amd64.deb',
+      'nutflix_0.1.0-1_amd64.deb', // a Debian revision: the maker writes none
+      'Nutflix-0.1.0-x64.zip',
+      'Nutflix-0.1.0-x64.AppImage.zsync',
+      'Nutflix-0.1.0-Setup.exe.blockmap',
+      'Nutflix-0.1.0-ia32.AppImage', // not a build arch (cli.ts), no pinned runtime
+      'nutflix_0.1.0_i386.deb',
+      'Nutflix-0.1.0-universal.dmg',
+      'Nutflix-0.1.0-amd64.AppImage', // the Debian arch name on a Forge shape
+      'nutflix_0.1.0_x64.deb', // and the other way round
+      'Nutflix-0.1.0-x64.deb',
+      'Other-0.1.0-x64.AppImage',
+      'nutflix-0.1.0-x64.AppImage',
+      'Nutflix_0.1.0_amd64.deb',
+      'xNutflix-0.1.0-x64.AppImage',
+      'Nutflix-0.1.0-x64.AppImagex',
+    ])
+      expect(m.nameCarriesVersion(n, '0.1.0'), n).toBe(false);
+    for (const n of [
+      'Nutflix-0.1.0-x64.AppImage',
+      'Nutflix-0.1.0-arm64.AppImage',
+      'Nutflix-0.1.0-x64.dmg',
+      'Nutflix-0.1.0-arm64.dmg',
+      'nutflix_0.1.0_amd64.deb',
+      'nutflix_0.1.0_arm64.deb',
+      'Nutflix-0.1.0-Setup.exe',
+    ])
+      expect(m.nameCarriesVersion(n, '0.1.0'), n).toBe(true);
+    // A prerelease release is matched whole as well: its names carry exactly its version.
+    for (const n of ['Nutflix-0.1.0-rc.1-x64.AppImage', 'Nutflix-0.1.0-rc.1-Setup.exe'])
+      expect(m.nameCarriesVersion(n, '0.1.0-rc.1'), n).toBe(true);
+    for (const n of [
+      'Nutflix-0.1.0-x64.AppImage',
+      'Nutflix-0.1.0-rc.10-x64.AppImage',
+      'Nutflix-0.1.0-rc.1.1-x64.AppImage',
+    ])
+      expect(m.nameCarriesVersion(n, '0.1.0-rc.1'), n).toBe(false);
+  });
+
+  it('positional mode refuses a stale rc artifact left in out/make for the 0.1.0 release', () => {
+    writeFileSync(join(make, 'appimage', 'x64', 'Nutflix-0.1.0-rc.1-x64.AppImage'), 'rc build');
+    const r = manifest();
+    expect(r.status).toBe(1);
+    expect(r.stderr).toMatch(/Nutflix-0\.1\.0-rc\.1-x64\.AppImage does not carry version 0\.1\.0/);
+    expect(existsSync(join(out, 'release-event.unsigned.json'))).toBe(false);
+    // …and so does a direct file argument, which skips the extension filter.
+    writeFileSync(join(dir, 'nutflix-0.1.0-full.nupkg'), 'nupkg');
+    const direct = runNode('release-manifest.mjs', [
+      join(dir, 'nutflix-0.1.0-full.nupkg'),
+      '--out',
+      out,
+      '--version',
+      '0.1.0',
+    ]);
+    expect(direct.status).toBe(1);
+    expect(direct.stderr).toMatch(/nutflix-0\.1\.0-full\.nupkg does not carry version 0\.1\.0/);
+  });
+
+  it("the shapes are the makers' own: prefixes, build arches, runtime pins, Debian arches", async () => {
+    const m = await lib<ManifestLib>('release-manifest.mjs');
+    const { APP, BUILD_ARCHES } = await packaging<IdentityLib>('identity.ts');
+    const { TARGETS } = await packaging<ForgeConfigLib>('forge-config.ts');
+    const { APPIMAGE_RUNTIMES } = await packaging<{ APPIMAGE_RUNTIMES: Record<string, unknown> }>(
+      'maker-appimage.ts',
+    );
+    const { debianArch } = (await import('@electron-forge/maker-deb')) as unknown as {
+      debianArch: (a: string) => string;
+    };
+    // cli.ts builds only BUILD_ARCHES, and each has a pinned AppImage runtime.
+    expect([...BUILD_ARCHES].sort()).toEqual(Object.keys(APPIMAGE_RUNTIMES).sort());
+    expect([...m.ARTIFACT_SHAPES].map((s) => s.maker).sort()).toEqual([...TARGETS].sort());
+    const shape = (maker: string): unknown => m.ARTIFACT_SHAPES.find((s) => s.maker === maker);
+    expect(shape('appimage')).toEqual({
+      maker: 'appimage',
+      prefix: `${APP.productName}-`,
+      tails: BUILD_ARCHES.map((a) => `-${a}.AppImage`),
+    });
+    expect(shape('dmg')).toEqual({
+      maker: 'dmg',
+      prefix: `${APP.productName}-`,
+      tails: BUILD_ARCHES.map((a) => `-${a}.dmg`),
+    });
+    expect(shape('deb')).toEqual({
+      maker: 'deb',
+      prefix: `${APP.name}_`,
+      tails: BUILD_ARCHES.map((a) => `_${debianArch(a)}.deb`),
+    });
+    expect(shape('squirrel')).toEqual({
+      maker: 'squirrel',
+      prefix: `${APP.productName}-`,
+      tails: ['-Setup.exe'],
+    });
+    // Why a name then matches only an artifact made for exactly this version: prefix + X + tail
+    // = prefix' + V + tail' with X ≠ V needs one prefix to start another or one tail to end another.
+    const prefixes = [...new Set(m.ARTIFACT_SHAPES.map((s) => s.prefix))];
+    const tails = m.ARTIFACT_SHAPES.flatMap((s) => s.tails);
+    expect(new Set(tails).size).toBe(tails.length);
+    for (const a of tails)
+      for (const b of tails) if (a !== b) expect(b.endsWith(a), `${a} ends ${b}`).toBe(false);
+    for (const a of prefixes)
+      for (const b of prefixes)
+        if (a !== b) expect(b.startsWith(a), `${a} starts ${b}`).toBe(false);
+  });
+
+  it('accepts what the Squirrel config and the dmg maker (stubbed hdiutil) write, per version', async () => {
+    const m = await lib<ManifestLib>('release-manifest.mjs');
+    const written = await makerNames('0.1.0', dir, false);
+    expect(written).toEqual([
+      'Nutflix-0.1.0-Setup.exe',
+      'Nutflix-0.1.0-arm64.dmg',
+      'Nutflix-0.1.0-x64.dmg',
+    ]);
+    for (const n of written) expect(m.nameCarriesVersion(n, '0.1.0'), n).toBe(true);
+    const rc = await makerNames('0.1.0-rc.1', dir, false);
+    for (const n of rc) expect(m.nameCarriesVersion(n, '0.1.0-rc.1'), n).toBe(true);
+    // Each version's artifacts are stale for the other.
+    for (const n of written) expect(m.nameCarriesVersion(n, '0.1.0-rc.1'), n).toBe(false);
+    for (const n of rc) expect(m.nameCarriesVersion(n, '0.1.0'), n).toBe(false);
+  });
+
+  it.runIf(process.platform === 'linux' && ['mksquashfs', 'dpkg', 'fakeroot'].every(hasBin))(
+    'accepts exactly what the four makers write, no more (real deb and AppImage makers)',
+    async () => {
+      const m = await lib<ManifestLib>('release-manifest.mjs');
+      const written = await makerNames('0.1.0', dir, true);
+      expect(written).toEqual([...m.releaseArtifactNames('0.1.0')].sort(byteOrder));
+      expect(written).toHaveLength(7);
+      // A prerelease: electron-installer-debian writes its Debian form (`0.1.0~rc.1`), and `~`
+      // is not a safe artifact name, so the manifest refuses that .deb (fails closed; ADR 0017
+      // §8). Everything else it writes is accepted for that version and refused for 0.1.0.
+      const rc = await makerNames('0.1.0-rc.1', dir, true);
+      const debs = rc.filter((n) => n.endsWith('.deb'));
+      expect(debs).toEqual(['nutflix_0.1.0~rc.1_amd64.deb', 'nutflix_0.1.0~rc.1_arm64.deb']);
+      for (const n of debs) expect(m.SAFE_NAME.test(n), n).toBe(false);
+      for (const n of rc.filter((x) => !x.endsWith('.deb')))
+        expect(m.nameCarriesVersion(n, '0.1.0-rc.1'), n).toBe(true);
+      for (const n of rc) expect(m.nameCarriesVersion(n, '0.1.0'), n).toBe(false);
+      for (const n of written) expect(m.nameCarriesVersion(n, '0.1.0-rc.1'), n).toBe(false);
+    },
+    60_000,
+  );
+});
+
 describe('scripts/release-verify.mjs', () => {
   it('the CLI REFUSES an event signed by any key but the SovTech one', () => {
     expect(manifest().status).toBe(0);
@@ -446,6 +718,21 @@ describe('scripts/release-verify.mjs', () => {
         /not a regular file/,
       );
   });
+
+  // Verifier, round 2: `openSync(path, 'r')` waits for a writer on a FIFO, so the fstat refusal
+  // was never reached and the CLI hung. The spawn is bounded: a regression fails, not hangs.
+  it.runIf(process.platform !== 'win32' && hasBin('mkfifo'))(
+    'the CLI refuses a FIFO event file at once, without waiting for a writer',
+    () => {
+      const fifo = join(dir, 'event.fifo');
+      expect(spawnSync('mkfifo', [fifo]).status).toBe(0);
+      const r = runNode('release-verify.mjs', [fifo, ...artifactPaths()], { timeout: 8_000 });
+      expect(r.signal, 'still blocked opening the FIFO when the timeout killed it').toBeNull();
+      expect(r.status).toBe(1);
+      expect(r.stderr).toMatch(/event file is not a regular file/);
+    },
+    30_000,
+  );
 
   it('the CLI refuses the unsigned template and junk', () => {
     expect(manifest().status).toBe(0);

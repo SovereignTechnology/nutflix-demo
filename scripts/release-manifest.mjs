@@ -35,9 +35,10 @@
 //   `packaging/cli.ts make`: exactly the artifacts THAT make produced (the preferred input).
 //   A directory contributes every file under it with a release extension (.deb .AppImage
 //   .dmg .exe .msix .zip .rpm); anything else is skipped (and listed on stderr).
-//   Every artifact name must carry the version (`Nutflix-0.1.0-x64.AppImage`,
-//   `nutflix_0.1.0_amd64.deb`, `Nutflix-0.1.0-Setup.exe` …), so a stale artifact of another
-//   version left in out/make is refused, not signed.
+//   Every artifact name must be exactly one a maker writes for this version (ARTIFACT_SHAPES:
+//   `Nutflix-0.1.0-x64.AppImage`, `nutflix_0.1.0_amd64.deb`, `Nutflix-0.1.0-Setup.exe` …), so a
+//   stale artifact of another version left in out/make, a prerelease one included, is refused,
+//   not signed. A name cannot tell two builds of the SAME version apart: that takes --made.
 //   --out defaults to packages/app-desktop/out/release (gitignored); --version to
 //   @sovit/app-desktop's version; --commit to `git rev-parse HEAD`; --created-at to now.
 import { createHash } from 'node:crypto';
@@ -172,11 +173,50 @@ export function readMadeList(file, version) {
   });
 }
 
-/** Whether `name` carries `version` as a whole field (`-0.1.0-`, `_0.1.0_`, `-0.1.0.`). */
+/**
+ * The file names the makers write: `<prefix><version><tail>`, one of these exact tails (verifier,
+ * round 2: the first rule took ANY `-`, `_` or `.` after the version, so for 0.1.0 it accepted a
+ * stale `Nutflix-0.1.0-rc.1-x64.AppImage` or `Nutflix-0.1.0.1-x64.AppImage`). Pinned by
+ * scripts/__tests__/release.test.ts to packages/app-desktop/packaging and to the real makers:
+ *   appimage  maker-appimage.ts  `${productName}-${version}-${arch}.AppImage`
+ *   dmg       maker-dmg.ts       `${productName}-${version}-${arch}.dmg`
+ *   deb       @electron-forge/maker-deb (electron-installer-debian's default name, no revision)
+ *                                `${name}_${version}_${debianArch(arch)}.deb`
+ *   squirrel  forge-config.ts    `setupExe: ${productName}-${version}-Setup.exe`
+ * `arch` is one of identity.ts BUILD_ARCHES (x64, arm64), the only ones cli.ts builds. No prefix
+ * starts another and no tail ends another, so a name matches only an artifact made for exactly
+ * this version. Squirrel's RELEASES and .nupkg are not release artifacts.
+ * electron-installer-debian writes a prerelease in Debian form (`0.1.0-rc.1` → `0.1.0~rc.1`),
+ * which SAFE_NAME refuses: a prerelease's .deb cannot be released yet (fails closed; ADR 0017 §8).
+ */
+export const ARTIFACT_SHAPES = Object.freeze([
+  Object.freeze({
+    maker: 'appimage',
+    prefix: 'Nutflix-',
+    tails: Object.freeze(['-x64.AppImage', '-arm64.AppImage']),
+  }),
+  Object.freeze({
+    maker: 'dmg',
+    prefix: 'Nutflix-',
+    tails: Object.freeze(['-x64.dmg', '-arm64.dmg']),
+  }),
+  Object.freeze({
+    maker: 'deb',
+    prefix: 'nutflix_',
+    tails: Object.freeze(['_amd64.deb', '_arm64.deb']),
+  }),
+  Object.freeze({ maker: 'squirrel', prefix: 'Nutflix-', tails: Object.freeze(['-Setup.exe']) }),
+]);
+
+/** Every name a maker writes for `version` (none for a malformed version). */
+export function releaseArtifactNames(version) {
+  if (typeof version !== 'string' || !VERSION.test(version)) return [];
+  return ARTIFACT_SHAPES.flatMap((s) => s.tails.map((t) => `${s.prefix}${version}${t}`));
+}
+
+/** Whether `name` is exactly a name a maker writes for `version` (ARTIFACT_SHAPES). */
 export function nameCarriesVersion(name, version) {
-  if (!VERSION.test(version)) return false;
-  const esc = version.replace(/[.+]/g, (c) => `\\${c}`);
-  return new RegExp(`(?:^|[-_])${esc}(?:[-_.]|$)`).test(name);
+  return releaseArtifactNames(version).includes(name);
 }
 
 export function sumsText(artifacts) {
@@ -226,7 +266,9 @@ export async function buildManifest(paths, { version, commit, createdAt }) {
     if (!SAFE_NAME.test(name)) throw new Error(`unsafe artifact name: ${JSON.stringify(name)}`);
     if (!nameCarriesVersion(name, version))
       throw new Error(
-        `${name} does not carry version ${version}: a stale artifact? Use the make's own list ` +
+        `${name} does not carry version ${version} in a name a maker writes ` +
+          `(${ARTIFACT_SHAPES.map((sh) => `${sh.prefix}${version}{${sh.tails.join(',')}}`).join(' ')}): ` +
+          "a stale artifact? Use the make's own list " +
           '(--made out/make/<platform>-<arch>.artifacts.json) or empty out/make',
       );
     if (seen.has(name)) throw new Error(`two artifacts named ${name}`);
