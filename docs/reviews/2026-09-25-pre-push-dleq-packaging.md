@@ -233,3 +233,312 @@ file) and the whole file was run:
 - **R-5 [Info].** Production shows the thread in use only when a seller receives its first PAY
   (the info line), or when none could start (the warn). A viewer never loads the thread, as
   designed.
+
+## Cross-lane review (round 4)
+
+Findings: the cross-lane worker/P2P review, the I1 verifier and the test-integrity lens, on this
+branch (`e55adf0`: the I1 fix on the Stage 3 integration head, with F33 #1, residuals #8 and
+images over Pear #5). The orchestrator ruled on each finding; its decisions are applied below.
+Cameron's rule for images: a thumbnail or avatar URL naming a paid core must never get the viewer
+banned or charged, and browsing never spends sats. Each finding was reproduced by a test on the
+unfixed code before it was fixed. The lane's `.lane` was widened to `packages/seeder/`,
+`packages/gateway/src/` and `packages/core/src/mocks/` for this round (the last was not needed).
+
+| # | Finding | Outcome |
+|---|---|---|
+| 1 | HIGH — `image.fetch` downloads any core a thumbnail URL names, unrouted and unpaid: the seeders of a paid video ban the viewer | **fixed** |
+| 2 | HIGH — one core's PAY failure aborts `payPending` for the whole peer | **fixed** |
+| 3 | HIGH — blocks owed at `play.close` or quit are never paid; the next start overruns the seeder | **fixed** (IR4 stays a residual) |
+| 4 | MEDIUM — `image.fetch` marks a paid core free on our own seeder, and the mark outlives `serveImages` off | **fixed** |
+| 5 | MEDIUM — a core closed by `closeCoreByKey` and reopened gets no upload gate | **fixed** |
+| 6 | LOW — a profile replica opened with serving off still counts image blocks and can ban | **fixed** |
+| 7 | MEDIUM (I1 verifier) — `Bare.exit` hangs on a parked DLEQ thread after an uncaught exception | **fixed** (R-4 closed) |
+| 8 | INFO — `releaseImageCore` can close a core under a concurrent `playOpen` | **fixed** |
+| 9 | INFO — routed cores are never detached on the desktop | **deferred** |
+| 10 | INFO (test lens) — the end-to-end "never raced" tests do not detect a racing hotswap queue | **fixed** (a test) |
+| 11 | INFO (test lens) — the real-mint blob wait went from 30 s to 60 s with no reason given | **fixed** (a comment) |
+| 12 | INFO (test lens) — a dist-gated skip; app-desktop tests read siblings from `dist` | **deferred** |
+| 13 | INFO (test lens) — a stale test title ("half the credit pool") | **fixed** |
+
+### 1. `image.fetch` and paid cores (HIGH) — fixed
+
+**Reproduced.** The new `images-paid-core.integration.test.ts` runs the reviewer's probe on the
+dev fixture rig: S1 and S2 seed a 16-block paid video, the worker has seeding off, and one
+`image.fetch` names the video's core. With the pre-fix `worker/host.ts` it fails with
+`s1 bans: expected [ {…} ] to deeply equal []`: both fixture seeders banned the viewer, as the
+reviewer measured (`{ uploaded: 6, paid: 0, windowBlocks: 5, banned: true }`).
+
+**The mechanism** (design and trade-offs in `docs/contract-requests/I1-dleqpack.md`):
+
+- **Refusal of known sold cores** (`WorkerHost.soldCore`). `image.fetch` refuses, before anything
+  is opened, any core that is:
+  - in `corePolicies` (a video played or opening; the policy is set before `playOpen` awaits);
+  - in `coresAttached`;
+  - priced by our own seeder (`corePolicyMap`: uploads, played cores);
+  - PRICEd by a seeder on the image path while no seeder served it free.
+
+  It checks again after the open is awaited.
+- **Image cores are routed** (`ViewerPayer.attachImageCore` → `SeederCredit.attachImageCore`, on
+  the same `OnePeerRouter`). For each `pay/1` seeder:
+  - its budget on an image core is its BARE window, less what it may already count: owed and
+    unpaid blocks, and (through the router's `used`) everything in flight on any core. So even a
+    seeder that counts every image block stays within its window, and **no `pay/1` seeder is
+    asked for more than its window by any path** (invariant 1);
+  - until it has delivered one block of the core with no `PRICE` before it, it is asked one
+    block at a time (new router option `probe`);
+  - a seeder that sent a `PRICE` for the core is never asked for it again (remembered per
+    seeder, across reconnects), and blocks it delivered after its `PRICE` are unpaid for good.
+
+  No seeder without a HELLO is asked anything. A peer without `pay/1` keeps the old bounded burst.
+  The payer and settler never watch image cores, so nothing is ever paid for them.
+- **The signal.** A seeder that counts a core's blocks announces the core's price before the first
+  one (`announceCorePrices`). This round turns it on everywhere this repository builds a seeder:
+  - the desktop worker, dev mocks included (it was on only with real payments);
+  - the dev fixture seeders;
+  - the gateway;
+  - the daemon (`runDaemon`, unless its config says otherwise).
+
+  The `Seeder` default stays off, as its own test pins. A free core returns before the hook, so
+  it never gets a `PRICE`.
+- **The read stops** as soon as a seeder PRICEs the core (`onImageVerdict` → the host rejects the
+  reads in flight with `forbidden`). The replica is released even while serving images, and the
+  core is refused from then on, unless a seeder has served it free.
+- **Free marking** (findings 4 and 6):
+  - the image path marks free only a replica it opened itself (`entry.opened`), and does so
+    while the replica is open, whatever the serving setting;
+  - the mark is dropped only after the replica is closed;
+  - `Seeder.setFreeCore` refuses a core with its own price policy, and `setCorePolicy` clears
+    the mark.
+
+**Invariants, with their tests** (`images-paid-core.integration.test.ts` unless named):
+
+1. No `pay/1` seeder is asked for more than its window, through any path. The reviewer's probe:
+   each fixture seeder uploads at most one block, `outstanding ≤ windowBlocks`, nobody is banned
+   and nothing is paid, and the viewer counts every block they may count. Unit tests:
+   `seeder-credit.test.ts` "image cores" (4 tests) and `one-peer-router.test.ts` "the probe
+   option".
+2. `image.fetch` refuses sold or attached cores, and never marks free a core it did not open.
+   Covered by:
+   - "a second read … refused at once" (nothing opened, nothing uploaded, under 2 s);
+   - "once played, the core is refused as an image, and it is never marked free";
+   - `seeder.test.ts` "setFreeCore refuses a core with its own price policy…".
+3. Honest free profile-core serving keeps working. `images-over-pear.integration.test.ts` is
+   unchanged and green. "An honest free image larger than the seeder's window loads" (6 blocks
+   against a window of 4) covers images larger than a window.
+4. Honest free image fetches do not erode paid playback credit. The same test finds S1 counting
+   nothing, and the viewer's `unpaid` and S1's router debt still at 0. "The video still plays in
+   full from the same seeders afterwards" then streams the paid video from S1 and S2 with every
+   downloaded block paid and nobody banned.
+
+### 2. The gateway payer (HIGH) — fixed
+
+**Reproduced.** The reviewer's probe as a unit test (`upstream-payer.test.ts`, "a PAY that cannot
+be built", first case): an engine rejecting CORE_A `session-closed`, one CORE_A block pending,
+then 4 CORE_B blocks under a per-seeder batch of 2. Before the fix, `expected [] to deeply equal
+[0, 1, 2, 3]`: no CORE_B PAY at all.
+
+**Fix** (`UpstreamPayer.payPending` and `payFailed`):
+
+- `engine.pay` is caught per core, and the peer's other cores are paid in the same pass.
+- The failure is logged by its outcome code only (`payOutcome`: the `<code>:` prefix or a `code`
+  field). No core, peer or message text goes in the log.
+- `session-closed` (every pending block of that core) and `forbidden` (the range) are final, and
+  so is a third failure in a row (`MAX_PAY_FAILURES`). Those blocks are given up: never paid,
+  replay-guarded, and reported through the new `onUnpayable`. `ViewerPayer` and the gateway wire
+  it to the new `CreditSettler.settleUnpaid`, which settles them now as UNPAID. The pool unit
+  comes back, and `SeederCredit` keeps the blocks off that seeder's credit for good, so the debt
+  is explicit.
+- Any other outcome keeps the blocks owed. They are retried once per `flush()` or tail timer (an
+  epoch), not on every pass the other cores cause.
+
+Tests: 4 in `upstream-payer.test.ts` (the probe; a transient failure retried; giving up after
+three; the log carries the code only) and 1 in `viewer-payer.test.ts` (settled unpaid, the
+seeder's budget less one, the other core paid).
+
+### 3. Owed blocks at `play.close` and at quit (HIGH) — fixed
+
+**Reproduced** in `desktop-pays.integration.test.ts`: real payment providers, the host's real
+money plane, a real seeder daemon. With the pre-fix `worker/host.ts`:
+
+- "A tail pending at `play.close` is paid before `play.close` answers" failed with `outstanding: 5`
+  (expected 0).
+- "A quit mid-video pays its tail" failed.
+- "The next start does not overrun the seeder" failed.
+
+`topup-host.test.ts` "pay.build during play.close is paid" (real money plane, fake worker) failed
+with the pre-fix host `sessions.ts`/`adapter.ts`: `expected [ 'session-closed' ] to deeply equal
+[ 'paid' ]`.
+
+**Fix** — the close is ordered so the flush completes first, each step bounded:
+
+- **Worker.**
+  - `closeSession` closes the gate and the link at once. It keeps the session (closed to the host,
+    but still found by `sidFor`) while `ViewerPayer.drain` pays and settles its core's tail,
+    bounded by `CLOSE_DRAIN_MS` (5 s): every PAY ACKed, nothing owed, nothing of the core in
+    flight (new `CreditSettler.owedOn` and `OnePeerRouter.inflightOn`).
+  - `play.close` answers only after the drain.
+  - `sidFor` prefers an open session of the core and falls back to a closing one.
+  - `close()` drains every session in parallel BEFORE the sessions go and before `node.destroy`.
+  - Blocks still owed after the bound are settled as unpaid (finding 2).
+- **Host.**
+  - `HostPlaySession.closeAsync` closes to the renderer at once. The new `onSettled` hooks, where
+    the adapter now revokes the money-plane session, run only after the worker answered
+    `play.close`, or when that call failed or the worker is gone.
+  - At quit, the host's SIGTERM runs `Host.shutdown(QUIT_FLUSH_MS = 7 s)`, which closes every
+    session through the worker (`SessionRegistry.closeAll`) before stopping it.
+- **Main.** `before-quit` holds the quit once, lets the host exit
+  (`HostLink.stopAndWait(QUIT_GRACE_MS = 9 s)`), then quits.
+
+Tests:
+
+- `desktop-pays` × 3 (above);
+- `topup-host` × 1;
+- `adapter-play` × 4: settle after the answer; settle on failure or worker gone, once; adapter
+  order; `shutdown` closes every session through the worker;
+- `host-link.test.ts` × 1 (`stopAndWait`);
+- `main-wiring.test.ts` "before-quit…", extended. It used to call the listener without an event;
+  Electron always passes one. The kill and the no-respawn assertions stay, and it now also
+  checks that the quit waits for the host's exit.
+
+**IR4 stays a residual.** Debts across a crash are the seeder's own count, and only the v7
+ACK-window request (S3-f33) fixes them. A graceful quit now pays its tail; a crash does not.
+
+### 4–6. Free marking, the reopened gate, serving-off replicas — fixed
+
+- **4 (MEDIUM).** Covered in 1. Tests: `seeder.test.ts` (the free-core rules) and
+  `images-paid-core` step 5.
+- **5 (MEDIUM).** `Seeder` keys its upload gates by the Hypercore SESSION: a reopen attaches a new
+  gate. `BlobStore.closeCoreByKey` also reports the close (new `onCoreClosed`), and the gate goes
+  with its session. Test: `seeder.test.ts` "a core closed by closeCoreByKey and reopened … gets
+  its upload gate back". It checks `listenerCount('upload')` as the reviewer's probe did, and
+  that `recordUpload` records a served block. Before the fix: `expected +0 to be 1`.
+- **6 (LOW).** A replica the image path opened is free while open, served or not. Test: the
+  honest-image case spies on `setFreeCore` with seeding off, and sees `[core, true]` then, once
+  closed, `[core, false]`.
+
+### 7. `Bare.exit` and a parked DLEQ thread (MEDIUM, I1 verifier) — fixed
+
+`pay/dleq-thread.ts` keeps a module-level registry of live mailboxes: added at `start()` after
+the spawn, removed once the reap ends. The new synchronous `quitDleqThreadsNow()` stores QUIT
+and notifies on each one. `worker/exit.ts` `exitWorker(code)` calls it, then `Bare.exit`.
+`entry.ts` uses it on every exit that does not follow `host.close()`:
+
+- the uncaught-exception handler;
+- a corrupt frame;
+- the shutdown force timer;
+- the normal end.
+
+Test: `bare-exit.test.ts`, under real Bare through bare-sidecar, with the built worker. The real
+`entry.js` installs its handlers, a real `bareDleqThread()` thread answers 4 checks and parks,
+and an uncaught exception is thrown. Before the fix the process was `hung` 5 s later and had to
+be SIGKILLed; now it exits 1 in milliseconds. Node unit tests in `dleq-thread.test.ts` show a
+parked thread seeing QUIT and leaving, the registry forgetting it, and `exitWorker` quitting
+threads before it exits. R-4 is closed: the verifier was right that this diff made it reachable
+in shipped builds.
+
+### 8–13. The INFO items
+
+- **8 — fixed.** `releaseImageCore` leaves a core with a policy (a play open sets it before any
+  await) as well as an attached one. `playOpen` refuses (`rate-limited`, retryable) a core with
+  an image read in flight. Test: "a play open racing the release of an image replica keeps it
+  open". A profile core is named as a video, and `serveImages` is switched off while the open
+  awaits; the core stays open, is no longer free, and plays.
+- **9 — deferred.** Detaching a routed core when no session plays it touches the new drain (a
+  closing session's in-flight blocks must still be routed and settled), parking, and the
+  settler's owed blocks. It is not cheap or safe in this round. Per-seeder caps hold, so the cost
+  is extra `updateAll` work and smaller batches, bounded by the videos played in one run.
+- **10 — fixed.** New `one-peer-router.test.ts` case: one seeder withholds the blocks it was
+  asked, a second has spare capacity, and hypercore consults the queue for it on every pass.
+  Each block is sent once, with no failover and nothing raced. The reviewer's mutation (the queue
+  offering every in-flight block at once) fails it, together with two stall-timing tests.
+- **11 — fixed.** A comment at the 60 s read deadline: routed pacing (each seeder is asked again
+  only after a real-mint PAY round trip) and small windows. It is an in-test deadline, not a
+  vitest timeout.
+- **12 — deferred.** Failing instead of skipping (`NUTFLIX_REQUIRE_BUILT`) is only useful once CI
+  sets it, and CI is the root `package.json`, outside this lane. The root `ci` script already
+  builds before `npm test`, and this round's gates build with `tsc -b --force` first. The new
+  real-Bare test uses the same dist gate.
+- **13 — fixed.** The title now reads "half the seeder's window", with a comment.
+
+### Mutation checks (round 4)
+
+Each mutation was applied alone and the named tests were run, then the file was restored (and
+`tsc -b` re-run where a consumer reads `dist`). The runner was a script in the scratchpad.
+
+| # | Mutation | Result |
+|---|---|---|
+| P1 | `payPending` rethrows a PAY failure (no per-core catch) | caught: 4 `upstream-payer` tests |
+| P2 | a final outcome is kept pending (never given up) | caught: 3 `upstream-payer` tests |
+| P3 | `ViewerPayer` does not settle unpayable blocks | caught: `viewer-payer` "a core whose session is gone" |
+| S1 | the gate attached only when none is recorded for the key | survived alone (see S1c) |
+| S1b | `closeCoreByKey` does not report the close | survived alone (see S1c) |
+| S1c | both (the original bug) | caught: `seeder.test` "…gets its upload gate back" |
+| S2 | `setFreeCore` marks a priced core free | caught: `seeder.test` free-core rules |
+| S3 | `setCorePolicy` leaves the free mark | caught: same |
+| C1 | image cores get the old unrouted no-pay burst | caught: 2 `seeder-credit` image tests (and `images-paid-core`) |
+| C2 | no probe | caught: 4 tests (`seeder-credit`, `images-paid-core`) |
+| C3 | a PRICE on an image core is ignored | caught: `seeder-credit` "a seeder that PRICEs the core" |
+| C4 | blocks after a PRICE not counted unpaid | caught: same |
+| R1 | the router ignores `probe` | caught: `one-peer-router` "the probe option" |
+| R2 | the no-race queue offers every in-flight block (the reviewer's mutation 1) | caught: the new spare-seeder case, and 2 stall-timing tests |
+| H1 | no sold-core refusal at the start of `image.fetch` | caught: "a second read … refused at once" (nothing opened) |
+| H2 | image cores not routed | caught: the reviewer's probe, and 2 more |
+| H3 | an image replica marked free only while serving (the old rule) | caught: the honest-image case |
+| H4 | `closeSession` deletes the session before its drain | caught: 3 `desktop-pays` tests |
+| H5 | `sidFor` ignores a closing session | caught: 3 `desktop-pays` tests |
+| A1 | fixture seeders do not announce core prices | caught: the reviewer's probe, and 2 more (the interim rests on the signal) |
+| D1 | `quitDleqThreadsNow` tells nobody | caught: `bare-exit` and 2 `dleq-thread` tests |
+| D2 | the entry exits through `Bare.exit` on an uncaught exception | caught: `bare-exit` |
+| HS1 | the session settles (is revoked) before `play.close` answers | caught: `adapter-play` and `topup-host` |
+| HS2 | `Host.shutdown` stops without closing the sessions | caught: `adapter-play` "quit: …" |
+| HL1 | `stopAndWait` does not wait for the exit | caught: `host-link` |
+| I1 | `releaseImageCore` ignores the play claim (policy) | caught: "a play open racing the release…" |
+| — | whole-file reverts to `e55adf0`: `worker/host.ts`; host `sessions.ts` + `adapter.ts` | caught: the reproductions under 1, 3 |
+
+**Survivors.** S1 and S1b are two independent layers for the reopened gate: the session-keyed
+check, and the close report from `closeCoreByKey`. Each alone restores the gate, so only their
+conjunction (S1c, the original bug) fails the test. Both are kept (defence in depth). No path in
+this repository closes a by-key core other than `closeCoreByKey`, so the session key has no
+separate test. H1 survived its first run, because the post-open re-check also refuses. The test
+now also asserts that nothing is opened, and the rerun was caught.
+
+### Gates (round 4)
+
+- Touched packages: `npx vitest run packages/seeder packages/gateway --maxWorkers=2` gave 45
+  files passed, 1 skipped (393 tests passed, 4 skipped). `packages/app-desktop scripts/__tests__`
+  showed one failure: `main-wiring.test.ts` "before-quit…" called the listener without the event
+  Electron passes. The test was extended (see 3), rerun and passed, and the whole suite below
+  covers the package again.
+- Whole suite, once: `npx vitest run --maxWorkers=2` gave 206 files passed, 3 skipped; 3144 tests
+  passed, 21 skipped, 0 failed. The skips are the real-mint suites gated on
+  `NUTFLIX_REAL_MINT_URL`.
+- `npx tsc -b --force`: clean. `eslint` and `prettier --check` on every changed file: clean.
+- `npm run check:locked`: OK (no locked path touched). `npm run lint:electron`: OK, 0 violations.
+- The Electron e2e was not run (per the brief).
+- No test was deleted or weakened. Changed assertions:
+  - the F5 batching test's title;
+  - `main-wiring.test.ts` "before-quit…", which now passes an event and asserts more.
+
+  Timeouts: the real-mint read deadline got a comment only; the new tests' in-test deadlines are
+  their own.
+
+### Residuals (round 4)
+
+- **IR4.** Debts across a crash or restart are the seeder's own count, and only the v7
+  ACK-window request (S3-f33) fixes them. A graceful quit or close now pays its tail; a crash
+  does not.
+- **The interim signal** (`docs/contract-requests/I1-dleqpack.md`). Invariant 1 on image reads
+  rests on every seeder announcing a counted core's price before its first block. A seeder that
+  counts in silence (announcing off, an older build, a third-party implementation, or a seeder
+  with no policy at all for the core) is taken as free after the probe block, and can still cut
+  the viewer. The request asks v7 for an explicit `PRICE.free` so that silence means "counted".
+- **One probe block per seeder of a sold core** is unpaid for good, since browsing never pays. An
+  attacker who publishes many thumbnails naming DIFFERENT paid cores of one seeder can use up that
+  seeder's credit for the run, one block per core, without a ban or a sat spent. The v7 window
+  report or the explicit signal removes this.
+- **Windows quit.** The quit flush runs on SIGTERM (`utilityProcess.kill()`), which is graceful on
+  Linux and macOS only. On Windows a quit still leaves the tail owed, as before.
+- **Non-`pay/1` peers** are asked one image block at a time for good (never proven free): slower
+  images from such peers, with no correctness cost.
+- **Finding 9** (routed cores never detached) and **finding 12** (the dist-gated skip): deferred,
+  see above.
