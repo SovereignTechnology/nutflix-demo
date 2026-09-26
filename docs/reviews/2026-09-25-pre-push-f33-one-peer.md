@@ -366,3 +366,55 @@ at the mint.
   `:3397`).
 - `npx tsc -b --force`, eslint and prettier on every changed file, `npm run check:locked`,
   `npm run lint:electron`: clean.
+
+## Fix round 2 (2026-09-25): an independent verifier's finding
+
+An independent verifier checked the fix pass above. It raised one finding (info, latent), and it
+is fixed.
+
+| # | Severity | Finding | Outcome |
+|---|---|---|---|
+| V1 | Info (latent) | A parked core taken over by a router did not start the failover ticker for blocks its queue still tracked. `route()` took the parked `NoRaceQueue` back through `unpark()` and `rebind(host)`, but the ticker starts only from the queue's `add()`. Scenario: a core is detached (parked) while block b is in flight at seeder S0, then re-attached. S0 is at its cap and nothing new is queued, so no ticker runs. If S0 withholds b, b never fails over, and the read waits until its timeout. | **Fixed.** `route()` calls `armTicker()` when the installed queue already tracks blocks (`queue.size > 0`), after the route and its peers are in place (`one-peer.ts` `route()`). The module comment now says a taken-over core's blocks in flight fail over like any other. |
+
+Production detaches only at shutdown, so no current caller reaches this path. That is why the
+finding is latent. The round-1 self-review said "Parking is one-way per router": a read of a
+parked core waits. That still holds while the core is parked. A takeover now fully resumes
+routing, including failover for blocks already in flight.
+
+### Test added (+2 cases, one `it.each`)
+
+- **Seeder `one-peer-router.test.ts`: "a core parked with a block in flight and taken over by
+  {the same router, another router}: the withheld block still fails over".**
+  - Setup: two seeders and `stallMs` 300. Seeder 0 has budget 1 and takes block 2, which its
+    link holds back. The router detaches, and the test waits one `stallMs` so the first router's
+    ticker finds no route and stops.
+  - Takeover: seeder 1 gets budget 4, the core is attached again (by the same router or a new
+    one), and `refresh()` runs. `refresh()` runs no hotswap step, so only the ticker can move the
+    block.
+  - Assertions: the `get` resolves within 3 s, with one failover from seeder 0 to seeder 1.
+    Downloads are `[{ index: 2, from: s1 }]` and uploads `[1, 1]`.
+  - It also pins the debt. Seeder 0 owes 1 through another router and 2 through the same one:
+    the known conservative double count of a detach followed by a re-attach, which round 1's
+    self-review records. The comment in the file cites it.
+
+### Mutation check
+
+| # | Mutation | Failing test |
+|---|---|---|
+| M43 | `route()` does not arm the ticker for a taken-over queue (the pre-fix code) | Both new cases: "still pending after 3000 ms", with the rest of the suite passing (2 failed, 19 passed). Run before the fix, and again against the final test with the fix line removed and then restored. |
+
+### Commands
+
+- `npx vitest run packages/seeder/src/__tests__/one-peer-router.test.ts`: 21 passed, ×3 in a row.
+- `npx vitest run packages/seeder packages/gateway packages/app-desktop/src/worker`: 62 files
+  (61 passed, 1 skipped); 502 passed, 4 skipped.
+- `npx tsc -b --force`, eslint and prettier `--check` on both changed files, and
+  `npm run check:locked`: clean. `app-desktop` did not change, so `lint:electron` was not needed.
+  The Electron e2e was not run (the orchestrator's).
+
+### Self-review
+
+- **Scope.** One guarded call in a private method. It only arms a ticker the router already owns.
+  The ticker is `unref`'d, no-ops once the router is closed, and stops itself on the first tick
+  where no route tracks a block.
+- **Unchanged.** No new log line or logged field, no locked path, no import, no IPC.
