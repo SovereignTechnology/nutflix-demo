@@ -31,6 +31,8 @@ import type {
 } from '@sovit/core';
 import { mocks, nostr, signer as signerMod, wallet as walletMod } from '@sovit/core';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { readFile } from 'node:fs/promises';
+import { join } from 'node:path';
 
 import { isHostOut } from '../../ipc/guards.js';
 import type { HostOut, PromptForm, ReplyMsg, SessionId } from '../../ipc/protocol.js';
@@ -38,6 +40,7 @@ import { IPC_V } from '../../ipc/protocol.js';
 import { SignerIdentity } from '../identity.js';
 import { memoryLogger } from '../log.js';
 import { MoneyPlane } from '../money.js';
+import { TOP_UP_LEDGER_FILE } from '../topup/ledger.js';
 import { seedVideos } from './support/catalog.js';
 import { coreTestKit } from './support/core-helpers.js';
 import type { Rig } from './support/rig.js';
@@ -82,6 +85,9 @@ interface World {
   readonly asked: PromptForm[];
   readonly lightning: mocks.TestLightning;
   readonly stranger: mocks.TestMint;
+  /** The top-up's source and target mints (round 4: a melt answered PENDING). */
+  readonly source: mocks.TestMint;
+  readonly target: mocks.TestMint;
   readonly trusted: VideoManifest;
   readonly foreign: VideoManifest;
   /** A video paid at two of the user's trusted mints. */
@@ -146,7 +152,7 @@ async function world(
   first.close();
 
   const asked: PromptForm[] = [];
-  const w = { asked, lightning, stranger, answer: true } as unknown as World;
+  const w = { asked, lightning, stranger, source, target, answer: true } as unknown as World;
   let t = 1_800_000_000_000;
   const rr = await rig({
     pool,
@@ -494,5 +500,58 @@ describe('every desktop melt goes through the PAY/melt gate (lane I2-paygate, AD
       entered.mockRestore();
       started.mockRestore();
     }
+  }, 30_000);
+});
+
+describe('cross-lane review round 4 through the whole host', () => {
+  it('a funding melt answered PENDING while the target already has the payment: its quote is kept sealed to the identity, the next play mints it once and goes ahead — no second melt', async () => {
+    const w = await world();
+    r = w.r;
+    w.source.holdNextMelt(1, { lightning: 'now' });
+    const first = await invoke(w.r, 'play', [w.trusted.id]);
+    expect(!first.ok && first.error.code).toBe('no-balance');
+    expect(w.lightning.paid).toHaveLength(1);
+    // Kept on the ledger entry, sealed (NIP-44 to self through the signer): no invoice in the clear.
+    const file = await readFile(join(w.r.userData, TOP_UP_LEDGER_FILE), 'utf8');
+    const saved = JSON.parse(file) as {
+      entries: { state: string; owner?: string; open?: string }[];
+    };
+    expect(saved.entries).toMatchObject([{ state: 'unknown' }]);
+    expect(saved.entries[0]?.owner).toMatch(/^[0-9a-f]{64}$/);
+    expect(saved.entries[0]?.open).toMatch(/^[A-Za-z0-9+/=]+$/);
+    expect(file).not.toMatch(/lnbc/);
+    expect(Buffer.from(saved.entries[0]?.open ?? '', 'base64').toString('latin1')).not.toMatch(
+      /lnbc|quoteId/,
+    );
+
+    const second = await invoke(w.r, 'play', [w.trusted.id]);
+    expect(second.ok).toBe(true);
+    expect(await balance(w.r, TARGET)).toBe(2_000);
+    expect(w.lightning.paid).toHaveLength(1); // never paid twice
+    expect(w.asked).toHaveLength(1);
+    expect(JSON.stringify(w.r.log.lines)).not.toMatch(/topup-host\.test|lnbc/);
+  }, 30_000);
+
+  it('a play at zero balance waits for a slow top-up only playWaitMs past the question: no-balance at once, the top-up finishes in the background, the next play goes ahead', async () => {
+    const t = holding();
+    const w = await world({ wrap: t.wrap, hooks: { playWaitMs: 50 } });
+    r = w.r;
+    t.hold((mint, path) => mint === SOURCE && path === 'POST /v1/melt/bolt11');
+    const started = Date.now();
+    const first = await invoke(w.r, 'play', [w.trusted.id]);
+    expect(!first.ok && first.error.code).toBe('no-balance');
+    expect(!first.ok && first.error.message).toMatch(/a top-up is on its way/);
+    expect(Date.now() - started).toBeLessThan(10_000);
+    const melt = await t.next(); // the Lightning payment still in flight
+    t.hold(null);
+    melt.release();
+    await vi.waitFor(
+      async () => {
+        expect(await balance(w.r, TARGET)).toBe(2_000); // minted in the background
+      },
+      { timeout: 10_000 },
+    );
+    expect((await invoke(w.r, 'play', [w.trusted.id])).ok).toBe(true);
+    expect(w.lightning.paid).toHaveLength(1);
   }, 30_000);
 });

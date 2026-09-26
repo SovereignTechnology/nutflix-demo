@@ -22,16 +22,22 @@ import type {
 } from '@sovit/core';
 import { NostrKind, mocks, nostr, payProtocol, payment, signer as signerMod } from '@sovit/core';
 import { describe, expect, it } from 'vitest';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 import {
   MELT_REQUEST_TIMEOUT_MS,
   PAY_BUILD_START_BY_MS,
   WORKER_HOST_REQUEST_TIMEOUT_MS,
+  payBuildStartByMs,
 } from '../../ipc/deadlines.js';
 import type { SessionId } from '../../ipc/protocol.js';
 import { memoryLogger } from '../log.js';
 import { MoneyPlane, sessionBudgetBlocks } from '../money.js';
 import { MELT_AT_MINT, PAY_TOO_LATE } from '../pay-melt-gate.js';
+import { TopUpLedger } from '../topup/ledger.js';
+import { serializeOpenTopUp } from '../topup/open-topup.js';
 
 const MINT = 'https://mint.money.test' as MintUrl;
 const OTHER_MINT = 'https://mint-other.money.test' as MintUrl;
@@ -662,6 +668,129 @@ describe('MoneyPlane: PAY builds and melts never overlap at a mint (ADR 0012 ame
     expect(one.done).toBe(true);
     expect(two.error).toMatchObject({ code: 'payments-unavailable' });
     expect(u.reached.filter((r) => isSwap(r.path)).length).toBeLessThanOrEqual(2);
+  });
+
+  it("round 4 (I2 verifier): a melt timed out at the mint leaves its journal entry — a PAY queued behind another is refused before any swap once past that PAY's reduced belt", async () => {
+    let now = 0;
+    const clock = (): number => now;
+    const t = holding(clock);
+    const { plane, h } = await rig({ fund: 200, wrap: t.wrap, clock });
+    plane.authorizeSession(SID, { core: CORE, blob: BLOB, policy: POLICY }, CREATOR);
+    const q = await plane.wallet.meltQuote(MINT, 'lnbc350n1paygate');
+    t.hold((p) => p === 'POST /v1/melt/bolt11');
+    const melt = observe(plane.wallet.melt(q));
+    const held = await t.next();
+    t.hold(null);
+    now += MELT_REQUEST_TIMEOUT_MS;
+    held.fail(new NetworkError(`timed out after ${String(MELT_REQUEST_TIMEOUT_MS)} ms`));
+    await settleIo();
+    expect(melt.error).toMatchObject({ code: 'mint-error' });
+    // Its outcome unknown: the melt stays journaled at the mint.
+    expect(await plane.topUpVault().meltPending(MINT, q.quoteId)).toBe(true);
+
+    t.hold(isSwap);
+    const first = observe(h['pay.build']!(build()));
+    const inFlight = await t.next(); // PAY 1 at the wallet at once (in time), its first send held
+    t.hold(null);
+    const second = observe(
+      h['pay.build']!(build({ range: { core: CORE, fromBlock: 12, toBlock: 13 } })),
+    );
+    await settleIo();
+    expect(second.done).toBe(false); // waiting its turn
+    // Past the belt of a PAY with one entry at a loaded mint — long inside the fixed 105.6 s one.
+    now += payBuildStartByMs(1, true) + 1;
+    expect(payBuildStartByMs(1, true) + 1).toBeLessThan(PAY_BUILD_START_BY_MS);
+    inFlight.release();
+    await settleIo();
+    await settleIo();
+    expect(first.error).toBeUndefined();
+    expect(second.error).toMatchObject({
+      code: 'rate-limited',
+      message: `rate-limited: ${PAY_TOO_LATE}`,
+    });
+    expect(t.reached.filter((r) => isSwap(r.path))).toHaveLength(2); // PAY 1's two sends only
+    // Each of PAY 1's sends settled the entry first (restore, check), as the model counts.
+    const calls = t.reached.map((r) => r.path);
+    const firstSwap = calls.indexOf('POST /v1/swap');
+    expect(calls.slice(firstSwap - 2, firstSwap)).toEqual([
+      'POST /v1/restore',
+      'POST /v1/checkstate',
+    ]);
+  });
+
+  it('round 4: two journal entries left at a mint — no start is early enough, so every PAY there is refused at once, nothing spent', async () => {
+    const t = holding();
+    const { plane, h } = await rig({ fund: 400, wrap: t.wrap });
+    plane.authorizeSession(SID, { core: CORE, blob: BLOB, policy: POLICY }, CREATOR);
+    for (const invoice of ['lnbc350n1paygate', 'lnbc360n1paygate']) {
+      const q = await plane.wallet.meltQuote(MINT, invoice);
+      t.hold((p) => p === 'POST /v1/melt/bolt11');
+      const melt = observe(plane.wallet.melt(q));
+      (await t.next()).fail(new NetworkError('timed out'));
+      t.hold(null);
+      await settleIo();
+      expect(melt.error).toMatchObject({ code: 'mint-error' });
+    }
+    const balance = await plane.wallet.balance(MINT);
+    const swaps = t.reached.filter((r) => isSwap(r.path)).length;
+    expect(await code(h['pay.build']!(build()))).toBe('rate-limited');
+    expect(t.reached.filter((r) => isSwap(r.path)).length).toBe(swaps);
+    expect(await plane.wallet.balance(MINT)).toBe(balance);
+  });
+
+  it('round 4: topUpVault — sealed to the identity (NIP-44 through its signer), which another identity cannot open; the journal and the mint say where a melt stands; a closed plane refuses', async () => {
+    const t = holding();
+    const { plane, mint } = await rig({ fund: 200, wrap: t.wrap });
+    const v = plane.topUpVault();
+    expect(v.owner).toBe(plane.pubkey);
+    expect(v.recovery()).toBe(plane.recovery);
+    const sealed = await v.seal('{"quoteId":"q-secret-1"}');
+    expect(sealed).not.toContain('q-secret-1');
+    expect(sealed).toMatch(/^[A-Za-z0-9+/=]+$/);
+    expect(await v.unseal(sealed)).toBe('{"quoteId":"q-secret-1"}');
+    const stranger = await rig();
+    await expect(stranger.plane.topUpVault().unseal(sealed)).rejects.toThrow();
+    // The largest record the ledger keeps, sealed, still fits its bound (and is stored by it).
+    const largest = serializeOpenTopUp({
+      quote: {
+        mint: `https://${'m'.repeat(499)}.test` as MintUrl,
+        quoteId: 'q'.repeat(256),
+        amount: 10_000,
+        bolt11: `lnbc${'q'.repeat(4092)}`,
+        expiry: Number.MAX_SAFE_INTEGER,
+        state: 'UNPAID',
+      },
+      melt: { mint: `https://${'s'.repeat(499)}.test` as MintUrl, quoteId: 'm'.repeat(256) },
+      before: {
+        newest: Number.MAX_SAFE_INTEGER,
+        ids: Array.from({ length: 20 }, () => 'ab'.repeat(32)),
+      },
+    });
+    const sealedMax = await v.seal(largest);
+    const dir = await mkdtemp(join(tmpdir(), 'nf-money-ledger-'));
+    try {
+      const ledger = await TopUpLedger.open(dir, memoryLogger());
+      const id = await ledger.reserve({ amount: 10_000, sats: 10_500, target: MINT, from: MINT });
+      await ledger.attach(id, { owner: v.owner, open: sealedMax });
+      expect(await v.unseal(sealedMax)).toBe(largest);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+
+    const q = await plane.wallet.meltQuote(MINT, 'lnbc350n1paygate');
+    expect(await v.meltPending(MINT, q.quoteId)).toBe(false);
+    expect(await v.meltState(MINT, q.quoteId)).toBe('UNPAID');
+    mint.holdNextMelt(1);
+    expect(await plane.wallet.melt(q)).toMatchObject({ paid: false }); // PENDING at the mint
+    expect(await v.meltPending(MINT, q.quoteId)).toBe(true);
+    expect(await v.meltState(MINT, q.quoteId)).toBe('PENDING');
+    mint.settleMelts('paid');
+    expect(await v.meltState(MINT, q.quoteId)).toBe('PAID');
+    plane.close();
+    await expect(v.seal('x')).rejects.toMatchObject({ code: 'payments-unavailable' });
+    await expect(v.meltState(MINT, q.quoteId)).rejects.toMatchObject({
+      code: 'payments-unavailable',
+    });
   });
 
   it('the mark clears after a melt that throws (the mint changed the amount since the quote was shown)', async () => {

@@ -88,7 +88,10 @@ export interface HostOptions {
   readonly now?: () => UnixSeconds;
   readonly workerStartTimeoutMs?: number;
   /** Tests: the auto top-up's wall clock (ms, shared with its ledger) and target polling. */
-  readonly topUp?: Pick<AutoTopUpOptions, 'now' | 'sleep' | 'pollAttempts' | 'pollIntervalMs'>;
+  readonly topUp?: Pick<
+    AutoTopUpOptions,
+    'now' | 'sleep' | 'pollAttempts' | 'pollIntervalMs' | 'playWaitMs'
+  >;
 }
 
 export class Host {
@@ -344,6 +347,8 @@ export async function createHost(o: HostOptions): Promise<Host> {
           switching.set(flow.money()?.wallet, unavailableReason(flow.moneyError()));
           if ((flow.money()?.mints.length ?? 1) === 0)
             log.warn('the wallet lists no mints: payments stay off until one is added in Settings');
+          // Round 4: the new plane's identity finishes its open top-ups (an unlock, a swap).
+          void late.autoTopUp?.resume();
         };
         await (late.worker === undefined ? run() : late.worker.restart(run));
       },
@@ -391,10 +396,16 @@ export async function createHost(o: HostOptions): Promise<Host> {
     walletProvider.kind === 'real'
       ? new AutoTopUp({
           settings: () => settings.get(),
-          // The money plane's own wallet (per signer), never the switching facade: a run, and a
-          // paid-but-unminted retry, stay with the wallet that paid. A closed plane (signed out,
-          // locked) is no wallet: a run in flight then stops before the melt.
+          // The money plane's own wallet (per signer), never the switching facade: a run stays
+          // with the wallet it started with. A closed plane (signed out, locked) is no wallet: a
+          // run in flight then stops before the melt.
           wallet: () => money()?.liveWallet,
+          // Round 4: the same plane's identity, sealing and journal — for its live wallet only
+          // (an open top-up is finished by its own identity, whichever wallet instance).
+          vault: (w) => {
+            const m = money();
+            return m?.liveWallet === w ? m.topUpVault() : undefined;
+          },
           ledger: await TopUpLedger.open(o.userData, log, topUpNow),
           ...(bridge === undefined
             ? {}
@@ -413,9 +424,14 @@ export async function createHost(o: HostOptions): Promise<Host> {
           ...(o.topUp?.pollIntervalMs === undefined
             ? {}
             : { pollIntervalMs: o.topUp.pollIntervalMs }),
+          ...(o.topUp?.playWaitMs === undefined ? {} : { playWaitMs: o.topUp.playWaitMs }),
         })
       : undefined;
-  if (autoTopUp !== undefined) late.autoTopUp = autoTopUp;
+  if (autoTopUp !== undefined) {
+    late.autoTopUp = autoTopUp;
+    // An injected signer's plane opened above: finish its open top-ups (after its settle).
+    void autoTopUp.resume();
+  }
   const images = new ImageService({
     transport: o.imageTransport ?? httpsTransport(),
     log,

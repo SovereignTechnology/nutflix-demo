@@ -22,13 +22,21 @@
  * their own, bounded to the newest `MAX_TOP_UP_MELTS` and never pruned by the 24-hour window, so
  * this device keeps showing yesterday's top-up as one (independent review, finding 2).
  *
+ * An OPEN top-up (cross-lane review round 4, money high): the target mint's quote of a top-up
+ * whose melt may have paid it, or paid it before the target minted, is kept on its entry until it
+ * is minted or provably unpaid — `open`, sealed to the identity that owns it (`owner`) by the
+ * money plane (NIP-44 to self through the signer, how the NIP-60 proofs are kept): a quote the
+ * mint did not lock to the wallet key (NUT-20; a signer-held key cannot lock one) is bearer money
+ * once paid, whoever holds its id mints it. An entry with an open top-up is never pruned by the
+ * window (it stops counting after 24 h like any other); at most `MAX_OPEN_TOP_UPS` are open.
+ *
  * Nothing here logs a mint URL, an amount beyond the numbers, or anything secret.
  */
 import { randomBytes } from 'node:crypto';
 import { copyFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
-import type { MintUrl, NostrEventId } from '@sovit/core';
+import type { MintUrl, NostrEventId, NostrPubkey } from '@sovit/core';
 import { AUTO_TOP_UP_MAX_SATS_PER_DAY } from '@sovit/core';
 
 import type { Guard } from '../../ipc/guards.js';
@@ -55,6 +63,16 @@ const MAX_ALLOWED = LIMITS.maxArray;
  * beyond this (a label, not a cap: losing one only shows an old top-up as "melt to Lightning").
  */
 export const MAX_TOP_UP_MELTS = 256;
+/**
+ * Open top-ups kept at once (every identity together): one per target and identity at most, as
+ * no new top-up runs into a target with one open. A reservation beyond this is refused.
+ */
+export const MAX_OPEN_TOP_UPS = 16;
+/**
+ * The longest sealed open top-up the file keeps: a NIP-44 payload of a record of at most ~7 KB
+ * (`open-topup.ts` bounds its invoice); 16 of them keep the file far under its 1 MiB.
+ */
+const MAX_OPEN_CHARS = 16_384;
 
 /**
  * `pending`  reserved, the melt not yet answered (counts its reservation);
@@ -79,6 +97,19 @@ export interface LedgerEntry {
   readonly from?: MintUrl;
   /** The funding melt's wallet-history id (NIP-60 kind 7376), shown as "top-up". */
   readonly melt?: NostrEventId;
+  /** The identity whose wallet ran it (hex): only that identity finishes its open top-up. */
+  readonly owner?: NostrPubkey;
+  /**
+   * The open top-up, sealed to `owner` (see the header); absent once it is finished — minted and
+   * its melt's history line found (or the melt settled without one), or released.
+   */
+  readonly open?: string;
+  /**
+   * Minted at the target while its melt was still unresolved at the source: kept open only to
+   * find the melt's history line once the journal settles it (the "top-up" label); it no longer
+   * holds back a new top-up.
+   */
+  readonly minted?: true;
 }
 
 interface LedgerRequired {
@@ -114,6 +145,11 @@ export const isLedgerMint = matches(
  */
 export const isHistoryId = matches(/^[0-9A-Za-z_-]{1,64}$/, 64) as Guard<NostrEventId>;
 
+/** An identity the ledger stores (a Nostr pubkey, 64 lowercase hex). */
+const isOwner = matches(/^[0-9a-f]{64}$/, 64) as Guard<NostrPubkey>;
+/** A sealed open top-up (NIP-44 payloads are base64), bounded. */
+const isSealed = matches(/^[A-Za-z0-9+/=]+$/, MAX_OPEN_CHARS);
+
 const isEntry: Guard<LedgerEntry> = obj(
   {
     id: matches(/^[0-9a-f]{16}$/, 16),
@@ -126,6 +162,9 @@ const isEntry: Guard<LedgerEntry> = obj(
     target: isLedgerMint,
     from: isLedgerMint,
     melt: isHistoryId,
+    owner: isOwner,
+    open: isSealed,
+    minted: literal(true),
   },
 );
 
@@ -133,7 +172,8 @@ const isLedgerFile: Guard<LedgerFile> = obj<LedgerRequired, LedgerOptional>(
   {
     v: literal(FILE_V),
     allowed: arrayOf(isLedgerMint, MAX_ALLOWED),
-    entries: arrayOf(isEntry, MAX_LEDGER_ENTRIES),
+    // The window's entries plus the open top-ups older than it.
+    entries: arrayOf(isEntry, MAX_LEDGER_ENTRIES + MAX_OPEN_TOP_UPS),
   },
   { melts: arrayOf(isHistoryId, MAX_TOP_UP_MELTS) },
 );
@@ -289,8 +329,46 @@ export class TopUpLedger {
   }
 
   /**
+   * Keep reservation `id`'s top-up open (the target's quote, sealed to `owner`) — before its melt
+   * runs. Rejects, and keeps nothing, when it cannot be persisted, would not be stored as it is,
+   * or `MAX_OPEN_TOP_UPS` are open already: the caller then moves nothing.
+   */
+  async attach(
+    id: string,
+    o: { readonly owner: NostrPubkey; readonly open: string },
+  ): Promise<void> {
+    if (this.hardClosed) throw new Error('ledger closed');
+    if (!isOwner(o.owner) || !isSealed(o.open))
+      throw new Error('not an open top-up the ledger stores');
+    if (this.openCount() >= MAX_OPEN_TOP_UPS) throw new Error('too many open top-ups');
+    const entries = this.entries.map((e) =>
+      e.id === id ? { ...e, owner: o.owner, open: o.open } : e,
+    );
+    if (!entries.some((e) => e.id === id)) throw new Error('no such reservation');
+    // Only once it is on disk may the melt run.
+    this.entries = await this.persist(this.allowed, entries);
+  }
+
+  /** How many top-ups are open (every identity). */
+  openCount(): number {
+    return this.entries.filter((e) => e.open !== undefined).length;
+  }
+
+  /** `owner`'s open top-ups, oldest first (all of them: the window does not end one). */
+  openEntries(owner: NostrPubkey): readonly LedgerEntry[] {
+    return this.entries.filter((e) => e.open !== undefined && e.owner === owner);
+  }
+
+  /** Whether `owner` has an open top-up into `target` not minted yet. */
+  hasOpen(owner: NostrPubkey, target: MintUrl): boolean {
+    return this.openEntries(owner).some((e) => e.target === target && e.minted !== true);
+  }
+
+  /**
    * Record how reservation `id` ended. Applied in memory first (this run counts it at once); a
    * failed write is logged and leaves the reservation on disk, which counts at least as much.
+   * `open: null` ends its open top-up (finished, or provably unpaid); so does `failed` (nothing
+   * moved, so nothing can pay the quote). `minted: true` marks it minted, still open.
    */
   async settle(
     id: string,
@@ -298,11 +376,14 @@ export class TopUpLedger {
       readonly state: Exclude<LedgerState, 'pending' | 'closed'>;
       readonly sats?: number;
       readonly melt?: NostrEventId;
+      readonly open?: null;
+      readonly minted?: true;
     },
   ): Promise<void> {
     const melt = patch.melt !== undefined && isHistoryId(patch.melt) ? patch.melt : undefined;
     if (melt !== undefined && !this.melts.includes(melt))
       this.melts = [...this.melts, melt].slice(-MAX_TOP_UP_MELTS);
+    const close = patch.open === null || patch.state === 'failed';
     this.entries = this.entries.map((e) => {
       if (e.id !== id) return e;
       // Never lower a count below the amount that reached (or may have reached) the target, and
@@ -310,11 +391,15 @@ export class TopUpLedger {
       // fail closed for a day): the ceiling is already twice the daily cap.
       const want = patch.sats === undefined ? e.sats : Math.max(patch.sats, e.amount);
       const sats = Number.isSafeInteger(want) ? Math.min(want, MAX_ENTRY_SATS) : MAX_ENTRY_SATS;
+      const { open, minted, ...rest } = e;
+      const keep = !close && open !== undefined;
       return {
-        ...e,
+        ...rest,
         state: patch.state,
         sats,
         ...(melt === undefined ? {} : { melt }),
+        ...(keep ? { open } : {}),
+        ...(keep && (minted === true || patch.minted === true) ? { minted: true as const } : {}),
       };
     });
     try {
@@ -336,15 +421,15 @@ export class TopUpLedger {
   }
 
   /**
-   * Writes the ledger, keeping only the rolling window of entries (the bounded melt-id list is
-   * written whole); resolves the entries written.
+   * Writes the ledger, keeping the rolling window of entries and every open top-up (the bounded
+   * melt-id list is written whole); resolves the entries written.
    */
   private async persist(
     allowed: readonly MintUrl[],
     entries: readonly LedgerEntry[],
   ): Promise<readonly LedgerEntry[]> {
     const now = this.now();
-    const kept = entries.filter((e) => e.at > now - DAY_MS);
+    const kept = entries.filter((e) => e.at > now - DAY_MS || e.open !== undefined);
     await this.file.save({ v: FILE_V, allowed, entries: kept, melts: this.melts });
     return kept;
   }

@@ -19,7 +19,9 @@
  *     (the blocks stay owed; `worker/pay/viewer-payer.ts` asks again after a backoff);
  *   - PAY builds take turns, in arrival order. Core would run their wallet calls one at a time
  *     anyway, so nothing is lost, and the wait for a turn becomes visible here: a PAY that has not
- *     reached the wallet `startByMs` after its request arrived is refused (the belt).
+ *     reached the wallet `startByMs` after its request arrived is refused (the belt) — or sooner,
+ *     by the bound its caller computes at its turn (the money plane's `payBuildStartByMs`: less
+ *     time with journal entries left at the mint; cross-lane review round 4).
  *
  * Every refusal is a `GateRefusal` (nothing reached the wallet): the auto top-up counts a refused
  * melt as nothing moved. Nothing here logs.
@@ -134,9 +136,16 @@ export class PayMeltGate {
   /**
    * Run one PAY build at `mint` when its turn comes. Refused at once while a melt is pending or in
    * flight there, and — at its turn — once `startByMs` has passed since `arrived` (`now()` when
-   * the request came in). `build` is never called for a refused PAY.
+   * the request came in), or the bound `startBy` answers then, if sooner (read at the turn, the
+   * clock after it; a bound that is not a number, or that throws, refuses). `build` is never
+   * called for a refused PAY.
    */
-  async pay<T>(mint: MintUrl, arrived: Arrival, build: () => Promise<T>): Promise<T> {
+  async pay<T>(
+    mint: MintUrl,
+    arrived: Arrival,
+    build: () => Promise<T>,
+    startBy?: () => number | Promise<number>,
+  ): Promise<T> {
     const m = this.mint(mint);
     if (m.melts > 0) throw new GateRefusal(MELT_AT_MINT);
     if (m.busy)
@@ -146,7 +155,18 @@ export class PayMeltGate {
       });
     else m.busy = true;
     try {
-      if (this.clock() - arrived > this.startByMs) throw new GateRefusal(PAY_TOO_LATE);
+      let limit = this.startByMs;
+      if (startBy !== undefined) {
+        let own: number;
+        try {
+          own = await startBy();
+        } catch {
+          own = Number.NaN;
+        }
+        limit = Math.min(limit, own);
+      }
+      // `!(… <= limit)`: a NaN bound refuses (`x > NaN` would let it through).
+      if (!(this.clock() - arrived <= limit)) throw new GateRefusal(PAY_TOO_LATE);
       return await build();
     } finally {
       m.busy = false;

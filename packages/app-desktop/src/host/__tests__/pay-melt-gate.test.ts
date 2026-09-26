@@ -244,6 +244,47 @@ describe('PayMeltGate: a melt and a PAY build at one mint never overlap', () => 
     expect(await g.pay(A, t0, () => Promise.resolve('on time'))).toBe('on time');
   });
 
+  it('round 4: a per-PAY bound read at the turn — shorter than the belt refuses, longer never extends it, not a number or a throw refuses', async () => {
+    const { g, advance } = gate();
+    let built = 0;
+    const build = (): Promise<string> => {
+      built++;
+      return Promise.resolve('built');
+    };
+    // Read at the turn (after the wait), the clock after it.
+    const slow = deferred<string>();
+    const first = g.pay(A, g.now(), () => slow.promise);
+    let reads = 0;
+    const queued = observe(
+      g.pay(A, g.now(), build, () => {
+        reads++;
+        return Promise.resolve(10_000);
+      }),
+    );
+    await tick();
+    expect(reads).toBe(0); // not read while waiting for the turn
+    advance(10_001);
+    slow.resolve('slow');
+    expect(await first).toBe('slow');
+    await tick();
+    expect(reads).toBe(1);
+    expect(refusal(queued.error)).toBe(`rate-limited: ${PAY_TOO_LATE}`);
+    // A bound past the belt is the belt.
+    const t0 = g.now();
+    advance(PAY_BUILD_START_BY_MS + 1);
+    await expect(g.pay(A, t0, build, () => Number.MAX_SAFE_INTEGER)).rejects.toThrow(PAY_TOO_LATE);
+    // No start early enough (negative), not a number, or a bound that throws: refused at once.
+    for (const bad of [
+      (): number => -1,
+      (): number => Number.NaN,
+      (): Promise<number> => Promise.reject(new Error('store closed')),
+    ])
+      await expect(g.pay(A, g.now(), build, bad)).rejects.toThrow(PAY_TOO_LATE);
+    expect(built).toBe(0);
+    // In time: built.
+    expect(await g.pay(A, g.now(), build, () => 0)).toBe('built');
+  });
+
   it("a melt waits at most the worker's deadline for the PAY in flight: then it is refused unmelted and the mark clears", async () => {
     const { g, timers } = gate();
     const stuck = deferred<string>();

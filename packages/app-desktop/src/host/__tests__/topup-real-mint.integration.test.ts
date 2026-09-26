@@ -16,7 +16,7 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import type { MeltQuote, MintUrl, Sats, Settings } from '@sovit/core';
+import type { MeltQuote, MintUrl, NostrPubkey, Sats, Settings } from '@sovit/core';
 import { wallet as walletMod } from '@sovit/core';
 import { afterAll, describe, expect, it, vi } from 'vitest';
 
@@ -24,6 +24,7 @@ import { memoryLogger } from '../log.js';
 import { DEFAULT_SETTINGS } from '../settings/settings.js';
 import { AutoTopUp, maxFeeReserve } from '../topup/auto-topup.js';
 import { TopUpLedger } from '../topup/ledger.js';
+import { testVault } from './support/topup-vault.js';
 
 const SOURCE = process.env['NUTFLIX_REAL_MINT_URL'] as MintUrl | undefined;
 const TARGET = process.env['NUTFLIX_REAL_MINT_URL_2'] as MintUrl | undefined;
@@ -41,10 +42,9 @@ describe.skipIf(SOURCE === undefined || TARGET === undefined)(
     it('tops up the target from the source within the cap; history in at the target, out at the source, once each', async () => {
       const source = SOURCE!;
       const target = TARGET!;
-      const wallet = new walletMod.CashuWallet({
-        mints: new walletMod.CashuMintConnections(),
-        store: new walletMod.MemoryProofStore(),
-      });
+      const mints = new walletMod.CashuMintConnections();
+      const store = new walletMod.MemoryProofStore();
+      const wallet = new walletMod.CashuWallet({ mints, store });
       // Fund the source (FakeWallet settles the mint's own invoice by itself).
       const q = await wallet.mintQuote(source, 3_000 as Sats);
       let funded = false;
@@ -66,6 +66,8 @@ describe.skipIf(SOURCE === undefined || TARGET === undefined)(
       const top = new AutoTopUp({
         settings: () => settings,
         wallet: () => wallet,
+        // Round 4: a bare wallet's vault (the money plane's own is tested with the host).
+        vault: () => testVault({ owner: 'a1'.repeat(32) as NostrPubkey, store, mints }),
         ledger: await TopUpLedger.open(dir, log),
         askFirstFunding: (x) => {
           asked.push(x);
