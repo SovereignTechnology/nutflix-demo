@@ -22,6 +22,7 @@ import {
 } from '@sovit/core';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
+import { MELT_REQUEST_TIMEOUT_MS } from '../../ipc/deadlines.js';
 import { memoryLogger } from '../log.js';
 import { GateRefusal, PAY_STILL_BUILDING } from '../pay-melt-gate.js';
 import { JsonFile } from '../settings/json-file.js';
@@ -30,9 +31,11 @@ import type { FirstFundingQuestion, TopUpOutcome, TopUpVault } from '../topup/au
 import {
   AutoTopUp,
   TOP_UP_DECLINED_BACKOFF_MS,
+  TOP_UP_EXPIRED_RELEASE_AFTER_MS,
   TOP_UP_FAIL_BACKOFF_MS,
   TOP_UP_MAX_BACKOFF_MS,
   TOP_UP_MIN_INTERVAL_MS,
+  TOP_UP_RELEASE_AFTER_MS,
   TOP_UP_RESOLVE_EVERY_MS,
   maxFeeReserve,
   meltSentNothing,
@@ -80,6 +83,8 @@ interface Setup {
   readonly ledger: TopUpLedger;
   readonly target: mocks.TestMint;
   readonly source: mocks.TestMint;
+  /** A third mint on the user's list (a second source, round 5). */
+  readonly second: mocks.TestMint;
   readonly lightning: mocks.TestLightning;
   readonly asked: FirstFundingQuestion[];
   readonly log: ReturnType<typeof memoryLogger>;
@@ -116,6 +121,8 @@ async function setup(
     sourceNut09?: boolean;
     /** The wallet's journal ages on the test's clock (`t`), not the system's. */
     walletClock?: boolean;
+    /** The expiry (unix seconds) of the target's invoices (round 5; default 2100-01-01). */
+    targetQuoteExpiry?: number;
   } = {},
 ): Promise<Setup> {
   const lightning = new mocks.TestLightning();
@@ -123,6 +130,7 @@ async function setup(
     url: TARGET,
     seed: new Uint8Array(32).fill(0x31),
     lightning,
+    ...(o.targetQuoteExpiry === undefined ? {} : { quoteExpiry: o.targetQuoteExpiry }),
   });
   const second = new mocks.TestMint({
     url: SECOND,
@@ -232,6 +240,7 @@ async function setup(
     ledger,
     target,
     source,
+    second,
     lightning,
     asked,
     log,
@@ -413,6 +422,11 @@ describe('AutoTopUp — executes (issue #2)', () => {
   });
 });
 
+// Round 5 (verifier, info): the tests given an explicit 30 s timeout here and in F3 below run
+// three to six REAL top-ups each (quotes at both mints, a melt, a mint with real blind signatures
+// and DLEQ, a ledger write per step). That takes 4-5 s on a shared box under load, and they timed
+// out at the default 5 s (5 057 and 5 042 ms at load average ~19 on 8 cores; 5 089-5 319 ms at
+// ~20). The file's precedent for heavy tests; no code path is timed by it.
 describe('AutoTopUp — caps', () => {
   it('rolling 24 h: at most 50 000 sats, fees included — the top-up beyond it is refused; the window rolls', async () => {
     const s = await setup({ fund: 80_000, amountSats: 10_000, belowSats: 60_000, feeReserve: 2 });
@@ -429,7 +443,7 @@ describe('AutoTopUp — caps', () => {
     // 24 h after the first one, it has left the window: room for one more.
     s.t = T0 + DAY_MS + 1;
     expect(await s.top.check(TARGET)).toBe('done');
-  });
+  }, 30_000); // five real top-ups and two refusals
 
   it('fees count: what left the source (input fees too) is what the ledger counts; the fee allowance is reserved', async () => {
     const s = await setup({
@@ -461,7 +475,7 @@ describe('AutoTopUp — caps', () => {
     expect(outcomes).toEqual(['done', 'done', 'done', 'done', 'done', 'cap']);
     expect(await s.wallet.balance(TARGET)).toBe(45_000);
     expect(AUTO_TOP_UP_MAX_SATS_PER_DAY).toBe(50_000);
-  });
+  }, 30_000); // five real top-ups
 
   it('the ledger survives a restart: what moved before still counts', async () => {
     const s = await setup({ fund: 80_000, amountSats: 10_000, belowSats: 60_000 });
@@ -477,7 +491,7 @@ describe('AutoTopUp — caps', () => {
     };
     expect(file.entries).toHaveLength(4);
     expect((await stat(join(s.dir, TOP_UP_LEDGER_FILE))).mode & 0o777).toBe(0o600);
-  });
+  }, 30_000); // four real top-ups and a restart
 
   it.each([
     ['not JSON', '{nope'],
@@ -873,10 +887,17 @@ describe('AutoTopUp — review F3: a reservation in flight when the host died', 
     }
     hang = false;
     const again = await s.restart();
+    // Round 5 (R4-R2): a melt that never answered may still reach the source mint, so its quote
+    // is kept — nothing new moves — until the latest it could have returned (the reservation
+    // plus the melt's timeout) plus TOP_UP_RELEASE_AFTER_MS. (Before round 5 the restart released
+    // it at once and this check read 'cap' right away.)
+    expect(await again.check(TARGET)).toBe('unresolved');
+    expect(await s.wallet.balance(TARGET)).toBe(30_000);
+    later(s, MELT_REQUEST_TIMEOUT_MS + TOP_UP_RELEASE_AFTER_MS);
     // 30 000 moved + 10 002 still reserved: another 10 002 would pass 50 000.
     expect(await again.check(TARGET)).toBe('cap');
     expect(await s.wallet.balance(TARGET)).toBe(30_000);
-  });
+  }, 30_000); // three real top-ups, a fourth reserved, a restart (see above 'AutoTopUp — caps')
 });
 
 describe('AutoTopUp — review F4 and info: still wanted after the question and right before the melt', () => {
@@ -1586,6 +1607,199 @@ describe('AutoTopUp — round 4 (info): the startup settle first, a play waits a
     later(s);
     expect(await top.checkForPlay(TARGET)).toBe('not-due');
   });
+});
+
+/**
+ * Round 5: an AutoTopUp over `s`'s wallet and ledger whose play waits `playWaitMs` (30 ms) and
+ * whose vault reports `recovery` as the money plane's startup settle.
+ */
+function playTop(s: Setup, recovery: Promise<unknown> = Promise.resolve()): AutoTopUp {
+  return new AutoTopUp({
+    settings: () => s.settings,
+    wallet: () => s.current,
+    vault: (w) =>
+      w === s.current
+        ? testVault({ owner: OWNER, store: s.store, mints: s.conns, recovery })
+        : undefined,
+    ledger: s.ledger,
+    askFirstFunding: () => Promise.resolve(true),
+    log: s.log,
+    now: () => s.t,
+    sleep: () => Promise.resolve(),
+    pollAttempts: 3,
+    playWaitMs: 30,
+  });
+}
+
+/** `p`, or `'still waiting'` after `ms` (a hang reads as a failed assertion, not a timeout). */
+function orStillWaiting<T>(p: Promise<T>, ms = 2_000): Promise<T | 'still waiting'> {
+  return Promise.race([
+    p,
+    new Promise<'still waiting'>((resolve) => {
+      setTimeout(() => {
+        resolve('still waiting');
+      }, ms).unref();
+    }),
+  ]);
+}
+
+describe('AutoTopUp — round 5 (low): the play bound starts before the run’s own waits', () => {
+  it('a slow startup settle: the play fails in the bound, not after the settle; the top-up finishes once it is over', async () => {
+    const s = await setup({ fund: 20_000, amountSats: 2_000 });
+    let settled: () => void = () => undefined;
+    const recovery = new Promise<void>((r) => {
+      settled = r;
+    });
+    const top = playTop(s, recovery);
+    const started = performance.now();
+    expect(await orStillWaiting(top.checkForPlay(TARGET))).toBe('in-flight');
+    expect(performance.now() - started).toBeLessThan(2_000);
+    expect(top.inFlight).not.toBeNull();
+    expect(s.lightning.paid).toEqual([]); // still waiting for the settle: nothing quoted
+    settled();
+    expect(await top.inFlight).toBe('done');
+    expect(await s.wallet.balance(TARGET)).toBe(2_000);
+  });
+
+  it('a slow finishing of an open top-up inside the run (the trigger’s own was paced): the play fails in the bound', async () => {
+    const s = await setup({ fund: 20_000, amountSats: 2_000 });
+    s.source.holdNextMelt(1); // answered PENDING: the target's quote is kept
+    expect(await s.top.check(TARGET)).toBe('failed');
+    const top = playTop(s);
+    await top.resume(); // finished just now: the play's own finishing is paced (30 s)
+    expect(s.ledger.openEntries(OWNER)).toHaveLength(1);
+    const poll = s.wallet.pollQuote.bind(s.wallet);
+    let answer: () => void = () => undefined;
+    const slow = new Promise<void>((r) => {
+      answer = r;
+    });
+    const polls = vi.spyOn(s.wallet, 'pollQuote').mockImplementation(async (q) => {
+      await slow; // the target takes its time
+      return poll(q);
+    });
+    expect(await orStillWaiting(top.checkForPlay(TARGET))).toBe('in-flight');
+    expect(polls).toHaveBeenCalledTimes(1); // the run's own resolveOpen is what it waits on
+    answer();
+    expect(await top.inFlight).toBe('unresolved'); // still pending at the source: nothing new
+    expect(s.lightning.paid).toEqual([]);
+  });
+});
+
+describe('AutoTopUp — round 5 (info): a quote is never released right after its melt returned', () => {
+  it('kept at the next trigger and until TOP_UP_RELEASE_AFTER_MS after the melt returned, then released (still counted); the next top-up runs', async () => {
+    const s = await setup({ fund: 20_000, amountSats: 2_000 });
+    s.source.failNextMelt(); // refused with a code: nothing journaled, the source's quote UNPAID
+    expect(await s.top.check(TARGET)).toBe('failed');
+    const released = (): number =>
+      s.log.lines.filter((l) => l.msg === 'auto top-up melt not paid: its quote is released')
+        .length;
+    // At once (a trigger right after the melt returned): target UNPAID, source UNPAID, nothing
+    // journaled — and still kept, as a request the transport gave up on may still reach the mint.
+    await s.top.resume();
+    expect(s.ledger.openEntries(OWNER)).toHaveLength(1);
+    later(s, TOP_UP_RELEASE_AFTER_MS - 1);
+    await s.top.resume();
+    expect(s.ledger.openEntries(OWNER)).toHaveLength(1);
+    expect(released()).toBe(0);
+    later(s, 1);
+    await s.top.resume();
+    expect(s.ledger.openEntries(OWNER)).toEqual([]);
+    expect(released()).toBe(1);
+    expect(s.ledger.snapshot().entries).toMatchObject([{ state: 'unknown', sats: 2_002 }]);
+    expect(s.ledger.used(s.t)).toBe(2_002);
+    pastBackoff(s);
+    expect(await s.top.check(TARGET)).toBe('done');
+    expect(s.lightning.paid).toHaveLength(1);
+  });
+
+  it('after a restart (when the melt returned is not known): kept until the reservation plus the melt timeout plus TOP_UP_RELEASE_AFTER_MS', async () => {
+    const s = await setup({ fund: 20_000, amountSats: 2_000 });
+    s.source.failNextMelt();
+    expect(await s.top.check(TARGET)).toBe('failed');
+    const [entry] = s.ledger.snapshot().entries;
+    const again = await s.restart();
+    const openOnDisk = async (): Promise<number> =>
+      (await TopUpLedger.open(s.dir, memoryLogger(), () => s.t)).openEntries(OWNER).length;
+    s.t = entry!.at + MELT_REQUEST_TIMEOUT_MS + TOP_UP_RELEASE_AFTER_MS - 1;
+    await again.resume();
+    expect(await openOnDisk()).toBe(1);
+    s.t += 1;
+    await again.resume();
+    expect(await openOnDisk()).toBe(0);
+  });
+});
+
+describe('AutoTopUp — round 5 (info): an open top-up whose source is gone for good', () => {
+  /** The target's invoice expires 10 minutes after the test's start (unix seconds). */
+  const EXPIRY_S = T0 / 1000 + 600;
+  const LAPSED = EXPIRY_S * 1000 + TOP_UP_EXPIRED_RELEASE_AFTER_MS;
+
+  it('released once the target still says UNPAID a day past its invoice’s expiry, not before (settled unknown, never failed: counted like any melt that may have run); the next top-up from the new source runs', async () => {
+    const s = await setup({ fund: 20_000, amountSats: 2_000, targetQuoteExpiry: EXPIRY_S });
+    s.source.holdNextMelt(1); // answered PENDING: journaled, the quote kept
+    expect(await s.top.check(TARGET)).toBe('failed');
+    // The source goes away for good; the user picks another one.
+    s.source.failNext(1_000_000);
+    const funding = await s.wallet.mintQuote(SECOND, 20_000 as Sats);
+    s.second.payQuote(funding.quoteId);
+    await s.wallet.pollQuote(funding);
+    s.settings = {
+      ...s.settings,
+      autoTopUp: { belowSats: 1_000 as Sats, fromMint: SECOND, amountSats: 2_000 as Sats },
+    };
+    pastBackoff(s);
+    expect(await s.top.check(TARGET)).toBe('unresolved'); // the source cannot be asked
+    s.t = LAPSED - 1;
+    await s.top.resume();
+    expect(s.ledger.openEntries(OWNER)).toHaveLength(1); // not a moment before
+    expect(s.lightning.paid).toEqual([]);
+    const settle = vi.spyOn(s.ledger, 'settle');
+    s.t = LAPSED;
+    expect(await s.top.check(TARGET)).toBe('done');
+    expect(settle.mock.calls[0]).toEqual([expect.any(String), { state: 'unknown', open: null }]);
+    expect(s.log.lines.map((l) => l.msg)).toContain(
+      'auto top-up invoice expired unpaid: its quote is released',
+    );
+    expect(s.ledger.openEntries(OWNER)).toEqual([]);
+    expect(s.lightning.paid).toHaveLength(1); // the new source's melt
+    expect(await s.wallet.balance(TARGET)).toBe(2_000);
+    expect(s.ledger.snapshot().entries.at(-1)).toMatchObject({ state: 'done', from: SECOND });
+    expect(JSON.stringify(s.log.lines)).not.toMatch(/topup\.test|lnbc/);
+  });
+
+  it.each(['the source says PAID', 'the invoice has no expiry'] as const)(
+    'kept past the lapse when %s (the target owes it / nothing proves it unpayable)',
+    async (why) => {
+      let unpaid = true;
+      const s = await setup({
+        fund: 20_000,
+        amountSats: 2_000,
+        targetQuoteExpiry: why === 'the invoice has no expiry' ? 0 : EXPIRY_S,
+        // The target keeps saying UNPAID (a target that does not see the payment it got).
+        wrap: (w) =>
+          Object.assign(Object.create(w) as Wallet, {
+            pollQuote: (q: Parameters<Wallet['pollQuote']>[0]) =>
+              unpaid ? Promise.resolve({ state: 'UNPAID' as const }) : w.pollQuote(q),
+          }),
+      });
+      s.source.holdNextMelt(1);
+      expect(await s.top.check(TARGET)).toBe('failed');
+      if (why === 'the source says PAID') {
+        s.source.settleMelts('paid');
+        await s.wallet.recoverPending(); // nothing journaled any more; the source says PAID
+      } else s.source.failNext(1_000_000); // the source gone: it says nothing
+      s.t = LAPSED + DAY_MS;
+      expect(await s.top.check(TARGET)).toBe('unresolved');
+      expect(s.ledger.openEntries(OWNER)).toHaveLength(1);
+      if (why === 'the source says PAID') {
+        unpaid = false; // the target sees it after all: minted once
+        later(s);
+        expect(await s.top.check(TARGET)).toBe('not-due');
+        expect(await s.wallet.balance(TARGET)).toBe(2_000);
+        expect(s.lightning.paid).toHaveLength(1);
+      }
+    },
+  );
 });
 
 describe('TopUpLedger — round 4: open top-ups', () => {

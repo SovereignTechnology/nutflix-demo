@@ -610,9 +610,10 @@ export class DesktopNetworkAdapter implements NetworkAdapter {
         // of a mint asks the user in main's prompt window; a manifest's other mints are never
         // topped up: `autoTopUpDue` requires the user's own list). One top-up at a time.
         // The first mint that is due decides: done, declined, capped or failed, no second mint
-        // is tried (and asked about) for the same play. Round 4 (info): waited for at most
-        // `PLAY_TOP_UP_WAIT_MS` once past the question; a slower top-up finishes in the
-        // background and the play fails `no-balance` now (the user retries).
+        // is tried (and asked about) for the same play. Round 4 (info), round 5: waited for at
+        // most `PLAY_TOP_UP_WAIT_MS` in all, the time the first-funding question is open aside;
+        // a slower top-up finishes in the background and the play fails `no-balance` now (the
+        // user retries).
         for (const m of mints) {
           const out = await top.checkForPlay(m);
           if (out === 'in-flight')

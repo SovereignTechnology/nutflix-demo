@@ -4,7 +4,8 @@
  *
  *   quote   the target mint's quote (NUT-04): polled, and minted once PAID, by the identity that
  *           created it (a NUT-20 locked quote carries its lock in the mint's own answer, so the
- *           wallet key signs it then; an unlocked one is bearer money once paid);
+ *           wallet key signs it then; an unlocked one is bearer money once paid); its expiry
+ *           releases it once the target still says UNPAID a day after it (round 5);
  *   melt    the source mint and its melt quote id: whether that melt is still journaled, and the
  *           mint's own state of it, say whether the invoice can still be paid;
  *   before  the source's history just before the melt (its newest time and the ids there): the

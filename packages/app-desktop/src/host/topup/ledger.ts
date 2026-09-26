@@ -24,7 +24,8 @@
  *
  * An OPEN top-up (cross-lane review round 4, money high): the target mint's quote of a top-up
  * whose melt may have paid it, or paid it before the target minted, is kept on its entry until it
- * is minted or provably unpaid — `open`, sealed to the identity that owns it (`owner`) by the
+ * is minted, provably unpaid, or (round 5) still unpaid a day after its invoice expired — `open`,
+ * sealed to the identity that owns it (`owner`) by the
  * money plane (NIP-44 to self through the signer, how the NIP-60 proofs are kept): a quote the
  * mint did not lock to the wallet key (NUT-20; a signer-held key cannot lock one) is bearer money
  * once paid, whoever holds its id mints it. An entry with an open top-up is never pruned by the
