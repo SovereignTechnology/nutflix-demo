@@ -41,6 +41,15 @@ export {
 } from './nip60-journal.js';
 export { guardedKeyset, type KeysetGuardOptions } from './keyset-guard.js';
 export {
+  SETTLE_MARGIN_S,
+  SETTLE_RETRY_MAX_S,
+  SETTLE_RETRY_MIN_S,
+  SettleLoop,
+  type SettleLoopOptions,
+  type SettleLoopWallet,
+  type SettleTimer,
+} from './settle-loop.js';
+export {
   openNip60Wallet,
   publishNutzapInfo,
   type Nip60Wallet,

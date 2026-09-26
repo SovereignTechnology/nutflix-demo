@@ -29,7 +29,13 @@ import type {
   WalletChangeEvent,
   WalletHistoryEntry,
 } from '../contracts/index.js';
-import { Spender, WalletError, type MintConnections, type WalletKey } from './spend.js';
+import {
+  PENDING_SETTLE_AFTER_S,
+  Spender,
+  WalletError,
+  type MintConnections,
+  type WalletKey,
+} from './spend.js';
 import { heldSecrets, proofTotal, type ProofStore } from './store.js';
 
 // ---------------------------------------------------------------------------------------
@@ -288,6 +294,35 @@ export class CashuWallet implements Wallet {
       }
     }
     return { recovered, left };
+  }
+
+  /**
+   * When the journal next needs a settle (issue #8 review: held inputs must come back without a
+   * restart). `count`: operations journaled; `next`: the earliest time one that is still young can
+   * be decided (`created + PENDING_SETTLE_AFTER_S`), `null` when none is; `overdue`: how many are
+   * past that already — a melt the mint still reports PENDING, or a mint that could not be asked —
+   * and are retried. `SettleLoop` (`settle-loop.ts`) plans `recoverPending` from this. Reads the
+   * store only; never asks a mint.
+   */
+  async settleSchedule(): Promise<{
+    readonly count: number;
+    readonly overdue: number;
+    readonly next: UnixSeconds | null;
+  }> {
+    const store = this.o.store;
+    if (store.pending === undefined) return { count: 0, overdue: 0, next: null };
+    const now = this.now();
+    let count = 0;
+    let overdue = 0;
+    let next: number | null = null;
+    for (const mint of await store.mints())
+      for (const op of await store.pending(mint)) {
+        count++;
+        const at = op.created + PENDING_SETTLE_AFTER_S;
+        if (at <= now) overdue++;
+        else if (next === null || at < next) next = at;
+      }
+    return { count, overdue, next: next === null ? null : (next as UnixSeconds) };
   }
 
   async meltQuote(mint: MintUrl, bolt11: string): Promise<MeltQuote> {

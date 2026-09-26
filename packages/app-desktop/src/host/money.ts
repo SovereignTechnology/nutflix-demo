@@ -7,7 +7,10 @@
  *            shares can reach them. Its journal (ADR 0014 and its amendment, issue #8) is a
  *            sealed file per identity in `journalDir` (`wallet-journal.ts`): every operation's
  *            outputs are on disk before its request reaches the mint, and what a crash cut off is
- *            settled at the next open (`recoverPending`, NUT-09). A journal that does not open
+ *            settled at the next open (`recoverPending`, NUT-09). While entries are left, the
+ *            plane settles them by itself (`SettleLoop`): a send or melt whose answer is unknown
+ *            holds its inputs out of the balance, and they come back (or leave) once the mint can
+ *            say — with no restart and no other payment needed. A journal that does not open
  *            refuses the whole wallet — loudly, and the file is kept (it may be money).
  *   viewer   `RealPaymentEngine` (viewer side) building OUR PAYs.
  *   seller   the hooks the worker's seeder engine calls: keysets (rate-limited), redeem, NUT-07
@@ -85,6 +88,8 @@ export interface MoneyPlaneOptions {
    */
   readonly createWallet?: boolean;
   readonly now?: () => UnixSeconds;
+  /** Tests: the journal settle loop's timer (default `setTimeout`, unref'd). */
+  readonly settleTimer?: walletMod.SettleTimer;
 }
 
 interface SessionBudget {
@@ -114,6 +119,11 @@ export class MoneyPlane {
    */
   recovery: Promise<{ readonly recovered: number; readonly left: number } | null> =
     Promise.resolve(null);
+  /**
+   * Settles the journal whenever an entry can be decided (issue #8 review, finding 1): held
+   * inputs come back after `PENDING_SETTLE_AFTER_S` even when nothing else runs at that mint.
+   */
+  readonly settles: walletMod.SettleLoop;
   private readonly sessions = new Map<SessionId, SessionBudget>();
   private readonly creators = new Map<string, NostrPubkey>();
   private readonly viewer: payment.RealPaymentEngine;
@@ -157,6 +167,15 @@ export class MoneyPlane {
       now: this.now,
     });
     this.keyset = walletMod.guardedKeyset((m, id) => this.wallet.keyset(m, id));
+    this.settles = new walletMod.SettleLoop({
+      wallet: this.wallet,
+      now: this.now,
+      ...(o.settleTimer === undefined ? {} : { timer: o.settleTimer }),
+      onSettled: (r) => {
+        if (r.recovered > 0)
+          o.log.info('wallet journal settled', { recovered: r.recovered, left: r.left });
+      },
+    });
   }
 
   /** Open the user's NIP-60 wallet with `signer` and publish their kind 10019. */
@@ -207,6 +226,11 @@ export class MoneyPlane {
             return null;
           },
         );
+      // From then on, entries settle by themselves when the mint can decide them (after the
+      // startup settle, so the two do not ask the mint twice).
+      void plane.recovery.then(() => {
+        plane.settles.start();
+      });
       // Where the user takes nutzaps: creators' shares of their own videos (best effort).
       walletMod
         .publishNutzapInfo({
@@ -289,6 +313,7 @@ export class MoneyPlane {
     if (this.closed) return;
     this.closed = true;
     this.sessions.clear();
+    this.settles.stop();
     this.closeKey();
     this.closeJournal();
   }

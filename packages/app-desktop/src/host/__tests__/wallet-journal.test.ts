@@ -188,6 +188,111 @@ describe('the money plane over the sealed journal', () => {
     again.close();
   });
 
+  it('held inputs come back by themselves: the plane settles an aged entry with only the balance read (review finding 1)', async () => {
+    // Before: settles ran only inside an operation at that mint, or once at open. With the whole
+    // balance held, the playback gate (`checkBalance`, which reads `wallet.balance`) refused
+    // before any operation could run, so the sats stayed held until a restart.
+    const mint = new mocks.TestMint({ url: MINT, seed: new Uint8Array(32).fill(0x2d) });
+    const pool = new nostr.FakeRelayPool();
+    const st = { refuseSwap: 0 };
+    const request: RequestFn = async <T>(args: Parameters<RequestFn>[0]): Promise<T> => {
+      if (st.refuseSwap > 0 && args.endpoint.endsWith('/v1/swap')) {
+        st.refuseSwap--;
+        throw new Error('connect ECONNREFUSED'); // never reached the mint
+      }
+      return mint.request<T>(args);
+    };
+    const clock = { t: 1_757_000_000 };
+    const timers: { fn: () => void; ms: number; live: boolean }[] = [];
+    const s = await localSigner();
+    const plane = await MoneyPlane.open({
+      signer: s,
+      pool,
+      relays: () => [{ url: RELAY, read: true, write: true }],
+      defaultMints: () => [MINT],
+      log: memoryLogger('warn'),
+      mintRequest: () => request,
+      journalDir: join(dir, WALLET_DIR),
+      createWallet: true,
+      now: () => clock.t as UnixSeconds,
+      settleTimer: (fn, ms) => {
+        const t = { fn, ms, live: true };
+        timers.push(t);
+        return () => {
+          t.live = false;
+        };
+      },
+    });
+    try {
+      await plane.recovery;
+      await fund(plane, mint, 16); // one 16-sat proof
+      st.refuseSwap = 1;
+      await expect(plane.wallet.send(4 as Sats, { p2pk: TO, mint: MINT })).rejects.toThrow(
+        /mint-error/,
+      );
+      expect(await plane.wallet.balance(MINT)).toBe(0); // held
+      await plane.settles.idle();
+      const planned = timers.filter((t) => t.live);
+      expect(planned).toHaveLength(1);
+      expect(planned[0]?.ms).toBe(
+        (walletMod.PENDING_SETTLE_AFTER_S + walletMod.SETTLE_MARGIN_S) * 1000,
+      );
+      // An hour passes; only the balance is read (the header chip, the playback gate).
+      clock.t += 3600;
+      expect(await plane.wallet.balance(MINT)).toBe(0);
+      // The planned settle runs (the runtime's timer): the input is back, spendable once.
+      const due = planned[0];
+      if (due === undefined) throw new Error('no settle planned');
+      due.live = false;
+      due.fn();
+      await plane.settles.idle();
+      expect(await plane.wallet.balance(MINT)).toBe(16);
+      expect(timers.filter((t) => t.live)).toHaveLength(0); // nothing left to settle
+      await plane.wallet.send(16 as Sats, { p2pk: TO, mint: MINT });
+      expect(await plane.wallet.balance(MINT)).toBe(0);
+    } finally {
+      plane.close();
+    }
+    // Closed: the loop plans nothing more.
+    expect(timers.filter((t) => t.live)).toHaveLength(0);
+  });
+
+  it('closing the plane (lock, sign-out) cancels its planned settle', async () => {
+    const net = lossy();
+    const { mint, pool } = rig(net.wrap);
+    const timers: { live: boolean }[] = [];
+    const s = await localSigner();
+    const plane = await MoneyPlane.open({
+      signer: s,
+      pool,
+      relays: () => [{ url: RELAY, read: true, write: true }],
+      defaultMints: () => [MINT],
+      log: memoryLogger('warn'),
+      mintRequest: () => net.wrap(mint.request),
+      journalDir: join(dir, WALLET_DIR),
+      createWallet: true,
+      settleTimer: () => {
+        const t = { live: true };
+        timers.push(t);
+        return () => {
+          t.live = false;
+        };
+      },
+    });
+    await plane.recovery;
+    await fund(plane, mint, 16);
+    net.st.drop = 1;
+    net.st.restoreDown = true;
+    await expect(plane.wallet.send(4 as Sats, { p2pk: TO, mint: MINT })).rejects.toThrow(
+      /mint-error/,
+    );
+    await plane.settles.idle();
+    expect(timers.filter((t) => t.live)).toHaveLength(1);
+    plane.close();
+    expect(timers.filter((t) => t.live)).toHaveLength(0);
+    expect(plane.settles.plannedAt).toBeNull();
+  });
+
   it('once closed, nothing more is journaled: a payment is refused before its request leaves', async () => {
     const { mint, open } = rig();
     const s = await localSigner();
