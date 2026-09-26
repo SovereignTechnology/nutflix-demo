@@ -197,6 +197,53 @@ used). Each finding was reproduced on the unfixed code first. Full record: the r
   `tsc -b --force`, eslint and prettier on the changed files, `check:locked` and `lint:electron`
   all clean. The Electron e2e was not run.
 
+## Fix round 5 (the verifier of fix round 4)
+
+Three findings on the round-4 fixes, all in the worker and the payer. Each was reproduced first,
+then fixed under the orchestrator's rulings. Full record: the review record's "Round 5" section.
+**On hold, untouched** (they wait for Cameron's protocol decision): the image-fetch probe,
+`PRICE` / `announceCorePrices` handling, and restart debt (IR4).
+
+- **HIGH, a rendition switch wrote off the old session's tail.** Fixed.
+  - A PAY is built for a play session whose blob COVERS its range: open sessions first, then
+    closing ones (`worker/pay/session-ranges.ts`, `sidsFor(range)`). It was resolved by core
+    alone.
+  - A host `forbidden` or `session-closed` from one session is not final while another covering
+    session may take the PAY.
+  - Two sessions of one core each pay their own blocks: the payer gives up only the refused
+    RANGE, and no PAY crosses a session's blob end (`boundRange`).
+  - The integration harness now carries the host's real error codes. It used to turn every one
+    into `internal`.
+  - The reviewer's repro (A streams, pause A, open B on the same core, close A while B streams)
+    is a `desktop-pays` test. With round 4's lookup it fails, and so do the quit and next-start
+    tests after it.
+- **MEDIUM, transient PAY failures at a seeder's cap.** Fixed.
+  - A failed core backs off in time (250 ms doubling to 4 s). After the backoff, any pass retries
+    it (a block, an ACK, pressure, a flush), and so does its own retry timer.
+  - A failing range is given up only after 3 attempts over 30 s. The close drain (5 s) therefore
+    never writes a transient failure off.
+  - Tests: the reviewer's repro (`no-balance` for ~300 ms at the cap, then pressure: 0 PAYs on
+    round 4, paid now), plus the timer alone and the drain-like burst.
+- **MEDIUM, the close drain waited on the whole core.** Fixed.
+  - `play.close` pays (`UpstreamPayer.hurry`) and waits for the closing session's own range only:
+    `CreditSettler.owedOn(core, range)` and `OnePeerRouter.inflightOn(core, range)`.
+  - The other session keeps batching.
+  - Tests: unit tests, and `desktop-pays` asserts `play.close(A)` answers in under
+    `CLOSE_DRAIN_MS` while B streams.
+- **Tests and mutations.**
+  - 28 new tests. Two round-4 payer tests changed with a comment: they asserted the retry at every
+    flush that this round removes, and now advance the clock and assert more.
+  - 22 targeted mutations and one whole-file revert. All were caught once three tests were
+    tightened, except H5 in the integration suite, which is proven at unit level.
+- **Gates.**
+  - Touched packages: green, apart from 3 load-related timeouts in untouched files that pass
+    alone.
+  - Whole suite, once: 3169 passed, 21 skipped, and 3 failed with `Test timed out in 5000ms` in
+    untouched `auto-topup.test.ts` / `money.test.ts` (load average about 20; each passes alone,
+    and they import nothing that changed).
+  - `tsc -b --force`, eslint, prettier, `check:locked` and `lint:electron`: clean.
+  - No Electron e2e.
+
 ## Residuals
 
 Detail in the review record.
@@ -218,6 +265,15 @@ Detail in the review record.
   - non-`pay/1` peers are probed one image block at a time;
   - routed cores are never detached, and the dist-gated skip (both deferred).
 - **R-5** Production reports the thread only at a seller's first PAY, or when none could start.
+- **Round 5:**
+  - two windows on the SAME rendition: closing one while the other streams can run to
+    `CLOSE_DRAIN_MS` (bounded; it pays correctly);
+  - one PAY per core in flight (F30) still couples a closing tail to the other session's PAY
+    awaiting its ACK (one round trip);
+  - a final `flush()` does not retry a core that is backing off;
+  - after a switch, the old tail's spend is shown under the new session (display only,
+    pre-existing);
+  - the payer's cut at a rendition's end is proven at unit level only.
 
 ## Proposed `docs/status.md` row (Stage 3 table)
 

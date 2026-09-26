@@ -542,3 +542,232 @@ now also asserts that nothing is opened, and the rerun was caught.
   images from such peers, with no correctness cost.
 - **Finding 9** (routed cores never detached) and **finding 12** (the dist-gated skip): deferred,
   see above.
+
+## Round 5 — the verifier of fix round 4
+
+Three findings on the round-4 fixes (`80f8dd5`), in the worker and the payer. The orchestrator
+ruled on each; the rulings are applied below. Each finding was reproduced by a test on the round-4
+code before it was fixed. **On hold, untouched** (they wait for Cameron's protocol decision): the
+image-fetch probe, `PRICE` / `announceCorePrices` handling, and restart debt (IR4).
+
+| # | Finding | Outcome |
+|---|---|---|
+| 1 | HIGH — `switchRendition` writes off the old session's tail: the PAY's session was resolved by core, preferring the new open one; the host refused the old tail as outside its video and round 4 gave it up for good | **fixed** |
+| 2 | MEDIUM — after a transient PAY failure a seeder at its cap was never retried until flush/close; at close the drain's 25 ms passes wrote a still-transient failure off in under a second | **fixed** |
+| 3 | MEDIUM — the close drain waited on the whole core, so every rendition switch froze for up to `CLOSE_DRAIN_MS` | **fixed** |
+
+### 1. The old session's tail after a rendition switch (HIGH) — fixed
+
+**Reproduced.** The reviewer's repro is a new `desktop-pays.integration.test.ts` case (real
+providers, the host's real money plane, a real seeder daemon): A streams, `play.pause` A, the
+host authorises B (the adapter's reopen) and the worker opens it on the same core, B starts
+streaming, `play.close` A. Mutation H1 puts round 4's lookup back (by core, the open session
+first, one session). The new case fails, and so do the two after it ("a quit mid-video…",
+"the next start does not overrun the seeder"): the blocks written off at the switch stay
+outstanding at the seeder, and the fresh worker is overrun. The reviewer saw the same thing.
+
+**Also fixed: the harness.** `worker/__tests__/helpers/harness.ts` answered every host-handler
+failure with `internal`, so no integration test ever saw the money plane's `forbidden` or
+`session-closed`. The payer's decisions depend on exactly those codes. It now replies with
+`toWireError(e)`, as the host's supervisor does (`onRequest`).
+
+**Fix.**
+
+- **The session a PAY is built for** (new `worker/pay/session-ranges.ts`):
+  - `sessionsCovering(range, sessions)`: the sessions whose blob covers ALL of the range, open
+    ones first, then those closing. Open-first applies only among the covering sessions.
+  - Each worker `Session` records its blob's `first` and `last` block.
+  - `real-providers.ts` takes `sidsFor(range)` (it was `sidFor(core)`) and asks the host for a
+    session that covers the range.
+- **A host refusal is not final while another covering session may pay** (the orchestrator's
+  ruling). The worker's `pay` asks the covering sessions in order.
+  - On `forbidden` or `session-closed` from one session, it asks the next.
+  - Any other failure (`no-balance`, the host busy) goes back to the payer at once, since it
+    would fail the same way for every session.
+  - When every covering session refuses, the last refusal goes back.
+  - When no session covers the range, the worker refuses `session-closed` without asking the
+    host.
+- **Two sessions on one core each pay their own blocks.**
+  - `UpstreamPayer.payFailed` gives up only the refused RANGE. For `session-closed`, round 4
+    gave up every pending block of the core, which would include the other session's blocks.
+  - After a range is given up, the core's next run is tried in the same pass.
+  - `boundToSessions` is passed to the payer as the new `boundRange` option. It ends a PAY where
+    a session's blob ends. Renditions sit side by side in the core (measured in the suite: A at
+    blocks 30–36, B at 37–60), so A's last block and B's first could otherwise merge into one
+    run that no session covers.
+
+Tests:
+
+- `desktop-pays` × 2: the reviewer's repro above, and "renditions side by side".
+- `session-ranges.test.ts` × 7: covering, open-first, none, the bound at each kind of boundary.
+- `real-providers-sessions.test.ts` × 5: the range is asked for; the next covering session
+  after `forbidden` or `session-closed`; the last refusal goes back; other codes are not tried
+  elsewhere; with no cover the host is not asked.
+- `upstream-payer.test.ts`: "a range refused for good gives up THAT range only" (for both
+  `session-closed` and `forbidden`), and `boundRange` (plus five malformed answers, all ignored).
+- `viewer-payer.test.ts`: `boundRange` reaches the payer.
+
+### 2. A transient PAY failure at a seeder's cap (MEDIUM) — fixed
+
+**Reproduced.** The reviewer's repro is a unit test (`upstream-payer.test.ts`): the engine refuses
+`no-balance` for about 300 ms, the seeder is at its cap, `tailMs` is 30, and then the player
+pressures the pool 10 times. On the round-4 payer the test fails with 2 calls and 0 PAYs. Three
+more cases also fail there:
+
+- "retried after its backoff even when nothing else happens";
+- "a burst of flushes … never writes a transient failure off in under a second": round 4 gave it
+  up after 3 flushes, in about 75 ms;
+- "a PAY refused for ~1 s … is retried within the drain and paid" (`viewer-payer`).
+
+**Fix** (`UpstreamPayer`): the round-4 epochs are gone.
+
+- Each core keeps a streak of transient failures: how many, since when, and `retryAt`.
+- The backoff is `PAY_RETRY_BASE_MS` (250 ms), doubling per failure up to `PAY_RETRY_MAX_MS`
+  (4 s).
+- Once the backoff is over, **any** pass retries the core: a block, an ACK, pool pressure or
+  `flush()`. The failed run is then due however short, because it was due when it failed.
+- A per-peer **retry timer** wakes the payer at `retryAt`. A seeder at its cap sends nothing,
+  and pressure may never come, so without the timer nothing would retry. The timer is unref'd
+  and cleared on detach and dispose.
+- **The give-up is bounded in time.** A failing range is given up only after at least
+  `MAX_PAY_FAILURES` (3) attempts over at least `PAY_GIVE_UP_MS` (30 s). After that, each later
+  failing range of that core is given up at once, until a PAY of the core succeeds.
+  - 30 s is longer than a mint blip or an auto top-up, and longer than the close drain (5 s). The
+    drain therefore never writes a transient failure off itself: when it ends, the session is
+    gone and the next try is refused `session-closed` (final).
+  - `session-closed` and `forbidden` stay final at once.
+
+Two round-4 tests asserted the behaviour this finding calls a defect. They were **changed, not
+weakened**, each with a comment citing round 5:
+
+- "retried at the next flush" now advances the clock past the backoff first. It also asserts
+  that a flush inside the backoff does NOT retry.
+- "given up after `MAX_PAY_FAILURES` attempts" now lets the clock run. It asserts that attempts
+  alone never give up before `PAY_GIVE_UP_MS`, that the give-up happens after it, and that
+  nothing is tried afterwards.
+
+New tests (`upstream-payer.test.ts` × 5, `viewer-payer.test.ts` × 1):
+
+- the reviewer's repro;
+- the timer alone retries;
+- a failed short tail is retried as a tail by its timer;
+- a failed run is due by its own streak after another core's block;
+- the burst;
+- the drain with a ~1 s refusal.
+
+### 3. The close drain waited on the whole core (MEDIUM) — fixed
+
+**Reproduced.** The reviewer's repro in `desktop-pays` measures `play.close(A)` while B streams on
+the same core and requires it to answer in under `CLOSE_DRAIN_MS`. Mutation H4 (`closeSession`
+drains without a range, i.e. every tail and everything owed or in flight) fails that assertion.
+The unit test "returns as soon as ITS tail is paid while another session of the same core has
+blocks owed" fails when the settle check ignores the range (V1).
+
+**Fix.**
+
+- `ViewerPayer.drain(ms, range)` takes the closing session's blob range, and `closeSession`
+  passes it.
+- **Paying.** It pays only that range now: the new `UpstreamPayer.hurry(range)` makes that
+  range's runs due however short, including a block of it that lands during the drain, until it
+  is released. B keeps batching. Round 4 flushed every tail, and followed the peer's whole chain
+  while B streamed.
+- **Waiting.** It waits only for that range. The new `CreditSettler.owedOn(core, range)` counts
+  owed blocks in the range. `OnePeerRouter.inflightOn(core, range)` counts the blocks of the
+  range with a request out or being verified: the no-race queue's tracked block requests, which
+  hypercore adds on send and removes on resolve (the pinned internals). Without a range, both
+  keep their round-4 meaning.
+
+Tests:
+
+- `viewer-payer.test.ts` × 2: returns while B's block is owed and does not pay it; a block of
+  the range that lands during the drain is paid.
+- `seeder-credit.test.ts` × 1: `owedOn` with and without a range, and after a link goes.
+- `one-peer-router.test.ts` × 1, on real corestores: two withheld requests, counted per range.
+- `desktop-pays`: the timing assertion above.
+
+### Mutation checks (round 5)
+
+Each mutation was applied alone by a script in the scratchpad and the named tests were run. The
+file was then restored, with `tsc -b` re-run where the consumer reads `dist`.
+
+| # | Mutation | Result |
+|---|---|---|
+| — | whole-file revert of `payer.ts` to `80f8dd5` | caught: 8 `upstream-payer` tests (both changed round-4 tests and 6 new ones) |
+| T1 | no retry timer | caught: 4 (the timer alone, the tail retry, the burst, the give-up) |
+| T2 | no backoff (retry on every pass) | caught: 4 (the changed transient test, the repro, the burst, the timer) |
+| T3 | give-up by count only (round 4) | caught: the burst and the changed give-up test; `viewer-payer` "refused for ~1 s" |
+| T4 | no next run after a range is given up | caught: "gives up THAT range only" (after it was tightened, see below) |
+| T6 | `boundRange` ignored | caught: the `boundRange` test |
+| T7 | `hurry` ignored | caught: the `hurry` test |
+| T8 | a failed run not due by its streak | caught: "due by its own streak" (a test added for it, see below) |
+| T9 | a hurried block that lands does not schedule a pass | caught: the `hurry` test's `payEveryBlocks: 4` case (added, see below) |
+| V1 | `drain` settles on the whole core | caught: `viewer-payer` "returns as soon as ITS tail is paid…" |
+| V2 | the scoped drain flushes everything | caught: same (B's block paid) |
+| V3 | the scoped drain pays nothing itself | caught: 2 `viewer-payer` drain tests |
+| V4 | `ViewerPayer` does not pass `boundRange` on | caught: "boundRange reaches the payer" |
+| H1 | round 4's lookup (by core, open first, one session) | caught: 3 `desktop-pays` tests (the repro, then the quit and next-start cases) |
+| H1b | `sessionsCovering` by core only | caught: 2 `session-ranges` tests |
+| H1c | closing sessions before open ones | caught: `session-ranges` "open sessions first" |
+| H4 | `closeSession` drains without a range | caught: `desktop-pays` rendition switch (`play.close` timing) |
+| H5 | no bound at session boundaries | caught: 3 `session-ranges` tests; **not** by `desktop-pays` (see below) |
+| R1 | the first refusal is final | caught: 2 `real-providers-sessions` tests |
+| R2 | any failure tries the next session | caught: "any other failure … is not tried on another session" |
+| S1 | `countIn` ignores the range | caught: `one-peer-router` `inflightOn` |
+| S2 | `inflightOn` ignores the range | caught: same |
+| G1 | `owedOn` ignores the range | caught: `seeder-credit` `owedOn` |
+
+**Survivors on the first run, and what was done.**
+
+- **T4.** The first version of the test had passes from the downloads that also reached the
+  second run. It now uses a batch of 8, so `flush()`'s single forced pass has to reach it.
+- **T8.** The tail-retry test was forced anyway (`due` stays set after a tail), so it could not
+  see T8. A new test ends the quiet spell with another core's block before the retry.
+- **T9.** The `ViewerPayer` pays every block (`payEveryBlocks: 1`), so every download schedules a
+  pass whatever `hurry` does. A gateway-style rig (`payEveryBlocks: 4`) was added.
+- **H5 in the integration suite.** Measured (a probe in the test, then removed): each host
+  `pay.build` takes about 1.5 s here. A's last block is always paid together with the block
+  before it before B's first blocks land, so the two runs never merge in this suite, and
+  "renditions side by side" stays a scenario test. The bound is proven at unit level
+  (`session-ranges`, `upstream-payer`, and the `viewer-payer` wiring).
+
+### Gates (round 5)
+
+- Touched packages: `npx vitest run packages/gateway packages/seeder packages/app-desktop
+  --maxWorkers=2` gave 3 failures, in `money.test.ts` (2) and `guards.test.ts` (1). Those files
+  are untouched, each test took 6–8 s, and the load average was about 20. Rerun alone, both files
+  passed (364 tests); every other test passed (1987 passed, 5 skipped).
+- Whole suite, once: `npx vitest run --maxWorkers=2` gave 211 files (206 passed, 2 failed,
+  3 skipped) and 3193 tests: 3169 passed, 21 skipped (the real-mint suites gated on
+  `NUTFLIX_REAL_MINT_URL`) and 3 failed. All three were `Test timed out in 5000ms` in untouched
+  files, `auto-topup.test.ts` (2) and `money.test.ts` (1), at a load average of about 20. Those
+  files import nothing this round changed (only a type from the unchanged host supervisor). Each
+  test passes alone, and `money.test.ts` passed alone as a whole file earlier.
+- `npx tsc -b --force`: clean. `eslint` and `prettier --check` on every changed file: clean.
+- `npm run check:locked`: OK (no locked path touched). `npm run lint:electron`: OK, 0 violations.
+- The Electron e2e was not run.
+- **No test was deleted or weakened.** Changed tests:
+  - the two round-4 payer tests above, with comments citing round 5;
+  - `real-providers-journal.test.ts` and `dleq-thread.test.ts` pass `sidsFor: () => []` for
+    `sidFor: () => undefined` (the option was renamed);
+  - the harness now carries the host's real error codes.
+
+  No timeout was raised. The new tests' in-test deadlines are their own.
+
+### Residuals (round 5)
+
+- **Two windows on the SAME rendition.** Closing one window while the other streams that blob:
+  the drain waits for owed and in-flight blocks in its range, and the other window's blocks are
+  in the same range. That close can run to `CLOSE_DRAIN_MS` (bounded, and it pays correctly). A
+  rendition switch uses a different blob and is not affected. Telling the two apart needs
+  per-session attribution of requests; the gate stops tracking at close.
+- **One PAY per core in flight** (F30) still couples A's tail to a PAY of B's that is awaiting its
+  ACK on the same core. That is one round trip, not a drain.
+- **`flush()` respects the backoff.** A core backing off at the moment of a final flush (gateway
+  shutdown, worker quit after its drains) is not retried by that flush. Its blocks stay owed, as
+  they would if the retry had failed.
+- **Spend attribution.** After a switch, A's tail PAY is still reported as a spend of the newest
+  session of the core (`onPaid`), so it adds to B's totals. This is display only (the wallet was
+  debited by `pay.build`). Reporting it under A would lose it, since the host ignores spends of a
+  closed session. Pre-existing, and unchanged.
+- **The bound's integration coverage** is timing-bound (see H5); it is proven at unit level.
+- **On hold:** the image-fetch probe, `PRICE` / `announceCorePrices`, and IR4.
