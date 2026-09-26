@@ -300,7 +300,8 @@ export function realProviders(o: RealProviderOptions): RealProviders {
     creditBlocks: DEFAULT_WINDOW_BLOCKS,
     loopbackOnly: false,
     close: () => {
-      dleq.close();
+      // Never blocks: the thread is joined in the background once it says it is leaving.
+      void dleq.close();
     },
   };
 }

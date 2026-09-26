@@ -9,7 +9,10 @@
  *             and the chunked fallback yields between chunks;
  *   failure   is never acceptance: a thread that never starts, answers FAIL, answers the wrong
  *             count, hangs, or cannot be spawned at all leaves the verdicts to the chunked path;
- *             a hung thread is replaced, and two failed starts turn the thread off for good.
+ *             a hung thread is replaced, and two failed starts turn the thread off for good;
+ *   retiring  never blocks (issue #8 review, finding 2): a thread given up on mid-job or mid-start
+ *             sees QUIT (never overwritten) and leaves; it is joined only once it says so, and
+ *             one that never says so is let go unjoined.
  */
 import { mkdir, mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -35,8 +38,12 @@ import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import {
   DleqThread,
   MAILBOX,
+  MAILBOX_HEADER_BYTES,
+  MAILBOX_WORDS,
+  WORD,
   chunkedDleq,
   dleqVerifier,
+  serveDleqMailbox,
   type DleqThreadHandle,
   type SpawnDleqThread,
 } from '../pay/dleq-thread.js';
@@ -155,11 +162,33 @@ setInterval(() => {}, 1000);
 `;
 /** Never says anything. */
 const SILENT = `setInterval(() => {}, 1000);`;
+/** The real serve loop with a verifier that takes 800 ms a check (a job outlives `jobMs`). */
+const SLOW_JOB = `
+import { workerData } from 'node:worker_threads';
+import { serveDleqMailbox } from '${join(HERE, '..', 'pay', 'dleq-thread.ts').replaceAll('\\', '/')}';
+serveDleqMailbox(workerData, () => { const t = Date.now(); while (Date.now() - t < 800) {} return true; });
+`;
+/** 800 ms of work before the real serve loop (a slow start: a cold disk, a starved CPU). */
+const SLOW_START = `
+import { workerData } from 'node:worker_threads';
+import { serveDleqMailbox } from '${join(HERE, '..', 'pay', 'dleq-thread.ts').replaceAll('\\', '/')}';
+const t = Date.now(); while (Date.now() - t < 800) {}
+serveDleqMailbox(workerData, () => true);
+`;
 
 beforeAll(async () => {
   dir = join(ROOT, 'node_modules', '.cache', `nf-s3res-dleq-${randomBytes(6).toString('hex')}`);
   await mkdir(dir, { recursive: true });
-  const sources = { SERVE, THROWING, FAIL_AT_START, WRONG_COUNT, HANG, SILENT };
+  const sources = {
+    SERVE,
+    THROWING,
+    FAIL_AT_START,
+    WRONG_COUNT,
+    HANG,
+    SILENT,
+    SLOW_JOB,
+    SLOW_START,
+  };
   for (const [name, contents] of Object.entries(sources)) {
     const outfile = join(dir, `${name}.mjs`);
     await build({
@@ -180,11 +209,21 @@ afterAll(async () => {
   await rm(dir, { recursive: true, force: true });
 });
 
-/** A spawner over node:worker_threads, recording what it did. */
-function nodeSpawner(name: string): SpawnDleqThread & { spawned: number; terminated: number } {
+/**
+ * A spawner over node:worker_threads, recording what it did. `joins` holds, for each `join()`,
+ * the thread's `exited` word at that moment: under Bare a join before the thread has said it is
+ * leaving blocks the event loop (issue #8 review, finding 2), so every entry must be 1.
+ */
+function nodeSpawner(name: string): SpawnDleqThread & {
+  spawned: number;
+  terminated: number;
+  joins: number[];
+  boxes: SharedArrayBuffer[];
+} {
   const s = Object.assign(
     (box: SharedArrayBuffer): DleqThreadHandle => {
       s.spawned++;
+      s.boxes.push(box);
       const file = entries[name];
       if (file === undefined) throw new Error(`no entry ${name}`);
       const w = new Worker(file, { workerData: box });
@@ -194,12 +233,23 @@ function nodeSpawner(name: string): SpawnDleqThread & { spawned: number; termina
           s.terminated++;
           void w.terminate();
         },
-        join: () => undefined,
+        join: () => {
+          s.joins.push(Atomics.load(new Int32Array(box, 0, MAILBOX_WORDS), WORD.EXITED));
+        },
       };
     },
-    { spawned: 0, terminated: 0 },
+    { spawned: 0, terminated: 0, joins: [] as number[], boxes: [] as SharedArrayBuffer[] },
   );
   return s;
+}
+
+/** Poll until `f()` holds (a thread's mailbox, seen from here), or fail after `ms`. */
+async function until(f: () => boolean, ms = 5000): Promise<void> {
+  const t0 = performance.now();
+  while (!f()) {
+    if (performance.now() - t0 > ms) throw new Error('condition not met in time');
+    await new Promise((r) => setTimeout(r, 10));
+  }
 }
 
 describe('DleqThread (the mailbox) — parity and liveness', () => {
@@ -215,7 +265,7 @@ describe('DleqThread (the mailbox) — parity and liveness', () => {
       const [a, b] = await Promise.all([t.verify(cs.slice(0, 3)), t.verify(cs.slice(3))]);
       expect([...a, ...b]).toEqual(want);
     } finally {
-      t.close();
+      await t.close();
     }
   });
 
@@ -231,7 +281,7 @@ describe('DleqThread (the mailbox) — parity and liveness', () => {
       // On the loop, one pass over 128 proofs; off it, the loop only waits.
       expect(off.stall).toBeLessThan(on.stall / 4);
     } finally {
-      t.close();
+      await t.close();
     }
   });
 
@@ -240,14 +290,14 @@ describe('DleqThread (the mailbox) — parity and liveness', () => {
     try {
       expect(await t.verify(checks(3))).toEqual([false, false, false]);
     } finally {
-      t.close();
+      await t.close();
     }
     const real = new DleqThread({ spawn: nodeSpawner('SERVE') });
     try {
       const junk = [null, { proof: 1 }, {}] as unknown as Check[];
       expect(await real.verify([...junk, ...checks(1)])).toEqual([false, false, false, true]);
     } finally {
-      real.close();
+      await real.close();
     }
   });
 
@@ -257,13 +307,13 @@ describe('DleqThread (the mailbox) — parity and liveness', () => {
       const cs = mixed(checks(12));
       expect(await t.verify(cs)).toEqual(inline(cs));
     } finally {
-      t.close();
+      await t.close();
     }
     const tiny = new DleqThread({ spawn: nodeSpawner('SERVE'), dataBytes: 64 });
     try {
       await expect(tiny.verify(checks(1))).rejects.toThrow(/too large/);
     } finally {
-      tiny.close();
+      await tiny.close();
     }
   });
 });
@@ -288,7 +338,8 @@ describe('dleqVerifier — failure is never acceptance', () => {
   ] as const)
     it(`a thread that ${what}: the verdicts come from the chunked path`, async () => {
       const spawn = nodeSpawner(name);
-      const v = dleqVerifier({ spawn, verify, startMs: 300, jobMs: 300 });
+      // reapMs: these stand-in threads never say they are leaving, so they are let go after it.
+      const v = dleqVerifier({ spawn, verify, startMs: 300, jobMs: 300, reapMs: 300 });
       try {
         // Three PAYs, each after the start that the one before began is over.
         for (let i = 0; i < 3; i++) {
@@ -296,32 +347,36 @@ describe('dleqVerifier — failure is never acceptance', () => {
           await v.ready();
         }
       } finally {
-        v.close();
+        // Awaited since the issue #8 review (finding 2): a retired thread is stopped in the
+        // background, never by a blocking join on the event loop.
+        await v.close();
       }
+      expect(spawn.joins).toEqual([]); // none said it was leaving: none was joined
       if (name === 'FAIL_AT_START' || name === 'SILENT') expect(spawn.spawned).toBe(2); // two failed starts: off for good
       if (name === 'HANG') expect(spawn.terminated).toBeGreaterThanOrEqual(1); // replaced
     });
 
   it('a thread that fails its first start is tried once more, then left off', async () => {
     const spawn = nodeSpawner('SILENT');
-    const t = new DleqThread({ spawn, startMs: 200 });
+    // reapMs: a stand-in that never says it is leaving is let go after it (finding 2).
+    const t = new DleqThread({ spawn, startMs: 200, reapMs: 200 });
     await expect(t.verify(cs)).rejects.toThrow(/did not start/);
     expect(t.usable).toBe(true);
     await expect(t.verify(cs)).rejects.toThrow(/did not start/);
     expect(t.usable).toBe(false);
     await expect(t.verify(cs)).rejects.toThrow(/unavailable/);
     expect(spawn.spawned).toBe(2);
-    t.close();
+    await t.close();
   });
 
   it('never waits for a start: the first PAY is checked inline while the thread comes up', async () => {
     const spawn = nodeSpawner('SILENT'); // a start that would take the whole start timeout
-    const v = dleqVerifier({ spawn, verify, startMs: 5000 });
+    const v = dleqVerifier({ spawn, verify, startMs: 5000, reapMs: 200 });
     const t0 = performance.now();
     expect(await v.verify(cs)).toEqual(want);
     expect(performance.now() - t0).toBeLessThan(4000);
     expect(spawn.spawned).toBe(1); // …but the start was begun
-    v.close();
+    await v.close();
   });
 
   it('close stops the thread; later checks still get verdicts (chunked)', async () => {
@@ -330,10 +385,73 @@ describe('dleqVerifier — failure is never acceptance', () => {
     expect(await v.verify(cs)).toEqual(want); // inline; the thread starts meanwhile
     expect(await v.ready()).toBe(true);
     expect(await v.verify(cs)).toEqual(want); // on the thread
-    v.close();
+    // Awaited since the issue #8 review (finding 2): close never blocks; it resolves once the
+    // thread has said it is leaving and was joined.
+    await v.close();
     expect(spawn.terminated).toBe(1);
+    expect(spawn.joins).toEqual([1]); // joined only after it said it was leaving
     expect(await v.verify(cs)).toEqual(want);
     expect(spawn.spawned).toBe(1);
+  });
+});
+
+describe('retiring a thread never blocks the event loop (issue #8 review, finding 2)', () => {
+  const cs = checks(2);
+
+  it('a thread given up on mid-job leaves after the job — QUIT is not overwritten — and is joined only then', async () => {
+    const spawn = nodeSpawner('SLOW_JOB');
+    const t = new DleqThread({ spawn, jobMs: 200, reapMs: 10_000 });
+    await expect(t.verify(cs)).rejects.toThrow(/timed out/);
+    const [box] = spawn.boxes;
+    if (box === undefined) throw new Error('no thread');
+    const ctl = new Int32Array(box, 0, MAILBOX_WORDS);
+    // The thread is still checking: not joined yet, and the worker moved on.
+    expect(spawn.joins).toEqual([]);
+    expect(Atomics.load(ctl, WORD.STATE)).toBe(MAILBOX.QUIT);
+    await t.close();
+    // Its job over, the thread kept QUIT (no RES over it) and said it was leaving.
+    expect(Atomics.load(ctl, WORD.STATE)).toBe(MAILBOX.QUIT);
+    expect(Atomics.load(ctl, WORD.EXITED)).toBe(1);
+    expect(spawn.joins).toEqual([1]);
+    expect(t.reaps).toEqual({ joined: 1, abandoned: 0 });
+  });
+
+  it('a slow start given up on: the thread finds QUIT instead of parking on IDLE, and leaves', async () => {
+    const spawn = nodeSpawner('SLOW_START');
+    const t = new DleqThread({ spawn, startMs: 200, reapMs: 10_000 });
+    await expect(t.verify(cs)).rejects.toThrow(/did not start/);
+    const [box] = spawn.boxes;
+    if (box === undefined) throw new Error('no thread');
+    const ctl = new Int32Array(box, 0, MAILBOX_WORDS);
+    await until(() => Atomics.load(ctl, WORD.EXITED) === 1);
+    expect(Atomics.load(ctl, WORD.STATE)).toBe(MAILBOX.QUIT); // never IDLE over it
+    await t.close();
+    expect(spawn.joins).toEqual([1]);
+    expect(t.reaps).toEqual({ joined: 1, abandoned: 0 });
+  });
+
+  it('a thread that never says it is leaving is let go without a join (it would block under Bare)', async () => {
+    const spawn = nodeSpawner('HANG');
+    const t = new DleqThread({ spawn, jobMs: 100, reapMs: 200 });
+    await expect(t.verify(cs)).rejects.toThrow(/timed out/);
+    await t.close();
+    expect(spawn.joins).toEqual([]);
+    expect(spawn.terminated).toBe(1); // asked to stop (never blocks), then let go
+    expect(t.reaps).toEqual({ joined: 0, abandoned: 1 });
+  });
+
+  it('serveDleqMailbox: a QUIT set before it boots returns at once, keeps QUIT, and says it is leaving', () => {
+    const box = new SharedArrayBuffer(MAILBOX_HEADER_BYTES + 64);
+    const ctl = new Int32Array(box, 0, MAILBOX_WORDS);
+    Atomics.store(ctl, WORD.STATE, MAILBOX.QUIT);
+    let called = 0;
+    serveDleqMailbox(box, () => {
+      called++;
+      return true;
+    }); // on this thread: it would never return if it parked
+    expect(Atomics.load(ctl, WORD.STATE)).toBe(MAILBOX.QUIT);
+    expect(Atomics.load(ctl, WORD.EXITED)).toBe(1);
+    expect(called).toBe(0);
   });
 });
 
@@ -448,8 +566,12 @@ describe('realProviders: a PAY’s DLEQ checks go to the thread (the wiring)', (
       expect(spawn.spawned).toBe(1); // one thread, reused
     } finally {
       p.close?.();
+      // The providers' close never blocks (issue #8 review, finding 2); this waits for the
+      // background join, so the count below is not a race.
+      await p.dleq.close();
       await rm(root, { recursive: true, force: true });
     }
     expect(spawn.terminated).toBe(1); // closing the providers stops it
+    expect(spawn.joins).toEqual([1]);
   });
 });

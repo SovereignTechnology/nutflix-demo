@@ -13,7 +13,11 @@
  * package.json — a `.js` entry is parsed as CommonJS, tsc's `export {}` is a SyntaxError there, and
  * that SyntaxError escapes the thread and aborts the worker (found by `bare-dleq-thread.test.ts`).
  */
-const MAILBOX_FAIL = 5; // MAILBOX.FAIL, spelled out: this file imports nothing statically
+// MAILBOX / WORD from dleq-thread.ts, spelled out: this file imports nothing statically.
+const MAILBOX_BOOT = 0;
+const MAILBOX_FAIL = 5;
+const WORD_STATE = 0;
+const WORD_EXITED = 2;
 
 interface ThreadSelf {
   readonly data?: unknown;
@@ -31,9 +35,13 @@ async function main(): Promise<void> {
     const { serveDleqMailbox } = await import('./dleq-thread.js');
     serveDleqMailbox(box, (proof, keyset) => payment.proofDleqOk(proof, keyset));
   } catch {
-    const ctl = new Int32Array(box, 0, 2);
-    Atomics.store(ctl, 0, MAILBOX_FAIL);
-    Atomics.notify(ctl, 0);
+    const ctl = new Int32Array(box, 0, 3);
+    // FAIL only over BOOT: a worker that gave up on this start meanwhile has set QUIT, which
+    // stays (issue #8 review, finding 2). Then "leaving", so the worker can join this thread.
+    Atomics.compareExchange(ctl, WORD_STATE, MAILBOX_BOOT, MAILBOX_FAIL);
+    Atomics.notify(ctl, WORD_STATE);
+    Atomics.store(ctl, WORD_EXITED, 1);
+    Atomics.notify(ctl, WORD_EXITED);
   }
 }
 

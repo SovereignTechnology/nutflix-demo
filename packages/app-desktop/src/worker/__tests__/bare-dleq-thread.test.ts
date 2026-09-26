@@ -7,6 +7,13 @@
  * behaviour before), on the thread, and on the chunked fallback — with the same verdicts each way
  * (valid accepted, a bad DLEQ refused). It also proves the process survives a thread that cannot
  * load core, and a missing entry file (an exception escaping a Bare thread aborts the process).
+ *
+ * And retiring a thread never blocks the loop (issue #8 review, finding 2): under Bare,
+ * `terminate()` stops neither a busy thread nor one parked in `Atomics.wait`, and `join()` blocks
+ * until the thread returns. A job that outlives `jobMs`, and a start slower than `startMs`, are
+ * given up on with the loop still turning; each thread leaves by itself (QUIT is never
+ * overwritten), is joined only then, and the process exits cleanly (a parked thread would keep
+ * `Bare.exit` from returning).
  */
 import { randomBytes } from 'node:crypto';
 import { copyFile, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
@@ -32,7 +39,7 @@ const built =
 const MINT = 'https://mint.bare-dleq.test' as MintUrl;
 
 /** The program Bare runs: measure, compare, report one JSON line over IPC. */
-const PROGRAM = (dist: string, broken: string): string => `
+const PROGRAM = (dist: string, broken: string, slowJob: string, slowStart: string): string => `
 const { payment } = await import('@sovit/core');
 const { bareDleqThread } = await import(${JSON.stringify(pathToFileURL(join(dist, 'adapters', 'bare.js')).href)});
 const { DleqThread, chunkedDleq } = await import(${JSON.stringify(pathToFileURL(join(dist, 'pay', 'dleq-thread.js')).href)});
@@ -70,7 +77,21 @@ ipc.on('data', async (c) => {
   const tb = Date.now();
   try { await b.verify(checks.slice(0, 1)); } catch (e) { brokenOutcome = String(e.message); }
   const brokenMs = Date.now() - tb;
-  b.close();
+  await b.close();
+  // Retiring never blocks the loop (review finding 2): a job past jobMs, a start past startMs.
+  async function retireCase(href, opts) {
+    const t = new DleqThread({ spawn: bareDleqThread(new URL(href)), reapMs: 10000, ...opts });
+    const r = await stall(async () => {
+      let outcome = 'accepted?';
+      try { await t.verify(checks.slice(0, 1)); } catch (e) { outcome = String(e.message); }
+      const t1 = Date.now();
+      await t.close();
+      return { outcome, closeMs: Date.now() - t1 };
+    });
+    return { ...r.value, total: r.total, stall: r.stall, reaps: t.reaps };
+  }
+  const slowJob = await retireCase(${JSON.stringify(pathToFileURL(slowJob).href)}, { jobMs: 500 });
+  const slowStart = await retireCase(${JSON.stringify(pathToFileURL(slowStart).href)}, { startMs: 500 });
   ipc.write(Buffer.from(JSON.stringify({
     inline: { total: inline.total, stall: inline.stall, verdicts: inline.value },
     thread: { startMs, total: thread.total, stall: thread.stall, verdicts: thread.value },
@@ -78,6 +99,8 @@ ipc.on('data', async (c) => {
     missing: missing === null ? 'no-thread' : 'started',
     broken: brokenOutcome,
     brokenMs,
+    slowJob,
+    slowStart,
     alive: true,
   }) + '\\n'));
   setTimeout(() => Bare.exit(0), 50);
@@ -106,7 +129,34 @@ beforeAll(async () => {
     join(work, 'boot.mjs'),
     "import 'bare-encoding/global'\nimport('./main.mjs').catch((e) => { throw e })\n",
   );
-  await writeFile(join(work, 'main.mjs'), PROGRAM(DIST, broken));
+  // Stand-in entries for the retire cases: the REAL serve loop from dist, with 2 s of work in a
+  // job, or before the loop starts (a cold start). They catch everything: an exception escaping a
+  // Bare thread aborts the process.
+  const serve = pathToFileURL(join(DIST, 'pay', 'dleq-thread.js')).href;
+  const slowJob = join(work, 'slow-job-entry.mjs');
+  const slowStart = join(work, 'slow-start-entry.mjs');
+  await writeFile(
+    slowJob,
+    `async function main() {
+  const box = Bare.Thread.self.data;
+  const { serveDleqMailbox } = await import(${JSON.stringify(serve)});
+  serveDleqMailbox(box, () => { const t = Date.now(); while (Date.now() - t < 2000) {} return true; });
+}
+void main().catch(() => undefined);
+`,
+  );
+  await writeFile(
+    slowStart,
+    `async function main() {
+  const box = Bare.Thread.self.data;
+  const t = Date.now(); while (Date.now() - t < 2000) {}
+  const { serveDleqMailbox } = await import(${JSON.stringify(serve)});
+  serveDleqMailbox(box, () => true);
+}
+void main().catch(() => undefined);
+`,
+  );
+  await writeFile(join(work, 'main.mjs'), PROGRAM(DIST, broken, slowJob, slowStart));
 });
 
 afterAll(async () => {
@@ -136,6 +186,14 @@ function checks(n: number): payment.DleqCheck[] {
     );
 }
 
+interface RetireCase {
+  readonly outcome: string;
+  readonly closeMs: number;
+  readonly total: number;
+  readonly stall: number;
+  readonly reaps: { readonly joined: number; readonly abandoned: number };
+}
+
 interface Report {
   readonly inline: { total: number; stall: number; verdicts: boolean[] };
   readonly thread: { startMs: number; total: number; stall: number; verdicts: boolean[] };
@@ -143,6 +201,8 @@ interface Report {
   readonly missing: string;
   readonly broken: string;
   readonly brokenMs: number;
+  readonly slowJob: RetireCase;
+  readonly slowStart: RetireCase;
   readonly alive: boolean;
 }
 
@@ -190,6 +250,9 @@ describe('DLEQ off the Bare worker’s event loop (issue #8 d, F5)', () => {
           r(-1);
         }, 10_000);
       });
+      // A bare that did not exit (a parked thread holds Bare.exit) ignores SIGTERM: kill it.
+      if (exited === -1)
+        (sc as unknown as { _process: { kill(signal: string): boolean } })._process.kill('SIGKILL');
 
       // Parity: every path answers exactly what core's proofDleqOk answers under Node.
       expect(report.inline.verdicts).toEqual(want);
@@ -205,7 +268,18 @@ describe('DLEQ off the Bare worker’s event loop (issue #8 d, F5)', () => {
       // …answered through the mailbox (FAIL) at once, not found out by the 5 s start timeout.
       expect(report.brokenMs).toBeLessThan(4000);
       expect(report.alive).toBe(true);
-      expect(exited).toBe(0);
+      // Retiring never blocks (review finding 2). Each case runs 2 s of thread work; the loop
+      // kept turning through it, the thread left by itself and was joined only then.
+      for (const [c, want] of [
+        [report.slowJob, /timed out/],
+        [report.slowStart, /did not start/],
+      ] as const) {
+        expect(c.outcome).toMatch(want);
+        expect(c.reaps).toEqual({ joined: 1, abandoned: 0 });
+        expect(c.total).toBeGreaterThan(1500); // the close waited for the thread to leave…
+        expect(c.stall).toBeLessThan(1000); // …without blocking the loop for it
+      }
+      expect(exited).toBe(0); // no thread left parked: Bare.exit returned
       // The numbers themselves, for the lane report: NUTFLIX_DLEQ_MEASURE=<file> writes them.
       const out = process.env['NUTFLIX_DLEQ_MEASURE'];
       if (out !== undefined && out !== '')
@@ -220,6 +294,10 @@ describe('DLEQ off the Bare worker’s event loop (issue #8 d, F5)', () => {
               maxStallMs: report.thread.stall,
             },
             chunked: { totalMs: report.chunked.total, maxStallMs: report.chunked.stall },
+            retire: {
+              slowJob: { totalMs: report.slowJob.total, maxStallMs: report.slowJob.stall },
+              slowStart: { totalMs: report.slowStart.total, maxStallMs: report.slowStart.stall },
+            },
           }),
         );
     },
