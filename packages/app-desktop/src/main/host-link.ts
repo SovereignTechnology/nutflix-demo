@@ -85,6 +85,26 @@ export class HostLink {
     }
   }
 
+  /**
+   * Fix round 4 (app quit): `stop()`, then resolve once the host has exited — it pays the open
+   * play sessions' tails first (SIGTERM → `Host.shutdown`) — or after `ms`, whichever is first.
+   */
+  stopAndWait(ms: number): Promise<void> {
+    const child = this.child;
+    if (child === undefined) {
+      this.stop();
+      return Promise.resolve();
+    }
+    return new Promise<void>((resolve) => {
+      const timer = setTimeout(resolve, Math.max(0, ms));
+      child.on('exit', () => {
+        clearTimeout(timer);
+        resolve();
+      });
+      this.stop();
+    });
+  }
+
   /** App quit: kill the host and never respawn it. */
   stop(): void {
     this.stopping = true;

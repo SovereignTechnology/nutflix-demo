@@ -687,12 +687,28 @@ describe('main.ts wiring (fake electron)', () => {
     expect(fx.order).toContain('reload');
   });
 
-  it('before-quit kills the host and it is not respawned', async () => {
+  // Fix round 4 (cross-lane review, HIGH): a quit lets the host pay the open play sessions'
+  // tails, so main holds the quit (Electron passes an event; this test used to pass none) until
+  // the host exits — bounded — then quits for real. The kill and the no-respawn still hold.
+  it('before-quit kills the host and it is not respawned; the quit waits for the host to exit', async () => {
     await boot();
-    for (const l of fx.appListeners.get('before-quit') ?? []) l();
+    let prevented = 0;
+    const ev = {
+      preventDefault: () => {
+        prevented++;
+      },
+    };
+    for (const l of fx.appListeners.get('before-quit') ?? []) l(ev);
     expect(fx.children[0]?.killed).toBe(true);
+    expect(prevented).toBe(1);
+    expect(fx.order).not.toContain('quit');
     for (const l of fx.children[0]?.listeners.get('exit') ?? []) l(0);
+    await new Promise((r) => setTimeout(r, 0));
+    expect(fx.order).toContain('quit'); // the host is gone: quit for real
     expect(fx.forks).toHaveLength(1);
+    // That second quit is not held again.
+    for (const l of fx.appListeners.get('before-quit') ?? []) l(ev);
+    expect(prevented).toBe(1);
   });
 
   it('ADR 0013: --keychain is forwarded only for a real keychain (never basic_text)', async () => {

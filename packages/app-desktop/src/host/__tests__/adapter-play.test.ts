@@ -14,6 +14,9 @@ import type { IpcError } from '../../ipc/errors.js';
 import type { HostOut } from '../../ipc/protocol.js';
 import type { PlayOpenArgs } from '../../ipc/worker-protocol.js';
 import type { HostPlaySession } from '../sessions.js';
+import { HostPlaySession as PlaySessionClass, SessionRegistry } from '../sessions.js';
+import type { WorkerCall } from '../sessions.js';
+import { silentLogger as hostSilent } from '../log.js';
 import { seedVideos } from './support/catalog.js';
 import type { SeededVideo } from './support/catalog.js';
 import { coreTestKit } from './support/core-helpers.js';
@@ -221,6 +224,96 @@ describe('the session backstop (≤ 1 unpaused session per webContents)', () => 
     expect(r.worker().calls('play.close')).toHaveLength(1);
     for (const p of [s.pauseAsync(), s.resumeAsync(), s.setPrefetchAsync(3), s.switchAsync('x')])
       expect(await codeOf(p)).toBe('session-closed');
+  });
+});
+
+// Fix round 4 (cross-lane review, HIGH): the host revoked a session the moment it closed — before
+// the worker even heard `play.close` — so every PAY for the session's tail was refused. The money
+// plane's revocation now waits for the worker's answer (its tail paid first), and quit closes every
+// session through the worker before stopping it.
+describe('closing a session: revoked only once the worker has paid its tail (fix round 4)', () => {
+  function bare(worker: WorkerCall, registry = new SessionRegistry()) {
+    const s = new PlaySessionClass(
+      {
+        sid: 'ab'.repeat(16) as HostPlaySession['sid'],
+        token: 'cd'.repeat(32),
+        owner: 1,
+        videoId: 'ef'.repeat(32) as NostrEventId,
+        title: 't',
+        rendition: '720p',
+        policy: mocks.VIDEOS[0]!.price,
+        prefetchSeconds: 30,
+      },
+      {
+        worker,
+        mediaLink: () => undefined,
+        log: hostSilent,
+        registry,
+        reopen: () => Promise.reject(new Error('not here')),
+      },
+    );
+    registry.add(s);
+    return s;
+  }
+
+  it('closeAsync: closed to the renderer at once; onSettled (the revocation) only after play.close answered', async () => {
+    let answer: () => void = () => undefined;
+    const order: string[] = [];
+    const s = bare((m: string) => {
+      order.push(`worker:${m}`);
+      return new Promise<undefined>((resolve) => {
+        answer = () => {
+          order.push('worker:answered');
+          resolve(undefined);
+        };
+      });
+    });
+    s.onClose(() => order.push('closed'));
+    s.onSettled(() => order.push('settled'));
+    const closing = s.closeAsync();
+    expect(s.closed).toBe(true);
+    await Promise.resolve();
+    expect(order).toEqual(['closed', 'worker:play.close']);
+    answer();
+    await closing;
+    expect(order).toEqual(['closed', 'worker:play.close', 'worker:answered', 'settled']);
+  });
+
+  it('a play.close that fails still settles; a worker gone settles at once; settling happens once', async () => {
+    const failing = bare(() => Promise.reject(new Error('backend-down: x')));
+    let n = 0;
+    failing.onSettled(() => n++);
+    await failing.closeAsync();
+    expect(n).toBe(1);
+    const gone = bare((() => new Promise(() => undefined)) as unknown as WorkerCall);
+    let m = 0;
+    gone.onSettled(() => m++);
+    gone.markClosed();
+    gone.markClosed();
+    expect(m).toBe(1);
+    gone.onSettled(() => m++); // registered late: runs at once
+    expect(m).toBe(2);
+  });
+
+  it('the adapter revokes the session on the money plane only after the worker answered play.close', async () => {
+    const { r, videos } = await devRig();
+    const s = await r.host.adapter.openSession(3, videos[0]!.video.id);
+    const settled: string[] = [];
+    s.onClose(() => settled.push('closed'));
+    s.onSettled(() => settled.push('settled'));
+    await s.closeAsync();
+    expect(settled).toEqual(['closed', 'settled']);
+    expect(r.worker().calls('play.close')).toHaveLength(1);
+  });
+
+  it('quit: Host.shutdown closes every session THROUGH the worker (tails paid) before it stops', async () => {
+    const { r, videos } = await devRig();
+    const a = await r.host.adapter.openSession(4, videos[0]!.video.id);
+    const b = await r.host.adapter.openSession(5, videos[1]!.video.id);
+    await r.host.shutdown(5000);
+    const closed = r.worker().calls('play.close') as { sid: string }[];
+    expect(closed.map((c) => c.sid).sort()).toEqual([a.sid, b.sid].sort());
+    expect(a.closed && b.closed).toBe(true);
   });
 });
 

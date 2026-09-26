@@ -70,6 +70,8 @@ export class HostPlaySession implements PlaySession {
   private readonly peerCbs = new Set<(p: readonly PeerSpend[]) => void>();
   private readonly spendCbs = new Set<(s: SpendPayload) => void>();
   private readonly closeCbs = new Set<() => void>();
+  private readonly settledCbs = new Set<() => void>();
+  private settledValue = false;
 
   constructor(init: SessionInit, deps: SessionDeps) {
     this.sid = init.sid;
@@ -169,19 +171,54 @@ export class HostPlaySession implements PlaySession {
     return next;
   }
 
-  /** Idempotent. Revokes the media link even when the worker cannot be reached. */
+  /**
+   * Idempotent. Revokes the media link even when the worker cannot be reached. Fix round 4: the
+   * `onSettled` hooks (the money plane's revocation of this session) run only once the worker has
+   * answered `play.close` — it pays the session's tail before it answers, and a PAY needs the
+   * session to be authorised — or once that call failed (the worker's own bound, or it is gone).
+   */
   async closeAsync(): Promise<void> {
     if (this.closedValue) return;
-    this.markClosed();
+    this.closeLocally();
     try {
       await this.d.worker('play.close', { sid: this.sid });
     } catch {
       this.d.log.debug('play.close failed (worker down?); link already revoked');
+    } finally {
+      this.settle();
     }
   }
 
-  /** The worker is gone: drop everything without asking it. */
+  /** The worker is gone: drop everything without asking it (nothing more can be paid). */
   markClosed(): void {
+    this.closeLocally();
+    this.settle();
+  }
+
+  /**
+   * Called once nothing more will be paid for this session: after the worker answered
+   * `play.close` (its tail paid), or when the worker is gone. Where the money plane revokes it.
+   */
+  onSettled(cb: () => void): void {
+    if (this.settledValue) cb();
+    else this.settledCbs.add(cb);
+  }
+
+  private settle(): void {
+    if (this.settledValue) return;
+    this.settledValue = true;
+    for (const cb of this.settledCbs) {
+      try {
+        cb();
+      } catch {
+        // listeners must not break closing
+      }
+    }
+    this.settledCbs.clear();
+  }
+
+  /** Closed to the renderer: registry, media link, listeners — the worker not asked yet. */
+  private closeLocally(): void {
     if (this.closedValue) return;
     this.closedValue = true;
     this.d.registry.remove(this);
@@ -271,5 +308,10 @@ export class SessionRegistry {
   /** Worker died: every session is gone, links revoked, nothing asked of the worker. */
   dropAll(): void {
     for (const s of this.all()) s.markClosed();
+  }
+
+  /** Fix round 4 (quit): close every session through the worker, so each tail is paid first. */
+  async closeAll(): Promise<void> {
+    await Promise.all(this.all().map((s) => s.closeAsync()));
   }
 }

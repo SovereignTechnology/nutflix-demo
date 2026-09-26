@@ -36,6 +36,7 @@ import { MoneyPlane } from '../money.js';
 import { seedVideos } from './support/catalog.js';
 import { coreTestKit } from './support/core-helpers.js';
 import type { Rig } from './support/rig.js';
+import type { FakeWorkerOptions } from './support/fake-worker.js';
 import { RELAY_A, eventually, rig } from './support/rig.js';
 
 const kit = await coreTestKit();
@@ -85,7 +86,11 @@ interface World {
 }
 
 async function world(
-  o: { readonly hooks?: object; readonly tickMs?: number } = {},
+  o: {
+    readonly hooks?: object;
+    readonly tickMs?: number;
+    readonly worker?: FakeWorkerOptions;
+  } = {},
 ): Promise<World> {
   const lightning = new mocks.TestLightning();
   const target = new mocks.TestMint({
@@ -137,6 +142,7 @@ async function world(
     pool,
     identity: new SignerIdentity(signer),
     mintRequest,
+    ...(o.worker === undefined ? {} : { worker: o.worker }),
     topUp: {
       ...o.hooks,
       now: () => (t += o.tickMs ?? 1_000),
@@ -341,5 +347,58 @@ describe('auto top-up follows payments, not balance events (issue #2, review fin
     expect(await balance(w.r, TARGET)).toBe(900 + 2_000);
     expect(await balance(w.r, SOURCE)).toBe(16_000);
     expect(w.asked).toHaveLength(1); // allowed at the play: no second question
+  }, 30_000);
+});
+
+// Fix round 4 (cross-lane review, HIGH): the host revoked a session before the worker heard
+// `play.close`, so the PAY the worker builds for the session's tail while it closes was refused
+// 'session-closed' — with the real money plane here, and the worker's side played by the fake.
+describe('closing a session: the tail PAY the worker builds meanwhile is authorised (fix round 4)', () => {
+  it('pay.build during play.close is paid; after play.close answered the session is revoked', async () => {
+    const outcomes: string[] = [];
+    const tailPay = async (fw: {
+      calls(m: 'play.open'): unknown[];
+      request(m: 'pay.build', a: never): Promise<unknown>;
+    }): Promise<string> => {
+      const open = fw.calls('play.open')[0] as {
+        readonly sid: SessionId;
+        readonly rendition: {
+          readonly hyper: { readonly core: CoreKeyHex; readonly blob: HyperblobId };
+        };
+        readonly policy: VideoManifest['price'];
+      };
+      const { core, blob } = open.rendition.hyper;
+      return fw
+        .request('pay.build', {
+          sid: open.sid,
+          range: { core, fromBlock: blob.blockOffset, toBlock: blob.blockOffset },
+          seeder: { pubkey: SEEDER, p2pk: SEEDER_P2PK, mint: TARGET },
+          policy: open.policy,
+          carryIn: 0,
+        } as never)
+        .then(
+          () => 'paid',
+          (e: unknown) => (e as { code?: string }).code ?? 'error',
+        );
+    };
+    const w = await world({
+      tickMs: 61_000,
+      worker: {
+        handlers: {
+          // The worker pays the session's tail BEFORE it answers play.close.
+          'play.close': async (_a, fw) => {
+            outcomes.push(await tailPay(fw));
+            return undefined;
+          },
+        },
+      },
+    });
+    r = w.r;
+    expect((await invoke(w.r, 'play', [w.trusted.id])).ok).toBe(true);
+    const [session] = w.r.host.adapter.sessions.all();
+    await session!.closeAsync();
+    expect(outcomes).toEqual(['paid']);
+    // Once play.close answered, nothing more is paid for that session.
+    expect(await tailPay(w.r.worker() as never)).toBe('session-closed');
   }, 30_000);
 });
