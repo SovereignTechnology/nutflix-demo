@@ -46,12 +46,15 @@ import {
   WORD,
   chunkedDleq,
   dleqVerifier,
+  liveDleqMailboxes,
+  quitDleqThreadsNow,
   serveDleqMailbox,
   timeoutOption,
   type DleqThreadHandle,
   type SpawnDleqThread,
 } from '../pay/dleq-thread.js';
 import { realProviders } from '../pay/real-providers.js';
+import { exitWorker } from '../exit.js';
 import { DLEQ_SELFCHECK_MSG, selfCheckChecks, startDleqSelfCheck } from '../dev/dleq-selfcheck.js';
 import type { LogRecord } from '@sovit/seeder';
 import { createLogger } from '@sovit/seeder';
@@ -413,6 +416,45 @@ describe('dleqVerifier — failure is never acceptance', () => {
     expect(spawn.joins).toEqual([1]); // joined only after it said it was leaving
     expect(await v.verify(cs)).toEqual(want);
     expect(spawn.spawned).toBe(1);
+  });
+});
+
+// Fix round 4 (I1 verifier): `Bare.exit` joins every live thread, and a parked one never returns
+// on its own — so the exits that skip `close()` tell every live mailbox to quit first (the real
+// Bare run is `bare-exit.test.ts`).
+describe('quitDleqThreadsNow: every live thread told to leave, synchronously (fix round 4)', () => {
+  const cs = checks(2);
+  const want = cs.map((c) => payment.proofDleqOk(c.proof, c.keyset));
+
+  it('a parked thread sees QUIT and leaves; the registry forgets it once it is joined', async () => {
+    const spawn = nodeSpawner('SERVE');
+    const t = new DleqThread({ spawn });
+    const before = liveDleqMailboxes();
+    expect(await t.verify(cs)).toEqual(want); // up, answered, now parked in Atomics.wait
+    expect(liveDleqMailboxes()).toBe(before + 1);
+    const box = spawn.boxes[0]!;
+    const ctl = new Int32Array(box, 0, MAILBOX_WORDS);
+    expect(Atomics.load(ctl, WORD.EXITED)).toBe(0);
+    expect(quitDleqThreadsNow()).toBeGreaterThanOrEqual(1);
+    expect(Atomics.load(ctl, WORD.STATE)).toBe(MAILBOX.QUIT);
+    await until(() => Atomics.load(ctl, WORD.EXITED) === 1); // it returned by itself
+    await t.close();
+    expect(spawn.joins).toEqual([1]);
+    expect(liveDleqMailboxes()).toBe(before);
+  });
+
+  it('exitWorker quits every live thread BEFORE it exits', async () => {
+    const spawn = nodeSpawner('SERVE');
+    const t = new DleqThread({ spawn });
+    expect(await t.verify(cs)).toEqual(want);
+    const ctl = new Int32Array(spawn.boxes[0]!, 0, MAILBOX_WORDS);
+    const seen: number[] = [];
+    exitWorker(1, (code) => {
+      seen.push(code, Atomics.load(ctl, WORD.STATE));
+    });
+    expect(seen).toEqual([1, MAILBOX.QUIT]);
+    await until(() => Atomics.load(ctl, WORD.EXITED) === 1);
+    await t.close();
   });
 });
 

@@ -107,6 +107,35 @@ type WaitAsync = (
   | { readonly async: false; readonly value: 'not-equal' | 'timed-out' }
   | { readonly async: true; readonly value: Promise<'ok' | 'timed-out'> };
 
+/**
+ * Every live thread's mailbox — started, and not yet joined or let go (fix round 4, I1 verifier).
+ * `Bare.exit` joins every live thread, and a thread parked in `Atomics.wait` never returns on its
+ * own, so an exit that skips `close()` (an uncaught exception, the shutdown force timer) would
+ * block for good. `quitDleqThreadsNow` tells each one to leave first.
+ */
+const liveMailboxes = new Set<SharedArrayBuffer>();
+
+/**
+ * SYNCHRONOUS: store QUIT in every live DLEQ thread's mailbox and wake it, so a parked thread
+ * returns and `Bare.exit` can join it (a thread busy with a job returns once the job ends: QUIT is
+ * never overwritten). For the exits that cannot wait for `close()`. Returns how many were told.
+ */
+export function quitDleqThreadsNow(): number {
+  let n = 0;
+  for (const box of liveMailboxes) {
+    const ctl = new Int32Array(box, 0, MAILBOX_WORDS);
+    Atomics.store(ctl, WORD.STATE, MAILBOX.QUIT);
+    Atomics.notify(ctl, WORD.STATE);
+    n++;
+  }
+  return n;
+}
+
+/** Live mailboxes (tests). */
+export function liveDleqMailboxes(): number {
+  return liveMailboxes.size;
+}
+
 /** Wait until control word `index` leaves `from`, or `ms` pass. `true` when it changed. */
 async function waitWord(
   ctl: Int32Array,
@@ -286,6 +315,7 @@ export class DleqThread {
     }
     this.handle = handle;
     this.mailbox = box;
+    liveMailboxes.add(box);
     const ready = await waitChange(ctl, MAILBOX.BOOT, this.startMs);
     if (!ready || Atomics.load(ctl, WORD.STATE) !== MAILBOX.IDLE) {
       this.failedStarts++;
@@ -307,10 +337,17 @@ export class DleqThread {
     const ctl = new Int32Array(box, 0, MAILBOX_WORDS);
     Atomics.store(ctl, WORD.STATE, MAILBOX.QUIT);
     Atomics.notify(ctl, WORD.STATE);
-    if (h === null) return;
+    if (h === null) {
+      liveMailboxes.delete(box);
+      return;
+    }
     const reap = this.reap(h, ctl);
     this.reaping.add(reap);
-    void reap.finally(() => this.reaping.delete(reap));
+    void reap.finally(() => {
+      this.reaping.delete(reap);
+      // Joined, or let go with QUIT stored (it leaves once its job ends): nothing left to tell.
+      liveMailboxes.delete(box);
+    });
   }
 
   /**
