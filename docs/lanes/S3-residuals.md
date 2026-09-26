@@ -9,6 +9,88 @@ belongs to another lane.
 - (c) held inputs out of the balance;
 - (d) DLEQ off the Bare worker's event loop.
 
+An independent review of `c1cf406` returned fix-first (two medium liveness findings, two low,
+two info). All six were verified; five are fixed and one info is deferred. See "Independent
+review round" below and `docs/reviews/2026-09-25-pre-push-residuals.md` § Independent review.
+
+## Independent review round
+
+| # | Finding | Outcome |
+|---|---|---|
+| 1 | [Medium] Held inputs never came back by themselves: a settle ran only inside an operation at that mint or once at open, and the playback gate reads the balance first | **fixed**: `SettleLoop` (core) settles on a schedule, started by the money plane |
+| 2 | [Medium] `DleqThread.retire()` could block the Bare worker's loop for ever (`terminate()` stops neither a busy nor an `Atomics.wait`-parked thread; the thread overwrote QUIT) | **fixed**: CAS transitions, an `exited` word, join only after it, background reap |
+| 3 | [Low] Compaction could publish a deletion before the token carrying its proofs | **fixed**: `compactOutbox` keeps the new token in the first replaced token's place |
+| 4 | [Low] `StaleKeysetError` (12xxx) and 429 read as ambiguous: inputs held, quote locked 10 min | **fixed**: `isDefinitive` takes exactly those two wrappers (not any coded `cause`) |
+| 5 | [Info] A retry of a melt recovered earlier said "melt failed"; recovered lookup not kind-checked | **fixed**: a PAID quote answers paid without a request; recovered entries keyed by kind |
+| 6 | [Info] The journal grows without bound during a long relay outage | **deferred** (info): documented in `nip60.ts` and the residuals |
+
+What changed:
+
+- **Finding 1.** `CashuWallet.settleSchedule()` reads the journal (count, the next wait, what is
+  overdue). `SettleLoop` (`core/src/wallet/settle-loop.ts`, new) runs `recoverPending` at an
+  entry's `created + PENDING_SETTLE_AFTER_S` + 5 s, retries overdue entries after 30 s doubling
+  to 600 s (back to 30 s once a settle decides one), re-plans on balance events but only ever
+  earlier, runs one settle at a time, and has an unref'd timer. `MoneyPlane` starts it after the
+  startup settle and stops it in `close()` (`settleTimer` option for tests).
+- **Finding 2.** The thread moves the state word only by `Atomics.compareExchange` (BOOT → IDLE,
+  REQ → RES/FAIL) and sets a new `exited` word on every way out (the entry's FAIL path too).
+  `retire()` sets QUIT and reaps in the background: `join()` only after `exited` (immediate
+  then), else a non-blocking `terminate()` after `reapMs` (60 s) and the handle is let go.
+  `close()` returns a promise and never blocks. Self-review follow-ups: no new thread starts
+  while a retired one is still leaving (no pile-up on a starved CPU); timeout options must be
+  finite and ≥ 0, `dataBytes` a positive integer.
+- **Finding 3.** `compactOutbox` (`nip60.ts`).
+- **Findings 4 and 5** (`spend.ts`, locked; `check:locked` OK): `isDefinitive` accepts
+  `StaleKeysetError` with a coded `cause` and `RateLimitError`; a coded `cause` under any other
+  error stays ambiguous (a `MeltChangeError` means the melt went through). A melt of a quote the
+  mint reports PAID returns `paid: true` (preimage, change 0) without a request. `settle`'s
+  recovered map is keyed `kind:key`.
+- ADR 0014 amendment: a section "After the independent review".
+
+Commits: `7e6f6c4` (1), `a32b2ec` and `d2e18ce` (2), `4c2c219` (3 to 6), `914a44e` (self-review),
+then the docs.
+
+Tests this round: 29 new (27 always on, 2 opt-in real-mint), 1 changed.
+
+- `core/src/wallet/__tests__/settle-loop.test.ts` (10, new): planning; no postponement by events
+  for a wait or a retry; backoff and reset; one settle at a time; stop; a future stamp; a NaN
+  clock; store and settle errors; the real wallet with only `balance()` read gets a refused
+  send's input back, spendable once.
+- `core/src/wallet/__tests__/journal-review.test.ts` (7, new): 12001 on a melt, 429 on a melt,
+  12002 on a send (nothing held, payable at once); a `MeltChangeError` with a coded cause still
+  restores the change; a lost answer stays ambiguous; a retry after a restart answers paid with
+  no second request; a recovered top-up never passes for a melt with the same (malicious) id.
+- `core/src/wallet/__tests__/nip60-journal.test.ts` (+2): the relay refusing token events after
+  an outage gets no deletion ahead of the token; `compactOutbox` order cases.
+- `core/src/wallet/__tests__/journal-residuals.test.ts` (1 changed): the refused-melt test makes
+  the mint refuse by sending no inputs (a second melt of a paid quote is now answered locally,
+  finding 5), and also checks the quote is payable right after.
+- `core/src/wallet/__tests__/journal-real-mint.integration.test.ts` (+2, opt-in): held inputs
+  come back by the loop (the mint's NUT-07 answer); a retry of a recovered melt answers paid.
+- `app-desktop/src/host/__tests__/wallet-journal.test.ts` (+2): the money plane returns 16 sat
+  after an hour of balance reads when its planned settle runs; `close()` cancels the plan.
+- `app-desktop/src/worker/__tests__/dleq-thread.test.ts` (+6): mid-job and slow-start retire
+  (QUIT kept, joined only after `exited`); a thread that never says it leaves is let go;
+  `serveDleqMailbox` with QUIT before boot; no pile-up; timeout options. Existing tests now
+  `await close()` and give stand-ins a short `reapMs` (comments cite the finding).
+- `app-desktop/src/worker/__tests__/bare-dleq-thread.test.ts` (extended): under the real Bare,
+  a job past `jobMs` and a start past `startMs` are given up on with the loop turning (max stall
+  16 ms over 2 s of thread work), each thread and the broken entry are joined, `Bare.exit`
+  returns.
+
+Mutation checks this round: 22 (R1 to R22), every one killed; R2 first survived and got a test.
+Table in the review record.
+
+Checks: full suite `npx vitest run --maxWorkers=2` at `914a44e`: 179 files passed, 3 skipped;
+2790 tests passed, 15 skipped (167 s). Real mints (Nutshell 0.21.0 on 3399, cdk-mintd 0.18.1 on
+3397, second Nutshell 3398 for invoices): core 12/12 and gateway swarm 3/3 on each.
+`npx tsc -b --force`, eslint, prettier, `check:locked`, `lint:electron`: clean. No dependency
+changed.
+
+Housekeeping note for the orchestrator: three `bare` processes from the reviewer's repro
+(`node_modules/.cache/nf-review-race/boot.mjs`, started 17:17, orphaned, idle) are still running
+in this worktree. They were not started by this lane and were left alone.
+
 ## What changed, and why
 
 ### (a) The desktop wallet journal is durable and sealed (ADR 0014 amendment)
@@ -124,6 +206,10 @@ balance event too. Two existing F31 tests expected 16 while the input was held; 
   - `docs/decisions/0014-wallet-journal-nut09.md` (amendment);
   - `docs/reviews/2026-09-25-pre-push-residuals.md`;
   - this report.
+- Review round: core `wallet/settle-loop.ts` (new), `wallet/wallet.ts` (`settleSchedule`),
+  `wallet/index.ts`, `wallet/nip60.ts` (`compactOutbox`), `wallet/spend.ts` (locked:
+  `isDefinitive`, the PAID answer, `opKey`); host `money.ts`; worker `pay/dleq-thread.ts`,
+  `pay/dleq-thread-entry.mts`, `pay/real-providers.ts`.
 
 ## Tests
 
@@ -189,6 +275,9 @@ Highlights:
 - M26: verification waits for the start;
 - M27: the host does not pass the journal directory.
 
+The independent review round added 22 more (R1 to R22), all killed; R2 (a change event
+postponing an overdue retry) first survived and got a test. 50 in all.
+
 ## Residuals
 
 - [Low] A result commit whose journal write fails after the mint executed. The entry stays on
@@ -196,7 +285,16 @@ Highlights:
   nobody.
 - [Low] Melt blanks at a mint without NUT-12 take the mint's amount on trust.
 - [Low] A melt whose connection failed holds its inputs, and a retry of the quote is refused,
-  until the mint shows its fate or 10 min pass.
+  until the mint shows its fate or 10 min pass; the settle loop then decides it by itself
+  (review finding 1). A keyset refusal or a 429 is no longer held (finding 4).
+- [Low] A mint (or proxy) that executes a request and then answers 429 or a keyset code loses
+  that operation's outputs, like any coded answer after executing (review finding 4).
+- [Low] The daemon has no settle loop: a payout send whose answer is unknown holds its inputs
+  until the next receive at that mint (each flush that redeems runs one) or a restart.
+- [Low] A retired DLEQ thread that never says it is leaving is let go after 60 s, unjoined (ours
+  always says so after its job).
+- [Info] Review finding 6, deferred: the journal grows by about 3 KB an operation during a relay
+  outage, every save rewrites it, and at 32 MiB commits fail closed until the relays return.
 - [Low] The journal key is a hex string while it passes through the signer's NIP-44, and cannot
   be wiped.
 - [Low] Journals are per identity and never deleted; they settle when that identity unlocks.
@@ -211,7 +309,7 @@ Highlights:
 
 ## Proposed row for `docs/status.md` (Stage 3 table)
 
-| Issue #8 residuals (ADR 0014 amendment, F5 desktop) | `stage-3/residuals` (on `c08c99f`) | **done**: (a) the desktop journal is a sealed file per identity. The key is wrapped with NIP-44 to self, then XChaCha20-Poly1305. Every transition, with the unpublished NIP-60 events, is fsynced before its request; `recoverPending` settles it at open; a damaged journal refuses the wallet loudly and is kept. Crash injection: SIGKILL between the journal write and the mint answer, recovered by a new process. (b) Melt change is journaled (NUT-08 blanks, NUT-09 restore, PENDING and NUT-07 handled). (c) Held inputs are out of the balance and the header chip. (d) DLEQ runs on a `Bare.Thread` over a SharedArrayBuffer mailbox, with chunked fallback, never acceptance. 128 proofs: 593 ms of stall before, 2 ms after. Real mints: Nutshell and cdk 3/3. 28 mutation checks |
+| Issue #8 residuals (ADR 0014 amendment, F5 desktop) | `stage-3/residuals` (on `c08c99f`) | **done** (independent review fix-first → fixed): (a) the desktop journal is a sealed file per identity. The key is wrapped with NIP-44 to self, then XChaCha20-Poly1305. Every transition, with the unpublished NIP-60 events, is fsynced before its request; `recoverPending` settles it at open and a `SettleLoop` settles later entries on a schedule; a damaged journal refuses the wallet loudly and is kept. Crash injection: SIGKILL between the journal write and the mint answer, recovered by a new process. (b) Melt change is journaled (NUT-08 blanks, NUT-09 restore, PENDING and NUT-07 handled). (c) Held inputs are out of the balance and the header chip, and come back by themselves. (d) DLEQ runs on a `Bare.Thread` over a SharedArrayBuffer mailbox, with chunked fallback, never acceptance; retiring a thread never blocks the loop. 128 proofs: 548 ms of stall before, 3 ms after. Real mints: Nutshell and cdk 5/5. 50 mutation checks |
 
 ## Proposed text for `docs/security-review.md`
 
@@ -219,13 +317,16 @@ Highlights:
   `stage-3/residuals`, ADR 0014 amendment)". Replace the residual sentence with: "The desktop's
   journal is a sealed file (a key wrapped with NIP-44 to self, then XChaCha20-Poly1305), written
   and fsynced with the unpublished NIP-60 events before each request, and settled at the next
-  open; crash injection is tested. Melt change is journaled. Held inputs are out of the balance.
+  open, then on a schedule (`SettleLoop`); crash injection is tested. Melt change is journaled.
+  Held inputs are out of the balance and come back by themselves.
   Residual [Low]: a result commit whose journal write fails after the mint executed loses a
   send's locked outputs (the recipient never gets them)."
 - **F5** (state row): replace "Open: the desktop's Bare worker still checks DLEQ inline" with
   "The desktop's Bare worker checks DLEQ on a `Bare.Thread` (SharedArrayBuffer mailbox; any
-  thread failure means chunked inline checks, two proofs per turn, never acceptance): 128
-  proofs, 593 ms of event-loop stall before, 2 ms after, measured under Bare 1.31
-  (`stage-3/residuals`)". Keep "Open: the credit pool …" for the other lane.
+  thread failure means chunked inline checks, two proofs per turn, never acceptance; a thread
+  given up on is stopped through the mailbox and joined only once it says it is leaving, so
+  retiring it never blocks the loop): 128 proofs, 548 ms of event-loop stall before, 3 ms after,
+  measured under Bare 1.31 (`stage-3/residuals`)". Keep "Open: the credit pool …" for the other
+  lane.
 - §0a / summary line 597: "[Done] F5 … Residual [Low]: a credit pool sized per seeder window"
   (drop "DLEQ in the desktop's Bare worker").

@@ -203,3 +203,26 @@ which sends "the whole balance", no longer tries to spend held inputs.
     proofs;
   - the journal key passes through the signer's NIP-44 as a hex string, which cannot be wiped
     (the NIP-60 wallet key's limit).
+
+### After the independent review (same day)
+
+- **Held inputs come back by themselves.** A settle used to run only inside an operation at that
+  mint or once at open, so a wallet whose whole balance was held could start no operation (the
+  playback gate reads the balance first) and got nothing back before a restart. The desktop's
+  money plane now runs `SettleLoop` (`core/src/wallet/settle-loop.ts`): `recoverPending` at an
+  entry's `created + PENDING_SETTLE_AFTER_S` (+5 s), overdue entries (a melt still PENDING, a
+  mint that could not be asked) retried after 30 s doubling to 10 min, re-planned on every
+  balance event but only ever earlier. The daemon settles at every receive, which each flush
+  runs.
+- **The outbox keeps deletions behind their token.** A compacted token's replacement takes its
+  place in the outbox, ahead of every deletion it covers, so a drain that fails part-way never
+  leaves the relays with an old token deleted and no token holding its proofs.
+- **Refusals cashu-ts wraps are refusals.** A keyset refusal (12xxx, thrown as a
+  `StaleKeysetError` with the code in its `cause`) and a 429 (`RateLimitError`) drop the entry at
+  once, like any coded answer. A coded `cause` under any other error does not: cashu-ts's
+  `MeltChangeError` means the melt went through, and its change is restored by NUT-09.
+- **A paid quote answers paid.** A melt of a quote the mint reports PAID (a retry after the
+  startup settle restored its change) returns `paid: true` without a request. Recovered entries
+  are matched by kind as well as key.
+- Deferred [Info]: the journal grows by about 3 KB an operation during a relay outage, and at
+  32 MiB commits fail closed until the relays take the events.

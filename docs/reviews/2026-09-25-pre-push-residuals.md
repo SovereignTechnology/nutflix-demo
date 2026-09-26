@@ -206,3 +206,230 @@ a copy, and the dist rebuilt where the test reads `dist/`.
   worker. Without it the checks run chunked, bounded but on the loop.
 - [Info] `bare-dleq-thread.test.ts` reads the built `dist/` (skipped when it is not built, like
   the daemon's DLEQ pool test). CI builds first; a stale `dist/` tests the older build.
+
+## Independent review (2026-09-25)
+
+An independent reviewer examined the lane at `c1cf406` and returned **fix-first**: two medium
+findings (both liveness; neither loses or double-spends money), two low and two info. Each was
+checked against the code first; all six hold. Fixes are on `stage-3/residuals`, `7e6f6c4` to
+`914a44e`.
+
+| # | Finding | Outcome |
+|---|---|---|
+| 1 | [Medium] Held inputs never come back by themselves on the desktop | **fixed** (`7e6f6c4`) |
+| 2 | [Medium] `DleqThread.retire()` can block the Bare worker's loop for ever | **fixed** (`a32b2ec`, `d2e18ce`) |
+| 3 | [Low] Outbox compaction can publish a deletion before the token that carries its proofs | **fixed** (`4c2c219`) |
+| 4 | [Low] A refusal cashu-ts wraps (`StaleKeysetError`, 429) read as ambiguous | **fixed** (`4c2c219`) |
+| 5 | [Info] A retry of a melt recovered earlier says "melt failed"; recovered lookup not kind-checked | **fixed** (`4c2c219`) |
+| 6 | [Info] The journal grows without bound during a long relay outage | **deferred** (documented; info) |
+
+### 1. Held inputs never came back by themselves — fixed
+
+Verified: `recoverPending` ran once at open (and only when the journal had entries), and a
+settle otherwise ran only inside an operation at that mint. `adapter.checkBalance` reads only
+`wallet.balance()`, so with the whole balance held no operation could start, and nothing
+settled the entry before a restart. The lane's tests called `recoverPending()` by hand, which
+hid it. Reproduced with the new host test before the fix: balance 0 after an hour of reads.
+
+Fix:
+
+- `core/src/wallet/wallet.ts` `CashuWallet.settleSchedule()`: reads the journal only (`count`,
+  `next` = the earliest `created + PENDING_SETTLE_AFTER_S` still in the future, `overdue`).
+- `core/src/wallet/settle-loop.ts` (new) `SettleLoop`:
+  - runs `recoverPending` at an entry's wait plus 5 s;
+  - retries overdue entries (a melt still PENDING, a mint that could not be asked) after 30 s,
+    doubling while settles decide nothing, up to 600 s; back to 30 s once one does;
+  - plans again on every balance event, but only ever earlier, so a stream of PAYs cannot
+    postpone a settle;
+  - one settle at a time; `stop()` cancels; the default timer is unref'd; nothing logs; a clock
+    that is not a number plans nothing.
+- `app-desktop/src/host/money.ts`: the money plane starts the loop after the startup settle and
+  stops it in `close()`. `onSettled` logs counts only.
+
+Tests: `settle-loop.test.ts` (10: planning, no postponement by events for a wait or a retry,
+backoff and reset, one at a time, stop, a future stamp, a NaN clock, store and settle errors;
+the real wallet with only `balance()` read gets a refused send's input back, spendable once, and
+the change event carries it). Host (`wallet-journal.test.ts`, +2): the money plane over the
+sealed journal, an hour of balance reads, then the planned settle returns 16 sat; `close()`
+cancels the planned settle. Real mints (opt-in, +1): the input comes back by the mint's own
+NUT-07 answer on Nutshell 0.21.0 and cdk-mintd 0.18.1.
+
+The daemon has the same shape (a payout send's held inputs), but it settles at every receive,
+which every flush runs; see the residuals.
+
+### 2. `retire()` could hang the Bare worker — fixed
+
+Verified under the real Bare 1.31 (bare-sidecar prebuilt), with standalone programs:
+`terminate()` returned at once but interrupted neither a busy thread (the following `join()`
+returned only when its 3 s loop ended) nor one parked in `Atomics.wait` (`join()` never
+returned; the process had to be killed). `Bare.exit` also hangs while a thread is parked, and
+`terminate()` does stop a thread idle in its own event loop, cleanly. The thread stored RES
+(after a job) and IDLE (after its boot) with plain stores over a QUIT the worker had set, then
+parked for good. So a job timeout (30 s) or a slow start (15 s) blocked the worker's loop for
+ever.
+
+Fix (`worker/pay/dleq-thread.ts`, `dleq-thread-entry.mts`):
+
+- the thread moves the state word only by `Atomics.compareExchange` from the state it expects
+  (BOOT → IDLE, REQ → RES/FAIL), so a QUIT is never overwritten; it returns on QUIT, and sets a
+  new `exited` control word on every way out (a `finally`; the entry's FAIL path too, FAIL only
+  over BOOT);
+- `retire()` sets QUIT and reaps in the background: `join()` only once `exited` is set (then it
+  is immediate), otherwise a non-blocking `terminate()` after `reapMs` (60 s) and the handle is
+  let go unjoined; `close()` resolves once every retired thread is reaped and never blocks.
+
+Tests: Node stand-ins (+4): a job past `jobMs` (the thread keeps QUIT, leaves after its job, is
+joined only then); a start past `startMs` (QUIT, not IDLE; joined); a thread that never says it
+leaves (let go, never joined); `serveDleqMailbox` with QUIT before boot returns at once. The
+real Bare runtime (`bare-dleq-thread.test.ts`): both cases given up on with the loop turning,
+each thread joined, the broken entry joined too, and `Bare.exit` returns (a parked thread would
+hold it). Existing tests now `await close()` and give stand-in threads a short `reapMs`, with a
+comment citing this finding.
+
+Measured on the final build (128-proof PAY, load 1.6):
+
+| Path | Max stall | Total |
+|---|---|---|
+| Inline | 548 ms | 548 ms |
+| Thread | 3 ms | 542 ms (start 143 ms) |
+| Chunked | 11 ms | 575 ms |
+| Retire: job past `jobMs` (2 s of thread work) | 16 ms | 2020 ms |
+| Retire: start past `startMs` (2 s) | 16 ms | 2021 ms |
+
+Before the fix the two retire rows do not finish: the loop stops.
+
+### 3. Compaction order — fixed
+
+Verified: commit B spends from published T1 (`[T2, K5(T1), H]`); commit C spends from
+unpublished T2, and T2 was filtered out with T3 appended: `[K5(T1), H, T3, K5(T2), H]`. A drain
+that published K5(T1) and then failed on T3 left the relays with T1 deleted and no token holding
+its unspent proofs. Fix (`core/src/wallet/nip60.ts` `compactOutbox`): the new token takes the
+first replaced token's place, ahead of every deletion it covers. Tests (+2): a relay that refuses
+token events after the outage publishes no deletion ahead of the token (a fresh load still sees
+`secret-1`), then the exact state once it takes everything; `compactOutbox` order cases.
+
+### 4. Wrapped refusals — fixed
+
+Verified in cashu-ts 4.10.0: `withStaleKeysetRepair` rethrows a 12xxx `MintOperationError` as a
+`StaleKeysetError` with the code only in `.cause`, around swap, mint and melt; a 429 is a
+`RateLimitError` (an `HttpResponseError`, no `code`). Both went to the ambiguous path: inputs
+held, and for a melt the quote locked locally for 10 min. Fix (`spend.ts`, locked;
+`check:locked` OK, the imports are cashu-ts's): `isDefinitive` accepts exactly these two
+wrappers. **Not** any coded `cause`: cashu-ts's `MeltChangeError` means the melt went through,
+and its `cause` can carry a code (a keyset fetch the mint refused); dropping that entry would
+lose the change. Tests (+5): a melt refused 12001 drops its entry at once and the quote is
+payable; a 429 likewise; a send refused 12002 holds nothing; a `MeltChangeError` with a coded
+cause still restores the change by NUT-09; a lost answer stays ambiguous. The same rule also
+stops a receive or top-up retry from reusing outputs on a stale keyset for 10 min.
+
+### 5. A melt recovered earlier — fixed
+
+Verified: a lost melt answer recovered by the startup `recoverPending`, then a retry of the same
+quote: the settle found nothing, a fresh entry was journaled, the mint refused ("quote already
+paid"), and the user saw "melt failed" for a paid invoice (no double payment: the mint enforces
+that). Fix (`spend.ts`): a quote the mint reports PAID answers `paid: true` (its preimage,
+change 0; the change is already in the wallet and the history has its line) without a request.
+Recovered entries are keyed by kind, so a recovered top-up whose quote id a malicious mint
+reused never answers a melt. Tests (+2, and +1 opt-in real-mint): the retry after a restart
+answers paid with no second request; a top-up recovered in the melt's own settle does not pass
+for the melt, which runs and reports its own change. The existing refused-melt test used a
+second melt of a paid quote to get a refusal; it now makes the mint refuse by sending no inputs
+(11002), with a comment citing this finding, and also checks the quote is payable right after.
+
+### 6. Journal growth during a relay outage — deferred (info)
+
+Holds: only superseded token events are compacted, so each operation adds a deletion and a
+history event (about 3 KB once sealed and hex-encoded) and every save rewrites the whole file;
+at `MAX_JOURNAL_BYTES` (32 MiB, about 10,000 operations) commits fail closed until the relays
+take the events. Deferred: it is a performance cliff after a long outage, not a loss, and it
+fails closed. Coalescing needs re-signed deletions or dropping history lines, a design change of
+its own. Documented in `nip60.ts`'s header and the residuals.
+
+### Self-review of the fix diff (`differential-review`, `sharp-edges`)
+
+Risk: HIGH for `spend.ts` (locked; value transfer: which failures drop an entry) and the thread
+protocol; MEDIUM for `SettleLoop` and the money plane; LOW for tests and docs. Blast radius:
+`isDefinitive` decides for send, receive, mint and melt; `CashuWallet.settleSchedule` and
+`SettleLoop` have one production caller (`MoneyPlane`); `compactOutbox` one (`apply`).
+
+Adversarial questions:
+
+- **A mint answering 429 or 12xxx after executing?** It loses the change, as it already could
+  with any coded error (the existing rule for coded answers). NUT-07 reconcile still removes only
+  proofs the mint reports SPENT. See the residuals.
+- **A mint answering PAID for a quote it never paid?** The wallet sends nothing and says paid;
+  the same mint could take the proofs and say PAID. No new capability.
+- **A mint that never answers restores?** The loop retries at most every 10 min: bounded load.
+- **Many PAYs while a retry is planned?** Never postponed (only ever earlier; tested for waits
+  and retries).
+
+Findings, fixed in `914a44e`:
+
+- S1 [Low] After a job timeout, the next PAY started a new thread while the retired one still
+  computed. On a starved CPU each would slow the next job past its timeout too, and they would
+  pile up. Fix: `tryVerify` starts no thread while a retired one is still leaving (the chunked
+  path answers). Mutation R19.
+- S2 [Low, sharp edge] `startMs` / `jobMs` / `reapMs` of NaN waited for ever (`waitAsync` reads
+  NaN as +∞); `dataBytes` of NaN made a zero-byte mailbox. Fix: `timeoutOption` (finite, ≥ 0,
+  else the default); `dataBytes` a positive integer, else the default. Mutations R20, R22.
+- S3 [Low, sharp edge] A `SettleLoop` clock that is not a number planned a settle for "now"
+  again and again. Fix: no plan. Mutation R21.
+- The mutation pass found the "only ever earlier" guard unpinned for overdue retries (R2
+  survived): a test with PAYs every 10 s against a 30 s retry now pins it.
+
+### Mutation checks (this round)
+
+Each guard broken, the named tests run, the guard restored with `git checkout`, and `dist/`
+rebuilt where the test reads it (runner in the lane's scratch directory).
+
+| # | Guard broken | Result |
+|---|---|---|
+| R1 | the money plane never starts the settle loop | 2 host tests fail |
+| R2 | a change event may postpone the plan | survived; retry test added, then fails |
+| R3 | `settleSchedule` does not count overdue entries | `settleSchedule` test fails |
+| R4 | progress does not reset the retry | backoff test fails |
+| R5 | `stop()` leaves the timer planned | "one settle at a time; stop cancels" fails |
+| R6 | `close()` does not stop the loop | 2 host tests fail |
+| R7 | thread BOOT → IDLE by plain store | Node slow-start test fails ("condition not met"); the whole run hangs on the parked thread |
+| R8 | thread REQ → RES by plain store | Node mid-job test and the Bare test fail |
+| R9 | join without waiting for `exited` | 9 tests fail |
+| R10 | `retire()` joins synchronously (the old code) | the Bare test fails (the loop stalls behind the join) |
+| R11 | `exited` never set | 9 tests fail |
+| R12 | the entry's FAIL path does not set `exited` | the Bare test fails (broken entry let go, not joined) |
+| R13 | `compactOutbox` appends the new token | 2 tests fail |
+| R14 | `StaleKeysetError` not a refusal | 2 tests fail |
+| R15 | 429 not a refusal | the 429 test fails |
+| R16 | any coded `cause` is a refusal | the `MeltChangeError` test fails (change lost) |
+| R17 | no PAID short-circuit | the retry-after-restart test fails |
+| R18 | recovered entries not keyed by kind | the malicious-ids test fails |
+| R19 | a new thread starts beside a retired one | the no-pile-up test fails |
+| R20 | `timeoutOption` accepts any number | its test fails |
+| R21 | a NaN clock plans a settle | its test fails |
+| R22 | `dataBytes` not validated | the options test fails |
+
+### Checks run
+
+- `npx vitest run --maxWorkers=2` (at `914a44e`): 179 files passed, 3 skipped (opt-in); 2790
+  tests passed, 15 skipped; 167 s.
+- Real mints, `NUTFLIX_REAL_MINT_URL` set, `NUTFLIX_REAL_MINT_URL_2` = Nutshell 3398: core's
+  two real-mint files 12/12 and the gateway's real-mint swarm 3/3, on Nutshell 0.21.0 (3399) and
+  on cdk-mintd 0.18.1 (3397).
+- `npx tsc -b --force`: clean. `npx eslint` and `npx prettier --check` on every changed file:
+  clean. `npm run check:locked`: OK. `npm run lint:electron`: OK. No dependency changed.
+
+### Residuals after this round
+
+- [Low] A mint (or a proxy in front of it) that executes a request and then answers 429 or a
+  keyset code loses that operation's outputs, like any coded answer after executing. Both are
+  refusals before processing by design (a rate limiter, and the keyset check, run before the
+  request is executed); an honest mint does not answer either after executing.
+- [Low] The daemon has no settle loop: a payout send whose answer is unknown holds its inputs
+  until the next receive at that mint (every flush that redeems runs one) or a restart. A node
+  that stops earning keeps them held, not lost.
+- [Low] A retired DLEQ thread that never says it is leaving is let go after 60 s, unjoined. Ours
+  always says so after its job; a thread stuck for ever in its own code would also keep
+  `Bare.exit` from returning (a Bare limit, not this code's).
+- [Info] Finding 6: the journal's growth during a long relay outage, deferred as above.
+- [Info] A second melt of a quote whose first is still unresolved locally is refused ("still
+  unresolved at the mint") even when the mint already reports it PAID; the loop settles it within
+  the wait and the retry then answers paid.
