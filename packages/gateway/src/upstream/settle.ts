@@ -88,14 +88,18 @@ export class CreditSettler {
 
   /**
    * Blocks of `core` (of every core without one) downloaded on live `pay/1` links and not settled
-   * yet — owed until their PAY is ACKed (fix round 4: what a closing session waits for).
+   * yet — owed until their PAY is ACKed (fix round 4: what a closing session waits for). With
+   * `range`, only blocks `fromBlock..toBlock` of `core` count (fix round 5: a closing session's
+   * own blocks — another session of the same core may be streaming beside it).
    */
-  owedOn(core?: string): number {
+  owedOn(core?: string, range?: { readonly fromBlock: number; readonly toBlock: number }): number {
     let n = 0;
     for (const l of this.links.values()) {
       if (l.closed) continue;
       if (core === undefined) for (const s of l.owed.values()) n += s.size;
-      else n += l.owed.get(core)?.size ?? 0;
+      else if (range === undefined) n += l.owed.get(core)?.size ?? 0;
+      else
+        for (const b of l.owed.get(core) ?? []) if (b >= range.fromBlock && b <= range.toBlock) n++;
     }
     return n;
   }

@@ -26,11 +26,20 @@
  *   - **A PAY that cannot be built stops only its own core (fix round 4).** `engine.pay` failing
  *     for one core (the desktop host refusing a core whose play session is gone, a wallet
  *     error) is logged by its outcome code alone and the peer's other cores are paid as usual.
- *     A core whose session is gone (`session-closed`) or whose PAY the host refuses for good
- *     (`forbidden`), or that failed `MAX_PAY_FAILURES` times in a row, gives its blocks up:
- *     they are never paid, and `onUnpayable` reports them so the downloader settles them as
- *     unpaid, explicitly (the seeder still counts them against its window). Any other failure
- *     keeps them owed; they are retried at the next forced pass (the tail timer, `flush()`).
+ *     A range whose session is gone (`session-closed`) or whose PAY the host refuses for good
+ *     (`forbidden`) is given up at once — that RANGE, not the core: another play session of the
+ *     same core may still pay its own blocks (fix round 5) — and the core's next run is tried in
+ *     the same pass. Given-up blocks are never paid, and `onUnpayable` reports them so the
+ *     downloader settles them as unpaid, explicitly (the seeder still counts them against its
+ *     window).
+ *   - **Any other failure is transient (fix round 5): retried after a backoff, bounded in TIME.**
+ *     The core waits `PAY_RETRY_BASE_MS`, doubling per failure up to `PAY_RETRY_MAX_MS`, and is
+ *     then retried by the next pass of any kind (a block, an ACK, pool pressure, `flush()`) or by
+ *     its own retry timer — a seeder at its cap sends nothing more and pressure may never come.
+ *     Only a failure that has lasted `PAY_GIVE_UP_MS` over at least `MAX_PAY_FAILURES` attempts
+ *     gives its range up (and, until a PAY of that core succeeds, each later failing range at
+ *     once): a mint blip or an auto top-up in flight is waited out, and a burst of passes (a
+ *     close drain polls every 25 ms) can never write a transient failure off in under a second.
  *
  * Only peers that sent a verified `HELLO` (protocol `open`) are paid; blocks downloaded before
  * it are counted and become payable the moment it arrives. Every `BlockRange` carries `core`
@@ -64,8 +73,24 @@ export type UpstreamPolicyResolver = (
 
 /** How long a short tail waits for more blocks before it is paid anyway. */
 export const DEFAULT_TAIL_MS = 2000;
-/** Consecutive failures to build a PAY for one core before its blocks are given up. */
+/** Consecutive failures to build a PAY for one core before its blocks may be given up. */
 export const MAX_PAY_FAILURES = 3;
+/** Fix round 5: the first wait before a failed PAY is tried again (doubles per failure). */
+export const PAY_RETRY_BASE_MS = 250;
+/** Fix round 5: the longest wait between two tries of a failed PAY. */
+export const PAY_RETRY_MAX_MS = 4000;
+/**
+ * Fix round 5: how long a core's PAYs must have kept failing (over at least `MAX_PAY_FAILURES`
+ * attempts) before a failing range is given up. Longer than a mint blip or an auto top-up, and
+ * longer than the desktop's close drain (5 s), which therefore never writes a transient failure
+ * off itself: once the drain is over the session is gone and the next try is refused for good.
+ */
+export const PAY_GIVE_UP_MS = 30_000;
+
+/** The wait after the `n`th consecutive failure (n ≥ 1). */
+function retryDelay(n: number): number {
+  return Math.min(PAY_RETRY_MAX_MS, PAY_RETRY_BASE_MS * 2 ** Math.min(16, Math.max(0, n - 1)));
+}
 /** Outcome codes after which a core's blocks can never be paid: they are given up at once. */
 const FINAL_OUTCOMES: ReadonlySet<string> = new Set(['session-closed', 'forbidden']);
 
@@ -114,6 +139,15 @@ export interface UpstreamPayerOptions {
    * so the seeder's credit keeps them for good. Called once per range given up.
    */
   readonly onUnpayable?: (noiseHex: string, range: BlockRange) => void;
+  /**
+   * Fix round 5: the longest prefix of `range` (same core, same first block) that ONE PAY may
+   * cover — the desktop worker ends it where a play session's blob ends, because the host builds a
+   * PAY for one session and only within that session's blocks; two renditions stored side by side
+   * in one core would otherwise merge into a run no session covers. Anything else it returns (a
+   * different core or first block, an empty or longer range, a throw) is ignored: the range is
+   * paid as it is. Default: no bound.
+   */
+  readonly boundRange?: (range: BlockRange) => BlockRange;
 }
 
 interface PriceOverride {
@@ -126,6 +160,14 @@ interface InFlight {
   readonly toBlock: number;
   /** The creator carry after this PAY — committed only if the seeder ACKs it ok. */
   readonly carryOut: number;
+}
+
+interface FailureStreak {
+  readonly n: number;
+  /** `Date.now()` of the streak's first failure. */
+  readonly since: number;
+  /** Not tried again before this `Date.now()`. */
+  readonly retryAt: number;
 }
 
 interface PeerState {
@@ -143,12 +185,12 @@ interface PeerState {
   /** core → the PAY awaiting its ACK (at most one per core). */
   readonly inflight: Map<CoreKeyHex, InFlight>;
   /**
-   * core → consecutive failures to build its PAY, and the `epoch` of the last one: it is retried
-   * once per `flush()` / tail timer (a new epoch), not on every pass the other cores cause.
+   * core → its streak of transient failures to build a PAY (fix round 5): how many, since when,
+   * and when it may be tried again. Cleared by the core's next PAY that is built.
    */
-  readonly failures: Map<CoreKeyHex, { readonly n: number; readonly epoch: number }>;
-  /** Bumped by every `flush()` and tail-timer fire (see `failures`). */
-  epoch: number;
+  readonly failures: Map<CoreKeyHex, FailureStreak>;
+  /** Wakes the peer when a failed core may be tried again (fix round 5). */
+  retryTimer: { readonly at: number; readonly handle: ReturnType<typeof setTimeout> } | null;
   /** `flush()` is draining: runs unlocked by an ACK are paid however short. */
   draining: boolean;
   /**
@@ -210,6 +252,9 @@ export class UpstreamPayer {
   private readonly credit: UpstreamPayerOptions['credit'];
   private readonly seederBatch: UpstreamPayerOptions['seederBatch'];
   private readonly onUnpayable: UpstreamPayerOptions['onUnpayable'];
+  private readonly boundRange: UpstreamPayerOptions['boundRange'];
+  /** Ranges being paid now however short their runs (`hurry`: a closing session's tail). */
+  private readonly hurried = new Set<BlockRange>();
   private readonly tailMs: number;
   private readonly offPressure: () => void;
   private readonly peers = new Map<string, PeerState>();
@@ -233,6 +278,7 @@ export class UpstreamPayer {
     this.credit = o.credit;
     this.seederBatch = o.seederBatch;
     this.onUnpayable = o.onUnpayable;
+    this.boundRange = o.boundRange;
     this.tailMs = o.tailMs ?? DEFAULT_TAIL_MS;
     // Pressure: pay whatever is held so the pool can refill.
     this.offPressure =
@@ -244,7 +290,10 @@ export class UpstreamPayer {
   /** Stop listening to the credit pool (the payer is being discarded). */
   dispose(): void {
     this.offPressure();
-    for (const s of this.peers.values()) this.clearTail(s);
+    for (const s of this.peers.values()) {
+      this.clearTail(s);
+      this.clearRetry(s);
+    }
   }
 
   /**
@@ -287,7 +336,7 @@ export class UpstreamPayer {
       carry: new Map(),
       inflight: new Map(),
       failures: new Map(),
-      epoch: 0,
+      retryTimer: null,
       draining: false,
       due: false,
       tailTimer: null,
@@ -344,6 +393,7 @@ export class UpstreamPayer {
     return () => {
       state.closed = true;
       this.clearTail(state);
+      this.clearRetry(state);
       for (const off of offs) off();
       if (this.peers.get(noiseHex) === state) this.peers.delete(noiseHex);
     };
@@ -377,8 +427,31 @@ export class UpstreamPayer {
     }
     set.add(index);
     state.due = false; // not quiet any more: batching resumes, the tail timer restarts
-    if (set.size >= this.payEvery || this.atCap(state)) this.schedule(state, false);
+    if (set.size >= this.payEvery || this.atCap(state) || this.isHurried(core, index, index))
+      this.schedule(state, false);
     this.armTail(state);
+  }
+
+  /**
+   * Fix round 5: pay every block of `range` that is pending — and every one that lands later — at
+   * once, however short its runs, until the returned function is called (the desktop's close
+   * drain: a closing session's tail, and nothing else, is paid now; the other sessions of that core
+   * keep batching). One PAY per core stays in flight, so a run waits for the ACK before it.
+   */
+  hurry(range: BlockRange): () => void {
+    const r: BlockRange = { core: range.core, fromBlock: range.fromBlock, toBlock: range.toBlock };
+    this.hurried.add(r);
+    for (const s of this.peers.values()) this.schedule(s, s.draining || s.due);
+    return () => {
+      this.hurried.delete(r);
+    };
+  }
+
+  /** Blocks `from..to` of `core` overlap a hurried range. */
+  private isHurried(core: CoreKeyHex, from: number, to: number): boolean {
+    for (const r of this.hurried)
+      if (r.core === core && r.fromBlock <= to && from <= r.toBlock) return true;
+    return false;
   }
 
   /** (Re)start the peer's tail timer: a quiet peer's short runs get paid. */
@@ -389,7 +462,6 @@ export class UpstreamPayer {
     const t = setTimeout(() => {
       state.tailTimer = null;
       if (state.closed) return;
-      state.epoch++;
       state.due = true;
       this.schedule(state, true);
     }, ms);
@@ -403,6 +475,32 @@ export class UpstreamPayer {
   }
 
   /**
+   * Fix round 5: wake the peer at `at` (a failed core may be tried again then), unless it is woken
+   * earlier already. The pass it runs is an ordinary one: the failed core's run is due by its own
+   * streak (see `payPending`), the other cores batch as usual.
+   */
+  private armRetry(state: PeerState, at: number): void {
+    if (state.closed) return;
+    if (state.retryTimer !== null && state.retryTimer.at <= at) return;
+    this.clearRetry(state);
+    const handle = setTimeout(
+      () => {
+        state.retryTimer = null;
+        if (state.closed) return;
+        this.schedule(state, state.draining || state.due);
+      },
+      Math.max(1, at - Date.now()),
+    );
+    (handle as { unref?: () => void }).unref?.();
+    state.retryTimer = { at, handle };
+  }
+
+  private clearRetry(state: PeerState): void {
+    if (state.retryTimer !== null) clearTimeout(state.retryTimer.handle);
+    state.retryTimer = null;
+  }
+
+  /**
    * Pay every pending run for every peer (or one peer), shorter ones included. Used at close and
    * by tests. A core with a PAY awaiting its ACK pays its next run when the ACK arrives; this
    * resolves once no more work is queued (it does not wait for ACKs that never come).
@@ -413,7 +511,6 @@ export class UpstreamPayer {
       if (!s) continue;
       s.draining = true;
       s.due = true;
-      s.epoch++;
       try {
         this.schedule(s, true);
         // ACKs that arrive while we wait schedule more work on the same chain: follow it.
@@ -447,69 +544,81 @@ export class UpstreamPayer {
     const batching = this.credit !== undefined || this.seederBatch !== undefined;
     const due = force || (batching && peerPending >= batch);
     for (const [core, set] of state.pending) {
-      if (set.size === 0 || state.inflight.has(core)) continue;
-      const sorted = [...set].sort((a, b) => a - b);
-      const run = contiguousRuns(sorted).find(([from, to]) => due || to - from + 1 >= batch);
-      if (run === undefined) continue;
-      // One PAY per core in flight: the first price segment of the first payable run now, the
-      // rest when its ACK arrives.
-      const [range] = this.splitAtPrice(state, { core, fromBlock: run[0], toBlock: run[1] });
-      if (range === undefined) continue;
-      const policy = this.resolvePolicy(state, core, hello, range);
-      if (policy === null) continue;
-      const mint = hello.acceptedMints.find(
-        (m) => this.ownMints.includes(m) && policy.mints.includes(m),
-      );
-      if (mint === undefined) {
-        this.counters.skippedNoPolicy++;
-        this.log.warn('no common mint with upstream — not paying', {
+      // Fix round 5: a range given up for good does not end the core's turn — its next run (the
+      // blocks of another play session of the same core) is tried in the same pass.
+      for (;;) {
+        if (set.size === 0 || state.inflight.has(core)) break;
+        // A core whose last PAY failed waits out its backoff (fix round 5: bounded in time, not in
+        // passes); once it is over, its run is due however short — it was due when it failed.
+        const failed = state.failures.get(core);
+        if (failed !== undefined && Date.now() < failed.retryAt) {
+          this.armRetry(state, failed.retryAt);
+          break;
+        }
+        const sorted = [...set].sort((a, b) => a - b);
+        const run = contiguousRuns(sorted).find(
+          ([from, to]) =>
+            due || failed !== undefined || to - from + 1 >= batch || this.isHurried(core, from, to),
+        );
+        if (run === undefined) break;
+        // One PAY per core in flight: the first price segment of the first payable run now, the
+        // rest when its ACK arrives.
+        const [split] = this.splitAtPrice(state, { core, fromBlock: run[0], toBlock: run[1] });
+        if (split === undefined) break;
+        const range = this.bound(split);
+        const policy = this.resolvePolicy(state, core, hello, range);
+        if (policy === null) break;
+        const mint = hello.acceptedMints.find(
+          (m) => this.ownMints.includes(m) && policy.mints.includes(m),
+        );
+        if (mint === undefined) {
+          this.counters.skippedNoPolicy++;
+          this.log.warn('no common mint with upstream — not paying', {
+            peer: state.noiseHex,
+            core,
+          });
+          break;
+        }
+        const carryIn = state.carry.get(core) ?? 0;
+        const amount = (range.toBlock - range.fromBlock + 1) * policy.satsPerBlock;
+        const carryOut = payment.splitPay(amount, policy.split, carryIn).carryOut;
+        let msg: PayMessage;
+        try {
+          msg = await this.engine.pay(
+            range,
+            { pubkey: hello.pubkey, p2pk: hello.p2pk, mint },
+            policy,
+            { carryIn },
+          );
+        } catch (err) {
+          // Fix round 4: this core only — the peer's other cores are paid as usual.
+          if (isClosed(state)) return;
+          if (this.payFailed(state, core, set, range, payOutcome(err))) continue;
+          break;
+        }
+        if (isClosed(state)) return;
+        state.failures.delete(core);
+        state.inflight.set(core, { fromBlock: range.fromBlock, toBlock: range.toBlock, carryOut });
+        state.protocol.sendPay(msg);
+        this.counters.pays++;
+        this.counters.blocksPaid += range.toBlock - range.fromBlock + 1;
+        let paidSet = state.paid.get(core);
+        if (!paidSet) {
+          paidSet = new Set();
+          state.paid.set(core, paidSet);
+        }
+        for (let i = range.fromBlock; i <= range.toBlock; i++) {
+          paidSet.add(i);
+          set.delete(i);
+        }
+        this.log.debug('PAY sent upstream', {
           peer: state.noiseHex,
           core,
+          fromBlock: range.fromBlock,
+          toBlock: range.toBlock,
         });
-        continue;
+        break;
       }
-      // A core whose last PAY could not be built is retried once per `flush()` / tail timer, not
-      // on every pass the other cores' blocks and ACKs cause.
-      const failed = state.failures.get(core);
-      if (failed !== undefined && (!force || failed.epoch === state.epoch)) continue;
-      const carryIn = state.carry.get(core) ?? 0;
-      const amount = (range.toBlock - range.fromBlock + 1) * policy.satsPerBlock;
-      const carryOut = payment.splitPay(amount, policy.split, carryIn).carryOut;
-      let msg: PayMessage;
-      try {
-        msg = await this.engine.pay(
-          range,
-          { pubkey: hello.pubkey, p2pk: hello.p2pk, mint },
-          policy,
-          { carryIn },
-        );
-      } catch (err) {
-        // Fix round 4: this core only — the peer's other cores are paid as usual.
-        if (isClosed(state)) return;
-        this.payFailed(state, core, set, range, payOutcome(err));
-        continue;
-      }
-      if (isClosed(state)) return;
-      state.failures.delete(core);
-      state.inflight.set(core, { fromBlock: range.fromBlock, toBlock: range.toBlock, carryOut });
-      state.protocol.sendPay(msg);
-      this.counters.pays++;
-      this.counters.blocksPaid += range.toBlock - range.fromBlock + 1;
-      let paidSet = state.paid.get(core);
-      if (!paidSet) {
-        paidSet = new Set();
-        state.paid.set(core, paidSet);
-      }
-      for (let i = range.fromBlock; i <= range.toBlock; i++) {
-        paidSet.add(i);
-        set.delete(i);
-      }
-      this.log.debug('PAY sent upstream', {
-        peer: state.noiseHex,
-        core,
-        fromBlock: range.fromBlock,
-        toBlock: range.toBlock,
-      });
     }
     let left = 0;
     for (const set of state.pending.values()) left += set.size;
@@ -518,7 +627,8 @@ export class UpstreamPayer {
 
   /**
    * `engine.pay` failed for `range` of `core` with outcome `code` (see the module comment): give
-   * the blocks up when they can never be paid, else keep them owed for the next forced pass.
+   * the range up when it can never be paid, else keep it owed and back the core off. Returns
+   * whether the range was given up (the core's next run may be tried at once).
    */
   private payFailed(
     state: PeerState,
@@ -526,46 +636,65 @@ export class UpstreamPayer {
     set: Set<number>,
     range: BlockRange,
     code: string,
-  ): void {
+  ): boolean {
     this.counters.payFailures++;
-    const n = (state.failures.get(core)?.n ?? 0) + 1;
-    const final = FINAL_OUTCOMES.has(code) || n >= MAX_PAY_FAILURES;
+    const now = Date.now();
+    let final = FINAL_OUTCOMES.has(code);
+    if (!final) {
+      // A transient failure: the streak grows, and gives up only once it has lasted long enough.
+      const prev = state.failures.get(core);
+      const n = (prev?.n ?? 0) + 1;
+      const since = prev?.since ?? now;
+      final = n >= MAX_PAY_FAILURES && now - since >= PAY_GIVE_UP_MS;
+      const retryAt = now + retryDelay(n);
+      state.failures.set(core, { n, since, retryAt });
+      if (!final) this.armRetry(state, retryAt);
+    }
     // The outcome code only: the message may name a core, a peer or a range.
     this.log.warn('a PAY could not be built — that core is skipped', {
       outcome: code,
       givenUp: final,
     });
-    if (!final) {
-      state.failures.set(core, { n, epoch: state.epoch });
-      return;
-    }
-    state.failures.delete(core);
-    // A core whose session is gone: none of its pending blocks can be paid any more.
-    const give: BlockRange[] =
-      code === 'session-closed'
-        ? contiguousRuns([...set].sort((a, b) => a - b)).map(([fromBlock, toBlock]) => ({
-            core,
-            fromBlock,
-            toBlock,
-          }))
-        : [range];
+    if (!final) return false;
     let paidSet = state.paid.get(core);
     if (!paidSet) {
       paidSet = new Set();
       state.paid.set(core, paidSet);
     }
-    for (const r of give) {
-      for (let i = r.fromBlock; i <= r.toBlock; i++) {
-        set.delete(i);
-        paidSet.add(i); // never paid: a re-download owes nothing new
-      }
-      this.counters.unpayableBlocks += r.toBlock - r.fromBlock + 1;
-      try {
-        this.onUnpayable?.(state.noiseHex, r);
-      } catch {
-        // the listener's failure is its own
-      }
+    for (let i = range.fromBlock; i <= range.toBlock; i++) {
+      set.delete(i);
+      paidSet.add(i); // never paid: a re-download owes nothing new
     }
+    this.counters.unpayableBlocks += range.toBlock - range.fromBlock + 1;
+    try {
+      this.onUnpayable?.(state.noiseHex, range);
+    } catch {
+      // the listener's failure is its own
+    }
+    return true;
+  }
+
+  /** `range` cut to what one PAY may cover (`boundRange`); a bad answer is ignored. */
+  private bound(range: BlockRange): BlockRange {
+    const f = this.boundRange;
+    if (f === undefined) return range;
+    let b: BlockRange;
+    try {
+      b = f(range);
+    } catch {
+      return range;
+    }
+    if (
+      b.core !== range.core ||
+      b.fromBlock !== range.fromBlock ||
+      !Number.isSafeInteger(b.toBlock) ||
+      b.toBlock < range.fromBlock ||
+      b.toBlock > range.toBlock
+    )
+      return range;
+    return b.toBlock === range.toBlock
+      ? range
+      : { core: range.core, fromBlock: range.fromBlock, toBlock: b.toBlock };
   }
 
   private splitAtPrice(state: PeerState, r: BlockRange): BlockRange[] {

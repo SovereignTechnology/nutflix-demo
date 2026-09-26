@@ -1003,4 +1003,30 @@ describe('OnePeerRouter', () => {
     expect(router.stats().cores).toBe(2);
     router.close();
   });
+
+  // Fix round 5 (the verifier, MEDIUM): a closing play session waited for every request in flight
+  // on its CORE — after a rendition switch the new session streams the same core, so the old
+  // one's close waited on the new one's blocks. With a range, only blocks of that range count.
+  it('inflightOn(core, range) counts the blocks of that range requested and not landed yet — not the rest of the core', async () => {
+    const w = await world(8, 1);
+    const r = routed(w.viewer, { budget: unlimited });
+    const key = toHex(w.viewer.key);
+    const [link] = w.links;
+    link!.hold(); // the seeder's answers are withheld: both requests stay in flight
+    const got = [w.viewer.get(1), w.viewer.get(6)];
+    await until(() => w.uploads[0] === 2, 5000, 'both requests to reach the seeder');
+    expect(r.inflightOn(key, { fromBlock: 0, toBlock: 3 })).toBe(1);
+    expect(r.inflightOn(key, { fromBlock: 4, toBlock: 7 })).toBe(1);
+    expect(r.inflightOn(key, { fromBlock: 2, toBlock: 5 })).toBe(0);
+    expect(r.inflightOn(key, { fromBlock: 0, toBlock: 7 })).toBe(2);
+    expect(r.inflightOn('ff'.repeat(32), { fromBlock: 0, toBlock: 7 })).toBe(0);
+    expect(r.inflightOn(key)).toBeGreaterThanOrEqual(2); // the whole core, as before
+    link!.release();
+    await Promise.all(got);
+    await until(
+      () => r.inflightOn(key, { fromBlock: 0, toBlock: 7 }) === 0,
+      5000,
+      'both blocks to land',
+    );
+  });
 });

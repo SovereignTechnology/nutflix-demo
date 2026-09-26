@@ -440,6 +440,28 @@ describe('CreditSettler — what settled without a payment (issue #8)', () => {
     expect(r.settler.owedBy(A)).toBe(0);
     expect(r.settler.linked(A)).toBe(false);
   });
+
+  // Fix round 5 (the verifier, MEDIUM): a closing play session waited until NOTHING of its core
+  // was owed — the new rendition streaming the same core kept that above 0 for the whole drain.
+  it('owedOn(core, range) counts only the blocks of that range; without a range, the whole core; without a core, everything', () => {
+    const r = rig();
+    const a = r.link(A);
+    const b = r.link(B);
+    for (const i of [0, 1, 2]) r.download(i, A);
+    r.download(7, B);
+    r.download(9, A);
+    expect(r.settler.owedOn(CORE, { fromBlock: 0, toBlock: 3 })).toBe(3);
+    expect(r.settler.owedOn(CORE, { fromBlock: 4, toBlock: 9 })).toBe(2);
+    expect(r.settler.owedOn(CORE, { fromBlock: 3, toBlock: 6 })).toBe(0);
+    expect(r.settler.owedOn(CORE)).toBe(5);
+    expect(r.settler.owedOn()).toBe(5);
+    expect(r.settler.owedOn(OTHER, { fromBlock: 0, toBlock: 9 })).toBe(0);
+    r.paid(a, 0, 2);
+    expect(r.settler.owedOn(CORE, { fromBlock: 0, toBlock: 3 })).toBe(0);
+    expect(r.settler.owedOn(CORE, { fromBlock: 4, toBlock: 9 })).toBe(2);
+    b.proto.remoteClose('remote'); // a link gone: nothing it was owed counts any more
+    expect(r.settler.owedOn(CORE, { fromBlock: 4, toBlock: 9 })).toBe(1);
+  });
 });
 
 describe('CreditPool.setLimit (issue #8)', () => {

@@ -357,6 +357,16 @@ class NoRaceQueue implements HotswapQueueLike {
     for (const block of this.tracked) if (stalled(block, now, this.host) !== null) return true;
     return false;
   }
+
+  /**
+   * Blocks `from..to` with a request out or being verified: hypercore adds a block here when it
+   * sends its request and removes it once it resolved, was dropped, or its requests all ended.
+   */
+  countIn(from: number, to: number): number {
+    let n = 0;
+    for (const block of this.tracked) if (block.index >= from && block.index <= to) n++;
+    return n;
+  }
 }
 
 // ---------------------------------------------------------------- parking (fail closed)
@@ -521,13 +531,20 @@ export class OnePeerRouter {
   /**
    * Requests in flight and blocks being verified on the routed core `core` (hex; every routed core
    * without one), across its peers — what may still land there (fix round 4: a closing session
-   * waits for it before its tail is paid).
+   * waits for it before its tail is paid). With `range`, the BLOCKS `fromBlock..toBlock` of `core`
+   * requested and not landed yet, whichever peer has them (fix round 5: a closing session's own
+   * blocks, not those of another session streaming the same core).
    */
-  inflightOn(core?: string): number {
+  inflightOn(
+    core?: string,
+    range?: { readonly fromBlock: number; readonly toBlock: number },
+  ): number {
     let n = 0;
     for (const route of this.routes.values()) {
       if (core !== undefined && route.keyHex !== core) continue;
-      for (const p of route.peers.keys()) n += p.inflight + p.dataProcessing;
+      if (core !== undefined && range !== undefined)
+        n += route.queue.countIn(range.fromBlock, range.toBlock);
+      else for (const p of route.peers.keys()) n += p.inflight + p.dataProcessing;
     }
     return n;
   }
