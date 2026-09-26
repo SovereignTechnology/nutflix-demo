@@ -73,11 +73,12 @@ ipc.on('data', async (c) => {
   const missing = bareDleqThread(new URL('file:///nonexistent/dleq-thread-entry.mjs'))(new SharedArrayBuffer(64));
   // An entry that cannot load core: it answers FAIL through the mailbox; the process lives on.
   let brokenOutcome = 'accepted?';
-  const b = new DleqThread({ spawn: bareDleqThread(new URL(${JSON.stringify(pathToFileURL(broken).href)})), startMs: 5000 });
+  const b = new DleqThread({ spawn: bareDleqThread(new URL(${JSON.stringify(pathToFileURL(broken).href)})), startMs: 5000, reapMs: 5000 });
   const tb = Date.now();
   try { await b.verify(checks.slice(0, 1)); } catch (e) { brokenOutcome = String(e.message); }
   const brokenMs = Date.now() - tb;
   await b.close();
+  const brokenReaps = b.reaps;
   // Retiring never blocks the loop (review finding 2): a job past jobMs, a start past startMs.
   async function retireCase(href, opts) {
     const t = new DleqThread({ spawn: bareDleqThread(new URL(href)), reapMs: 10000, ...opts });
@@ -99,6 +100,7 @@ ipc.on('data', async (c) => {
     missing: missing === null ? 'no-thread' : 'started',
     broken: brokenOutcome,
     brokenMs,
+    brokenReaps,
     slowJob,
     slowStart,
     alive: true,
@@ -201,6 +203,7 @@ interface Report {
   readonly missing: string;
   readonly broken: string;
   readonly brokenMs: number;
+  readonly brokenReaps: { readonly joined: number; readonly abandoned: number };
   readonly slowJob: RetireCase;
   readonly slowStart: RetireCase;
   readonly alive: boolean;
@@ -267,6 +270,8 @@ describe('DLEQ off the Bare worker’s event loop (issue #8 d, F5)', () => {
       expect(report.broken).toMatch(/did not start/);
       // …answered through the mailbox (FAIL) at once, not found out by the 5 s start timeout.
       expect(report.brokenMs).toBeLessThan(4000);
+      // …and it said it was leaving, so it was joined (not let go after reapMs).
+      expect(report.brokenReaps).toEqual({ joined: 1, abandoned: 0 });
       expect(report.alive).toBe(true);
       // Retiring never blocks (review finding 2). Each case runs 2 s of thread work; the loop
       // kept turning through it, the thread left by itself and was joined only then.
