@@ -23,6 +23,7 @@ import {
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { memoryLogger } from '../log.js';
+import { GateRefusal, PAY_STILL_BUILDING } from '../pay-melt-gate.js';
 import { JsonFile } from '../settings/json-file.js';
 import { DEFAULT_SETTINGS } from '../settings/settings.js';
 import type { FirstFundingQuestion, TopUpOutcome } from '../topup/auto-topup.js';
@@ -568,6 +569,22 @@ describe('AutoTopUp — refusals and failures back off', () => {
     expect(await short.top.check(TARGET)).toBe('source-short');
     expect(short.ledger.snapshot().entries).toMatchObject([{ state: 'failed' }]);
     expect(short.ledger.used(short.t)).toBe(0);
+  });
+
+  it('a melt the money plane’s PAY/melt gate refused (it never started: a PAY at the source was still being built) moved nothing: not counted, backed off (lane I2-paygate)', async () => {
+    const s = await setup({
+      fund: 20_000,
+      amountSats: 3_000,
+      wrap: (w) =>
+        Object.assign(Object.create(w) as Wallet, {
+          melt: () => Promise.reject(new GateRefusal(PAY_STILL_BUILDING)),
+        }),
+    });
+    expect(await s.top.check(TARGET)).toBe('failed');
+    expect(s.ledger.snapshot().entries).toMatchObject([{ state: 'failed' }]);
+    expect(s.ledger.used(s.t)).toBe(0);
+    expect(s.lightning.paid).toEqual([]);
+    expect(await s.top.check(TARGET)).toBe('backoff'); // a failure's backoff, as any other
   });
 });
 

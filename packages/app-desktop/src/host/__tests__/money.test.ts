@@ -573,16 +573,16 @@ describe('MoneyPlane: PAY builds and melts never overlap at a mint (ADR 0012 ame
     held.fail(new NetworkError(`timed out after ${String(MELT_REQUEST_TIMEOUT_MS)} ms`));
     await settleIo();
     await settleIo();
-    expect(melt.done).toBe(true);
-    expect(melt.error).toMatchObject({ code: 'mint-error' });
-    expect(pay.done).toBe(true);
-    expect(pay.error).toMatchObject({ code: 'rate-limited' });
-
     // Every swap (a P2PK set made) reached the mint before the worker's deadline for that PAY.
     const late = t.reached.filter(
       (r) => isSwap(r.path) && r.at >= asked + WORKER_HOST_REQUEST_TIMEOUT_MS,
     );
     expect(late).toEqual([]);
+    expect(melt.done).toBe(true);
+    expect(melt.error).toMatchObject({ code: 'mint-error' });
+    expect(pay.done).toBe(true);
+    expect(pay.error).toMatchObject({ code: 'rate-limited' });
+
     // The PAY spent nothing; the melt's outcome is unknown to the wallet, so its inputs stay held
     // until the mint can say (core's journal, ADR 0014 amendment) — the balance is unchanged.
     expect(await plane.wallet.balance(MINT)).toBe(during);
@@ -620,6 +620,48 @@ describe('MoneyPlane: PAY builds and melts never overlap at a mint (ADR 0012 ame
     // Budget 12 blocks: 2 paid, the refused 2 returned — five more PAYs of 2 fit.
     for (let i = 0; i < 5; i++) await h['pay.build']!(build());
     expect(await code(h['pay.build']!(build()))).toBe('forbidden');
+  });
+
+  it('a PAY whose session closed — or whose wallet locked — while it waited for its turn is refused at its turn, nothing spent', async () => {
+    const t = holding();
+    const { plane, h } = await rig({ fund: 200, wrap: t.wrap });
+    plane.authorizeSession(SID, { core: CORE, blob: BLOB, policy: POLICY }, CREATOR);
+    t.hold(isSwap);
+    const first = observe(h['pay.build']!(build()));
+    const held = await t.next();
+    t.hold(null);
+    const waiting = observe(
+      h['pay.build']!(build({ range: { core: CORE, fromBlock: 12, toBlock: 13 } })),
+    );
+    await settleIo();
+    plane.revokeSession(SID); // play.close while the PAY waits
+    held.release();
+    await settleIo();
+    await settleIo();
+    expect(first.error).toBeUndefined();
+    expect(waiting.error).toMatchObject({ code: 'session-closed' });
+    expect(t.reached.filter((r) => isSwap(r.path))).toHaveLength(2); // the first PAY's only
+    expect(await plane.wallet.balance(MINT)).toBe(196);
+
+    // The same with a sign-out (the plane closes) while the PAY waits.
+    const u = holding();
+    const b = await rig({ fund: 200, wrap: u.wrap });
+    b.plane.authorizeSession(SID, { core: CORE, blob: BLOB, policy: POLICY }, CREATOR);
+    u.hold(isSwap);
+    const one = observe(b.h['pay.build']!(build()));
+    const inFlight = await u.next();
+    u.hold(null);
+    const two = observe(
+      b.h['pay.build']!(build({ range: { core: CORE, fromBlock: 12, toBlock: 13 } })),
+    );
+    await settleIo();
+    b.plane.close();
+    inFlight.release();
+    await settleIo();
+    await settleIo();
+    expect(one.done).toBe(true);
+    expect(two.error).toMatchObject({ code: 'payments-unavailable' });
+    expect(u.reached.filter((r) => isSwap(r.path)).length).toBeLessThanOrEqual(2);
   });
 
   it('the mark clears after a melt that throws (the mint changed the amount since the quote was shown)', async () => {
