@@ -418,3 +418,75 @@ routing, including failover for blocks already in flight.
   The ticker is `unref`'d, no-ops once the router is closed, and stops itself on the first tick
   where no route tracks a block.
 - **Unchanged.** No new log line or logged field, no locked path, no import, no IPC.
+
+## Fix round 3 (2026-09-25): the verifier's finding on the round-2 fix
+
+The verifier of fix round 2 raised one finding (low, latent), and it is fixed.
+
+| # | Severity | Finding | Outcome |
+|---|---|---|---|
+| V2 | Low (latent) | After a takeover of a parked core, the blocks delivered while it was parked were never recorded: no router listens to `download` on a parked core, and a new router's `delivered` map starts empty (so does the same router's, for a peer that delivered nothing before the park). The ticker that round 2 arms then judged a seeder that kept delivering as silent (quiet = request age ≥ `stallMs`) and failed its blocks over. Each of those is a cancel after sending, so the block is paid twice. The verifier measured: park, slow release (one message per 400 ms), takeover → failovers 3, debt 3, uploads [4, 3]. Without the park: failovers 0. | **Fixed.** When `route()` installs a queue that still tracks blocks (a parked queue taken over), it restarts every peer's quiet clock at the takeover: for each peer in `replicator.peers`, `delivered.set(p, max(existing, now))`. It then arms the ticker, as in round 2 (`one-peer.ts` `route()`). A seeder that keeps delivering is stamped again by the new route's `download` listener. A withholding seeder fails over one `stallMs` after the takeover. The module comment now says so. |
+
+Of the verifier's two fixes, this one was taken over a `download` listener kept on parked cores
+that stamps a delivery map shared by every router. The reason: the park listens only through the
+sessions attached when the core was released. If those sessions close while another session keeps
+the replicator alive, deliveries would again go unrecorded. Restarting the clock depends on no
+listener. The cost is one extra `stallMs` of wait for a seeder that withheld throughout the park.
+
+The stamp changes the stall rule only for requests that went out before the takeover. A request
+made after it carries a later timestamp, and the rule measures quiet from the later of the two.
+The 4 × `stallMs` hard rule is unchanged: it measures request age, not the delivery clock. It
+treats a request that aged while parked exactly as it would have treated it while routed.
+
+### Tests (+2 cases, one `it.each`; one assertion added)
+
+- **Added: "a core parked while its seeder keeps delivering, taken over by {the same router,
+  another router}: that seeder is not failed over".**
+  - Setup: two seeders and `stallMs` 1000. Seeder 0 (budget 6) takes six requests, and its link
+    holds the answers back. The core is detached (parked). Half a `stallMs` later, the answers
+    are released one every 400 ms.
+  - Takeover: just after the second block lands, seeder 1 gets budget 6 and the core is
+    attached again. Every request is older than `stallMs` by then, and the next block is about
+    400 ms away. The ticker ticks every 250 ms.
+  - Assertions: failovers 0; uploads `[6, 0]`; all six downloads from seeder 0.
+  - Debt: 0 through another router. Through the same router it is 6, not 0: the six requests in
+    flight at the detach are remembered as lost, which is the conservative double count the
+    round-2 case pins too. The comment in the file cites it.
+- **Strengthened: the round-2 case ("… the withheld block still fails over").** It now also
+  asserts that the failover comes at least one `stallMs` after the takeover. That pins the
+  documented timing for a withholding seeder. The assertion only makes the test stricter; its
+  other assertions are unchanged.
+
+### Mutation checks
+
+| # | Mutation | Failing tests |
+|---|---|---|
+| M44 | `route()` does not restart the quiet clock at a takeover (the pre-fix code) | Both new cases: "expected 4 to be +0" (failovers). Both round-2 cases: "expected 77 to be greater than or equal to 300" (a failover at the first tick after the takeover). 4 failed, 19 passed. The new test also failed with 4 failovers before the fix was written. |
+| M43 (re-run) | `route()` does not arm the ticker at a takeover | Both round-2 cases: "still pending after 3000 ms". 2 failed, 21 passed. |
+
+Each mutation was made in the working file after a copy of the fixed file was saved. The copy
+was put back after each run, and `cmp` confirmed it.
+
+### Commands
+
+- `npx vitest run packages/seeder/src/__tests__/one-peer-router.test.ts`: 23 passed, three times
+  in a row, both before and after a lint fix to the new test (an unused variable).
+- `npx vitest run packages/seeder packages/gateway packages/app-desktop/src/worker`: 62 files
+  (61 passed, 1 skipped); 504 passed, 4 skipped.
+- `npx tsc -b --force`, eslint and prettier `--check` on both changed files, and
+  `npm run check:locked`: clean. `app-desktop` did not change, so `lint:electron` was not needed.
+  The Electron e2e was not run (the orchestrator's).
+
+### Self-review
+
+- **Scope.** One guarded block in a private method. It writes only the router's own `delivered`
+  `WeakMap`, keyed by replication peer objects, so nothing is retained after a peer is gone. It
+  runs only when a taken-over queue still tracks blocks.
+- **Direction of the error.** The stamp can only delay a failover by up to one `stallMs` after a
+  takeover. It never causes one. The worst case is one extra `stallMs` of wait on a block a
+  seeder withheld through the park. The failure mode being closed was a double payment.
+- **Clock.** `max(existing, now)` keeps a later stamp if the wall clock stepped backwards.
+- **Residual.** A park longer than 4 × `stallMs`, with its seeder still delivering, meets the hard
+  rule at the takeover: the oldest requests fail over at the first tick. A routed core applies
+  the same rule to requests of the same age. Production parks only at shutdown.
+- **Unchanged.** No new log line or logged field, no locked path, no import, no IPC.
