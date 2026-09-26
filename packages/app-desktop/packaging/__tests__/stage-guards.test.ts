@@ -12,7 +12,7 @@
  *   - bare-sidecar (loaded at runtime, invisible to the bundler) must be shipped;
  *   - the build the stage copies must be current (cross-lane review, round 4): no workspace
  *     package tsc would rebuild, no UI stylesheet older than its sources, no bundle output
- *     older than the bundles' sources.
+ *     older than what the bundles read (round 5: that includes @sovit/ui's dist/).
  *
  * (stage.test.ts stages the REAL app; this file breaks one rule per case.)
  */
@@ -445,8 +445,11 @@ describe(
       );
       touch(join(ui, 'dist', 'ui.css'), 61);
       // The UI's css rebuilt, but scripts/bundle.ts (which copies it into renderer/) not rerun.
+      // Round 5: the newest input named is now the file the bundle actually copies, ui's
+      // dist/ui.css (61), not the src stylesheet it is built from (60): rule (3) compares the
+      // bundle outputs against ui's dist/ too (cross-lane review round 5, `bundleInputDirs`).
       await expect(restage(pkg, repoRoot, out)).rejects.toThrow(
-        /dist\/\S+ is older than packages\/ui\/src\/ui\.css: run `npm run build`/,
+        /dist\/\S+ is older than packages\/ui\/dist\/ui\.css: run `npm run build`/,
       );
       for (const f of [
         ...RENDERER_FILES.map((n) => join('renderer', n)),
@@ -461,6 +464,66 @@ describe(
       await expect(restage(pkg, repoRoot, out)).rejects.toThrow(
         /would build project '[^']*packages[\\/]ui[\\/]tsconfig\.json'/,
       );
+    });
+
+    /** The fixture's scripts/bundle.ts: writes every output at `at`, app.js inlining ui's dist. */
+    const bundleAt = (pkg: string, ui: string, at: number): void => {
+      for (const f of [
+        ...RENDERER_FILES.map((n) => join('renderer', n)),
+        ...PROMPT_FILES.map((n) => join('prompt', n)),
+        ...PRELOAD_FILES,
+      ]) {
+        const p = join(pkg, 'dist', f);
+        if (f === join('renderer', 'app.js'))
+          writeFileSync(p, readFileSync(join(ui, 'dist', 'index.js')));
+        if (f === join('renderer', 'ui.css'))
+          writeFileSync(p, readFileSync(join(ui, 'dist', 'ui.css')));
+        touch(p, at);
+      }
+    };
+
+    // Cross-lane review round 5, the verifier's probe: the bundle reads @sovit/ui's dist/, not
+    // its src/. (1) edit a ui source, (2) bundle (`npm start` bundles before any tsc: it inlines
+    // the OLD ui/dist), (3) tsc the ui (`npm run typecheck`), (4) stage. Every other rule passes:
+    // tsc's dry run is clean, the css is current, and the bundle is newer than ui/src. Before
+    // round 5 this staged the old renderer.
+    it('a bundle made from an old @sovit/ui dist/ (ui rebuilt after the bundle) is refused', async () => {
+      const { pkg, root: repoRoot } = fixture({ ui: true });
+      const out = join(root, 'out-ui-dist');
+      const ui = join(repoRoot, 'packages', 'ui');
+      await restage(pkg, repoRoot, out);
+      writeFileSync(join(ui, 'src', 'index.ts'), 'export const Button = 2;\n'); // (1)
+      touch(join(ui, 'src', 'index.ts'), 60);
+      bundleAt(pkg, ui, 61); // (2)
+      expect(readFileSync(join(pkg, 'dist', 'renderer', 'app.js'), 'utf8')).toMatch(/Button = 1/);
+      tscBuild(ui); // (3)
+      touch(join(ui, 'dist', 'index.js'), 62); // …after the bundle (the fixture's clock is ahead)
+      expect(readFileSync(join(ui, 'dist', 'index.js'), 'utf8')).toMatch(/Button = 2/);
+      await expect(restage(pkg, repoRoot, out)).rejects.toThrow(
+        /dist\/\S+ is older than packages\/ui\/dist\/index\.js: run `npm run build`/,
+      );
+      // Bundled again from the current ui/dist, it stages, and ships the new value.
+      bundleAt(pkg, ui, 63);
+      await restage(pkg, repoRoot, out);
+      expect(readFileSync(join(out, 'renderer', 'app.js'), 'utf8')).toMatch(/Button = 2/);
+    });
+
+    it("the same with ui's stylesheet: bundled (copying the old dist/ui.css), then build:css", async () => {
+      const { pkg, root: repoRoot } = fixture({ ui: true });
+      const out = join(root, 'out-ui-css');
+      const ui = join(repoRoot, 'packages', 'ui');
+      await restage(pkg, repoRoot, out);
+      writeFileSync(join(ui, 'src', 'ui.css'), '.button{color:red}\n');
+      touch(join(ui, 'src', 'ui.css'), 60);
+      bundleAt(pkg, ui, 61);
+      writeFileSync(join(ui, 'dist', 'ui.css'), '.button{color:red}\n'); // build:css
+      touch(join(ui, 'dist', 'ui.css'), 62);
+      await expect(restage(pkg, repoRoot, out)).rejects.toThrow(
+        /dist\/\S+ is older than packages\/ui\/dist\/ui\.css: run `npm run build`/,
+      );
+      bundleAt(pkg, ui, 63);
+      await restage(pkg, repoRoot, out);
+      expect(readFileSync(join(out, 'renderer', 'ui.css'), 'utf8')).toMatch(/color:red/);
     });
   },
 );

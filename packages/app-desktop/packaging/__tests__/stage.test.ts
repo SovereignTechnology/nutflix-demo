@@ -3,6 +3,7 @@
  * unpacked. (The staged worker actually booting under the real Bare, through the staged
  * bare-sidecar and the host's supervisor, is src/host/__tests__/packaged-worker.integration.test.ts.)
  */
+import { build } from 'esbuild';
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import {
@@ -12,13 +13,15 @@ import {
   mkdtempSync,
   readFileSync,
   readdirSync,
+  realpathSync,
   rmSync,
   statSync,
   symlinkSync,
   writeFileSync,
 } from 'node:fs';
+import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
-import { dirname, join, relative } from 'node:path';
+import { dirname, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
@@ -40,6 +43,7 @@ import {
   WORKER_BOOT_SOURCE,
   assertReplaceable,
   builtFromWorkspaces,
+  bundleInputDirs,
   copyPackage,
   normalizeModes,
   npmFilter,
@@ -367,6 +371,54 @@ describe('the build the stage copies must be current (cross-lane review, round 4
       ).toBe(true);
     // The fifth copy is @sovit/ui's stylesheet: a bundled workspace, checked as one.
     expect(script).toMatch(/require\.resolve\('@sovit\/ui\/ui\.css'\)/);
+  });
+
+  // Cross-lane review round 5: the freshness rule watched ui's src/, but the bundle reads ui's
+  // dist/ (74 inputs under packages/ui/dist, none under src/), so a bundle made from an old
+  // ui/dist staged. This pins the watched set against what the renderer bundle actually reads.
+  it('bundleInputDirs covers every workspace file the renderer bundle reads and the ui stylesheet it copies', async () => {
+    const script = readFileSync(join(PKG_DIR, 'scripts', 'bundle.ts'), 'utf8');
+    // The build below resolves as scripts/bundle.ts's renderer build does: same entry, tsconfig
+    // and platform, and no resolution overrides in the script.
+    const renderer = /async function bundleRenderer\(\)[\s\S]*?\n\}\n/.exec(script)?.[0] ?? '';
+    expect(renderer).toContain("entryPoints: ['src/renderer/main.tsx']");
+    expect(renderer).toContain("platform: 'browser'");
+    expect(renderer).toContain("tsconfig: 'tsconfig.renderer.json'");
+    expect(script).not.toMatch(/\b(?:conditions|mainFields|alias|nodePaths|preserveSymlinks):/);
+    const r = await build({
+      absWorkingDir: PKG_DIR,
+      entryPoints: ['src/renderer/main.tsx'],
+      bundle: true,
+      write: false,
+      format: 'esm',
+      platform: 'browser',
+      jsx: 'automatic',
+      tsconfig: 'tsconfig.renderer.json',
+      metafile: true,
+      logLevel: 'silent',
+    });
+    const lock = JSON.parse(readFileSync(join(REPO_ROOT, 'package-lock.json'), 'utf8')) as Lockfile;
+    const packages = runtimeClosure(lock, {
+      workspace: 'packages/app-desktop',
+      exclude: Object.keys(NOT_SHIPPED),
+      platform: 'linux',
+      arch: 'x64',
+    });
+    const { bundled } = builtFromWorkspaces(lock, 'packages/app-desktop', packages);
+    const dirs = bundleInputDirs(PKG_DIR, REPO_ROOT, bundled);
+    const covered = (p: string): boolean => dirs.some((d) => p.startsWith(d + sep));
+    const ours = Object.keys(r.metafile.inputs)
+      .map((p) => resolve(PKG_DIR, p))
+      .filter((p) => !p.split(sep).includes('node_modules'));
+    const uiDist = join(REPO_ROOT, 'packages', 'ui', 'dist') + sep;
+    expect(ours.filter((p) => p.startsWith(uiDist)).length).toBeGreaterThan(0);
+    expect(ours.filter((p) => !covered(p))).toEqual([]);
+    // The copied stylesheet, resolved as scripts/bundle.ts resolves it.
+    const css = realpathSync(
+      createRequire(join(PKG_DIR, 'scripts', 'bundle.ts')).resolve('@sovit/ui/ui.css'),
+    );
+    expect(css).toBe(join(uiDist, 'ui.css'));
+    expect(covered(css)).toBe(true);
   });
 });
 

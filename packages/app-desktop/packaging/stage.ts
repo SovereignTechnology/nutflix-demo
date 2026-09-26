@@ -358,6 +358,22 @@ export const TSC_WOULD_BUILD = 6357;
 export const BUNDLE_SOURCES = ['src/renderer', 'src/preload', 'src/ipc', 'static'] as const;
 
 /**
+ * Every directory scripts/bundle.ts reads, so every one its outputs must be at least as new as:
+ * this package's BUNDLE_SOURCES, and each bundled workspace's dist/ and src/. The bundle reads a
+ * bundled workspace through its package exports, i.e. its BUILD: `@sovit/ui` resolves to
+ * dist/*.js and the copied stylesheet is dist/ui.css (cross-lane review, round 5: a bundle made
+ * from an old ui/dist, with ui rebuilt afterwards, staged the old renderer). src/ reaches the
+ * bundle only through dist/ (rules 1 and 2 hold dist/ to it) and stays as a second, stricter
+ * check. Pinned against the real renderer bundle's inputs by a test.
+ */
+export function bundleInputDirs(pkg: string, root: string, bundled: readonly string[]): string[] {
+  return [
+    ...BUNDLE_SOURCES.map((d) => join(pkg, d)),
+    ...bundled.flatMap((w) => [join(root, w, 'dist'), join(root, w, 'src')]),
+  ];
+}
+
+/**
  * The workspace packages the staged app is built from, repo-relative: `shipped` are the
  * closure's (their dist/ is copied into node_modules/ and inlined into the host bundle),
  * `bundled` the NOT_SHIPPED roots that are workspace links (inlined into renderer/app.js by
@@ -472,7 +488,8 @@ export interface CurrentBuildOptions {
  *   2. their CSS built beside tsc (@sovit/ui's build:css, dist/*.css): each file at least as new
  *      as the package's newest src CSS;
  *   3. scripts/bundle.ts's output that the stage copies: each file at least as new as the newest
- *      file under BUNDLE_SOURCES and the bundled packages' src/ (tests and stories excluded).
+ *      file the bundle reads (`bundleInputDirs`: BUNDLE_SOURCES and the bundled packages' dist/
+ *      and src/; tests and stories excluded).
  *
  * (2) and (3) compare mtimes: `npm run build` rewrites every one of those files each run, so a
  * refusal clears after it. The remedy is `npm run build` (for outputs deleted by hand,
@@ -512,10 +529,7 @@ export function assertCurrentBuild(o: CurrentBuildOptions): void {
         fail(`${w}/dist/${f} is older than ${rel(css.path)}: ${remedy}`);
   }
   let newest: Newest | undefined;
-  for (const dir of [
-    ...BUNDLE_SOURCES.map((d) => join(o.pkg, d)),
-    ...o.bundled.map((w) => join(o.root, w, 'src')),
-  ]) {
+  for (const dir of bundleInputDirs(o.pkg, o.root, o.bundled)) {
     const n = newestInput(dir);
     if (n !== undefined && (newest === undefined || n.mtimeMs > newest.mtimeMs)) newest = n;
   }
