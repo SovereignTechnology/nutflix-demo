@@ -26,8 +26,8 @@ directories" for this list. Each fix carries a test that fails without it, excep
 | F1 | **Fixed** | `UpstreamPayer`: the seeder's asking price (HELLO or `PRICE`) may only lower the manifest price; above it nothing is paid (`skippedOverpriced`) |
 | F2 | **Fixed** | `manifestPolicyResolver` replaces `helloPolicyResolver`: per-core manifest policy or no payment; split from the manifest; mint ∈ seeder ∩ wallet ∩ manifest |
 | F3 | **Fixed** | Every Blossom response: `nosniff` + `CSP: sandbox`; only inert types inline (`servedAs`), everything else an `octet-stream` attachment; upload MIME allowlist by default (explicit `null` = any) |
-| F4 | **Fixed (policy)** | `autoTopUpDue` tops up only mints in `defaultMints`, and now follows the v5 direction (it had it backwards); contract text says so. Executing top-ups (with caps) is Stage 3 |
-| F5 | **Partly fixed** | Proofs per set capped at `bitLength(amount) + 6` (`maxProofsFor`); one unacknowledged PAY per core batches PAYs naturally (F30); DLEQ checks off the event loop for the seeder daemon and the gateway — a `worker_threads` pool behind `PaymentEngineDeps.dleq`, failure falls back to the synchronous check (`stage-3/dleq-batching`, ADR 0011 §10). Explicit batching tied to the credit pool: PAYs cover half the pool per seeder, all pending paid under pressure, short tails after 2 s (`stage-3/upstream-credit`, ADR 0011 §11). Open: the desktop's Bare worker still checks DLEQ inline; the credit pool stays at the minimum window (a per-seeder window would batch more) |
+| F4 | **Fixed** (`stage-3/auto-topup`, integration rounds 4–5) | Auto top-ups execute (issue #2), started only from the payment path (a play opening, a PAY for an open session — never a balance change such as the user's own withdrawal): only into mints on the user's own `defaultMints` (never a manifest's, never `fromMint`), ≤ 10 000 sats each, ≤ 50 000 in any rolling 24 h (fees and in-flight included; persisted ledger that fails closed), the first top-up into each mint confirmed in main's trusted prompt window (only a yes is remembered), one at a time with backoff; main's settings gate also asks on an amount change. The cross-lane review found a funding melt with an unclear outcome dropped the target quote (Lightning paid twice): the quote is now kept, sealed to the identity, minted exactly once, and no second top-up runs into a target with one open (F42). Residuals [Low]: other devices label the funding melt "melt to Lightning" until `Wallet.melt` takes a memo; allowed mints and the cap are per install |
+| F5 | **Fixed** | Proofs per set capped at `bitLength(amount) + 6` (`maxProofsFor`); one unacknowledged PAY per core batches PAYs naturally (F30); DLEQ checks off the event loop for the seeder daemon and the gateway (`worker_threads`, `stage-3/dleq-batching`) and, since `stage-3/residuals`, for the desktop's Bare worker (`Bare.Thread` over a SharedArrayBuffer mailbox; any thread failure means chunked inline checks, never acceptance; 128 proofs: ~550 ms of stall before, 3 ms after) — and the packaged app now actually finds its thread entry (`stage-3/int-dleq-packaging`, F44). Batching on credit: PAYs cover half of each seeder's window (`stage-3/f33-one-peer`: credit sized per seeder window) |
 | F6 | **Verified on Nutshell 0.21.0 and cdk-mintd 0.18.1** (2026-09-24, `stage-3/real-mint`) | Both mints accept the `pay1` tag and still refuse the set without the creator's witness; the whole pay/1 path, three seeders, double-spends and a network drop pass against both (§0a) |
 | F7 | **Fixed** | `studio.upload` asks with a native dialog naming the file main resolved from the token |
 | F8 | **Fixed** | The money gate is a native dialog (`dialog.showMessageBox`, Cancel default) built from guarded args; `seeder.melt` cross-checks the invoice amount; settings patches that add mints or turn on auto top-up are asked about too |
@@ -43,7 +43,7 @@ directories" for this list. Each fix carries a test that fails without it, excep
 | F18 | **Fixed (loading)** (`stage-3/image-privacy`) | The distinctive user agent is gone. Cameron's decision (2026-09-24): `Settings.loadRemoteImages`, default off — the desktop host refuses an image without a signed sha256 before any request, so a publisher's URL cannot act as a tracking pixel; hash-addressed images load, verified; Settings › Appearance has the switch. Thumbnails over Pear (ADR 0015, `stage-3/images-over-pear`): Studio writes the thumbnail into the creator's profile core, and viewers read it over Pear (no `https:` request), with hash and size checked; seeders serve profile cores free and outside payment, or not at all (`serveImages`). Viewer-side avatars from a profile core work too, and setting one's own (`setProfilePicture`, `stage-3/profile-picture`) puts the picture in the profile core and re-publishes kind 0 with every other field kept |
 | F19 | **Fixed** | Watch refuses a session whose policy charges more than the quote (play and quality switch) |
 | F20 | **Fixed** | `StoredReport.signatureVerified` is `true` after the auth boundary verified the report |
-| F21 | **Partly fixed** (`stage-3/f21-dev-flags`) | A packaged build (`app.isPackaged`) refuses `--dev-mocks`, `--dev-fixtures` and `--e2e-hooks` and exits 78 before anything is registered, like a sandbox bypass (tested). Open, with the packaging lane: the Electron fuses (`RunAsNode`, `EnableNodeOptionsEnvironmentVariable`, `EnableNodeCliInspectArguments` off; `EnableEmbeddedAsarIntegrityValidation`, `OnlyLoadAppFromAsar` on). They can only be flipped on a packaged binary, and nothing packages yet: forge/pear makers, targets and signing are decisions. No runtime check can replace them, since `NODE_OPTIONS`, `--inspect` and `ELECTRON_RUN_AS_NODE` act before main's code runs |
+| F21 | **Fixed** (`stage-3/f21-dev-flags`, `stage-3/packaging`, integration) | A packaged build refuses the dev flags, Chromium's remote-debugging switches and the sandbox-weakening / process-wrapper switches (exit 78, tested). Packaged builds (ADR 0017, Electron Forge) set the fuses `RunAsNode`, `EnableNodeOptionsEnvironmentVariable`, `EnableNodeCliInspectArguments` and (Cameron, 2026-09-26) `GrantFileProtocolExtraPrivileges` off, `EnableEmbeddedAsarIntegrityValidation` and `OnlyLoadAppFromAsar` on; every packaged binary's fuses are read back and the build fails on a mismatch; main, the host (with its npm code) and the renderer are inside `app.asar`; a stale build refuses to stage. Releases are a SovTech-signed Nostr manifest of sha256 sums (`scripts/release-verify.mjs`; signing through Bunker46 is Cameron's step). Residual: asar integrity is checked on macOS and Windows only, and the unpacked worker, `node_modules` and native addons are outside it everywhere (ADR 0017 open question 5); no platform code signing (accepted) |
 | F22 | **Fixed** | `app.requestSingleInstanceLock()`; a second launch focuses the first window |
 | F23 | **Fixed** | `Nip60ProofStore` verifies every event itself |
 | F24 | **Fixed** — seeder daemon (`stage-3/seeder-runtime`) and desktop (`stage-3/desktop-signer`) | Daemon: key file 0600 (`--keygen`, `O_EXCL`, refused when group/other can read it), headless unlock from the `seeder-key-passphrase` systemd credential (ADR 0011 §1). Desktop (ADR 0013): the file `KeyStore` writes 0600 in a 0700 dir through an `O_EXCL` temp file, reads with `O_NOFOLLOW` and refuses a symlink, another owner or a loose mode before any passphrase is asked; unlock is the user's choice — a passphrase in main's trusted prompt window, the OS keychain (`safeStorage`, never Linux `basic_text`), or a NIP-46 bunker |
@@ -51,7 +51,7 @@ directories" for this list. Each fix carries a test that fails without it, excep
 | F26 | **Partly fixed** | Natural batching (F30) cuts dust PAYs; explicit batching open (F5) |
 | F27 | **Fixed** (real-mint lane) | Hit by the network-drop test: a new session binding a pubkey now cuts any older live session of it (no ban) — one pay/1 channel per pubkey, so the per-pubkey carry is unambiguous |
 | F28, F29, F32 | Info | Recorded, no change |
-| F33 | **Open (new)** | See §0a |
+| F33 | **Fixed** (`stage-3/f33-one-peer`, ADR 0018) | One seeder per block (`OnePeerRouter`: hypercore's hotswap racing replaced by single-peer failover, 4 s), credit per seeder window (`SeederCredit`): 48 of 48 delivered and paid (was 49–51), real mint 24 of 24. Cross-lane fixes: per-core PAY isolation (F46), tails paid at close and quit, a rendition switch no longer writes off the old tail (F47). In progress: debts across a restart or crash (the seeder's `OWED` report and the viewer paying what it can prove, F45) |
 | F34 | **Fixed (new)** | See §0a |
 | F35 | **Fixed (new)** | See §0a |
 | F36 | **Fixed (new)** — seeder daemon and gateway | See §0b |
@@ -59,7 +59,7 @@ directories" for this list. Each fix carries a test that fails without it, excep
 | F38 | **Fixed (new)** | See §0b |
 | F39 | **Fixed (new)** — desktop signer lane | See §0c |
 | F30 | **Fixed** | `UpstreamPayer` keeps the carry per channel, commits it on `ACK ok`, one PAY per core in flight |
-| F31 | **Fixed** (`stage-3/wallet-journal`, ADR 0014) | `spentByUs` dep: a "spent" answer to a RETRIED redeem whose witness is our own signature is our lost swap — no ban, creator still paid. A first attempt answered "spent" is a double-spend even with our witness (a set we redeemed before a restart carries it too — found by the real-mint lane); the attempt is persisted before it is made. The swapped proofs are now recovered too: a send / receive / mint journals its outputs in the store before the request, and a lost answer is restored with NUT-09 (instead of NUT-13 deterministic secrets — ADR 0014 says why). Verified on Nutshell 0.21.0 and cdk-mintd 0.18.1. Residual: the desktop's journal is in memory (a crash mid-recovery), melt change is not journaled |
+| F31 | **Fixed** (`stage-3/wallet-journal`, ADR 0014; residuals closed in `stage-3/residuals`) | A lost mint answer is restored with NUT-09 from outputs journaled before the request. Since `stage-3/residuals` the desktop's journal is a sealed file (a key wrapped with NIP-44 to self, then XChaCha20-Poly1305) written and fsynced with the unpublished NIP-60 events before each request and settled at open and on a schedule (`SettleLoop`); crash injection tested; melt change journaled; held inputs out of the balance. Every mint request is single-attempt (a retrying transport made a 429 on a retry look like a refusal and lost a proof, F40). Residual [Low]: a result commit whose journal write fails after the mint executed loses a send's locked outputs |
 
 ## 0a. Found by the real-mint lane (2026-09-24, `stage-3/real-mint`)
 
@@ -137,6 +137,22 @@ real-mint-swarm.integration.test.ts`). Both real-mint suites are opt-in
   `resumeBunker` now default `onauth` to a no-op (a caller that supports the flow passes its own);
   a test spies on `console.warn`. The rest of that review (the prompt throttle, the keychain-record
   ordering, pool disposal): docs/reviews/2026-09-24-pre-push-desktop-signer.md.
+
+## 0d. Found by the Stage 3 fan-out reviews (2026-09-25/26, `stage-3/integration`)
+
+Each lane was reviewed independently, its fix pass checked by a third agent, and the merged tree
+reviewed by a four-lens panel (money plane, worker/P2P, packaging, test integrity). New findings:
+
+| # | Sev. | Finding | State |
+|---|---|---|---|
+| F40 | High | cashu-ts's default fetch transport retries NUT-19 cached endpoints; a 429 answering the retry of a swap that had executed was taken as a refusal, the journal entry dropped and the proofs lost (reproduced on cdk-mintd) | **Fixed** (`stage-3/residuals` rounds 2–3): single-attempt transports everywhere (desktop `node:http`, core default over `fetch`), a 429 is ambiguous (held, then NUT-09/NUT-07), melts get 300 s |
+| F41 | High | A PAY queued behind a 300 s melt at its mint was built after the worker's `pay.build` deadline; its P2PK proofs were never delivered | **Fixed** (`stage-3/int-pay-melt-gate`, ADR 0012 amendment): a per-mint PAY/melt gate and a per-PAY start-by bound that counts journal settles |
+| F42 | High | An auto top-up whose funding melt ended unclear dropped the target quote; the melt later paid, the quote was never minted and a second top-up ran (Lightning paid twice) | **Fixed** (integration round 4): the quote is kept and sealed before the melt, minted exactly once, and blocks new top-ups into that target |
+| F43 | High | A thumbnail/avatar URL naming a paid video core made `image.fetch` download it unrouted and unpaid, so its honest seeders banned the viewer | **Fixed** (round 4: sold/attached cores refused, reads capped under each window); final form `PRICE.free` (Cameron, 2026-09-26) in progress |
+| F44 | Medium | Packaged builds never found the DLEQ thread entry and checked PAYs inline on the worker's loop, silently | **Fixed** (`stage-3/int-dleq-packaging`): resolved from the worker root, staged and gated |
+| F45 | High | Blocks unpaid at a close, quit or crash stay counted by the seeder; the next run overruns it and is banned | Close and quit now pay the tail (round 4); crash and restart: pay/1 `OWED` + `ACK.outstanding`, the viewer pays what it can prove (Cameron, 2026-09-26) — in progress |
+| F46 | High | One core's failing PAY aborted paying every other core of that seeder | **Fixed** (round 4): per-core isolation, time-bounded retries, explicit unpaid settlement |
+| F47 | High | A rendition switch built the old tail's PAYs under the new session; the host refused them and they were written off, zeroing that seeder's credit | **Fixed** (round 5): sessions resolved by core and block range; a closing session drains only its own range |
 
 ## 1. Summary
 
@@ -550,7 +566,7 @@ hash-addressed images).
 | SE-1 | **Fixed** by file tokens (L6-A); residual F7 |
 | SE-2 | **Fixed**: `renderer/coordinator.ts` owns every session; host backstop ≤ 1 unpaused per webContents; `wc-gone` closes all; e2e asserts one open session after Watch→Watch |
 | SE-3 | **Fixed**: Shorts `onPlaybackStart` wired to the coordinator |
-| SE-4 | **Fixed** for Stage 1 (`autoTopUpDue` false for `belowSats <= 0`, tested; v5 normative); executing top-ups is Stage 3, see F4 |
+| SE-4 | **Fixed** (`autoTopUpDue` false for `belowSats <= 0`, tested; v5 normative). Since issue #2 top-ups execute with the real wallet (F4); with `--dev-mocks` still only logged |
 | SE-5 | **Fixed**: `unreact` publishes a kind-5 naming only the viewer's own kind-7 ids, never `-` (tested) |
 
 ## 5. Stage 2 modules — what holds, what is residual
@@ -593,19 +609,19 @@ finding's section above plus its row in §0. **Filing waits for Cameron's go-ahe
 
 | Issue title |
 |---|
-| [Medium] F33: duplicate block deliveries — request each range from one peer (Cameron, 2026-09-24) |
-| [Done] F5: DLEQ off the event loop (Node) and batching on the credit pool (ADR 0011 §10–§11). Residual [Low]: DLEQ in the desktop's Bare worker; a credit pool sized per seeder window |
+| [Done] F33: one seeder per block, credit per seeder window (`stage-3/f33-one-peer`, ADR 0018); in progress: restart debts via pay/1 `OWED` (F45) |
+| [Done] F5: DLEQ off the event loop (Node, and the desktop's Bare worker since `stage-3/residuals`) and batching on per-seeder credit (ADR 0011 §10–§11, ADR 0018) |
 | [Done] Seeder: an append-only pending-PAY journal and a cap that stops serving at `maxPendingPays` (daemon + gateway, ADR 0011 §12; the desktop worker too, cap 1024, `stage-3/worker-journal`) |
 | [Done] F37: the gateway's upstream fetches are paced (ADR 0011 §11) |
 | [Done] F10/F11/F12/F31 hooks in the desktop runtime — the worker's seeder engine persists seen secrets and pending PAYs and asks the host for `checkSpent` / `spentByUs` (ADR 0012) |
-| [Done] F31: a lost mint answer is restored (write-ahead journal + NUT-09, ADR 0014). Residual [Low]: the desktop's journal is in memory; melt change is not journaled |
-| [Medium] NUT-13 seed backup in Stage 3 (Cameron, 2026-09-24): design + ADR first |
+| [Done] F31: a lost mint answer is restored (write-ahead journal + NUT-09, ADR 0014); the desktop journal is sealed and durable, melt change journaled (`stage-3/residuals`) |
+| [In progress] NUT-13 seed backup (ADR 0016 accepted 2026-09-25: a phrase per device, sealed + relay copy, reissue once, `@scure/bip39`); lanes `stage-3/nut13-core`, `stage-3/nut13-desktop` |
 | [Done] Pear only (Cameron, 2026-09-24/25): Studio's third-party Blossom mirroring removed, our manifests name no Blossom server (contracts v6); the gateway's Blossom endpoints stay as a Nostr-signed HTTP face over its Pear seeder; per-pubkey quota default 2 GiB (`stage-3/pear-only`) |
-| [Medium] F18: images hash-addressed only by default; thumbnails in the video's core (seeder's choice, default free, placeholder if paid); avatars from a per-creator Pear core (Cameron, 2026-09-24) |
+| [Done] F18: images hash-addressed only by default; thumbnails and avatars in the creator's profile core over Pear (ADR 0015); a thumbnail naming a paid core can no longer get the viewer banned (F43); in progress: `PRICE.free` so image reads ask only seeders that said free |
 | [Done] F15: per-pubkey upload quota (`blossom.maxBytesPerPubkey`) |
 | [Done] F17: NUT-20 locked mint quotes; opaque quote handles over IPC. Residual [Low]: a signer-held wallet key (the seeder daemon) takes unlocked quotes — cashu-ts signs NUT-20 itself and needs the key as a string |
-| [Medium] F4: execute auto top-ups — off by default, 10 000 sat per top-up, 50 000 sat per day, own mints only, first-time confirm (Cameron, 2026-09-24) |
-| [Low] F21: packaging with Electron Forge + Pear makers (exe, dmg, deb, AppImage, `pear://`), fuses set, releases signed with the SovTech Nostr key (Cameron, 2026-09-24) |
+| [Done] F4: auto top-ups execute — off by default, ≤ 10 000 sat per top-up, ≤ 50 000 per rolling 24 h (fees included), own mints only, first-time confirm in main's prompt window, every top-up in wallet history (`stage-3/auto-topup`) |
+| [Done] F21: packaging (ADR 0017): Forge build, six fuses, `.deb` built here, `.exe`/`.dmg`/AppImage configured, the Nostr-signed release manifest (unsigned template + verifier); `pear://` and in-repo makers instead of Pear makers await Cameron (ADR 0017 open questions) |
 | [Done] F24: the desktop's file `KeyStore` (ADR 0013) |
 | [Done] Desktop signer: remove the key from this device; NIP-46 `auth_url` approval links (ADR 0013 §7) |
 | [Done] F25: external links open only after main's prompt window showed the real host |
@@ -618,5 +634,6 @@ finding's section above plus its row in §0. **Filing waits for Cameron's go-ahe
 - The web build's served headers (`scripts/csp-sri.mjs`): out of scope (no web portal).
 - Remote-signer interop against real bunkers and NIP-07 extensions.
 - BUD-11 text (F29).
+- Packaged builds: the dev-flag and remote-debugging refusals on the packaged binary (sandbox profile), `NODE_OPTIONS`/`--inspect` beyond the fuse read, Windows/macOS builds (including the Squirrel lifecycle, unit-tested only), AppImage on Ubuntu ≥ 24.04 (use the `.deb`; never a userns profile on the `/tmp` mount point), reproducibility of packaged outputs.
 - Performance numbers are from one laptop (the dev laptop, Node 22); F5's budget needs a
   measurement on target hardware.
