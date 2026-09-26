@@ -25,6 +25,8 @@ import {
   OnePeerRouter,
   ROUTED_HYPERCORE_VERSION,
   RoutingUnsupported,
+  STALL_HARD_FACTOR,
+  UNCAPPED,
   isRoutablePeer,
   routableReplicator,
 } from '../net/one-peer.js';
@@ -106,7 +108,9 @@ function coreOf(s: Corestore, opts: { name?: string; key?: Uint8Array }): RawCor
 
 /**
  * Pipe `seeder` → `viewer`. `hold()` withholds everything the seeder sends from then on (a peer
- * that took our requests and answers none of them), `release()` lets it through.
+ * that took our requests and answers none of them), `release()` lets it through, and
+ * `releaseSlowly(ms)` lets it through one message every `ms` from now on (a slow link: the seeder
+ * keeps delivering, each request waits behind the ones before it).
  */
 function connect(seeder: Corestore, viewer: Corestore) {
   const a = seeder.replicate(true) as unknown as RawStream;
@@ -114,13 +118,22 @@ function connect(seeder: Corestore, viewer: Corestore) {
   a.on('error', () => undefined);
   b.on('error', () => undefined);
   let held = false;
+  let slowMs = 0;
+  let nextAt = 0;
   const queued: Buffer[] = [];
+  const later = (chunk: Buffer): void => {
+    nextAt = Math.max(Date.now(), nextAt + slowMs);
+    setTimeout(() => gate.push(chunk), nextAt - Date.now());
+  };
   const gate = new Transform({
     transform(chunk: Buffer, _enc: BufferEncoding, cb: TransformCallback) {
-      if (held) {
-        queued.push(chunk);
-        cb();
-      } else cb(null, chunk);
+      if (held) queued.push(chunk);
+      else if (slowMs > 0) later(chunk);
+      else {
+        cb(null, chunk);
+        return;
+      }
+      cb();
     },
   });
   a.pipe(gate).pipe(b as unknown as NodeJS.WritableStream);
@@ -137,6 +150,12 @@ function connect(seeder: Corestore, viewer: Corestore) {
       held = false;
       for (const c of queued.splice(0)) gate.push(c);
     },
+    releaseSlowly: (ms: number): void => {
+      held = false;
+      slowMs = ms;
+      nextAt = Date.now() - ms;
+      for (const c of queued.splice(0)) later(c);
+    },
     destroy: (): void => {
       a.destroy();
       b.destroy();
@@ -146,6 +165,9 @@ function connect(seeder: Corestore, viewer: Corestore) {
 
 interface World {
   readonly viewer: RawCore;
+  /** The seeders' stores (index = seeder) and the viewer's, to connect again. */
+  readonly stores: Corestore[];
+  readonly viewerStore: Corestore;
   readonly remotes: string[];
   readonly links: ReturnType<typeof connect>[];
   /** Blocks each seeder sent the viewer (its `upload` events), by seeder index. */
@@ -195,7 +217,7 @@ async function world(n: number, seeders: number, blockSize = BLOCK): Promise<Wor
   }
   await until(() => viewer.peers.length === seeders, 10_000, 'every seeder to join the core');
   await viewer.update({ wait: true });
-  return { viewer, remotes, links, uploads, downloads };
+  return { viewer, stores, viewerStore: vs, remotes, links, uploads, downloads };
 }
 
 function perIndex(downloads: readonly { index: number }[]): Map<number, number> {
@@ -204,7 +226,7 @@ function perIndex(downloads: readonly { index: number }[]): Map<number, number> 
   return m;
 }
 
-const unlimited: PeerBudget = () => null;
+const unlimited: PeerBudget = () => UNCAPPED;
 
 function routed(
   viewer: RawCore,
@@ -475,15 +497,21 @@ describe('OnePeerRouter', () => {
     const detach = router.attachCore(w.viewer);
     const other = new OnePeerRouter({ budget: unlimited, logger: silentLogger });
     expect(() => other.attachCore(w.viewer)).toThrow(/another router/);
-    // The same router again is reference counted; the last detach restores hypercore.
+    // The same router again is reference counted. The last detach PARKS the core rather than
+    // restoring hypercore's scheduler (F33 independent review, 2026-09-25: a released core may
+    // still be replicating, and hypercore's cap and racing would overrun every seeder): every peer
+    // is asked for nothing until a router takes the core over.
     const again = router.attachCore(w.viewer);
     detach();
     expect(router.stats().cores).toBe(1);
     again();
     expect(router.stats().cores).toBe(0);
-    expect(Object.prototype.hasOwnProperty.call(w.viewer.peers[0], 'getMaxInflight')).toBe(false);
+    expect(w.viewer.peers[0]!.getMaxInflight()).toBe(0);
     expect(() => other.attachCore(w.viewer)).not.toThrow();
+    expect(other.stats().cores).toBe(1);
+    expect(w.viewer.peers[0]!.getMaxInflight()).toBeGreaterThan(0); // `other` caps it now
     other.close();
+    expect(w.viewer.peers[0]!.getMaxInflight()).toBe(0);
     router.close();
     expect(() => router.attachCore(w.viewer)).toThrow(RoutingUnsupported);
   });
@@ -585,15 +613,17 @@ describe('OnePeerRouter', () => {
     expect(r.stats().raced).toBe(1);
   });
 
-  it('the cap: only null keeps hypercore’s own, a finite budget caps it, NaN / ±Infinity / negative / a throw ask nothing', async () => {
-    let budget: () => number | null = () => null;
+  it('the cap: only UNCAPPED keeps hypercore’s own, a finite budget caps it, NaN / ±Infinity / negative / null / undefined / a throw ask nothing', async () => {
+    let budget: () => unknown = () => UNCAPPED;
     const w = await world(2, 1);
-    const r = routed(w.viewer, { budget: () => budget() });
+    const r = routed(w.viewer, { budget: () => budget() as number });
     const peer = w.viewer.peers[0]!;
     const base = (Object.getPrototypeOf(peer) as RawPeer).getMaxInflight.call(peer);
     expect(peer.getMaxInflight()).toBe(base);
     budget = () => 3;
     expect(peer.getMaxInflight()).toBe(peer.inflight + 3 - r.used(w.remotes[0]!));
+    // `null` / `undefined` mean "unknown" in the APIs next to the budget (a window before HELLO):
+    // they must never lift the cap (F33 independent review, 2026-09-25).
     for (const bad of [
       Number.NaN,
       -1,
@@ -601,6 +631,10 @@ describe('OnePeerRouter', () => {
       0.5,
       Number.NEGATIVE_INFINITY,
       Number.POSITIVE_INFINITY,
+      null,
+      undefined,
+      '8',
+      Symbol('uncapped'),
     ]) {
       budget = () => bad;
       expect(peer.getMaxInflight(), String(bad)).toBe(peer.inflight);
@@ -619,5 +653,184 @@ describe('OnePeerRouter', () => {
     r.refresh();
     expect(await p).not.toBeNull();
     expect(w.downloads).toHaveLength(1);
+  });
+  // ------------------------------------------------ independent review, 2026-09-25
+
+  it('close() PARKS a core still replicating: a held-back get and a block landing afterwards send nothing new, nor does a peer that joins (fail closed)', async () => {
+    const w = await world(8, 2);
+    const [s0] = w.remotes as [string, string];
+    const r = routed(w.viewer, { budget: (remote) => (remote === s0 ? 1 : 0) });
+    w.links[0]!.hold();
+    const gets = Array.from({ length: 5 }, (_, i) => w.viewer.get(i).catch(() => null));
+    await until(() => w.uploads[0] === 1, 5000, 'the first request to seeder 0');
+    await sleep(100);
+    expect(w.uploads).toEqual([1, 0]); // its budget of 1 holds the other four back
+    // Shutdown with the connections still open.
+    r.close();
+    // The block in flight lands: hypercore's `_ondata` runs `updatePeer` on seeder 0 at once.
+    // Handed back to hypercore, its own cap (≥ 16) would send it the four held-back requests.
+    w.links[0]!.release();
+    await until(() => w.downloads.length === 1, 5000, 'the block in flight at close()');
+    await sleep(300);
+    expect(w.uploads, 'requests sent after close()').toEqual([1, 0]);
+    for (const p of w.viewer.peers) expect(p.getMaxInflight()).toBe(0);
+    // A seeder that joins the parked core again is asked for nothing either.
+    w.links[1]!.destroy();
+    await until(() => w.viewer.peers.length === 1, 5000, 'seeder 1 to leave');
+    const back = connect(w.stores[1]!, w.viewerStore);
+    cleanups.push(() => {
+      back.destroy();
+      return Promise.resolve();
+    });
+    await back.remote();
+    await until(() => w.viewer.peers.length === 2, 5000, 'seeder 1 to join again');
+    await sleep(300);
+    expect(w.uploads, 'requests to a peer that joined after close()').toEqual([1, 0]);
+    for (const p of w.viewer.peers) expect(p.getMaxInflight()).toBe(0);
+    expect(gets).toHaveLength(5); // still pending: the stores' close rejects them
+  });
+
+  it('a seeder still delivering is never failed over, however old its last request — only a silent one is', async () => {
+    const STALL = 1000;
+    let open = new Set<string>();
+    const w = await world(6, 2);
+    const [s0, s1] = w.remotes as [string, string];
+    const r = routed(w.viewer, {
+      budget: (remote) => (open.has(remote) ? 4 : 0),
+      stallMs: STALL,
+    });
+    // Seeder 0 takes four requests and its answers wait in the gate…
+    w.links[0]!.hold();
+    open = new Set([s0]);
+    r.refresh();
+    const got = Promise.all([0, 1, 2, 3].map((i) => w.viewer.get(i)));
+    await until(() => w.uploads[0] === 4, 5000, 'four requests at seeder 0');
+    // …seeder 1 could take any of them over…
+    open = new Set([s0, s1]);
+    r.refresh();
+    // …and they arrive one every 400 ms: the last is 1.2 s old (> stallMs) when it lands, but
+    // seeder 0 delivered a block 400 ms before it — a slow link, not a stalled peer. Measured by
+    // request age alone, it was failed over (a cancel after sending: a debt for good).
+    w.links[0]!.releaseSlowly(400);
+    await within(got, 10_000);
+    expect(r.stats().failovers).toBe(0);
+    expect(r.debt(s0)).toBe(0);
+    expect(r.isStalled(s0)).toBe(false);
+    expect(w.uploads[1]).toBe(0);
+    expect(w.downloads.map((d) => d.from)).toEqual([s0, s0, s0, s0]);
+  });
+
+  it(`a request ${String(STALL_HARD_FACTOR)} × stallMs old has stalled, however recently its seeder delivered other blocks`, async () => {
+    const STALL = 200;
+    const w = await world(2, 2);
+    routed(w.viewer, { budget: () => 4, stallMs: STALL });
+    const [p0, p1] = w.viewer.peers as [RawPeer, RawPeer];
+    const queue = (
+      w.viewer as unknown as {
+        replicator: {
+          hotswaps: {
+            add(b: unknown): void;
+            remove(b: unknown): void;
+            pick(p: unknown): Iterable<unknown>;
+          };
+        };
+      }
+    ).replicator.hotswaps;
+    /** Would `to` be offered a block whose one request went to `from` `age` ms ago? */
+    const offered = (from: RawPeer, to: RawPeer, age: number): boolean => {
+      const block = {
+        index: 0,
+        hotswap: null,
+        inflight: [{ peer: from, timestamp: Date.now() - age, priority: 1 }],
+      };
+      queue.add(block);
+      try {
+        return [...queue.pick(to)].includes(block);
+      } finally {
+        queue.remove(block);
+      }
+    };
+    // p1 delivered nothing: its request has stalled once it is stallMs old.
+    expect(offered(p1, p0, STALL / 2)).toBe(false);
+    expect(offered(p1, p0, STALL * 2)).toBe(true);
+    // p0 delivered a block just now: its request of the same age has not…
+    (w.viewer as unknown as EventEmitter).emit('download', 1, BLOCK, p0);
+    expect(offered(p0, p1, STALL * 2)).toBe(false);
+    expect(offered(p0, p1, STALL * STALL_HARD_FACTOR - 50)).toBe(false);
+    // …until it is STALL_HARD_FACTOR × stallMs old: one block cannot be held back for ever by a
+    // peer trickling the others.
+    expect(offered(p0, p1, STALL * STALL_HARD_FACTOR)).toBe(true);
+  });
+
+  it('a replication peer without the pinned fields: refused at attach, asked for nothing when it joins later (fail closed)', async () => {
+    const w = await world(2, 2);
+    const hs = (w.viewer as unknown as { replicator: { hotswaps: unknown } }).replicator;
+    const hypercoreQueue = hs.hotswaps;
+    const peer = w.viewer.peers[0] as unknown as Record<string, unknown>;
+    const saved = peer['dataProcessing'];
+    const router = new OnePeerRouter({ budget: unlimited, logger: silentLogger });
+    cleanups.push(() => {
+      router.close();
+      return Promise.resolve();
+    });
+    peer['dataProcessing'] = undefined; // a renamed field, as a hypercore release might do
+    try {
+      expect(() => router.attachCore(w.viewer)).toThrow(/pinned fields/);
+    } finally {
+      peer['dataProcessing'] = saved;
+    }
+    expect(router.stats().cores).toBe(0);
+    expect(hs.hotswaps).toBe(hypercoreQueue); // nothing installed by the refused attach
+    router.attachCore(w.viewer);
+    const odd = { remotePublicKey: new Uint8Array(32), getMaxInflight: (): number => 16 };
+    (w.viewer as unknown as EventEmitter).emit('peer-add', odd);
+    expect(odd.getMaxInflight()).toBe(0);
+  });
+
+  it('a core closed and reopened under the same key (a new replicator) is routed anew, not left to hypercore', () => {
+    const noop = (): void => undefined;
+    class Peer {
+      getMaxInflight(): number {
+        return 16;
+      }
+      getMaxHotswapInflight(): number {
+        return 16;
+      }
+      _cancelRequest(): void {
+        // no wire
+      }
+      _requestBlock(): boolean {
+        return false;
+      }
+    }
+    class Replicator {
+      static Peer: unknown = Peer;
+      hotswaps: unknown = { add: noop, remove: noop, pick: noop };
+      peers: unknown[] = [];
+      updateAll = noop;
+      updatePeer = noop;
+      _updateHotswap = noop;
+    }
+    const key = new Uint8Array(32).fill(7);
+    const session = (replicator: Replicator): RoutableCore =>
+      Object.assign(new EventEmitter(), {
+        key,
+        opened: true,
+        replicator,
+      }) as unknown as RoutableCore;
+    const first = new Replicator();
+    const reopened = new Replicator();
+    const hypercoreQueue = reopened.hotswaps;
+    const router = new OnePeerRouter({ budget: unlimited, logger: silentLogger });
+    router.attachCore(session(first));
+    router.attachCore(session(reopened));
+    expect(router.stats().cores).toBe(2);
+    expect(reopened.hotswaps).not.toBe(hypercoreQueue);
+    // Two sessions of ONE replicator share its route (every session sees every event).
+    const again = router.attachCore(session(first));
+    expect(router.stats().cores).toBe(2);
+    again();
+    expect(router.stats().cores).toBe(2);
+    router.close();
   });
 });

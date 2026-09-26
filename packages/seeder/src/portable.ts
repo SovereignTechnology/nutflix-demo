@@ -41,6 +41,8 @@ export {
   OnePeerRouter,
   ROUTED_HYPERCORE_VERSION,
   RoutingUnsupported,
+  STALL_HARD_FACTOR,
+  UNCAPPED,
   isRoutablePeer,
   routableReplicator,
 } from './net/one-peer.js';

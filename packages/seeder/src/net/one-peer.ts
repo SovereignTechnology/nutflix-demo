@@ -2,7 +2,7 @@
  * OnePeerRouter — every block a downloader asks the swarm for travels from ONE peer (security
  * review F33; Cameron, 2026-09-24: "request each range from a single seeder — no duplicates,
  * seeders paid fairly"), and no peer is ever asked for more blocks than its credit allows
- * (issue #8: the viewer's credit sized per seeder window).
+ * (issue #8: the viewer's credit sized per seeder window). ADR 0018.
  *
  * WHY THIS REACHES INTO HYPERCORE. Hypercore chooses the peer a request goes to and offers no
  * public way to choose it. Its normal paths already give a block to one peer at a time: a queued
@@ -19,24 +19,38 @@
  * pins every internal named here and fails loudly when one moves):
  *
  *   1. `replicator.hotswaps` becomes a queue that never races. `pick(peer)` yields a block only
- *      when its single request has gone unanswered for `stallMs` (a stalled or withholding peer),
- *      and as the replacement request goes out the stalled one is CANCELLED: a failover to one
- *      other peer, never two peers at once.
+ *      when its single request has STALLED (below), and as the replacement request goes out the
+ *      stalled one is CANCELLED: a failover to one other peer, never two peers at once.
  *   2. Each replication `Peer`'s `getMaxInflight()` — hypercore's per-peer pipelining cap, read
  *      before every request it makes to that peer — is capped at
  *      `inflight + budget(remote, core) − used(remote)`, so what is outstanding at a peer never
- *      exceeds its credit, whichever blocks hypercore picks. Only an explicit `null` budget
- *      leaves hypercore's own cap.
+ *      exceeds its credit, whichever blocks hypercore picks. Only the `UNCAPPED` sentinel leaves
+ *      hypercore's own cap; anything else that is not a finite number ≥ 1 asks nothing.
  *   3. `refresh()` re-runs hypercore's scheduler (`updateAll()`) after a budget grew (an ACK, a
  *      HELLO), and while a request is stalled a ticker runs `updatePeer()` so a failover can fire.
+ *
+ * A request has STALLED when it is at least `stallMs` old AND its peer has delivered no block on
+ * that core for `stallMs` (measured from the later of the request and the peer's last block): a
+ * peer still delivering — an honest seeder on a slow link, its pipeline queued behind the blocks
+ * it is sending — is never failed over; only a silent one is. A request `STALL_HARD_FACTOR ×
+ * stallMs` old has stalled whatever its peer delivers, so a peer trickling other blocks cannot
+ * hold one block back for ever.
  *
  * `used(remote)` is what the peer may have sent that nothing will pay yet: requests in flight and
  * blocks being verified, plus, for good, every request cancelled after it went out and every
  * request that died with its channel. The peer may have sent those; hypercore drops a late
  * answer, so it can never be paid, and the seeder still counts it against its window.
  *
- * When the internals are not what this was written against, `attachCore` throws
- * `RoutingUnsupported`: fail closed, never download from a core this cannot route.
+ * FAIL CLOSED, ALWAYS:
+ *   - When the internals are not what this was written against — the replicator, or any peer
+ *     already on it — `attachCore` throws `RoutingUnsupported`: nothing downloads unrouted.
+ *   - A peer that joins later without the pinned fields is asked for nothing (cap 0).
+ *   - A replicator the router lets go of (the last detach, or `close()`) is PARKED, not handed
+ *     back to hypercore's own scheduler: the core may still be replicating (shutdown closes the
+ *     connections after the payer), and hypercore's cap (≥ 16) plus its racing hotswap would
+ *     overrun every seeder the moment a block landed. Parked, every peer — and every peer that
+ *     joins — is capped at 0 new requests and the no-race queue stays; blocks already in flight
+ *     still land. The next `attachCore` of that core, by any router, takes it over.
  *
  * Runtime-neutral (Node and Bare): no Node imports, timers only.
  */
@@ -46,16 +60,29 @@ import { toHex } from '../util/hex.js';
 /** The hypercore release whose internals this module was written and tested against. */
 export const ROUTED_HYPERCORE_VERSION = '11.35.3';
 /**
- * A request unanswered this long is moved to another peer that has the block. A 64 KiB block takes
- * well under a second from any peer worth streaming from; the default prefetch (30 s) covers it.
+ * A request unanswered this long, from a peer that delivered nothing for as long, is moved to
+ * another peer that has the block. A 64 KiB block takes well under a second from any peer worth
+ * streaming from; the default prefetch (30 s) covers it.
  */
 export const DEFAULT_STALL_MS = 4000;
 /** The shortest `stallMs` accepted: below it nearly every request would be failed over. */
 export const MIN_STALL_MS = 50;
+/**
+ * A request this many `stallMs` old has stalled even when its peer keeps delivering other blocks
+ * (a peer holding one block back while trickling the rest). 16 s by default.
+ */
+export const STALL_HARD_FACTOR = 4;
 /** Remotes whose lost-request count is remembered after their last peer is gone. */
 export const MAX_REMEMBERED_REMOTES = 4096;
 /** `PRIORITY.CANCELLED` in `hypercore/lib/replicator.js`: a request cancelled or answered. */
 const CANCELLED = 255;
+
+/**
+ * The one budget value that keeps hypercore's own per-peer cap (a test measuring racing alone).
+ * A dedicated sentinel, so no `null` / `undefined` / `Infinity` — "unknown" in the APIs next to
+ * this one — can lift a cap by accident.
+ */
+export const UNCAPPED: unique symbol = Symbol('one-peer-router.uncapped');
 
 /** The `peer` of a `download` event (the fields read here). */
 export interface DownloadPeer {
@@ -75,11 +102,12 @@ export interface RoutableCore {
 /**
  * Blocks `remote` (its Noise key, hex) may have outstanding toward us right now, for a request on
  * `core`: its credit — its window less the blocks it delivered that are not paid yet. Read before
- * every request. `null` — and only `null` — means "no cap" (hypercore's own); every other value
- * that is not a finite number ≥ 1 asks nothing: 0, negatives, `NaN`, `±Infinity` (a division by
- * zero must not uncap a peer) and a throw all fail closed.
+ * every request. `UNCAPPED` — and only `UNCAPPED` — means "no cap" (hypercore's own); every other
+ * value that is not a finite number ≥ 1 asks nothing: 0, negatives, `NaN`, `±Infinity` (a
+ * division by zero must not uncap a peer), `null` / `undefined` ("unknown") and a throw all fail
+ * closed.
  */
-export type PeerBudget = (remote: string, core: string) => number | null;
+export type PeerBudget = (remote: string, core: string) => number | typeof UNCAPPED;
 
 export interface OnePeerRouterOptions {
   readonly budget: PeerBudget;
@@ -209,30 +237,46 @@ function live(block: BlockRequestInternals): number {
   return n;
 }
 
-/** The block's one live request when it has gone unanswered for `stallMs`, else `null`. */
-function stalled(block: BlockRequestInternals, now: number, stallMs: number): WireRequest | null {
-  let live: WireRequest | null = null;
-  for (const r of block.inflight) {
-    if (r.priority === CANCELLED) continue;
-    if (live !== null) return null;
-    live = r;
-  }
-  if (live === null || now - live.timestamp < stallMs) return null;
-  return live;
-}
-
 /** What a `NoRaceQueue` asks of its router. */
 interface QueueHost {
   readonly stallMs: number;
   mayAsk(peer: ReplicationPeerInternals): boolean;
+  /** When `peer` last delivered a block on this core (`Date.now()`), 0 if never. */
+  lastDelivery(peer: ReplicationPeerInternals): number;
   takeOver(block: BlockRequestInternals, stale: WireRequest): void;
   tracking(): void;
   raced(block: BlockRequestInternals): void;
 }
 
+/** The block's one live request when it has STALLED (see the module comment), else `null`. */
+function stalled(block: BlockRequestInternals, now: number, host: QueueHost): WireRequest | null {
+  let one: WireRequest | null = null;
+  for (const r of block.inflight) {
+    if (r.priority === CANCELLED) continue;
+    if (one !== null) return null;
+    one = r;
+  }
+  if (one === null) return null;
+  const age = now - one.timestamp;
+  if (age < host.stallMs) return null;
+  if (age >= host.stallMs * STALL_HARD_FACTOR) return one;
+  const quiet = now - Math.max(one.timestamp, host.lastDelivery(one.peer));
+  return quiet >= host.stallMs ? one : null;
+}
+
+/** The host of a parked queue: nothing is offered, nothing is asked. */
+const PARKED_HOST: QueueHost = {
+  stallMs: DEFAULT_STALL_MS,
+  mayAsk: () => false,
+  lastDelivery: () => 0,
+  takeOver: () => undefined,
+  tracking: () => undefined,
+  raced: () => undefined,
+};
+
 /**
  * The replicator's hotswap queue, minus the racing: it tracks the blocks in flight and offers one
- * only when its single request is older than `stallMs` and the picking peer has credit.
+ * only when its single request has stalled and the picking peer has credit.
  */
 class NoRaceQueue implements HotswapQueueLike {
   private readonly tracked = new Set<BlockRequestInternals>();
@@ -240,10 +284,16 @@ class NoRaceQueue implements HotswapQueueLike {
   private offered: { readonly block: BlockRequestInternals; readonly stale: WireRequest } | null =
     null;
 
-  constructor(private readonly host: QueueHost) {}
+  constructor(private host: QueueHost) {}
 
   get size(): number {
     return this.tracked.size;
+  }
+
+  /** Serve another router (a parked core taken over), or nobody (`PARKED_HOST`). */
+  rebind(host: QueueHost): void {
+    this.host = host;
+    this.offered = null;
   }
 
   /** hypercore: a request for `block` went out (or one of several ended). */
@@ -275,7 +325,7 @@ class NoRaceQueue implements HotswapQueueLike {
     const now = Date.now();
     for (const block of [...this.tracked]) {
       if (!this.host.mayAsk(peer)) return;
-      const stale = stalled(block, now, this.host.stallMs);
+      const stale = stalled(block, now, this.host);
       if (stale === null || stale.peer === peer) continue;
       this.offered = { block, stale };
       try {
@@ -292,29 +342,90 @@ class NoRaceQueue implements HotswapQueueLike {
   }
 
   hasStalled(now: number): boolean {
-    for (const block of this.tracked)
-      if (stalled(block, now, this.host.stallMs) !== null) return true;
+    for (const block of this.tracked) if (stalled(block, now, this.host) !== null) return true;
     return false;
   }
 }
 
+// ---------------------------------------------------------------- parking (fail closed)
+
+/** A replicator no router routes any more, while its core may still replicate. */
+interface Parked {
+  readonly queue: NoRaceQueue;
+  /** Its `peer-add` listeners (a peer that joins is parked too). */
+  readonly offs: readonly (() => void)[];
+}
+
+const parked = new WeakMap<object, Parked>();
+
+/** The cap of a peer that must be asked for nothing: hypercore gates every request on it. */
+const NOTHING = (): number => 0;
+
+function askNothing(p: unknown): void {
+  if (typeof p !== 'object' || p === null) return;
+  Object.defineProperty(p, 'getMaxInflight', {
+    value: NOTHING,
+    configurable: true,
+    writable: true,
+  });
+}
+
+/**
+ * Park `replicator`: its no-race queue stays (serving nobody), every peer and every peer that
+ * joins through one of `sessions` is capped at 0 new requests. Blocks already requested land.
+ */
+function park(
+  replicator: ReplicatorInternals,
+  queue: NoRaceQueue,
+  sessions: Iterable<RoutableCore>,
+): void {
+  queue.rebind(PARKED_HOST);
+  replicator.hotswaps = queue;
+  for (const p of replicator.peers) askNothing(p);
+  const offs: (() => void)[] = [];
+  for (const s of sessions) {
+    const onAdd = (peer: never): void => {
+      askNothing(peer);
+    };
+    s.on('peer-add', onAdd);
+    offs.push(() => {
+      s.off('peer-add', onAdd);
+    });
+  }
+  parked.set(replicator, { queue, offs });
+}
+
+/** Take `replicator` out of the parked set; its queue when it is still the installed one. */
+function unpark(replicator: ReplicatorInternals): NoRaceQueue | null {
+  const p = parked.get(replicator);
+  if (p === undefined) return null;
+  parked.delete(replicator);
+  for (const off of p.offs) off();
+  return replicator.hotswaps === p.queue ? p.queue : null;
+}
+
 // ---------------------------------------------------------------- the router
+
+interface Session {
+  refs: number;
+  readonly off: () => void;
+}
 
 interface Route {
   readonly keyHex: string;
   readonly replicator: ReplicatorInternals;
-  readonly original: HotswapQueueLike;
-  queue: NoRaceQueue | null;
+  readonly queue: NoRaceQueue;
   readonly peers: Map<ReplicationPeerInternals, string>;
-  refs: number;
-  readonly offs: (() => void)[];
+  /** The sessions attached to this replicator (their listeners), reference counted. */
+  readonly sessions: Map<RoutableCore, Session>;
 }
 
 export class OnePeerRouter {
   readonly stallMs: number;
   private readonly o: OnePeerRouterOptions;
   private readonly log: Logger;
-  private readonly routes = new Map<string, Route>();
+  /** Keyed by REPLICATOR: a core closed and reopened under the same key is a new one to route. */
+  private readonly routes = new Map<ReplicatorInternals, Route>();
   /** remote → its live replication peers on the routed cores. */
   private readonly byRemote = new Map<string, Set<ReplicationPeerInternals>>();
   /** remote → requests it may have answered that nothing will ever pay (peers gone). */
@@ -325,6 +436,8 @@ export class OnePeerRouter {
    * otherwise take a fresh batch after every failover and delay each block by `stallMs`.
    */
   private readonly stalled = new Set<string>();
+  /** Replication peer → when it last delivered a block on its core (the stall rule). */
+  private readonly delivered = new WeakMap<object, number>();
   private failovers = 0;
   private raced = 0;
   private ticker: ReturnType<typeof setInterval> | null = null;
@@ -341,72 +454,25 @@ export class OnePeerRouter {
   }
 
   /**
-   * Route `core`'s block requests (the core must be open). Reference counted per core; returns a
-   * detach function. Throws `RoutingUnsupported` when hypercore's internals are not the pinned
-   * ones, or another router already routes this core.
+   * Route `core`'s block requests (the core must be open). Reference counted per replicator (and
+   * per session of it); returns a detach function — the last one PARKS the replicator (see the
+   * module comment). Throws `RoutingUnsupported` when hypercore's internals are not the pinned
+   * ones — the replicator's, or those of a peer already on it — or another router routes it.
    */
   attachCore(core: RoutableCore): () => void {
     if (this.closed) throw new RoutingUnsupported('the router is closed');
-    const keyHex = toHex(core.key);
-    const existing = this.routes.get(keyHex);
-    if (existing !== undefined) {
-      existing.refs++;
-      return this.detacher(existing);
-    }
     const replicator = routableReplicator(core);
-    if (owners.has(replicator))
-      throw new RoutingUnsupported('another router already routes this core');
-    const route: Route = {
-      keyHex,
-      replicator,
-      original: replicator.hotswaps,
-      queue: null,
-      peers: new Map(),
-      refs: 1,
-      offs: [],
-    };
-    const queue = new NoRaceQueue({
-      stallMs: this.stallMs,
-      mayAsk: (peer) => peer.inflight < peer.getMaxInflight(),
-      takeOver: (block, stale) => {
-        this.takeOver(route, block, stale);
-      },
-      tracking: () => {
-        this.armTicker();
-      },
-      raced: (block) => {
-        this.raced++;
-        this.log.error('a block is in flight at two peers (unknown request path)', {
-          core: keyHex,
-          index: block.index,
-        });
-      },
-    });
-    route.queue = queue;
-    owners.set(replicator, this);
-    replicator.hotswaps = queue;
-    const onAdd = (peer: never): void => {
-      this.addPeer(route, peer);
-    };
-    const onRemove = (peer: never): void => {
-      this.removePeer(route, peer);
-    };
-    const onDownload = (_index: number, _bytes: number, peer: DownloadPeer): void => {
-      if (this.stalled.size > 0) this.stalled.delete(toHex(peer.remotePublicKey));
-    };
-    core.on('peer-add', onAdd);
-    core.on('peer-remove', onRemove);
-    core.on('download', onDownload);
-    route.offs.push(() => {
-      core.off('peer-add', onAdd);
-      core.off('peer-remove', onRemove);
-      core.off('download', onDownload);
-    });
-    this.routes.set(keyHex, route);
-    // Peers already there. A new one is added in the same tick as `_addPeer` puts it in
-    // `replicator.peers`, before its first sync, so it cannot have asked for a block yet.
-    for (const p of replicator.peers) this.addPeer(route, p);
-    return this.detacher(route);
+    let route = this.routes.get(replicator);
+    if (route === undefined) {
+      if (owners.has(replicator))
+        throw new RoutingUnsupported('another router already routes this core');
+      for (const p of replicator.peers)
+        if (!isRoutablePeer(p))
+          throw new RoutingUnsupported('a replication peer lacks the pinned fields');
+      route = this.route(core, replicator);
+    }
+    this.listen(route, core);
+    return this.detacher(route, core);
   }
 
   /** Budgets may have grown: re-run hypercore's scheduler on every routed core (coalesced). */
@@ -458,42 +524,119 @@ export class OnePeerRouter {
     return { cores: this.routes.size, peers, failovers: this.failovers, raced: this.raced };
   }
 
-  /** Detach every core (the downloader is going away). */
+  /**
+   * Let go of every core (the downloader is going away): each is PARKED — nothing more is asked
+   * of any peer on it, even while its connections are still open.
+   */
   close(): void {
     if (this.closed) return;
-    for (const route of [...this.routes.values()]) this.release(route);
+    for (const route of [...this.routes.values()]) this.release(route, []);
     this.closed = true;
     this.stopTicker();
   }
 
   // -------------------------------------------------------------- private
 
-  private detacher(route: Route): () => void {
+  private route(core: RoutableCore, replicator: ReplicatorInternals): Route {
+    const keyHex = toHex(core.key);
+    const host: QueueHost = {
+      stallMs: this.stallMs,
+      mayAsk: (peer) => peer.inflight < peer.getMaxInflight(),
+      lastDelivery: (peer) => this.delivered.get(peer) ?? 0,
+      takeOver: (block, stale) => {
+        this.takeOver(keyHex, block, stale);
+      },
+      tracking: () => {
+        this.armTicker();
+      },
+      raced: (block) => {
+        this.raced++;
+        this.log.error('a block is in flight at two peers (unknown request path)', {
+          core: keyHex,
+          index: block.index,
+        });
+      },
+    };
+    // A parked core keeps its queue (and the blocks it tracks); otherwise hypercore's goes.
+    let queue = unpark(replicator);
+    if (queue === null) queue = new NoRaceQueue(host);
+    else queue.rebind(host);
+    replicator.hotswaps = queue;
+    owners.set(replicator, this);
+    const route: Route = { keyHex, replicator, queue, peers: new Map(), sessions: new Map() };
+    this.routes.set(replicator, route);
+    // Peers already there. A new one is added in the same tick as `_addPeer` puts it in
+    // `replicator.peers`, before its first sync, so it cannot have asked for a block yet.
+    for (const p of replicator.peers) this.addPeer(route, p);
+    return route;
+  }
+
+  /** Follow `core`'s peers and downloads (once per session; every session sees every event). */
+  private listen(route: Route, core: RoutableCore): void {
+    const had = route.sessions.get(core);
+    if (had !== undefined) {
+      had.refs++;
+      return;
+    }
+    const onAdd = (peer: never): void => {
+      this.addPeer(route, peer);
+    };
+    const onRemove = (peer: never): void => {
+      this.removePeer(route, peer);
+    };
+    const onDownload = (_index: number, _bytes: number, peer: DownloadPeer): void => {
+      this.delivered.set(peer, Date.now());
+      if (this.stalled.size > 0) this.stalled.delete(toHex(peer.remotePublicKey));
+    };
+    core.on('peer-add', onAdd);
+    core.on('peer-remove', onRemove);
+    core.on('download', onDownload);
+    route.sessions.set(core, {
+      refs: 1,
+      off: () => {
+        core.off('peer-add', onAdd);
+        core.off('peer-remove', onRemove);
+        core.off('download', onDownload);
+      },
+    });
+  }
+
+  private detacher(route: Route, core: RoutableCore): () => void {
     let done = false;
     return () => {
       if (done) return;
       done = true;
-      if (--route.refs > 0) return;
-      this.release(route);
+      const s = route.sessions.get(core);
+      if (s === undefined) return; // released already (`close()`)
+      if (--s.refs > 0) return;
+      s.off();
+      route.sessions.delete(core);
+      if (route.sessions.size === 0) this.release(route, [core]);
     };
   }
 
-  private release(route: Route): void {
-    if (this.routes.get(route.keyHex) !== route) return;
-    this.routes.delete(route.keyHex);
-    for (const off of route.offs) off();
+  /** Stop routing `route` and PARK its replicator (listening for new peers on `extra` too). */
+  private release(route: Route, extra: readonly RoutableCore[]): void {
+    if (this.routes.get(route.replicator) !== route) return;
+    this.routes.delete(route.replicator);
+    const sessions = [...route.sessions.keys(), ...extra];
+    for (const s of route.sessions.values()) s.off();
+    route.sessions.clear();
     for (const p of [...route.peers.keys()]) this.removePeer(route, p);
-    // Racing comes back for whoever else reads this core. Blocks our queue still tracks keep
-    // `hotswap.ref` pointing at it, so hypercore's removals still reach it.
-    if (route.replicator.hotswaps === route.queue) route.replicator.hotswaps = route.original;
     if (owners.get(route.replicator) === this) owners.delete(route.replicator);
+    park(route.replicator, route.queue, sessions);
+    // A read of a parked core waits for ever (or its timeout): say why, once.
+    this.log.info('core released and parked: nothing more is asked of its peers', {
+      core: route.keyHex,
+    });
   }
 
   private addPeer(route: Route, p: unknown): void {
     if (!isRoutablePeer(p)) {
-      // The pinned tests make this unreachable on 11.35.3. Should it happen, the peer keeps
-      // hypercore's cap: say so loudly.
-      this.log.error('replication peer without the pinned fields: not capped');
+      // The pinned tests make this unreachable on 11.35.3. Should it happen, the peer cannot be
+      // capped by its credit, so it is asked for nothing at all: say so loudly.
+      askNothing(p);
+      this.log.error('replication peer without the pinned fields: asked for nothing');
       return;
     }
     const peer = p as ReplicationPeerInternals;
@@ -515,7 +658,7 @@ export class OnePeerRouter {
     });
   }
 
-  /** `peer` left the core (`peer-remove`), or the core is being detached: stop tracking it. */
+  /** `peer` left the core (`peer-remove`), or the core is being released: stop tracking it. */
   private removePeer(route: Route, p: unknown): void {
     const peer = p as ReplicationPeerInternals;
     const remote = route.peers.get(peer);
@@ -529,6 +672,7 @@ export class OnePeerRouter {
     const set = this.byRemote.get(remote);
     set?.delete(peer);
     if (set?.size === 0) this.byRemote.delete(remote);
+    // A peer gone from the core is never scheduled again; on a release `park` caps it at 0.
     delete (peer as { getMaxInflight?: unknown }).getMaxInflight;
   }
 
@@ -546,14 +690,15 @@ export class OnePeerRouter {
 
   /** hypercore's `getMaxInflight()` for `peer` (`base`), capped by the peer's credit. */
   private cap(route: Route, peer: ReplicationPeerInternals, remote: string, base: number): number {
-    let budget: number | null;
+    let budget: unknown;
     try {
       budget = this.o.budget(remote, route.keyHex);
     } catch {
       budget = 0;
     }
-    if (budget === null) return base;
-    const credit = Number.isFinite(budget) && budget >= 1 ? Math.floor(budget) : 0;
+    if (budget === UNCAPPED) return base;
+    const credit =
+      typeof budget === 'number' && Number.isFinite(budget) && budget >= 1 ? Math.floor(budget) : 0;
     let free = Math.max(0, credit - this.used(remote));
     if (this.stalled.has(remote)) free = Math.min(free, Math.max(0, 1 - this.inflight(remote)));
     return Math.min(base, peer.inflight + free);
@@ -564,7 +709,7 @@ export class OnePeerRouter {
    * the queue's `add` before sending it): withdraw the stalled one, so the block stays with one
    * peer.
    */
-  private takeOver(route: Route, block: BlockRequestInternals, stale: WireRequest): void {
+  private takeOver(keyHex: string, block: BlockRequestInternals, stale: WireRequest): void {
     if (stale.priority !== CANCELLED) stale.peer._cancelRequest(stale);
     // hypercore leaves a cancelled request in `inflight` only on a block it is dropping; on a
     // live block it would keep the block from ever being queued again.
@@ -579,9 +724,9 @@ export class OnePeerRouter {
       if (oldest.done === true) break;
       this.stalled.delete(oldest.value);
     }
-    this.log.info('block moved from a stalled peer', { core: route.keyHex, index: block.index });
+    this.log.info('block moved from a stalled peer', { core: keyHex, index: block.index });
     try {
-      this.o.onFailover?.(remote, route.keyHex);
+      this.o.onFailover?.(remote, keyHex);
     } catch {
       // the listener's failure is its own
     }
@@ -604,7 +749,7 @@ export class OnePeerRouter {
     const now = Date.now();
     for (const route of this.routes.values()) {
       const queue = route.queue;
-      if (queue === null || queue.size === 0) continue;
+      if (queue.size === 0) continue;
       tracking = true;
       if (!queue.hasStalled(now)) continue;
       // `updatePeer` runs hypercore's hotswap step for that peer, which asks our queue.
