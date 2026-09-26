@@ -21,6 +21,8 @@ export type LogEvent =
   // Issue #6 (ADR 0017): a packaged build refuses Chromium's remote-debugging switches, and
   // handles Squirrel.Windows' lifecycle launches (squirrel.ts) before anything else.
   | 'app.debug-switch-refused'
+  // Cross-lane review (round 4): and the process-wrapper / V8 / isolation switches.
+  | 'app.process-switch-refused'
   | 'app.squirrel-event'
   | 'app.squirrel-update-failed'
   | 'window.created'

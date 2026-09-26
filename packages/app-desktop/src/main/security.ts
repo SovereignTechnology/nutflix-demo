@@ -121,8 +121,30 @@ export function installSessionPolicy(ses: PolicySession): void {
   });
 }
 
-/** Never `--no-sandbox` (D4): main refuses to start when the switch is present. */
-export const SANDBOX_BYPASS_SWITCHES = ['no-sandbox', 'disable-gpu-sandbox', 'no-zygote'] as const;
+/**
+ * Never `--no-sandbox` (D4): main refuses to start, in EVERY build, when a switch is present
+ * that turns a Chromium sandbox layer off or runs sandboxed code inside the unsandboxed browser
+ * process. The first three were D4's; the cross-lane review (round 4) found the rest of
+ * Chromium's list (sandbox/policy/switches.cc and content_switches.cc) still accepted, e.g.
+ * `Exec=nutflix --disable-seccomp-filter-sandbox`. Every name here is a string in Electron
+ * 44.2.0's Linux binary (checked with `strings`). The e2e harness passes none of them (it
+ * asserts six of them absent, e2e/support.ts).
+ */
+export const SANDBOX_BYPASS_SWITCHES = [
+  'no-sandbox', // every process type
+  'disable-gpu-sandbox', // the GPU process
+  'no-zygote', // renderers forked without the zygote, so without its sandbox
+  'no-zygote-sandbox', // the zygote itself starts unsandboxed (Linux)
+  'disable-seccomp-filter-sandbox', // no seccomp-bpf filter in renderers (Linux)
+  'disable-namespace-sandbox', // no user/PID/network namespaces (Linux)
+  'disable-setuid-sandbox', // no setuid helper (Linux)
+  'disable-landlock-sandbox', // no Landlock layer (Linux)
+  'allow-sandbox-debugging', // sandboxed children stay dumpable/ptrace-able by the same user
+  'gpu-sandbox-allow-sysv-shm', // loosens the GPU sandbox policy
+  'disable-webnn-compiler-sandbox', // the WebNN compiler process's sandbox
+  'single-process', // the renderer runs inside the (unsandboxed) browser process
+  'in-process-gpu', // the GPU code runs inside the browser process
+] as const;
 
 export function sandboxBypassSwitch(commandLine: {
   hasSwitch(name: string): boolean;
@@ -147,4 +169,36 @@ export function remoteDebuggingSwitch(commandLine: {
   hasSwitch(name: string): boolean;
 }): string | undefined {
   return REMOTE_DEBUGGING_SWITCHES.find((s) => commandLine.hasSwitch(s));
+}
+
+/**
+ * Cross-lane review (round 4), same reasoning as the remote-debugging switches: a wrapper script
+ * or an edited `.desktop` line must not be able to change what runs in, or around, a packaged
+ * build's processes. A PACKAGED build refuses these (exit 78), checked after the dev flags and
+ * the remote-debugging switches; a dev build keeps them (a developer wraps a renderer in gdb
+ * with `--renderer-cmd-prefix`, or passes `--js-flags`).
+ *
+ * Chromium may already have started its zygote and GPU process when main runs, so a prefix on
+ * those has already run once. The refusal means the app never goes on with them: no window, no
+ * host, no worker, no secret typed.
+ *
+ * Left out on purpose: debug pauses (`*-startup-dialog`, `wait-for-debugger*`) pause a process
+ * and widen nothing; `--enable-features`/`--disable-features` carry a list, and refusing them
+ * outright breaks Wayland users (ADR 0017, open question 11).
+ */
+export const PACKAGED_REFUSED_SWITCHES = [
+  'renderer-cmd-prefix', // a program around every renderer
+  'utility-cmd-prefix', // … around every utility process, the host (money plane) among them
+  'gpu-launcher', // … around the GPU process
+  'zygote-cmd-prefix', // … around the zygote
+  'browser-subprocess-path', // another executable AS every child process
+  'js-flags', // V8 flags for main's isolate and every renderer's
+  'disable-site-isolation-trials', // the prompt and app windows could share a renderer process
+  'disable-web-security', // Chromium's same-origin-policy switch
+] as const;
+
+export function packagedRefusedSwitch(commandLine: {
+  hasSwitch(name: string): boolean;
+}): string | undefined {
+  return PACKAGED_REFUSED_SWITCHES.find((s) => commandLine.hasSwitch(s));
 }

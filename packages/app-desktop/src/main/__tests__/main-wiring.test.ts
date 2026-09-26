@@ -411,6 +411,108 @@ describe('main.ts wiring (fake electron)', () => {
     },
   );
 
+  // Cross-lane review (round 4, LOW): the rest of Chromium's sandbox-off and in-process
+  // switches, refused like D4's three — in a dev build AND a packaged one.
+  it.each([
+    'no-zygote-sandbox',
+    'disable-seccomp-filter-sandbox',
+    'disable-namespace-sandbox',
+    'disable-setuid-sandbox',
+    'disable-landlock-sandbox',
+    'allow-sandbox-debugging',
+    'gpu-sandbox-allow-sysv-shm',
+    'disable-webnn-compiler-sandbox',
+    'single-process',
+    'in-process-gpu',
+  ])('refuses to start with --%s, dev or packaged (exit 78, nothing started)', async (sw) => {
+    for (const packaged of [false, true]) {
+      vi.resetModules();
+      fx.packaged = packaged;
+      fx.exitCode = undefined;
+      fx.switches.clear();
+      fx.switches.add(sw);
+      process.argv = [argv[0] ?? 'node', 'dist/main/main.js'];
+      await expect(import('../main.js'), String(packaged)).rejects.toThrow(/sandbox/);
+      expect(fx.exitCode).toBe(78);
+      expect(fx.order).toEqual([]);
+      expect(fx.protocols.size).toBe(0);
+      expect(fx.forks).toHaveLength(0);
+    }
+    expect(logged.join('')).toMatch(/app\.sandbox-bypass-refused/);
+  });
+
+  // Round 4 (LOW): process wrappers, V8 flags and isolation overrides — packaged builds only.
+  it.each([
+    'renderer-cmd-prefix',
+    'utility-cmd-prefix',
+    'gpu-launcher',
+    'zygote-cmd-prefix',
+    'browser-subprocess-path',
+    'js-flags',
+    'disable-site-isolation-trials',
+    'disable-web-security',
+  ])(
+    'a packaged build refuses --%s (exit 78, nothing started); a dev build keeps it',
+    async (sw) => {
+      fx.packaged = true;
+      fx.switches.add(sw);
+      process.argv = [argv[0] ?? 'node', 'dist/main/main.js'];
+      await expect(import('../main.js')).rejects.toThrow(/refused in a packaged build/);
+      expect(fx.exitCode).toBe(78);
+      expect(fx.order).toEqual([]);
+      expect(fx.protocols.size).toBe(0);
+      expect(fx.windows).toHaveLength(0);
+      expect(fx.forks).toHaveLength(0);
+      expect(logged.join('')).toMatch(/app\.process-switch-refused/);
+      // The dev build starts (a developer wraps a renderer in gdb, or passes --js-flags).
+      vi.resetModules();
+      fx.packaged = false;
+      fx.exitCode = undefined;
+      await boot();
+      expect(fx.exitCode).toBeUndefined();
+      expect(fx.forks).toHaveLength(1);
+    },
+  );
+
+  // Round 4: the order of the before-ready refusals is Squirrel (pinned in its own describe),
+  // then the sandbox, the dev flags, the remote-debugging switches, the process switches. Each
+  // step below removes the one that fired and checks the next one takes over.
+  it('refusal order: sandbox, dev flags, remote debugging, process switches', async () => {
+    const steps: { drop: string | null; expect: RegExp; event: string }[] = [
+      { drop: null, expect: /sandbox/, event: 'app.sandbox-bypass-refused' },
+      {
+        drop: 'disable-seccomp-filter-sandbox',
+        expect: /dev flags/,
+        event: 'app.dev-flag-refused',
+      },
+      { drop: '--dev-mocks', expect: /remote debugging/, event: 'app.debug-switch-refused' },
+      {
+        drop: 'remote-debugging-port',
+        expect: /process-wrapper/,
+        event: 'app.process-switch-refused',
+      },
+    ];
+    const switches = new Set(['disable-seccomp-filter-sandbox', 'remote-debugging-port']);
+    switches.add('utility-cmd-prefix');
+    let flags = ['--dev-mocks'];
+    for (const step of steps) {
+      if (step.drop === '--dev-mocks') flags = [];
+      else if (step.drop !== null) switches.delete(step.drop);
+      vi.resetModules();
+      logged = [];
+      fx.packaged = true;
+      fx.exitCode = undefined;
+      fx.switches.clear();
+      for (const sw of switches) fx.switches.add(sw);
+      process.argv = [argv[0] ?? 'node', 'dist/main/main.js', ...flags];
+      await expect(import('../main.js'), step.event).rejects.toThrow(step.expect);
+      expect(fx.exitCode).toBe(78);
+      expect(logged, step.event).toHaveLength(1);
+      expect(logged[0]).toContain(` ${step.event}`);
+      expect(fx.order).toEqual([]);
+    }
+  });
+
   it('registers the two protocols, the three IPC channels + the two prompt ones, one window at app://nutflix/', async () => {
     await boot();
     expect([...fx.protocols.keys()].sort()).toEqual(['app', 'nf-media']);
