@@ -12,10 +12,16 @@
  * through the real `WorkerSupervisor`: init with `--dev-mocks --dev-fixtures` → ready → the
  * fixture rig (a local hyperdht testnet and two seeders inside the Bare process) → play.open →
  * the bytes over the worker's loopback HTTP server equal the manifest's sha256 → stop.
+ *
+ * And the DLEQ thread (issue #8 d; lane I1): the bundled worker finds worker/pay/
+ * dleq-thread-entry.mjs from its own root, and a `Bare.Thread` started from that staged entry
+ * loads core from the staged node_modules and answers the fixture self-check
+ * (`src/worker/dev/dleq-selfcheck.ts`) with core's verdicts, ON the thread — not the chunked
+ * inline fallback every packaged build used before the entry was staged.
  */
 import { spawnSync } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
-import { accessSync, constants, existsSync, realpathSync, statSync } from 'node:fs';
+import { accessSync, constants, existsSync, lstatSync, realpathSync, statSync } from 'node:fs';
 import { mkdtemp, rm } from 'node:fs/promises';
 import http from 'node:http';
 import { tmpdir } from 'node:os';
@@ -80,6 +86,28 @@ function get(url: string): Promise<{ status: number; body: Buffer }> {
   });
 }
 
+/** The worker's DLEQ self-check line (dev/dleq-selfcheck.ts), parsed from the host's log. */
+function selfCheck(
+  lines: readonly { msg: string; [k: string]: unknown }[],
+): Record<string, unknown> | undefined {
+  for (const l of lines) {
+    if (l.msg !== 'worker log' || typeof l['line'] !== 'string') continue;
+    let rec: unknown;
+    try {
+      rec = JSON.parse(l['line']);
+    } catch {
+      continue;
+    }
+    if (
+      typeof rec === 'object' &&
+      rec !== null &&
+      (rec as { msg?: unknown }).msg === 'DEV FIXTURES: DLEQ self-check'
+    )
+      return rec as Record<string, unknown>;
+  }
+  return undefined;
+}
+
 describe('the packaged worker (staged tree, real bare, real supervisor)', () => {
   it('ships an executable bare for this platform only, and the unbundled boot module', () => {
     const prebuilds = join(unpacked, 'node_modules', 'bare-sidecar', 'prebuilds');
@@ -95,6 +123,9 @@ describe('the packaged worker (staged tree, real bare, real supervisor)', () => 
     );
     expect(existsSync(join(unpacked, 'worker', 'boot.mjs'))).toBe(true);
     expect(existsSync(join(unpacked, 'worker', 'worker.mjs'))).toBe(true);
+    // Lane I1: the DLEQ thread's entry, a regular file where the bundle looks for it.
+    const dleq = join(unpacked, 'worker', 'pay', 'dleq-thread-entry.mjs');
+    expect(lstatSync(dleq).isFile()).toBe(true);
     // pear-runtime is not shipped (the host never constructs it; no OTA).
     expect(existsSync(join(unpacked, 'node_modules', 'pear-runtime'))).toBe(false);
   });
@@ -161,6 +192,16 @@ describe('the packaged worker (staged tree, real bare, real supervisor)', () => 
         expect(full.body.byteLength).toBe(r.size);
         expect(createHash('sha256').update(full.body).digest('hex')).toBe(r.sha256);
         await sup.request('play.close', { sid });
+        // Lane I1: the packaged worker checked DLEQ proofs on its thread, with core's verdicts.
+        const check = await eventually(
+          () => selfCheck(log.lines),
+          `the DLEQ self-check line (log: ${JSON.stringify(log.lines.slice(-8))})`,
+          60_000,
+        );
+        expect(check).toMatchObject({
+          level: 'info',
+          fields: { where: 'thread', verdicts: 'right', checks: 4, onThread: 4 },
+        });
         // No restart happened: the first worker served everything.
         expect(log.lines.some((l) => l.msg === 'media worker exited')).toBe(false);
       } finally {

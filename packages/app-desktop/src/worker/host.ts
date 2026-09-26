@@ -46,6 +46,7 @@ import type {
 } from '../ipc/worker-protocol.js';
 import { WORKER_V } from '../ipc/worker-protocol.js';
 import { randomHex, sodiumCrypto, sodiumSha256 } from './crypto.js';
+import type { DleqSelfCheck } from './dev/dleq-selfcheck.js';
 import type { LoopbackPayHub } from './dev/loopback-pay.js';
 import type { DevTestnet, FixtureInput, FixtureNet } from './dev/fixtures-net.js';
 import { probeFfmpeg } from './ffmpeg.js';
@@ -53,6 +54,7 @@ import { createWorkerLogger } from './log.js';
 import type { LogEvent } from './log.js';
 import { PeerNode } from './net/peer-node.js';
 import type { BootstrapNode } from './net/peer-node.js';
+import type { SpawnDleqThread } from './pay/dleq-thread.js';
 import type { PaidEvent } from './pay/viewer-payer.js';
 import { ViewerPayer } from './pay/viewer-payer.js';
 import { CreditPool } from './playback/credit.js';
@@ -173,6 +175,8 @@ export class WorkerHost {
   private hub: LoopbackPayHub | null = null;
   private fixtures: FixtureNet | null = null;
   private testnet: DevTestnet | null = null;
+  /** `--dev-fixtures`: the DLEQ self-check (`dev/dleq-selfcheck.ts`), once it is loaded. */
+  private devDleq: Promise<DleqSelfCheck | null> | null = null;
   private seeding: WorkerInit['seeding'] = { enabled: false, diskCapBytes: 0 };
   private readonly sessions = new Map<string, Session>();
   private readonly corePolicies = new Map<CoreKeyHex, PricePolicy>();
@@ -415,6 +419,25 @@ export class WorkerHost {
     log.info('worker initialised', { seeding: a.seeding.enabled, port: server.port });
 
     if (dev?.fixtures === true && bootstrap !== null) void this.startFixtures(bootstrap);
+    // ADR 0017: show whether this build's worker finds its DLEQ thread (only a runtime that has
+    // threads — Bare — can say; the check logs one line).
+    if (dev?.fixtures === true && runtime.dleqThread !== undefined)
+      this.devDleq = this.startDevDleqCheck(runtime.dleqThread, log);
+  }
+
+  private async startDevDleqCheck(
+    spawn: SpawnDleqThread,
+    log: Logger,
+  ): Promise<DleqSelfCheck | null> {
+    try {
+      const { startDleqSelfCheck } = await import('./dev/dleq-selfcheck.js');
+      // Closing meanwhile: never start a thread that `close` would not stop.
+      if (this.closing !== null) return null;
+      return startDleqSelfCheck({ spawn, logger: log });
+    } catch (err) {
+      log.error('the DLEQ self-check could not start', { error: err });
+      return null;
+    }
   }
 
   private async startFixtures(bootstrap: readonly BootstrapNode[]): Promise<void> {
@@ -857,6 +880,8 @@ export class WorkerHost {
       if (this.statusTimer !== null) clearTimeout(this.statusTimer);
       this.statusTimer = null;
       await this.initialising?.catch(() => undefined);
+      // Its thread must be gone before the worker exits: a parked Bare thread holds `Bare.exit`.
+      await (await this.devDleq)?.close();
       for (const sid of [...this.sessions.keys()]) this.closeSession(sid);
       await this.net?.payer.flush().catch(() => undefined);
       await this.live?.server.close();

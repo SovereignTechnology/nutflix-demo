@@ -12,6 +12,10 @@
  *   worker/boot.mjs           UNBUNDLED boot module: `bare-encoding/global` first (D6), then…
  *   worker/worker.mjs         the worker bundle (our sources only; every npm package stays an
  *                             import that Bare resolves itself — export conditions, addons)
+ *   worker/pay/dleq-thread-entry.mjs   the DLEQ thread's entry (issue #8 d), bundled on its own
+ *                             (src/worker/pay + src/ipc only; core and bare-encoding stay imports
+ *                             Bare resolves from worker/pay/ up to node_modules/). The worker
+ *                             bundle finds it at `./pay/` from itself (src/worker/worker-root.ts)
  *   node_modules/             the lockfile runtime closure (closure.ts), native prebuilds for the
  *                             target platform only, workspace packages as real directories
  *
@@ -40,6 +44,7 @@ import { keepPrebuild, runtimeClosure, type ClosureEntry, type Lockfile } from '
 import {
   APP,
   NOT_SHIPPED,
+  PACKAGED_DLEQ_THREAD_ENTRY,
   PACKAGED_WORKER_BUNDLE,
   PACKAGED_WORKER_ENTRY,
   PRELOAD_FILES,
@@ -63,6 +68,12 @@ export const WORKER_BOOT_SOURCE =
 /** Electron 44.2.0: Chromium 152, Node 24.20. */
 const NODE_TARGET = 'node24';
 
+/**
+ * The DLEQ thread's entry source. `.mts`, and built to `.mjs`: a `Bare.Thread` entry takes its
+ * module type from the extension alone (see the file).
+ */
+export const DLEQ_THREAD_SOURCE = 'src/worker/pay/dleq-thread-entry.mts';
+
 export interface StageOptions {
   readonly out: string;
   readonly platform: string;
@@ -77,8 +88,13 @@ export interface StageReport {
   readonly packages: readonly ClosureEntry[];
   readonly files: number;
   readonly bytes: number;
-  /** Bare specifiers the host and worker bundles import (each resolves in `node_modules/`). */
-  readonly externals: { readonly host: readonly string[]; readonly worker: readonly string[] };
+  /** Bare specifiers the bundles import (each resolves in `node_modules/`). */
+  readonly externals: {
+    readonly host: readonly string[];
+    readonly worker: readonly string[];
+    /** The DLEQ thread entry's (resolved by Bare from `worker/pay/` up). */
+    readonly dleqThread: readonly string[];
+  };
 }
 
 export class StageError extends Error {
@@ -391,12 +407,48 @@ export async function stageApp(o: StageOptions): Promise<StageReport> {
     fail(`worker bundle may only contain src/worker and src/ipc:\n  ${workerBad.join('\n  ')}`);
   writeFileSync(join(out, PACKAGED_WORKER_ENTRY), WORKER_BOOT_SOURCE);
 
+  // ---- the DLEQ thread's entry (issue #8 d) ----------------------------------------------
+  // Its own bundle: the dev entry imports ../bare-globals.js and ./dleq-thread.js, neither of
+  // which exists in worker/pay/ once the worker is one file. Every import in it is dynamic,
+  // inside its try (an exception escaping a Bare thread aborts the worker): esbuild inlines the
+  // local ones as lazily-run modules, so that still holds, and bare-globals becomes
+  // `bare-encoding/global` as in the worker bundle (D6). Nothing here is loaded from outside
+  // the worker directory: our sources inline, npm packages resolved from node_modules/.
+  if (!existsSync(join(pkg, DLEQ_THREAD_SOURCE)))
+    fail(`${DLEQ_THREAD_SOURCE} is missing: the worker's DLEQ thread would have no entry`);
+  const dleqBuild = await build({
+    absWorkingDir: pkg,
+    entryPoints: [DLEQ_THREAD_SOURCE],
+    outfile: join(out, PACKAGED_DLEQ_THREAD_ENTRY),
+    bundle: true,
+    packages: 'external',
+    platform: 'neutral',
+    format: 'esm',
+    target: 'es2022',
+    tsconfig: 'tsconfig.worker.json',
+    sourcemap: false,
+    minify: false,
+    legalComments: 'eof',
+    metafile: true,
+    logLevel: 'warning',
+    plugins: [d6FirstImport],
+  });
+  const dleqAllowed = [join(pkg, 'src', 'worker', 'pay') + sep, join(pkg, 'src', 'ipc') + sep];
+  const dleqBad = inputsOf(dleqBuild.metafile, pkg).filter(
+    (p) => !dleqAllowed.some((a) => p.startsWith(a)),
+  );
+  if (dleqBad.length > 0)
+    fail(
+      `DLEQ thread bundle may only contain src/worker/pay and src/ipc:\n  ${dleqBad.join('\n  ')}`,
+    );
+
   // ---- every external the bundles import must be a shipped package ----------------------
   const externals = {
     host: externalPackages(hostBuild.metafile).filter((n) => n !== 'electron'),
     worker: [...new Set([...externalPackages(workerBuild.metafile), 'bare-encoding'])].sort(),
+    dleqThread: externalPackages(dleqBuild.metafile),
   };
-  const missing = [...externals.host, ...externals.worker].filter(
+  const missing = [...externals.host, ...externals.worker, ...externals.dleqThread].filter(
     (n) => !existsSync(join(out, 'node_modules', n, 'package.json')),
   );
   if (missing.length > 0)

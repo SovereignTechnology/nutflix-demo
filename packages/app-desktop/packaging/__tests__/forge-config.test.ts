@@ -12,11 +12,13 @@ import {
   readdirSync,
   rmSync,
   statSync,
+  symlinkSync,
   writeFileSync,
 } from 'node:fs';
 import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { createPackageWithOptions } from '@electron/asar';
 import type { ResolvedForgeConfig } from '@electron-forge/shared-types';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
@@ -28,11 +30,14 @@ import {
   MADE_LIST_SCHEMA,
   MADE_LIST_SUFFIX,
   NOT_SHIPPED,
+  PACKAGED_DLEQ_THREAD_ENTRY,
+  PACKAGED_WORKER_BUNDLE,
   PACKAGED_WORKER_ENTRY,
   PRELOAD_FILES,
   PROMPT_FILES,
   RENDERER_FILES,
   UNPACKED_DIRS,
+  UNPACKED_FILES,
 } from '../identity.ts';
 import { PACKED, layoutProblems } from '../layout.ts';
 import { PKG_DIR } from '../stage.ts';
@@ -201,7 +206,8 @@ async function fakeOutput(
   name = 'Nutflix-linux-x64',
 ): Promise<string> {
   const src = join(root, 'src');
-  for (const f of [...PACKED, 'worker/boot.mjs', 'worker/worker.mjs']) {
+  // Lane I1: every unpacked file the layout requires (the DLEQ thread entry joined the two).
+  for (const f of [...PACKED, ...UNPACKED_FILES]) {
     mkdirSync(join(src, f, '..'), { recursive: true });
     writeFileSync(join(src, f), f);
   }
@@ -239,6 +245,56 @@ describe('layoutProblems', () => {
     expect(p).toMatch(/other platforms' Bare runtimes shipped: win32-x64/);
     expect(p).toMatch(/worker\/boot\.mjs is not unpacked/);
     expect(p).toMatch(/resources[\\/]app exists/);
+  });
+
+  it('requires the DLEQ thread entry unpacked as a regular file: missing, a symlink or a directory is refused (lane I1)', async () => {
+    expect(UNPACKED_FILES).toEqual([
+      PACKAGED_WORKER_ENTRY,
+      PACKAGED_WORKER_BUNDLE,
+      PACKAGED_DLEQ_THREAD_ENTRY,
+    ]);
+    const missing = await fakeOutput((src) => {
+      rmSync(join(src, PACKAGED_DLEQ_THREAD_ENTRY));
+    }, 'Missing');
+    expect(layoutProblems(missing, 'linux', 'x64', 'Nutflix')).toEqual([
+      'worker/pay/dleq-thread-entry.mjs is not unpacked',
+    ]);
+    // Swapped in after packing (asar would otherwise record the link in its header).
+    const unpackedEntry = (out: string): string =>
+      join(out, 'resources', 'app.asar.unpacked', PACKAGED_DLEQ_THREAD_ENTRY);
+    const linked = await fakeOutput(undefined, 'Linked');
+    const outside = join(root, 'outside.mjs');
+    writeFileSync(outside, 'x');
+    rmSync(unpackedEntry(linked));
+    symlinkSync(outside, unpackedEntry(linked));
+    expect(layoutProblems(linked, 'linux', 'x64', 'Nutflix')).toEqual([
+      'worker/pay/dleq-thread-entry.mjs is a symlink; it must be a regular file',
+    ]);
+    const dir = await fakeOutput(undefined, 'Dir');
+    rmSync(unpackedEntry(dir));
+    mkdirSync(unpackedEntry(dir));
+    expect(layoutProblems(dir, 'linux', 'x64', 'Nutflix')).toEqual([
+      'worker/pay/dleq-thread-entry.mjs is not a regular file',
+    ]);
+    // A symlinked directory on the way leads out as surely as a symlinked file.
+    const linkedDir = await fakeOutput(undefined, 'LinkedDir');
+    const pay = join(linkedDir, 'resources', 'app.asar.unpacked', 'worker', 'pay');
+    const elsewhere = join(root, 'elsewhere-pay');
+    mkdirSync(elsewhere);
+    copyFileSync(join(pay, 'dleq-thread-entry.mjs'), join(elsewhere, 'dleq-thread-entry.mjs'));
+    rmSync(pay, { recursive: true });
+    symlinkSync(elsewhere, pay);
+    expect(layoutProblems(linkedDir, 'linux', 'x64', 'Nutflix')).toEqual([
+      'worker/pay/dleq-thread-entry.mjs: worker/pay/ is a symlink; it must be a real directory',
+    ]);
+    // The boot module and the bundle are held to the same rule.
+    const linkedBoot = await fakeOutput(undefined, 'LinkedBoot');
+    const boot = join(linkedBoot, 'resources', 'app.asar.unpacked', PACKAGED_WORKER_ENTRY);
+    rmSync(boot);
+    symlinkSync(outside, boot);
+    expect(layoutProblems(linkedBoot, 'linux', 'x64', 'Nutflix')).toEqual([
+      'worker/boot.mjs is a symlink; it must be a regular file',
+    ]);
   });
 
   it('PACKED covers main, host, both preloads, and every app-window and prompt-window file', () => {
@@ -359,6 +415,30 @@ describe('constants that must agree with the app (this code cannot import it at 
     expect([...RENDERER_FILES]).toEqual([...proto.APP_FILES]);
     expect([...PROMPT_FILES]).toEqual([...proto.PROMPT_FILES]);
     expect(PRELOAD_FILES).toEqual(['preload.cjs', 'prompt-preload.cjs']);
+  });
+
+  it('the DLEQ thread entry: where the worker bundle resolves it from its root module (lane I1)', async () => {
+    const rootPath = join(PKG_DIR, 'src', 'worker', 'worker-root.ts');
+    const wr = (await import(/* @vite-ignore */ rootPath)) as {
+      DLEQ_THREAD_ENTRY_PATH: string;
+      DLEQ_THREAD_ENTRY: URL;
+      WORKER_ROOT: URL;
+    };
+    // The packaged bundle inlines worker-root.ts, so its import.meta.url is the bundle's.
+    const app = join(root, 'app.asar.unpacked');
+    const bundle = pathToFileURL(join(app, PACKAGED_WORKER_BUNDLE));
+    expect(new URL(wr.DLEQ_THREAD_ENTRY_PATH, bundle).href).toBe(
+      pathToFileURL(join(app, PACKAGED_DLEQ_THREAD_ENTRY)).href,
+    );
+    // Only paths under the worker root: the entry can never resolve outside its directory.
+    expect(wr.DLEQ_THREAD_ENTRY_PATH.startsWith('./')).toBe(true);
+    expect(wr.DLEQ_THREAD_ENTRY_PATH).not.toMatch(/\.\.|\\|^\/|:/);
+    expect(wr.DLEQ_THREAD_ENTRY.href.startsWith(wr.WORKER_ROOT.href)).toBe(true);
+    // Unbundled (tsc output, and vitest's own src/ run), the same relation holds.
+    expect(wr.WORKER_ROOT.href).toBe(pathToFileURL(join(PKG_DIR, 'src', 'worker') + '/').href);
+    expect(wr.DLEQ_THREAD_ENTRY.href).toBe(
+      pathToFileURL(join(PKG_DIR, 'src', 'worker', 'pay', 'dleq-thread-entry.mjs')).href,
+    );
   });
 
   it('NOT_SHIPPED names real dependencies, and no runtime source imports pear-runtime', () => {

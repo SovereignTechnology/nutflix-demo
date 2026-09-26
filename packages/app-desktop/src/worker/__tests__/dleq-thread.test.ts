@@ -13,6 +13,9 @@
  *   retiring  never blocks (issue #8 review, finding 2): a thread given up on mid-job or mid-start
  *             sees QUIT (never overwritten) and leaves; it is joined only once it says so, and
  *             one that never says so is let go unjoined.
+ *   visible   (lane I1) the verifier counts what each path answered and says, once, which one is
+ *             in use; the `--dev-fixtures` self-check reports it in one line, and the worker's
+ *             close stops the self-check's thread before it exits.
  */
 import { mkdir, mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -49,7 +52,11 @@ import {
   type SpawnDleqThread,
 } from '../pay/dleq-thread.js';
 import { realProviders } from '../pay/real-providers.js';
-import { nodeStateFs } from './helpers/harness.js';
+import { DLEQ_SELFCHECK_MSG, selfCheckChecks, startDleqSelfCheck } from '../dev/dleq-selfcheck.js';
+import type { LogRecord } from '@sovit/seeder';
+import { createLogger } from '@sovit/seeder';
+import type { WorkerEvent } from '../../ipc/worker-protocol.js';
+import { nodeRuntime, nodeStateFs, startWorker, tempDir } from './helpers/harness.js';
 
 // Real curve work (issuing and checking a PAY's worth of proofs) on a shared, loaded box.
 vi.setConfig({ testTimeout: 60_000 });
@@ -653,5 +660,210 @@ describe('realProviders: a PAY’s DLEQ checks go to the thread (the wiring)', (
     }
     expect(spawn.terminated).toBe(1); // closing the providers stops it
     expect(spawn.joins).toEqual([1]);
+  });
+});
+
+/** A logger that keeps its records (level, msg, fields). */
+function recording(): { logger: ReturnType<typeof createLogger>; records: LogRecord[] } {
+  const records: LogRecord[] = [];
+  const logger = createLogger({
+    level: 'debug',
+    sink: (_line, rec) => {
+      records.push(rec);
+    },
+  });
+  return { logger, records };
+}
+
+describe('which path answered, and saying so (lane I1, ADR 0017)', () => {
+  it('answered() counts each path; the thread coming up is said once, at info', async () => {
+    const cs = mixed(checks(4));
+    const want = inline(cs);
+    const { logger, records } = recording();
+    const v = dleqVerifier({ spawn: nodeSpawner('SERVE'), verify, logger });
+    try {
+      expect(v.answered()).toEqual({ thread: 0, inline: 0 });
+      expect(await v.verify(cs)).toEqual(want); // inline while the thread starts
+      expect(v.answered()).toEqual({ thread: 0, inline: 4 });
+      expect(await v.ready()).toBe(true);
+      expect(await v.verify(cs)).toEqual(want);
+      expect(await v.verify(cs.slice(0, 1))).toEqual(want.slice(0, 1));
+      expect(v.answered()).toEqual({ thread: 5, inline: 4 });
+    } finally {
+      await v.close();
+    }
+    expect(records.map((r) => [r.level, r.msg])).toEqual([
+      ['info', 'DLEQ checks run on their own thread'],
+    ]);
+  });
+
+  it('a runtime with threads whose spawner says no (no entry file) is said once, at warn — never after close', async () => {
+    const cs = checks(2);
+    const { logger, records } = recording();
+    const v = dleqVerifier({ spawn: () => null, verify, logger });
+    for (let i = 0; i < 3; i++) expect(await v.verify(cs)).toEqual(inline(cs));
+    expect(v.answered()).toEqual({ thread: 0, inline: 6 });
+    expect(records.map((r) => [r.level, r.msg])).toEqual([
+      ['warn', 'no DLEQ thread could start: checks run inline, in small chunks'],
+    ]);
+    // A runtime without threads (Node, tests) says nothing; nor does a verifier after close.
+    const q = recording();
+    const none = dleqVerifier({ spawn: undefined, verify, logger: q.logger });
+    await none.verify(cs);
+    const closed = dleqVerifier({ spawn: nodeSpawner('SERVE'), verify, logger: q.logger });
+    await closed.close();
+    expect(await closed.verify(cs)).toEqual(inline(cs));
+    expect(q.records).toEqual([]);
+    await v.close();
+  });
+});
+
+describe('the --dev-fixtures DLEQ self-check (lane I1)', () => {
+  it('its vectors are what core says they are: three valid, one forged', () => {
+    const { checks: cs, want } = selfCheckChecks();
+    expect(cs).toHaveLength(4);
+    expect(inline(cs)).toEqual(want);
+    expect(want).toEqual([true, true, true, false]);
+    // Each keyset holds only the key for its proof's amount (the DleqCheck shape).
+    for (const c of cs) expect(Object.keys(c.keyset.keys)).toEqual([String(c.proof.amount)]);
+    // The mint exists nowhere (RFC 2606 `.invalid`).
+    expect(new Set(cs.map((c) => new URL(c.keyset.mint).hostname.endsWith('.invalid')))).toEqual(
+      new Set([true]),
+    );
+  });
+
+  it('on a working thread: ONE info line, where=thread, verdicts right, counts only; the thread is joined', async () => {
+    const spawn = nodeSpawner('SERVE');
+    const { logger, records } = recording();
+    const sc = startDleqSelfCheck({ spawn, logger });
+    const report = await sc.done;
+    expect(report).toEqual({ where: 'thread', answered: { thread: 4, inline: 4 }, right: true });
+    expect(records).toHaveLength(1);
+    expect(records[0]).toMatchObject({
+      level: 'info',
+      msg: DLEQ_SELFCHECK_MSG,
+      fields: { where: 'thread', onThread: 4, inline: 4, checks: 4, verdicts: 'right' },
+    });
+    // Counts and two words: no proof, key or secret in the line.
+    expect(Object.keys(records[0]!.fields).sort()).toEqual(
+      ['checks', 'inline', 'onThread', 'verdicts', 'where'].sort(),
+    );
+    await sc.close();
+    expect(spawn.spawned).toBe(1);
+    expect(spawn.joins).toEqual([1]); // stopped, and joined only once it said it was leaving
+  });
+
+  it('with no thread (the spawner says no): a warn line, where=inline, verdicts still right', async () => {
+    const { logger, records } = recording();
+    const report = await startDleqSelfCheck({ spawn: () => null, logger }).done;
+    expect(report).toEqual({ where: 'inline', answered: { thread: 0, inline: 4 }, right: true });
+    expect(records.map((r) => [r.level, r.msg, r.fields['where']])).toEqual([
+      ['warn', DLEQ_SELFCHECK_MSG, 'inline'],
+    ]);
+  });
+
+  it('a thread that fails to start (FAIL, as when core does not load): where=inline, warn', async () => {
+    const spawn = nodeSpawner('FAIL_AT_START');
+    const { logger, records } = recording();
+    const sc = startDleqSelfCheck({ spawn, logger, startMs: 2000 });
+    expect(await sc.done).toMatchObject({ where: 'inline', right: true });
+    expect(records.map((r) => r.level)).toEqual(['warn']);
+    await sc.close();
+  });
+
+  it('wrong verdicts are an error line', async () => {
+    const { logger, records } = recording();
+    const report = await startDleqSelfCheck({ spawn: () => null, logger, verify: () => true }).done;
+    expect(report).toMatchObject({ right: false });
+    expect(records.map((r) => [r.level, r.fields['verdicts']])).toEqual([['error', 'wrong']]);
+  });
+
+  it('stopped before it is over: no line, and its thread is still stopped and joined', async () => {
+    const spawn = nodeSpawner('SERVE');
+    const { logger, records } = recording();
+    const sc = startDleqSelfCheck({ spawn, logger });
+    await sc.close();
+    expect(await sc.done).toBeNull();
+    expect(records).toEqual([]);
+    expect(spawn.joins.filter((x) => x !== 1)).toEqual([]);
+  });
+
+  it('WorkerHost with --dev-fixtures and a thread: the line is emitted, and close() stops the thread', async () => {
+    const d = await tempDir('nf-dleq-selfcheck-host-');
+    const spawn = nodeSpawner('SERVE');
+    const w = startWorker({ runtime: { ...nodeRuntime(), dleqThread: spawn } });
+    try {
+      await w.call('init', {
+        v: 1,
+        storage: join(d.dir, 'worker'),
+        seeding: { enabled: false, diskCapBytes: 1024 ** 3 },
+        prefetchSeconds: 30,
+        dev: { mocks: true, fixtures: true },
+      });
+      const line = await w.event(
+        (e): e is Extract<WorkerEvent, { e: 'log' }> =>
+          e.e === 'log' && e.msg.includes(DLEQ_SELFCHECK_MSG),
+        30_000,
+        'the DLEQ self-check line',
+      );
+      expect(line.level).toBe('info');
+      expect(JSON.parse(line.msg)).toMatchObject({
+        fields: { where: 'thread', verdicts: 'right', onThread: 4 },
+      });
+    } finally {
+      await w.close();
+      await d.rm();
+    }
+    expect(spawn.spawned).toBe(1);
+    expect(spawn.terminated).toBe(1);
+    expect(spawn.joins).toEqual([1]);
+  });
+
+  it('WorkerHost closed while the self-check’s thread starts: close() stops and joins it first', async () => {
+    const d = await tempDir('nf-dleq-selfcheck-mid-');
+    // 800 ms of work before the serve loop: the check is certainly mid-flight at close().
+    const spawn = nodeSpawner('SLOW_START');
+    const w = startWorker({ runtime: { ...nodeRuntime(), dleqThread: spawn } });
+    try {
+      await w.call('init', {
+        v: 1,
+        storage: join(d.dir, 'worker'),
+        seeding: { enabled: false, diskCapBytes: 1024 ** 3 },
+        prefetchSeconds: 30,
+        dev: { mocks: true, fixtures: true },
+      });
+      await until(() => spawn.spawned === 1, 20_000);
+      await w.close();
+      // A worker that exited here with the thread still up would hang in Bare.exit.
+      expect(spawn.terminated).toBe(1);
+      expect(spawn.joins).toEqual([1]);
+    } finally {
+      await w.close();
+      await d.rm();
+    }
+    expect(w.events.some((e) => e.e === 'log' && e.msg.includes(DLEQ_SELFCHECK_MSG))).toBe(false);
+  });
+
+  it('WorkerHost closed right after init: the self-check never leaves a thread behind', async () => {
+    const d = await tempDir('nf-dleq-selfcheck-early-');
+    const spawn = nodeSpawner('SERVE');
+    const w = startWorker({ runtime: { ...nodeRuntime(), dleqThread: spawn } });
+    try {
+      await w.call('init', {
+        v: 1,
+        storage: join(d.dir, 'worker'),
+        seeding: { enabled: false, diskCapBytes: 1024 ** 3 },
+        prefetchSeconds: 30,
+        dev: { mocks: true, fixtures: true },
+      });
+      await w.close();
+    } finally {
+      await d.rm();
+    }
+    // Either it never started one, or the one it started was stopped and joined.
+    expect(spawn.terminated).toBe(spawn.spawned);
+    expect(spawn.joins).toHaveLength(spawn.spawned);
+    expect(spawn.joins.filter((x) => x !== 1)).toEqual([]);
+    expect(w.events.some((e) => e.e === 'log' && e.msg.includes(DLEQ_SELFCHECK_MSG))).toBe(false);
   });
 });

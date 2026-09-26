@@ -17,10 +17,12 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, relative } from 'node:path';
+import { dirname, join, relative } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 import {
+  PACKAGED_DLEQ_THREAD_ENTRY,
   PACKAGED_WORKER_BUNDLE,
   PACKAGED_WORKER_ENTRY,
   PRELOAD_FILES,
@@ -28,6 +30,7 @@ import {
   RENDERER_FILES,
 } from '../identity.ts';
 import {
+  PKG_DIR,
   REPO_ROOT,
   StageError,
   WORKER_BOOT_SOURCE,
@@ -43,6 +46,8 @@ import {
 let tmp = '';
 let a: StageReport;
 let b: StageReport;
+/** src/worker/worker-root.ts's path (this build-time project cannot import app sources). */
+let DLEQ_THREAD_ENTRY_PATH = '';
 
 function walk(root: string): string[] {
   const out: string[] = [];
@@ -67,6 +72,10 @@ function treeHash(root: string): string {
 }
 
 beforeAll(async () => {
+  const root = join(PKG_DIR, 'src', 'worker', 'worker-root.ts');
+  ({ DLEQ_THREAD_ENTRY_PATH } = (await import(/* @vite-ignore */ root)) as {
+    DLEQ_THREAD_ENTRY_PATH: string;
+  });
   tmp = mkdtempSync(join(tmpdir(), 'nf-stage-'));
   a = await stageApp({ out: join(tmp, 'a'), platform: 'linux', arch: 'x64' });
   b = await stageApp({ out: join(tmp, 'b'), platform: 'linux', arch: 'x64' });
@@ -99,9 +108,60 @@ describe('stageApp', () => {
     expect(readdirSync(join(a.out, 'prompt')).sort()).toEqual([...PROMPT_FILES].sort());
     expect(readdirSync(join(a.out, 'main'))).toEqual(['main.js']);
     expect(readdirSync(join(a.out, 'host'))).toEqual(['main.js']);
-    expect(readdirSync(join(a.out, 'worker')).sort()).toEqual(['boot.mjs', 'worker.mjs']);
+    // Lane I1: `pay/` joined the worker dir (the DLEQ thread's entry); nothing else did.
+    expect(readdirSync(join(a.out, 'worker')).sort()).toEqual(['boot.mjs', 'pay', 'worker.mjs']);
+    expect(readdirSync(join(a.out, 'worker', 'pay'))).toEqual(['dleq-thread-entry.mjs']);
     expect(PACKAGED_WORKER_ENTRY).toBe('worker/boot.mjs');
     expect(PACKAGED_WORKER_BUNDLE).toBe('worker/worker.mjs');
+    expect(PACKAGED_DLEQ_THREAD_ENTRY).toBe('worker/pay/dleq-thread-entry.mjs');
+  });
+
+  it('the DLEQ thread entry is staged where the worker bundle resolves it, inside worker/ (lane I1)', () => {
+    const entry = join(a.out, PACKAGED_DLEQ_THREAD_ENTRY);
+    expect(lstatSync(entry).isFile()).toBe(true);
+    // The bundle resolves it from its own URL (src/worker/worker-root.ts, inlined at its root)…
+    const w = readFileSync(join(a.out, PACKAGED_WORKER_BUNDLE), 'utf8');
+    expect(w).toContain(`= ${JSON.stringify(DLEQ_THREAD_ENTRY_PATH)};`);
+    expect(w).toMatch(/new URL\(DLEQ_THREAD_ENTRY_PATH, import\.meta\.url\)/);
+    // …never from a path that climbs out of the worker directory (the gap lane I1 closed).
+    expect(w).not.toMatch(/\.\.\/pay\/dleq-thread-entry/);
+    const bundleUrl = pathToFileURL(join(a.out, PACKAGED_WORKER_BUNDLE));
+    const resolved = fileURLToPath(new URL(DLEQ_THREAD_ENTRY_PATH, bundleUrl));
+    expect(resolved).toBe(entry);
+    expect(resolved.startsWith(join(a.out, 'worker') + '/')).toBe(true);
+  });
+
+  it('the DLEQ thread entry is its own bundle: every import dynamic, npm ones shipped and resolved from node_modules/', () => {
+    const e = readFileSync(join(a.out, PACKAGED_DLEQ_THREAD_ENTRY), 'utf8');
+    // An exception escaping a Bare thread aborts the worker: nothing may load before its try.
+    expect(e).not.toMatch(/^\s*import\s/m);
+    expect(e).not.toMatch(/^\s*export\s/m);
+    // Our sources inlined (dleq-thread.ts, ipc/codec.ts); no relative load left to miss.
+    expect(e).toMatch(/function serveDleqMailbox\(/);
+    expect(e).not.toMatch(/import\(\s*["']\.{1,2}\//);
+    expect(e).not.toMatch(/node_modules/);
+    // D6 first in the thread's own isolate, then core.
+    const g = e.indexOf('await import("bare-encoding/global")');
+    const c = e.indexOf('await import("@sovit/core")');
+    expect(g).toBeGreaterThan(0);
+    expect(c).toBeGreaterThan(g);
+    expect(a.externals.dleqThread).toEqual(['@sovit/core', 'bare-encoding']);
+    // Bare resolves them by walking up from worker/pay/: the first node_modules it meets is the
+    // shipped closure at the stage root (none in worker/ or worker/pay/).
+    for (const n of a.externals.dleqThread) {
+      let dir = dirname(join(a.out, PACKAGED_DLEQ_THREAD_ENTRY));
+      let hit: string | undefined;
+      for (;;) {
+        if (lstatSync(dir).isDirectory() && readdirSync(dir).includes('node_modules')) {
+          hit = join(dir, 'node_modules');
+          break;
+        }
+        if (dir === a.out) break;
+        dir = dirname(dir);
+      }
+      expect(hit, n).toBe(join(a.out, 'node_modules'));
+      expect(lstatSync(join(a.out, 'node_modules', n, 'package.json')).isFile(), n).toBe(true);
+    }
   });
 
   it('writes a minimal package.json (the Electron version only for Forge; no scripts, no deps)', () => {

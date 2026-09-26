@@ -45,6 +45,20 @@ export const MADE_LIST_SCHEMA = 'nutflix-made/1';
 export const PACKAGED_WORKER_ENTRY = 'worker/boot.mjs';
 /** The bundle the boot module loads (our sources only; npm packages stay imports). */
 export const PACKAGED_WORKER_BUNDLE = 'worker/worker.mjs';
+/**
+ * The DLEQ thread's entry (issue #8 d), a bundle of its own beside the worker's. The worker
+ * resolves it from its root module (src/worker/worker-root.ts `DLEQ_THREAD_ENTRY_PATH`,
+ * `./pay/dleq-thread-entry.mjs`), which the worker bundle inlines, so it must sit exactly here
+ * relative to `PACKAGED_WORKER_BUNDLE` (a test pins the two together). Without it the worker
+ * runs every DLEQ check inline, chunked, on its event loop.
+ */
+export const PACKAGED_DLEQ_THREAD_ENTRY = 'worker/pay/dleq-thread-entry.mjs';
+/** The files Bare loads by path from `app.asar.unpacked/`: each must be a regular file there. */
+export const UNPACKED_FILES = [
+  PACKAGED_WORKER_ENTRY,
+  PACKAGED_WORKER_BUNDLE,
+  PACKAGED_DLEQ_THREAD_ENTRY,
+] as const;
 
 /**
  * Directories of the staged app that `asar` must leave as real files in `app.asar.unpacked/`:

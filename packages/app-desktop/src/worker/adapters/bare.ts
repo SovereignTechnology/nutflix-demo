@@ -18,6 +18,7 @@ import type { SpawnDleqThread } from '../pay/dleq-thread.js';
 import type { StateFs, WorkerRuntime } from '../runtime.js';
 import type { BareSpawn } from '../transcode/index.js';
 import { createBareProcessRunner } from '../transcode/index.js';
+import { DLEQ_THREAD_ENTRY } from '../worker-root.js';
 
 function errno(err: unknown): string | undefined {
   if (typeof err !== 'object' || err === null) return undefined;
@@ -145,14 +146,20 @@ type BareThreadClass = new (
   opts: { readonly data: unknown },
 ) => { terminate(): void; join(): void };
 
-/** The DLEQ thread's entry, built next to this module's directory (`../pay/`). */
-export const DLEQ_THREAD_ENTRY = new URL('../pay/dleq-thread-entry.mjs', import.meta.url);
+/**
+ * The DLEQ thread's entry: resolved from the worker ROOT (`../worker-root.ts`), never from this
+ * module — `adapters/` is one level down in dev but inlined into the root bundle when packaged,
+ * so a path relative to it pointed outside the worker directory there (ADR 0017).
+ */
+export { DLEQ_THREAD_ENTRY };
 
 /**
  * `WorkerRuntime.dleqThread` on `Bare.Thread` (issue #8 d), or `undefined` where there is none.
  * An exception that escapes a Bare thread aborts the whole process — a missing entry file
  * included — so a thread is only ever started from an entry that exists as a regular file (a
- * bundled test worker has none: its checks run inline, chunked).
+ * bundled test worker has none: its checks run inline, chunked). `lstat`, not `stat`: a symlink
+ * there is refused like a missing file, so the entry cannot lead out of the worker directory
+ * (packaging/layout.ts refuses one in a package too).
  */
 export function bareDleqThread(entry: URL = DLEQ_THREAD_ENTRY): SpawnDleqThread | undefined {
   const Thread = (globalThis as { Bare?: { Thread?: BareThreadClass } }).Bare?.Thread;
@@ -160,7 +167,8 @@ export function bareDleqThread(entry: URL = DLEQ_THREAD_ENTRY): SpawnDleqThread 
   return (mailbox) => {
     try {
       // Under Bare the global URL is bare-url's, which bare-fs takes as a file URL.
-      if (!fs.statSync(entry as unknown as Parameters<typeof fs.statSync>[0]).isFile()) return null;
+      if (!fs.lstatSync(entry as unknown as Parameters<typeof fs.lstatSync>[0]).isFile())
+        return null;
     } catch {
       return null;
     }
