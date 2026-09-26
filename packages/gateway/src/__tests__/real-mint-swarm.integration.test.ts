@@ -406,6 +406,10 @@ describe.skipIf(MINT === undefined)(
         links.push(await connect(s, viewer, w.viewerSigner, w.stack, w.policy, windows[k]!));
       const vcore = await viewer.blobs.openCoreByKey(Buffer.from(w.core, 'hex'));
       const detachCore = w.stack.attachCore(vcore.core);
+      // 60 s, not the one-seeder test's 30 s (fix round 4, test lens: the reason was unstated):
+      // routed, each seeder is asked again only after a real-mint PAY round trip frees its window,
+      // and these windows are small (e.g. 6/3/2), so 24 blocks take several paced rounds. An
+      // in-test read deadline, not a vitest timeout.
       const full = await vcore.blobs.get(w.put.entry.blob, { wait: true, timeout: 60_000 });
       expect(Buffer.from(full!).equals(Buffer.from(w.data))).toBe(true);
       await w.payer.flush();
