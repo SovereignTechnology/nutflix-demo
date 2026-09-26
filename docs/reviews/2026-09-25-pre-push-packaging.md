@@ -404,3 +404,66 @@ FIFO case was killed with `SIGTERM`. The three shape tests failed because `ARTIF
   safe path, and the only one CI uses.
 - **R11 (new).** A prerelease cannot release its `.deb`: the Debian-form name contains `~`, and
   the manifest refuses it (fails closed; ADR §8).
+
+## Fix round 3 (verifier, 2026-09-25)
+
+The verifier of round 2 found one Low finding, about test hygiene. It was reproduced before
+the fix: the new assertions failed on the old code and listed the four staging dirs that run
+had just left in `/tmp`. Fix: commit `e159210`, a change to the test file only.
+
+| # | Sev | Finding | Outcome |
+|---|---|---|---|
+| V3 | Low | The real-maker test in `scripts/__tests__/release.test.ts` runs maker-deb. Its electron-installer-common stages each `.deb` in `tmp.dir()` and removes it only in tmp's graceful-cleanup exit hook, which never runs in a vitest worker. Every run left four `electron-installer-*` dirs (about 0.5 MB each on disk) in the real `os.tmpdir()` | **Fixed.** `makerNames` points `TMPDIR` at `<work>/tmp` while the makers run and restores it afterwards in a `finally`: the old value, or no key at all if there was none. tmp calls `os.tmpdir()` each time it makes a dir, so the staging goes into the test's own temp dir, which `afterEach`'s cleanup already removes. The test lists `electron-installer-*` in the real `os.tmpdir()` before and after. It asserts that no new entry belongs to this process (tmp puts the pid in the name, and another process or session may stage there at the same time). It also asserts that the four staging dirs (two arches, two versions) are in the test's dir under this pid, so the comparison is not vacuous, and that `TMPDIR` is restored. Mutations R41–R44 |
+
+Sharp edges checked and left as is (this round):
+
+- `process.env` is global to the worker. Anything else in the same worker that called
+  `os.tmpdir()` while the makers ran would also land in the test's dir. Tests in a file run
+  one at a time, and the `finally` bounds the window to the `makerNames` call.
+- If tmp's exit hook ever runs (a runner that exits normally), its dirs are already gone. Its
+  garbage collector catches each removal error ("already removed?"), so nothing throws at exit.
+
+### Mutation checks (each guard broken, at least one test failed, guard restored)
+
+R41 no redirect, the old code (1: the four `electron-installer--<pid>-*` dirs of that run
+listed as left in `/tmp`) · R42 redirect with no restore (1: `TMPDIR` still the test's dir) ·
+R43 an unconditional restore, which sets the string `'undefined'` when `TMPDIR` was unset (1)
+· R44 redirect to a sibling dir outside `work`, which leaks and is not in `/tmp` itself (1: the
+positive control found 0 staging dirs, not 4).
+
+### Tests and evidence
+
+- The real-maker test gained five `expect` lines. No test was removed or weakened, and
+  `release.test.ts` still has 27 tests.
+- `npx vitest run scripts/__tests__`: 5 files, 51 tests, all passing. The listings of
+  `/tmp/electron-installer-*` and `/tmp/nutflix-release-*` were identical before and after
+  that run.
+- `npx tsc -b --force` is clean. eslint and `prettier --check` are clean on the changed file,
+  and `npm run check:locked` reports OK. `npm run lint:electron` was not run, since
+  app-desktop did not change. The Electron e2e was not run.
+
+### /tmp cleanup
+
+- **Removed: 84 dirs.** 80 were left by this lane's runs from 20:02 to 20:19 (round-2
+  development and its verifier), and 4 by this round's failing pre-fix run (pid 3338068).
+  Until `stage-3/integration` merged this branch at 20:57:44, this worktree was the only one
+  with the fixture. A script checked each dir without following symlinks, and removed only
+  the ones that passed every check:
+  - It is a real directory owned by the developer, named `electron-installer--<pid>-<12 alnum>`,
+    and the pid that made it is no longer running.
+  - It holds exactly one child, `nutflix_<0.1.0|0.1.0~rc.1>_<amd64|arm64>`. Every file in it
+    is owned by the developer, the only symlink is `usr/bin/nutflix -> ../lib/nutflix/nutflix`, and
+    the total is under 2 MB.
+  - It carries the fixture's own bytes. `usr/lib/nutflix/nutflix` is `#!/bin/sh\n` (a real
+    build stages an Electron ELF), `version` is `44.2.0`, and `resources/app/package.json`
+    is exactly the fixture's object for that version.
+- Four of the 84 were earlier drafts of the same fixture. They were accepted only because
+  they predate the round-2 commit `00221a0` (20:12:19). Three, from 20:02, have a five-field
+  package.json with description `x`. One, from 20:08, stages an `i386` probe with the final
+  package.json.
+- Mutation R44 made its own `/tmp/m3-<pid>`. It was checked by hand before removal: owned by
+  the developer, created by that run, holding only four `electron-installer--<that pid>-*` staging
+  dirs, with no symlink except each tree's `usr/bin/nutflix`.
+- **Left alone:** four `electron-installer--3346135-*` dirs, made at 21:02 by a `vitest run`
+  in the `stage-3/integration` worktree, which has the round-2 version of this test. Each run
+  there leaves four more until that branch takes `e159210`.
