@@ -55,6 +55,7 @@ import type { LogEvent } from './log.js';
 import { PeerNode } from './net/peer-node.js';
 import type { BootstrapNode } from './net/peer-node.js';
 import type { SpawnDleqThread } from './pay/dleq-thread.js';
+import { boundToSessions, sessionsCovering } from './pay/session-ranges.js';
 import type { ImageVerdict, PaidEvent } from './pay/viewer-payer.js';
 import { ViewerPayer } from './pay/viewer-payer.js';
 import { CreditPool } from './playback/credit.js';
@@ -136,6 +137,9 @@ interface PeerTally {
 interface Session {
   readonly sid: SessionId;
   readonly core: CoreKeyHex;
+  /** Its rendition's blocks in `core`, first and last (fix round 5: whose PAYs are whose). */
+  readonly first: number;
+  readonly last: number;
   readonly gate: PlaybackGate;
   readonly openedAt: number;
   total: number;
@@ -370,18 +374,11 @@ export class WorkerHost {
           state: runtime.stateFs,
           ...(runtime.dleqThread === undefined ? {} : { dleqThread: runtime.dleqThread }),
           request: this.o.request,
-          // An open session of the core first; else one closing — its tail is being paid (fix
-          // round 4: the session stays until that is done, and the host revokes it only then).
-          sidFor: (core) => {
-            let open: SessionId | undefined;
-            let closing: SessionId | undefined;
-            for (const [id, s] of this.sessions)
-              if (s.core === core) {
-                if (s.closed) closing = id as SessionId;
-                else open = id as SessionId;
-              }
-            return open ?? closing;
-          },
+          // Fix round 5: a PAY is built for a session whose blob covers its blocks (open ones
+          // first, then those closing — fix round 4 keeps a closing session until its tail is
+          // paid). By core alone, a rendition switch's NEW session was named for the old one's
+          // tail, the host refused it as outside its video, and the blocks were written off.
+          sidsFor: (range) => sessionsCovering(range, this.sessions.values()),
           priceCeiling: () => {
             let max = 0;
             for (const p of this.net?.seeder.corePolicyMap().values() ?? [])
@@ -437,6 +434,7 @@ export class WorkerHost {
       credit,
       logger: log,
       policyFor: (core) => this.corePolicies.get(core) ?? null,
+      boundRange: (range) => boundToSessions(range, this.sessions.values()),
       onPaid: (e) => {
         this.onPaid(e);
       },
@@ -638,6 +636,8 @@ export class WorkerHost {
     const s: Session = {
       sid: a.sid,
       core,
+      first: hyper.blob.blockOffset,
+      last: hyper.blob.blockOffset + hyper.blob.blockLength - 1,
       gate,
       openedAt: this.now(),
       total: 0,
@@ -656,8 +656,11 @@ export class WorkerHost {
    * Close a play session. Its tail is paid FIRST (fix round 4): PAYs for blocks pending below a
    * batch, waiting behind an unACKed PAY, or still in flight need the session — the host builds a
    * PAY only for an open session it authorised, and it revokes it only after `play.close` answers
-   * — so the session stays (closed to the host, but found by `sidFor`) until the drain is done or
-   * `CLOSE_DRAIN_MS` passed. Blocks left owed after that are settled as unpaid by the payer.
+   * — so the session stays (closed to the host, but a PAY can still name it: `sessionsCovering`)
+   * until the drain is done or `CLOSE_DRAIN_MS` passed. Blocks left owed after that are settled as
+   * unpaid by the payer. Fix round 5: the drain pays and waits for THIS session's blocks only —
+   * after a rendition switch the new session streams the same core, and its blocks must not hold
+   * the old one's `play.close` (and the switch) up.
    */
   private closeSession(sid: string): Promise<void> {
     const s = this.sessions.get(sid);
@@ -669,7 +672,11 @@ export class WorkerHost {
     const payer = this.net?.payer;
     s.closing = (async () => {
       try {
-        await payer?.drain(CLOSE_DRAIN_MS, s.core);
+        await payer?.drain(CLOSE_DRAIN_MS, {
+          core: s.core,
+          fromBlock: s.first,
+          toBlock: s.last,
+        });
       } catch {
         // a drain never throws; nothing may keep the session from closing
       } finally {

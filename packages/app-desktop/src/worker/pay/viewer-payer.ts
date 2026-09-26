@@ -30,6 +30,7 @@
  *     PAYs batch to half each seeder's window.
  */
 import type {
+  BlockRange,
   CoreKeyHex,
   HelloMessage,
   MintUrl,
@@ -77,6 +78,12 @@ export interface ViewerPayerOptions {
    * first). The first of each per core (`SeederCredit.onImageVerdict`).
    */
   readonly onImageVerdict?: (core: CoreKeyHex, verdict: ImageVerdict) => void;
+  /**
+   * Fix round 5: the longest prefix of `range` one PAY may cover — the worker ends it where the
+   * play session holding `range.fromBlock` ends (the host builds a PAY for one session, within its
+   * blob). Passed to `UpstreamPayer` as `boundRange`.
+   */
+  readonly boundRange?: (range: BlockRange) => BlockRange;
 }
 
 /** How often `drain` looks again while a tail settles. */
@@ -153,6 +160,7 @@ export class ViewerPayer {
       onUnpayable: (noiseHex, range) => {
         this.settler.settleUnpaid(noiseHex, range);
       },
+      ...(o.boundRange !== undefined ? { boundRange: o.boundRange } : {}),
     });
   }
 
@@ -209,13 +217,31 @@ export class ViewerPayer {
   }
 
   /**
-   * Fix round 4: pay `core`'s tail (every core's without one) and wait, at most `ms`, until what
-   * was downloaded of it is SETTLED — every PAY ACKed, nothing of it owed, no request of it still
-   * in flight (a block that lands meanwhile is paid too). Session close and shutdown call it while
-   * the play session still authorises PAYs. Never rejects; `true` when everything settled in time.
+   * Fix round 4: pay a tail and wait, at most `ms`, until what was downloaded of it is SETTLED —
+   * every PAY ACKed, nothing of it owed, no request of it still in flight (a block that lands
+   * meanwhile is paid too). Session close and shutdown call it while the play session still
+   * authorises PAYs. Never rejects; `true` when everything settled in time.
+   *
+   * Fix round 5: with `range` (a closing session's blocks) only that range is paid now (`hurry`)
+   * and waited for. Another session streaming the same core — the new rendition after a switch —
+   * keeps batching, and its blocks owed or in flight do not hold this close up. Without `range`,
+   * every pending tail is flushed and everything is waited for.
    */
-  async drain(ms: number, core?: CoreKeyHex): Promise<boolean> {
+  async drain(ms: number, range?: BlockRange): Promise<boolean> {
     const until = Date.now() + Math.max(0, ms);
+    if (range !== undefined) {
+      const release = this.upstream.hurry(range);
+      try {
+        for (;;) {
+          if (this.settled(range)) return true;
+          const left = until - Date.now();
+          if (left <= 0) return false;
+          await sleep(Math.min(DRAIN_POLL_MS, left));
+        }
+      } finally {
+        release();
+      }
+    }
     for (;;) {
       const left = until - Date.now();
       // A PAY is built by the host: a flush waits on it, so the wait is bounded too.
@@ -226,15 +252,18 @@ export class ViewerPayer {
         ),
         sleep(Math.max(0, left)).then(() => false),
       ]);
-      if (flushed && this.settled(core)) return true;
+      if (flushed && this.settled()) return true;
       if (Date.now() >= until) return false;
       await sleep(Math.min(DRAIN_POLL_MS, Math.max(0, until - Date.now())));
     }
   }
 
-  /** Nothing of `core` (of any core without one) owed, and nothing of it in flight. */
-  private settled(core?: CoreKeyHex): boolean {
-    return this.settler.owedOn(core) === 0 && this.seeders.router.inflightOn(core) === 0;
+  /** Nothing of `range` (of any core without one) owed, and nothing of it in flight. */
+  private settled(range?: BlockRange): boolean {
+    return (
+      this.settler.owedOn(range?.core, range) === 0 &&
+      this.seeders.router.inflightOn(range?.core, range) === 0
+    );
   }
 
   /** Stop routing and paying (shutdown, after `flush()`): timers and hooks go. */

@@ -659,7 +659,7 @@ describe('realProviders: a PAY’s DLEQ checks go to the thread (the wiring)', (
         m === 'seller.keyset'
           ? Promise.resolve(mint.keyset())
           : Promise.reject(new Error(`not in this test: ${m}`)),
-      sidFor: () => undefined,
+      sidsFor: () => [],
       priceCeiling: () => 2 as Sats,
       logger: silentLogger,
       dleqThread: spawn,
