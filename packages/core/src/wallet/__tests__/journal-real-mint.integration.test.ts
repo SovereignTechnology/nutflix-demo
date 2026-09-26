@@ -16,7 +16,10 @@
  *     verifier's run on cdk-mintd lost the outputs: with a retrying stand-in transport and with
  *     cashu-ts's own fetch transport, nothing is lost now; and the Node transport every production
  *     wallet uses (`httpModuleRawHttp` under `cashuRequestFn`) sends a lost swap ONCE, even to a
- *     mint that advertises NUT-19.
+ *     mint that advertises NUT-19;
+ *   - (issue #8 fix round 3) so does `CashuMintConnections`' default (`cashuRequestFn` over
+ *     `fetch`), where a retry would reach the mint and be answered 11001 for the inputs the first
+ *     attempt spent — the verifier's 64 sat lost with cashu-ts's transport as the default.
  */
 import * as nodeHttp from 'node:http';
 import * as nodeHttps from 'node:https';
@@ -43,6 +46,7 @@ import { MemoryProofStore, type ProofStore } from '../store.js';
 import type { RawHttp } from '../transport.js';
 import { cashuRequestFn } from '../transport.js';
 import { CashuMintConnections, CashuWallet } from '../wallet.js';
+import { cashuTsOwnTransport } from './cashu-ts-own-transport.js';
 
 const MINT_URL = process.env['NUTFLIX_REAL_MINT_URL'] as MintUrl | undefined;
 const MINT_URL_2 = process.env['NUTFLIX_REAL_MINT_URL_2'] as MintUrl | undefined;
@@ -364,7 +368,10 @@ describe.skipIf(MINT_URL === undefined)(
         },
       );
       const store = new MemoryProofStore();
-      const w = walletOver(store); // no request: cashu-ts's default transport
+      // cashu-ts's own transport (global fetch, NUT-19 retries). Until fix round 3 this was
+      // `walletOver(store)`, `CashuMintConnections`' default; that default is single-attempt now
+      // (the last test here), so the transport this test is about is built explicitly.
+      const w = new CashuWallet({ mints: cashuTsOwnTransport(), store });
       await fund(w, mint, 64);
       st.armed = true;
       const set = await w.send(3 as Sats, { p2pk: TO, mint });
@@ -387,6 +394,38 @@ describe.skipIf(MINT_URL === undefined)(
       };
       const store = new MemoryProofStore();
       const w = walletOver(store, cashuRequestFn(http));
+      await fund(w, mint, 64);
+      st.armed = true;
+      const set = await w.send(3 as Sats, { p2pk: TO, mint });
+      await new Promise((r) => setTimeout(r, 500)); // a retry would have arrived by now
+      expect(st.swapPosts).toBe(1);
+      expect(set.proofs.reduce((a, p) => a + p.amount, 0)).toBe(3);
+      await settled(w, store);
+    });
+
+    it('fix round 3: CashuMintConnections’ default (no request) sends a lost swap once — a retry would be answered 11001 — and the send completes', async () => {
+      const real = globalThis.fetch;
+      const st = { armed: false, swapPosts: 0 };
+      vi.stubGlobal(
+        'fetch',
+        async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+          const url =
+            typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+          const method = (init?.method ?? 'GET').toUpperCase();
+          if (st.armed && method === 'POST' && new URL(url).pathname === '/v1/swap') {
+            st.swapPosts++;
+            if (st.swapPosts === 1) {
+              const res = await real(input, init);
+              await res.text(); // executed at the mint…
+              throw new TypeError('fetch failed'); // …and the answer never arrives
+            }
+            // A retry reaches the mint, which answers 11001 for the inputs attempt 1 spent.
+          }
+          return real(input, init);
+        },
+      );
+      const store = new MemoryProofStore();
+      const w = walletOver(store); // no request: the default
       await fund(w, mint, 64);
       st.armed = true;
       const set = await w.send(3 as Sats, { p2pk: TO, mint });

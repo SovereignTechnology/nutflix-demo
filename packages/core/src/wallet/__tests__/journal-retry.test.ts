@@ -15,6 +15,12 @@
  *                                       NUT-19, the first POST /v1/swap executes and its answer is
  *                                       lost, cashu-ts retries, a rate limiter answers 429 — the
  *                                       wallet loses nothing.
+ *
+ * Fix round 3 (verifier, INFO): `CashuMintConnections` with no `request` still fell back to that
+ * retrying transport, and a CODED answer to the retry (the mint's 11001 "already spent" for the
+ * inputs the first attempt had spent) dropped the journal entry: 64 sat lost. The default is now
+ * `cashuRequestFn` over `fetch`, one attempt per request, so the retry never happens: the send
+ * completes from NUT-09, the same network, the same mint.
  */
 import {
   getPubKeyFromPrivKey,
@@ -30,6 +36,7 @@ import { TestMint } from '../../mocks/test-mint.js';
 import { PENDING_SETTLE_AFTER_S } from '../spend.js';
 import { MemoryProofStore } from '../store.js';
 import { CashuMintConnections, CashuWallet } from '../wallet.js';
+import { cashuTsOwnTransport } from './cashu-ts-own-transport.js';
 
 const MINT = 'https://mint.journal-retry.example' as MintUrl;
 const INVOICE_20 = 'lnbc200n1testinvoice'; // 20 sat
@@ -166,67 +173,120 @@ describe('fix round 2: a 429 after a retry is not a refusal (the journal keeps t
   });
 });
 
+/** What cdk-mintd 0.18.1 on 3397 advertises: ttl 60, swap / mint / melt cached. */
+const CDK_NUT19 = {
+  ttl: 60,
+  cachedEndpoints: [
+    { method: 'POST', path: '/v1/swap' },
+    { method: 'POST', path: '/v1/mint/bolt11' },
+    { method: 'POST', path: '/v1/melt/bolt11' },
+  ],
+} as const;
+
+/**
+ * The network as a global `fetch`: the mint behind it. The first POST /v1/swap reaches the mint
+ * (it executes) and its answer is lost (the connection drops). A later POST /v1/swap is answered
+ * 429 by a rate limiter (`'429'`), or reaches the mint (`'mint'`), which answers 11001 for inputs
+ * the first attempt spent.
+ */
+function nut19Fetch(mint: TestMint, later: '429' | 'mint') {
+  const st = { swapPosts: 0 };
+  const fetch = async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+    const endpoint =
+      typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+    const method = (init?.method ?? 'GET').toUpperCase();
+    const raw = init?.body;
+    const requestBody =
+      typeof raw === 'string' ? (JSON.parse(raw) as Record<string, unknown>) : undefined;
+    const isSwap = method === 'POST' && new URL(endpoint).pathname === '/v1/swap';
+    if (isSwap) st.swapPosts++;
+    if (isSwap && st.swapPosts > 1 && later === '429')
+      return new Response('', { status: 429, headers: { 'Retry-After': '1' } });
+    if (isSwap && st.swapPosts === 1) {
+      await mint.request({ endpoint, method, ...(requestBody ? { requestBody } : {}) });
+      throw new TypeError('fetch failed'); // executed; the answer never arrives
+    }
+    try {
+      const res = await mint.request({
+        endpoint,
+        method,
+        ...(requestBody ? { requestBody } : {}),
+      });
+      return new Response(JSON.stringify(res), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    } catch (e) {
+      if (e instanceof MintOperationError)
+        return new Response(JSON.stringify({ code: e.code, detail: e.message }), { status: 400 });
+      throw e;
+    }
+  };
+  return { st, fetch };
+}
+
 describe('fix round 2: cashu-ts’s own fetch transport, a NUT-19 mint, a lost swap and a 429 on the retry', () => {
   afterEach(() => {
     vi.unstubAllGlobals();
   });
 
   it('the verifier’s scenario in process: the wallet loses nothing', async () => {
-    const mint = new TestMint({
-      url: MINT,
-      seed: new Uint8Array(32).fill(0x5c),
-      // What cdk-mintd 0.18.1 on 3397 advertises: ttl 60, swap / mint / melt cached.
-      nut19: {
-        ttl: 60,
-        cachedEndpoints: [
-          { method: 'POST', path: '/v1/swap' },
-          { method: 'POST', path: '/v1/mint/bolt11' },
-          { method: 'POST', path: '/v1/melt/bolt11' },
-        ],
-      },
-    });
-    let swapPosts = 0;
-    // The network: the mint behind a rate limiter. The first POST /v1/swap reaches the mint and
-    // its answer is lost (the connection drops); every later one is answered 429.
-    const net = async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
-      const endpoint =
-        typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
-      const method = (init?.method ?? 'GET').toUpperCase();
-      const raw = init?.body;
-      const requestBody =
-        typeof raw === 'string' ? (JSON.parse(raw) as Record<string, unknown>) : undefined;
-      if (method === 'POST' && new URL(endpoint).pathname === '/v1/swap') {
-        swapPosts++;
-        if (swapPosts > 1)
-          return new Response('', { status: 429, headers: { 'Retry-After': '1' } });
-        await mint.request({ endpoint, method, ...(requestBody ? { requestBody } : {}) });
-        throw new TypeError('fetch failed'); // executed; the answer never arrives
-      }
-      try {
-        const res = await mint.request({
-          endpoint,
-          method,
-          ...(requestBody ? { requestBody } : {}),
-        });
-        return new Response(JSON.stringify(res), {
-          status: 200,
-          headers: { 'Content-Type': 'application/json' },
-        });
-      } catch (e) {
-        if (e instanceof MintOperationError)
-          return new Response(JSON.stringify({ code: e.code, detail: e.message }), { status: 400 });
-        throw e;
-      }
-    };
-    vi.stubGlobal('fetch', net);
+    const mint = new TestMint({ url: MINT, seed: new Uint8Array(32).fill(0x5c), nut19: CDK_NUT19 });
+    const net = nut19Fetch(mint, '429');
+    vi.stubGlobal('fetch', net.fetch);
     const store = new MemoryProofStore();
-    // No `request`: cashu-ts's default transport (global fetch, NUT-19 retries).
-    const wallet = new CashuWallet({ mints: new CashuMintConnections(), store });
+    // cashu-ts's own transport (global fetch, NUT-19 retries). Until fix round 3 this was
+    // `new CashuMintConnections()`, whose default it was; that default is single-attempt now (see
+    // the next describe), so the transport this test is about is built explicitly.
+    const wallet = new CashuWallet({ mints: cashuTsOwnTransport(), store });
     await fund(wallet, mint, 64);
     const set = await wallet.send(3 as Sats, { p2pk: TO, mint: MINT });
-    expect(swapPosts).toBe(2); // cashu-ts did retry, and met the 429
+    expect(net.st.swapPosts).toBe(2); // cashu-ts did retry, and met the 429
     expect(set.proofs.reduce((a, p) => a + p.amount, 0)).toBe(3);
     expect(await wallet.balance(MINT)).toBe(61);
     expect(await store.pending(MINT)).toEqual([]);
+  });
+});
+
+describe('fix round 3: CashuMintConnections’ default sends each request once (never cashu-ts’s retrying transport)', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it('no request: at a NUT-19 mint whose first swap answer is lost, exactly ONE swap attempt, and the send completes from NUT-09', async () => {
+    const mint = new TestMint({ url: MINT, seed: new Uint8Array(32).fill(0x5d), nut19: CDK_NUT19 });
+    // The verifier's losing variant: a retry would reach the mint and be answered 11001 (the
+    // first attempt spent the inputs) — a coded answer, which drops the journal entry.
+    const net = nut19Fetch(mint, 'mint');
+    vi.stubGlobal('fetch', net.fetch);
+    const store = new MemoryProofStore();
+    const wallet = new CashuWallet({ mints: new CashuMintConnections(), store });
+    await fund(wallet, mint, 64); // one 64-sat proof
+    const set = await wallet.send(3 as Sats, { p2pk: TO, mint: MINT });
+    await new Promise((r) => setTimeout(r, 300)); // a retry would have been sent by now
+    expect(net.st.swapPosts).toBe(1);
+    expect(swaps(mint)).toBe(1);
+    expect(mint.calls).toContain('POST /v1/restore');
+    expect(set.proofs.reduce((a, p) => a + p.amount, 0)).toBe(3);
+    expect(await wallet.balance(MINT)).toBe(61);
+    expect(await store.pending(MINT)).toEqual([]);
+    expect(await wallet.checkSpent({ mint: MINT, proofs: await store.proofs(MINT) })).not.toContain(
+      true,
+    );
+  });
+
+  it('a request function that answers undefined for a mint gets the same single-attempt default', async () => {
+    const mint = new TestMint({ url: MINT, seed: new Uint8Array(32).fill(0x5e), nut19: CDK_NUT19 });
+    const net = nut19Fetch(mint, 'mint');
+    vi.stubGlobal('fetch', net.fetch);
+    const store = new MemoryProofStore();
+    const wallet = new CashuWallet({
+      mints: new CashuMintConnections({ request: () => undefined }),
+      store,
+    });
+    await fund(wallet, mint, 64);
+    await wallet.send(3 as Sats, { p2pk: TO, mint: MINT });
+    expect(net.st.swapPosts).toBe(1);
+    expect(await wallet.balance(MINT)).toBe(61);
   });
 });

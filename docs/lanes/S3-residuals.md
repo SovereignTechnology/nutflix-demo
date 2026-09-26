@@ -17,6 +17,70 @@ An independent verifier then checked that fix pass. It found one high regression
 finding-4 fix, and two low findings. All three are fixed: see "Fix round 2" below and the review
 record § Fix round 2.
 
+The verifier of fix round 2 reported one low and one info finding. Both are fixed: see "Fix
+round 3" below and the review record § Fix round 3.
+
+## Fix round 3
+
+| # | Finding | Outcome |
+|---|---|---|
+| LOW | The desktop's mint transport gave a melt the 30 s whole-exchange default. cashu-ts passes no timeout for `POST /v1/melt/bolt11`, and the mint pays before it answers, so a 30 to 60 s Lightning payment was cut off: held until a settle, or "melt failed" with no change blanks for an invoice that then got paid | **fixed** (`fea148b`): `cashuRequestFn` gives `POST …/v1/melt/{method}` 300 s; quotes, quote checks, swaps and mints keep 30 s; desktop and daemons alike |
+| INFO | `CashuMintConnections` with no request function (or one answering `undefined`) still fell back to cashu-ts's retrying fetch transport; a coded answer to a retry drops the journal entry (the verifier lost 64 sat to an 11001) | **fixed** (`0a32cb4`): the default is `cashuRequestFn` over a fetch-based raw HTTP (`fetchRawHttp`), one attempt per request; cashu-ts's retrying transport is unreachable through the class |
+
+What changed:
+
+- `core/src/wallet/transport.ts`: `meltTimeoutMs` (default 300 s) for `POST …/v1/melt/{method}`,
+  matched on the path's tail. cashu-ts's own `requestTimeout` still wins.
+- `core/src/wallet/fetch-http.ts` (new, exported): `fetchRawHttp`, a `RawHttp` over `fetch`, for
+  Node and browsers, bounded like `httpModuleRawHttp`:
+  - one timer to the last byte;
+  - a streamed cap and a `Content-Length` pre-check;
+  - redirects never followed;
+  - http(s) only;
+  - no cookies, cache or referrer;
+  - the caller's abort.
+- `core/src/wallet/wallet.ts`: `CashuMintConnections` falls back to `cashuRequestFn(fetchRawHttp())`
+  for any mint without a request function. The desktop and the daemons keep passing `node:http(s)`
+  for every mint: the daemons run `--jitless`, where `fetch` crashes.
+- Construction sites (desktop, seeder, gateway; app-web has none; tests) compile unchanged.
+- ADR 0014: a section "Fix round 3".
+
+Tests this round: 10 new (9 always on, 1 opt-in real-mint), 2 changed with comments:
+
+- `core/src/wallet/__tests__/transport.test.ts` (+1): which requests get which timeout.
+- `app-desktop/src/host/__tests__/mint-transport.test.ts` (+2), a local mint holding its answers
+  and fake timers:
+  - a melt answered after 45 s succeeds, and one never answered gives up at 300 s;
+  - a mint quote, a melt quote, a swap and a quote check time out at 30 s.
+- `core/src/wallet/__tests__/fetch-http.test.ts` (4, new).
+- `core/src/wallet/__tests__/journal-retry.test.ts` (+2): the default makes exactly ONE swap
+  attempt at a NUT-19 mint whose first answer is lost, where a retry would be answered 11001, and
+  the send completes from NUT-09. The same for a request function answering `undefined`.
+- `core/src/wallet/__tests__/cashu-ts-own-transport.ts` (new test helper, 1 own check).
+- `core/src/wallet/__tests__/journal-real-mint.integration.test.ts` (+1, opt-in).
+- Changed: the two tests of cashu-ts's own transport (in process and on a real mint) got it from
+  `new CashuMintConnections()`. They now build it explicitly, with assertions unchanged. Comments
+  in the host and seeder transport tests explain how the header check also tells `node:http` from
+  the fetch default.
+
+Mutation checks: pre-fix runs for both findings and T1 to T11, every one killed. Table in the
+review record.
+
+Checks:
+
+- touched packages (`packages/core`, `packages/seeder`, `packages/app-desktop/src/host`): 102
+  files passed, 1 skipped; 1167 tests passed, 16 skipped;
+- full suite `npx vitest run --maxWorkers=2` at `0a32cb4`: 186 files passed, 2 skipped; 2818
+  tests passed, 19 skipped (170 s). The helper's check runs in each file that imports it, so
+  `journal-real-mint` no longer counts as a skipped file;
+- real mints (Nutshell 0.21.0 on 3399, cdk-mintd 0.18.1 on 3397, invoices from Nutshell 3398):
+  core's two real-mint files and the gateway swarm, 20/20 on each. That is core 7, journal 9, the
+  helper's check 1, and swarm 3. The wallets these tests build with no request function (core's
+  real-mint wallets, the swarm's viewer) now run on the fetch default; the daemons' stay on
+  `node:http`;
+- `npx tsc -b --force`, eslint, prettier, `check:locked`, `lint:electron`: clean;
+- no dependency changed; the Electron e2e was not run.
+
 ## Fix round 2
 
 | # | Finding | Outcome |
@@ -294,6 +358,9 @@ balance event too. Two existing F31 tests expected 16 while the input was held; 
   `wallet/spend.ts` (locked: `isDefinitive`), `wallet/wallet.ts` (`recoverPending`, a doc note),
   `mocks/test-mint.ts` (`nut19`); host `mint-transport.ts` (new), `money.ts`, `host.ts`; seeder
   `runtime/mint-http.ts`, `runtime/index.ts`; worker `pay/dleq-thread.ts`.
+- Fix round 3: core `wallet/transport.ts` (`meltTimeoutMs`), `wallet/fetch-http.ts` (new),
+  `wallet/wallet.ts` (the default), `wallet/index.ts`; host `mint-transport.ts` (comment); seeder
+  `runtime/mint-http.ts` (comment).
 
 ## Tests
 
@@ -373,6 +440,9 @@ postponing an overdue retry) first survived and got a test. 50 in all.
   (review finding 1). A keyset refusal or a 429 is no longer held (finding 4).
 - [Low] A mint (or proxy) that executes a request and then answers 429 or a keyset code loses
   that operation's outputs, like any coded answer after executing (review finding 4).
+- [Low] A melt whose Lightning payment takes longer than 300 s is still cut off (fix round 3).
+  With change blanks it is held and settled later. With none, the user is told "melt failed"
+  although the invoice may still be paid. This is the same bound undici gave before round 2.
 - [Low] The daemon has no settle loop: a payout send whose answer is unknown holds its inputs
   until the next receive at that mint (each flush that redeems runs one) or a restart.
 - [Low] A retired DLEQ thread that never says it is leaving is let go after 60 s, unjoined (ours
@@ -393,7 +463,7 @@ postponing an overdue retry) first survived and got a test. 50 in all.
 
 ## Proposed row for `docs/status.md` (Stage 3 table)
 
-| Issue #8 residuals (ADR 0014 amendment, F5 desktop) | `stage-3/residuals` (on `c08c99f`) | **done** (independent review fix-first → fixed): (a) the desktop journal is a sealed file per identity. The key is wrapped with NIP-44 to self, then XChaCha20-Poly1305. Every transition, with the unpublished NIP-60 events, is fsynced before its request; `recoverPending` settles it at open and a `SettleLoop` settles later entries on a schedule; a damaged journal refuses the wallet loudly and is kept. Crash injection: SIGKILL between the journal write and the mint answer, recovered by a new process. (b) Melt change is journaled (NUT-08 blanks, NUT-09 restore, PENDING and NUT-07 handled). (c) Held inputs are out of the balance and the header chip, and come back by themselves. (d) DLEQ runs on a `Bare.Thread` over a SharedArrayBuffer mailbox, with chunked fallback, never acceptance; retiring a thread never blocks the loop. 128 proofs: 548 ms of stall before, 3 ms after. Real mints: Nutshell and cdk 5/5. 50 mutation checks |
+| Issue #8 residuals (ADR 0014 amendment, F5 desktop) | `stage-3/residuals` (on `c08c99f`) | **done** (independent review fix-first → fixed): (a) the desktop journal is a sealed file per identity. The key is wrapped with NIP-44 to self, then XChaCha20-Poly1305. Every transition, with the unpublished NIP-60 events, is fsynced before its request; `recoverPending` settles it at open and a `SettleLoop` settles later entries on a schedule; a damaged journal refuses the wallet loudly and is kept. Crash injection: SIGKILL between the journal write and the mint answer, recovered by a new process. (b) Melt change is journaled (NUT-08 blanks, NUT-09 restore, PENDING and NUT-07 handled). (c) Held inputs are out of the balance and the header chip, and come back by themselves. (d) DLEQ runs on a `Bare.Thread` over a SharedArrayBuffer mailbox, with chunked fallback, never acceptance; retiring a thread never blocks the loop. 128 proofs: 548 ms of stall before, 3 ms after. Real mints: Nutshell and cdk 5/5. 50 mutation checks. Fix rounds 2 and 3 (independent verifier): every mint request is sent once (no retrying transport as a default anywhere), a 429 is ambiguous (held, then NUT-09 / NUT-07), a melt gets 300 s to pay; 10 and 13 more mutation checks; real mints 20/20 on each |
 
 ## Proposed text for `docs/security-review.md`
 

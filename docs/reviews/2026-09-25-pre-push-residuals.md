@@ -696,3 +696,217 @@ Each guard was broken, the named tests run, and the guard restored with `git che
   - a retired DLEQ thread that never says it is leaving is let go after 60 s;
   - finding 6: the journal's growth during a relay outage;
   - a second melt of a quote that is still unresolved locally is refused.
+
+## Fix round 3 (2026-09-25)
+
+The verifier of fix round 2 reported one low and one info finding, the info one to be fixed too.
+Both were checked against the code and hold. Both are fixed on `stage-3/residuals`, `fea148b` and
+`0a32cb4`, then the docs.
+
+| # | Finding | Outcome |
+|---|---|---|
+| LOW | `hostMintRequest()` gave a melt the 30 s whole-exchange default; a Lightning payment of 30 to 60 s or more was cut off | **fixed**: `fea148b` |
+| INFO | `CashuMintConnections` with no request function still fell back to cashu-ts's retrying fetch transport; a coded answer to a retry drops the journal entry (the verifier lost 64 sat to an 11001) | **fixed**: `0a32cb4` |
+
+### LOW: a melt was cut off at 30 s — fixed
+
+Verified:
+
+- cashu-ts 4.10.0 sends `POST /v1/melt/{method}` through `requestWithAuth` with no
+  `requestTimeout`, so `cashuRequestFn` applied its 30 s default. The mint pays the invoice
+  before it answers.
+- Nutshell's LND backends allow 60 s for a payment. Before round 2 the desktop's transport was
+  cashu-ts's fetch, with undici's 300 s header and body timeouts.
+- `spend.ts`: a melt with change blanks that times out is held ("outcome unknown") until a settle
+  decides it. One with no blanks (a fee reserve of 0) is not journaled, and the user is told
+  "melt failed" for an invoice that may then get paid.
+- Main, the preload bridge and the host dispatch put no deadline of their own in front of a melt.
+  So the transport's timeout is the only one.
+
+Fix (`core/src/wallet/transport.ts`):
+
+- `cashuRequestFn` gives `POST …/v1/melt/{method}` 300 s (`meltTimeoutMs`), matched on the tail of
+  the path, so a mint URL with a path prefix is covered.
+- Melt quotes (`…/v1/melt/quote/…`), quote checks, swaps and mints keep 30 s. cashu-ts's own
+  `requestTimeout` still wins.
+- The desktop (`hostMintRequest`) and the daemons (`nodeMintRequest`, whose only melt is the
+  operator's `melt` command) get it through the shared function. Comments updated in
+  `host/mint-transport.ts` and `seeder/src/runtime/mint-http.ts`.
+
+Tests:
+
+- `transport.test.ts` (+1): which requests get which timeout.
+  - 300 s: bolt11, bolt12, and a path prefix.
+  - 30 s: the melt quote, the quote check, swap, mint, the mint quote, a longer path, and a GET of
+    the melt path.
+  - `requestTimeout` and both options are honoured.
+- `host/__tests__/mint-transport.test.ts` (+2), over a local mint that holds its answers, with
+  fake timers:
+  - a melt answered after 45 s succeeds;
+  - a melt with no answer is a `NetworkError` at 300 s, not before;
+  - a mint quote, a melt quote, a swap and a quote check each time out at 30 s, not before.
+
+### INFO: the retrying default — fixed
+
+Verified: `CashuMintConnections` built `new Mint(mint)` with no `customRequest` whenever `request`
+was absent or answered `undefined`, so cashu-ts used its default request function, the NUT-19
+retry loop around `fetch`.
+In process, with the verifier's network (the first swap executes and its answer is lost; a retry
+reaches the mint), the send failed with `P2PK swap failed (MintOperationError 11001)`.
+
+Fix: the default is now single-attempt, `cashuRequestFn` over a new fetch-based raw HTTP
+(`core/src/wallet/fetch-http.ts`, `fetchRawHttp`, exported). It is bounded like
+`httpModuleRawHttp`:
+
+- one timer for the whole exchange, to the last byte of the body;
+- the body is read incrementally and refused past the cap, and a larger `Content-Length` is
+  refused before reading;
+- `redirect: 'manual'`: Node's fetch hands back the 3xx, a browser an opaque redirect (status 0).
+  Either is an `HttpResponseError`;
+- http(s) only, checked before anything is sent;
+- no cookies, cache or referrer;
+- the caller's abort signal.
+
+It works in Node and in browsers. `fetch` is looked up per request, so nothing loads at import.
+cashu-ts's retrying transport is no longer reachable through `CashuMintConnections` at all; the
+option to request "no custom transport" does not exist.
+
+Construction sites, all compiling unchanged (`npx tsc -b --force` clean):
+
+- desktop `host/money.ts` and the seeder `runtime/index.ts`: they pass `cashuRequestFn` over
+  `node:http(s)` for every mint. That stays: the daemons run `--jitless`, where `fetch`'s
+  WebAssembly parser crashes;
+- the gateway: through the seeder runtime; its real-mint swarm test builds a bare
+  `CashuMintConnections()` and now gets the single-attempt default;
+- app-web: builds none;
+- the tests: every other site passes a `TestMint` request. Core's `real-mint.integration.test.ts`
+  and `journal-real-mint`'s invoice helper use the default.
+
+Tests:
+
+- `fetch-http.test.ts` (4, new), against Node's real `fetch` and a local server:
+  - exact bytes both ways, with no cookie or referer sent;
+  - a redirect is not followed (the target is never requested);
+  - both size caps;
+  - a stalled body times out;
+  - the caller's abort;
+  - schemes, and the `fetch` init;
+  - one request under `cashuRequestFn` with NUT-19 ttl and cached endpoints.
+- `journal-retry.test.ts` (+2):
+  - no `request`: at a NUT-19 `TestMint` whose first swap answer is lost, where a retry would be
+    answered 11001, exactly ONE swap attempt is made, and the send completes from NUT-09
+    (balance 61, nothing pending, nothing spent);
+  - the same for a request function that answers `undefined`.
+- The round-2 test of cashu-ts's own transport got it from `new CashuMintConnections()`. It now
+  builds that transport explicitly (`__tests__/cashu-ts-own-transport.ts`, a test helper with its
+  own check, since core's vitest config runs every file under `__tests__`). A comment cites this
+  round, and the assertions are unchanged: two swap POSTs, nothing lost.
+- `journal-real-mint.integration.test.ts` (+1, opt-in): the default on a real mint, with a retry
+  that would reach the mint. The cashu-ts-transport test there builds it explicitly too.
+- The host and seeder transport tests tell `node:http` from any `fetch` by the `User-Agent` Node's
+  `fetch` adds. Their comments now say so. Round 2's M4 and M5, re-run against the new default,
+  are still killed.
+
+### Self-review of this round (`differential-review`, `sharp-edges` method)
+
+Risk:
+
+- MEDIUM: the default transport of `CashuMintConnections`. No production wallet uses it: the
+  desktop and daemons pass their own for every mint.
+- LOW: the melt timeout (every desktop and daemon melt).
+
+`spend.ts` is unchanged (`check:locked` OK).
+
+Blast radius:
+
+- `cashuRequestFn`: all mint traffic of the desktop and daemons;
+- `DEFAULT_REQUEST`: tests, the gateway's real-mint swarm, and any future caller that passes no
+  transport.
+
+Adversarial questions:
+
+- **A mint that holds every melt open?** Each is bounded at 300 s, and melts are user- or
+  operator-initiated. Liveness only, and the same as before round 2.
+- **Can another request be made to match the melt pattern?** The endpoint is built by cashu-ts
+  from the configured mint URL, and a match only lengthens a timeout. A GET, a melt quote and a
+  longer path do not match (tested).
+- **A payment longer than 300 s?** With blanks, held and settled; with none, "melt failed", as
+  before round 2 (residual).
+- **The fetch default in a daemon?** It is never reached: the runtime falls back to `node:http`
+  for every mint, and the seeder test pins it. Under `--jitless` the default would crash at the
+  first request, not retry.
+- **The fetch default in a browser?** An opaque redirect is refused (status 0,
+  `HttpResponseError`, held then settled). A browser mint needs CORS, as it did before. No browser
+  wallet exists today.
+- **Compressed answers?** undici decodes them, and the streamed cap counts decoded bytes. The
+  `Content-Length` pre-check counts encoded bytes, which is conservative.
+- **Shared state in `DEFAULT_REQUEST`?** None: `cashuRequestFn` and `fetchRawHttp` are closures
+  with no state; each request has its own timer and controller.
+
+Found and fixed during the round:
+
+- the first matcher also excluded a bare `…/v1/melt/quote`, which is not an endpoint (and would
+  have left a surviving mutant). Dropped: a quote path has more segments.
+- core's vitest config runs every file under `__tests__`, so the test helper failed as "no test
+  suite". It now carries its own check, like `nostr/__tests__/helpers.ts`.
+
+### Mutation checks (fix round 3)
+
+Each guard was broken, the named tests run, and the guard restored from a saved copy. Core's
+`dist/` was rebuilt where a desktop test reads `@sovit/core`.
+
+| # | Guard broken | Result |
+|---|---|---|
+| pre-a | the new timeout tests against the unfixed transport | core timeout test fails (all 30 s); host 45 s melt test fails (done at 30 s) |
+| pre-b | the new default tests against the unfixed `wallet.ts` | 2 `journal-retry` tests fail (`P2PK swap failed (MintOperationError 11001)`); the real-mint test fails on cdk-mintd and passes on Nutshell (no NUT-19, so no retry) |
+| T1 | melt matcher anchored at the start of the path | core timeout test fails (path prefix) |
+| T2 | no method check | core timeout test fails (a GET of the melt path) |
+| T3 | 300 s for every request | host 30 s test fails |
+| T4 | the default only without a `request` option (an `undefined` answer gets cashu-ts's transport) | the `undefined`-answer test fails |
+| T5 | `redirect: 'follow'` | 2 `fetch-http` tests fail |
+| T6 | no streamed cap | `fetch-http` cap test fails |
+| T7 | timer cleared at the headers | `fetch-http` stall test fails |
+| T8 | no `Content-Length` pre-check | `fetch-http` declared-length test fails |
+| T9 | no scheme check | 2 `fetch-http` tests fail |
+| T10 | `credentials: 'include'` | `fetch-http` init test fails |
+| T11 | round 2's M4 and M5 together, against the new default | 3 fail (seeder transport, host fallback, host source pin) |
+
+### Checks run (fix round 3)
+
+- `npx vitest run --maxWorkers=2` at `0a32cb4`: 186 files passed, 2 skipped (opt-in); 2818 tests
+  passed, 19 skipped; 170 s. The helper's check runs in each file that imports it, so
+  `journal-real-mint` no longer counts as a skipped file.
+- Touched packages (`packages/core`, `packages/seeder`, `packages/app-desktop/src/host`): 102 files
+  passed, 1 skipped; 1167 tests passed, 16 skipped.
+- Real mints, with `NUTFLIX_REAL_MINT_URL` set and `NUTFLIX_REAL_MINT_URL_2` = Nutshell 3398. The
+  files are core's `real-mint.integration.test.ts` and `journal-real-mint.integration.test.ts`,
+  and the gateway's `real-mint-swarm.integration.test.ts`. The wallets they build with no request
+  function (core's real-mint wallets, the swarm's viewer, the invoice helper) now run on the
+  fetch default, melts included.
+  - Nutshell 0.21.0 (3399): 3 files, 20/20 (core 7, journal 9, the helper's check 1, gateway
+    swarm 3).
+  - cdk-mintd 0.18.1 (3397): 3 files, 20/20.
+- `npx tsc -b --force`: clean.
+- `npx eslint` and `npx prettier --check` on every changed file: clean.
+- `npm run check:locked`: OK. `npm run lint:electron`: OK.
+- The Electron e2e was not run (not asked). No dependency changed.
+
+### Residuals after fix round 3
+
+- Closed: round 2's "[Low] Core's `CashuMintConnections` with no `request` is still cashu-ts's
+  retrying fetch transport".
+- [Low] A melt whose Lightning payment takes longer than 300 s is still cut off. With change
+  blanks it is held and settled later; with none, the user is told "melt failed" although the
+  invoice may still be paid. This is the bound undici gave before round 2.
+- [Info] The fetch default sends `fetch`'s own `User-Agent` (`node` in Node, the browser's in a
+  browser). `node:http` sends none. No production wallet uses the default.
+- [Info] The test helper's own check runs in every file that imports it (core's vitest config), as
+  `nostr/__tests__/helpers.ts` does.
+- Unchanged from fix round 2:
+  - a 429 on a request that never ran holds its inputs for the wait;
+  - a mint that executes and then answers with a code loses that operation's outputs;
+  - `http://` and LAN mints named by a manifest are contacted;
+  - the daemon has no settle loop;
+  - a retired DLEQ thread that never says it is leaving is let go after 60 s;
+  - finding 6: the journal's growth during a relay outage;
+  - a second melt of a quote that is still unresolved locally is refused.

@@ -36,23 +36,35 @@ import {
   type MintConnections,
   type WalletKey,
 } from './spend.js';
+import { fetchRawHttp } from './fetch-http.js';
 import { heldSecrets, proofTotal, type ProofStore } from './store.js';
+import { cashuRequestFn } from './transport.js';
 
 // ---------------------------------------------------------------------------------------
 // Mint connections
 // ---------------------------------------------------------------------------------------
 
 /**
+ * Every mint of a `CashuMintConnections` not given a request function: `cashuRequestFn` (one
+ * attempt per request, 30 s, 300 s for a melt, no redirects, a 4 MiB cap) over the platform's
+ * `fetch` (`fetch-http.ts`). `fetch` is looked up per request, so building this loads nothing.
+ */
+const DEFAULT_REQUEST: RequestFn = cashuRequestFn(fetchRawHttp());
+
+/**
  * One loaded cashu-ts `Wallet` per mint, created on first use. `request` overrides the HTTP
  * transport per mint (the in-process `TestMint`, or a host transport with its own policy).
  * `requireSigDleq`: a mint that advertises NUT-12 must return DLEQ proofs on every signature.
  *
- * Without `request` (or where it answers `undefined`), cashu-ts's OWN fetch transport is used,
- * which RETRIES swaps, melts and mints at a mint advertising NUT-19. `spend.ts` reads a coded
- * answer as the mint's answer to its one request (`isDefinitive`), so every production wallet
- * passes a single-attempt transport for every mint: the desktop's `host/mint-transport.ts`, the
- * daemons' `@sovit/seeder` `runtime/mint-http.ts` (issue #8 fix round 2). Only the opt-in
- * real-mint tests use the default.
+ * Every mint is reached through a SINGLE-ATTEMPT transport: `spend.ts` reads a coded answer as the
+ * mint's answer to its one request (`isDefinitive`). Without `request`, or where it answers
+ * `undefined`, that is `cashuRequestFn` over `fetch` (`fetch-http.ts`) — never cashu-ts's own
+ * fetch transport, which RETRIES swaps, melts and mints at a mint advertising NUT-19; a coded
+ * answer to such a retry dropped the journal entry of a request that had executed (issue #8 fix
+ * round 3; before, only the callers kept it away). The Node wallets pass `cashuRequestFn` over
+ * `node:http(s)` instead — the daemons run `--jitless`, where `fetch`'s parser (WebAssembly)
+ * crashes: the desktop's `host/mint-transport.ts`, the daemons' `@sovit/seeder`
+ * `runtime/mint-http.ts`. An injected `request` must not retry either.
  */
 export class CashuMintConnections implements MintConnections {
   private readonly wallets = new Map<MintUrl, Promise<CashuTsWallet>>();
@@ -64,11 +76,11 @@ export class CashuMintConnections implements MintConnections {
   wallet(mint: MintUrl): Promise<CashuTsWallet> {
     let w = this.wallets.get(mint);
     if (w === undefined) {
-      const customRequest = this.opts.request?.(mint);
-      const cashu = new CashuTsWallet(
-        new Mint(mint, customRequest === undefined ? {} : { customRequest }),
-        { unit: 'sat', requireSigDleq: true },
-      );
+      const customRequest = this.opts.request?.(mint) ?? DEFAULT_REQUEST;
+      const cashu = new CashuTsWallet(new Mint(mint, { customRequest }), {
+        unit: 'sat',
+        requireSigDleq: true,
+      });
       w = cashu.loadMint().then(() => cashu);
       // A failed load is not cached: the next call retries.
       w.catch(() => this.wallets.delete(mint));

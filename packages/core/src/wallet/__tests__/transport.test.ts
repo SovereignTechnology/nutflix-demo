@@ -58,6 +58,40 @@ describe('cashuRequestFn: the RequestFn error contract over a raw HTTP call', ()
     expect(seen[2]?.timeoutMs).toBe(1234);
   });
 
+  it('fix round 3: a melt (POST …/v1/melt/{method}) gets 300 s, the mint pays before it answers; quotes, swaps and mints keep 30 s', async () => {
+    const seen: RawHttpRequest[] = [];
+    const http = fixed({ body: '{}' }, seen);
+    const post = (request: ReturnType<typeof cashuRequestFn>, endpoint: string): Promise<unknown> =>
+      request({ endpoint, method: 'POST', requestBody: { quote: 'q' } });
+    const request = cashuRequestFn(http);
+    await post(request, `${MINT}/v1/melt/bolt11`);
+    await post(request, `${MINT}/v1/melt/bolt12`);
+    await post(request, 'https://mint.transport.example/cashu/v1/melt/bolt11'); // a path prefix
+    await post(request, `${MINT}/v1/melt/quote/bolt11`);
+    await request({ endpoint: `${MINT}/v1/melt/quote/bolt11/q1` }); // GET: checking a quote
+    await post(request, `${MINT}/v1/swap`);
+    await post(request, `${MINT}/v1/mint/bolt11`);
+    await post(request, `${MINT}/v1/mint/quote/bolt11`);
+    await post(request, `${MINT}/v1/melt/bolt11/extra`);
+    expect(seen.map((r) => r.timeoutMs)).toEqual([
+      300_000, 300_000, 300_000, 30_000, 30_000, 30_000, 30_000, 30_000, 30_000,
+    ]);
+    // A GET of the melt path is not a payment; cashu-ts's own timeout still wins; both configurable.
+    await request({ endpoint: `${MINT}/v1/melt/bolt11` });
+    await request({
+      endpoint: `${MINT}/v1/melt/bolt11`,
+      method: 'POST',
+      requestBody: {},
+      requestTimeout: 1234,
+    });
+    await post(
+      cashuRequestFn(http, { meltTimeoutMs: 90_000, timeoutMs: 5000 }),
+      `${MINT}/v1/melt/bolt11`,
+    );
+    await post(cashuRequestFn(http, { meltTimeoutMs: 90_000, timeoutMs: 5000 }), `${MINT}/v1/swap`);
+    expect(seen.slice(9).map((r) => r.timeoutMs)).toEqual([30_000, 1234, 90_000, 5000]);
+  });
+
   it('400 { code, detail } → MintOperationError with the NUT code (spend.ts tells a double-spend by it)', async () => {
     const err = await call(
       fixed({ status: 400, body: '{"code": 11001, "detail": "Token already spent."}' }),
