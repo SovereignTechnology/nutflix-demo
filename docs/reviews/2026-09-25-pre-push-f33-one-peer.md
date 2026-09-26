@@ -99,7 +99,8 @@ closed).
   - Claiming another seeder's pubkey to merge debts into its budget: the HELLO is signed and bound
     to the connection (v5).
   - Withholding blocks: see R3.
-- **Denial of service by resources.** Every map is bounded:
+- **Denial of service by resources.** Every map is bounded (the `byPubkey` index was not until the
+  independent review's IR2, below):
   - the router's lost-request and stalled-remote maps: 4096 remotes each;
   - `SeederCredit`'s records: 4096, evicting disconnected seeders first.
   The failover ticker runs only while blocks are tracked, is unref'd, and stops at `close()`.
@@ -193,7 +194,8 @@ Each guard was broken on purpose. At least one test failed each time, and the gu
   - A hypercore bump must re-verify `net/one-peer.ts`. The pin test fails first.
   - At runtime a replicator of the wrong shape is refused.
   - A replication peer INSTANCE missing the pinned fields is logged as an error and keeps
-    hypercore's own cap. That is fail-open for that peer, and unreachable on 11.35.3.
+    hypercore's own cap. That is fail-open for that peer, and unreachable on 11.35.3. *(Fixed by
+    IR6 below: such a peer is refused at attach and asked for nothing when it joins later.)*
 - **Withholding peers.** Each one delays one block at a time by `stallMs` (4 s). Hotswap masked
   them by racing, at the price of paying duplicates. Many Sybil withholders can still slow
   playback.
@@ -214,7 +216,8 @@ Each guard was broken on purpose. At least one test failed each time, and the gu
   contract says. A seeder whose own policy has a smaller minimum PAY than the manifest's is
   misconfigured against the contract, and could be overrun.
 - **Real-mint test.** It still pays through a bare `UpstreamPayer` (no `SeederCredit`, no router)
-  and its F33 comment describes that rig. Converting it needs a real-mint run.
+  and its F33 comment describes that rig. Converting it needs a real-mint run. *(Done after the
+  independent review: routed, with a labelled unrouted baseline. See below.)*
 
 ## Tests
 
@@ -232,3 +235,134 @@ Each guard was broken on purpose. At least one test failed each time, and the gu
 - `npx vitest run --maxWorkers=2`: 174 files passed, 2 skipped; 2748 tests passed, 10 skipped.
 - `tsc -b --force`, eslint and prettier on every changed file, `check:locked` and `lint:electron`:
   all OK. The Electron e2e is left to the orchestrator.
+
+## Independent review (2026-09-25) and what was done
+
+An independent reviewer read and tested the lane: verdict **fix first**, one medium finding and
+seven low/info ones. It confirmed that racing is closed, that the cap sits where hypercore reads
+it, that the in-flight to owed hand-off is synchronous, and that late answers are never paid.
+Every finding was first checked against the code. All eight are real. Seven are fixed, each with
+a test that fails without the fix. One (IR4, low) is deferred, with the reason.
+
+| # | Severity | Finding | Outcome |
+|---|---|---|---|
+| IR1 | Medium | `host.ts` `close()` ran `payer.close()` before the connections closed. `OnePeerRouter.close()` then restored hypercore's scheduler (its cap, at least 16, and its racing hotswap) on cores still replicating. The next block to land sent every held-back request to one seeder, which cut and banned the viewer. `gateway.close()` had the same order. | **Fixed**, twice. (1) The router fails closed. A released core (the last detach, or `close()`) is PARKED. Every peer, and every peer that joins through an attached session, is capped at 0 new requests (`one-peer.ts` `park()`). The no-race queue stays, serving nobody. The next `attachCore` of that core takes the core over, keeping its queue. (2) Shutdown order: the desktop closes the payer only after `node.destroy()` (`host.ts` `close()`, in a `finally`). The gateway releases routes and disposes `SeederCredit` only after `seeder.close()` (`gateway.ts` `close()`, in a `finally`). The router logs once, with the core key, when it parks a core. |
+| IR2 | Low | `SeederCredit.byPubkey` grew without bound when one Noise key kept announcing new HELLO pubkeys. | **Fixed.** `setHello()` moves the Noise key from its previous pubkey's set to the new one's, and deletes empty sets. A seeder record now keeps `pubkey`, the last HELLO pubkey. `hello` is the current connection's, and stays `null` (budget 0) until it arrives. So `byPubkey` holds at most one entry per seeder record (≤ 4096 + live), and a reconnect that drops before its HELLO keeps what the pubkey inherits. `stats().pubkeys` exposes the size. |
+| IR3 | Low | A request failed over by its age alone, even while its peer was delivering. Honest seeders on slow links took permanent debt (a cancel after sending) and the one-request limit, and playback could stop. | **Fixed.** A request is stalled only when it is at least `stallMs` old AND its peer has delivered no block on that core for `stallMs`, counted from the later of the request and the peer's last `download` (per replication peer, in a `WeakMap`). A request `STALL_HARD_FACTOR × stallMs` old (4 × 4 s = 16 s) is stalled whatever its peer delivers. That keeps a peer from trickling other blocks while holding one back for ever. |
+| IR4 | Low | Debts live in memory only. After a viewer restart, a seeder that is still running counts k unpaid blocks from the previous run, the viewer gives it its full window, overshoots by k, and is cut and banned. | **Deferred** (low; it predates the lane, since the old global pool forgot too). Persisting the debts would make things worse. They are permanent, conservative estimates, and the seeder's own counts reset when it restarts. A persisted estimate would therefore make an honest seeder unusable across every later run. Only the seeder knows what it counts. Recorded in the residuals below, in ADR 0018, and in `docs/contract-requests/S3-f33.md`. That request now names the restart case, and asks for the window report once the seeder binds the viewer's HELLO, before the first request. |
+| IR5 | Info | `PeerBudget` used `null` for "no cap", while the APIs next to it (`windowOf`, `seederBatch`, `policyFor`) use `null` for "unknown". | **Fixed.** The only uncapped value is the exported `UNCAPPED` symbol. `null`, `undefined`, strings, other symbols and every non-finite or sub-1 number ask nothing. The type (`number \| typeof UNCAPPED`) rejects `null` at compile time. |
+| IR6 | Info | A replication peer without the pinned fields kept hypercore's cap (fail open). | **Fixed.** `attachCore` throws `RoutingUnsupported` when any peer already on the replicator lacks a pinned field, and installs nothing. A peer that joins later without them is asked for nothing: an own `getMaxInflight() → 0`, which hypercore gates every request on. |
+| IR7 | Info | `attachCore` reference-counted routes by core key without checking the replicator. A core closed and reopened was left unrouted. The reachable path was ADR 0015's image path closing a core a playback had attached. | **Fixed**, twice. (1) Routes are keyed by replicator. A reopened core (a new replicator) is routed anew, and several sessions of one replicator share its route, with per-session listeners and reference counts. (2) `host.ts` `releaseImageCore` never closes a core a playback attached (`coresAttached`). It still clears the free flag. |
+| IR8 | Info | `readUpstreamBlob`'s default lookahead followed the pool, which any connected `pay/1` peer's HELLO (downstream browsers included) can grow to 1024. The gateway would then buy up to 1023 blocks ahead of a reader that may stop. | **Fixed.** The default is fixed at `upstream.creditBlocks − 1`, the pre-lane value, and is independent of the pool. An explicit `opts.lookahead` is unchanged. |
+
+### Tests added (10)
+
+- **Seeder `one-peer-router.test.ts`** (+5):
+  - `close()` parks a core that is still replicating (IR1). This is the reviewer's probe: budget
+    1, five `get`s held back, `close()`, then the in-flight block let through. Uploads stay at 1.
+    A seeder that rejoins the parked core is asked for nothing.
+  - A seeder still delivering on a slow link is not failed over: four requests released one
+    message every 400 ms with `stallMs` 1 s (IR3).
+  - The 4 × `stallMs` hard limit (IR3).
+  - A peer without the pinned fields: refused at attach, asked for nothing when it joins (IR6).
+  - A reopened core (a new replicator under the same key) is routed anew (IR7).
+- **Gateway `seeder-credit.test.ts`** (+1): 50 fresh pubkeys under one Noise key leave one index
+  entry, and a reconnect that drops before its HELLO keeps the inheritance (IR2).
+- **Gateway `one-peer.integration.test.ts`** (+2): `close()` releases routes only after the seeder
+  closed (IR1), and the lookahead stays at 3 with the pool at 1024 (IR8).
+- **Desktop `host.test.ts`** (+2): the image path does not close a core a playback attached
+  (IR7), and shutdown closes the payer only after `node.destroy()` (IR1).
+
+### Tests updated
+
+- **The router's refusal test.** It asserted that the last detach restores hypercore
+  (`getMaxInflight` no longer an own property). That is the behaviour IR1 removes. It now asserts
+  that the core is parked (cap 0), that another router takes it over, and that its `close()`
+  parks it again. The comment in the file cites the review.
+- **The router's cap test.** It adds `null`, `undefined`, a string and a foreign symbol to the
+  fail-closed values (IR5).
+- **`unlimited`.** It returns `UNCAPPED`.
+
+### Mutation checks (each broken on purpose, at least one test failed, then restored)
+
+| # | Mutation | Failing test |
+|---|---|---|
+| M29 | `release()` does not park (hypercore's cap back) | `close()` parks: failed, the four held-back requests went out with the landing block (5 downloads, never exactly 1); refusal test "expected 48 to be 0" |
+| M30 | Park without the `peer-add` listener | `close()` parks: "requests to a peer that joined after close(): expected [1, 4] to equal [1, 0]" |
+| M31 | Stall by request age alone (the old rule) | Slow-link test ("expected 1 failover to be 0"); hard-limit test |
+| M32 | Hard limit removed | Hard-limit test ("expected false to be true") |
+| M33 | `null` budget uncaps again | Cap test ("null: expected 48 to be 0") |
+| M34 | Attach-time peer check removed | Pinned-fields test ("expected [Function] to throw") |
+| M35 | Joining non-routable peer not capped | Pinned-fields test ("expected 16 to be 0") |
+| M36 | Routes looked up by core key | Reopened-core test ("expected 1 to be 2") |
+| M37 | `setHello` does not unindex the old pubkey | IR2 test (`pubkeys` 51, not 1) |
+| M38 | Inheritance keyed on the current HELLO, not the last pubkey | IR2 test ("expected 4 to be 3") |
+| M39 | Lookahead follows the pool again | Lookahead test ("expected 39 to be 3") |
+| M40 | Gateway disposes `SeederCredit` before `seeder.close()` | Gateway close-order test |
+| M41 | Desktop `payer.close()` before `node.destroy()` | Host shutdown-order test |
+| M42 | `releaseImageCore` closes an attached core | Host image test ("expected undefined to be defined") |
+
+### Real-mint lane, now routed (orchestrator request)
+
+`real-mint-swarm.integration.test.ts` pays through the production stack (`viewerStack`, built as
+`gateway.ts` and `viewer-payer.ts` build it): `CreditPool`, `CreditSettler`, `SeederCredit` (so
+`OnePeerRouter`), and `UpstreamPayer` with `seederBatch`. The viewer reads unpaced, so the
+per-seeder caps alone must hold the windows.
+
+- **The routed test.** Three seeders with windows 6/3/2. Paid deliveries must equal blocks, each
+  seeder must be paid exactly what it sent, each seeder's peak outstanding (read inside its own
+  `recordUpload`) must stay within its window, and nothing may race.
+- **The BASELINE.** A clearly labelled test that keeps the pre-F33 rig: a bare `UpstreamPayer`,
+  windows of 64. It measures what the routing changes.
+- **Setup change.** The mirrors copy the core while the origin marks it free (ADR 0015). Otherwise
+  the origin's small window would be spent on the mirrors' unpaid warm-up.
+- **Output.** The counts are reported as test annotations, since the package allows no console.
+- **The other real-mint tests** (network drop, double spend) run on the routed stack too.
+
+Results (`NUTFLIX_REAL_MINT_URL`, `--reporter=verbose` shows the annotations):
+
+| Mint | Baseline (unrouted) paid / blocks | Routed paid / blocks | Routed per seeder (sent = paid, peak ≤ window) |
+|---|---|---|---|
+| Nutshell `:3399`, 5 runs | 26, 25, 25, 26, 26 / 24 | 24 / 24 every run | e.g. 10 / 8 / 6 sent, peaks 6 / 3 / 2 |
+| cdk-mintd `:3397`, 1 run | 27 / 24 | 24 / 24 | peaks at the windows |
+
+All four real-mint tests pass on both mints. No rejected ACK, no ban, and every seeder redeemed
+at the mint.
+
+### Self-review of the fixes (differential-review and sharp-edges, inline)
+
+- **Parking is one-way per router.** A caller that detaches the router and then reads the core
+  waits until its timeout. That is the fail-closed direction, and the router now logs it once
+  (core key only). Production detaches only at shutdown.
+- **A detach followed by a re-attach double-counts in-flight load as debt.** It is conservative,
+  and no production caller does it.
+- **IR3 trades delay for withholders.** A trickling withholder delays one block per batch by up to
+  16 s (was 4 s per block). A silent one still delays each block by 4 s.
+- **The fixed gateway lookahead (3 by default)** gives up the growing lookahead the lane had
+  added. That is the pre-lane behaviour.
+- **Nothing new logs a peer key.** No locked path is touched, and no IPC changed.
+
+### Residuals, updated
+
+- **IR4 (deferred).** Debts are per process: after a viewer restart, a seeder that is still
+  running can be overrun by what it counted from the previous run, and bans the viewer. This
+  predates the lane. Needs the seeder's own count (contract request `S3-f33`, v7).
+- **Trickling withholders** delay one block per batch by up to 16 s (`STALL_HARD_FACTOR`).
+- **A core session closed under the router** while other, unattached sessions keep its replicator
+  alive stops delivering `peer-add` to the router. A new peer there would keep hypercore's cap.
+  Nothing in the desktop or gateway does this: one session per core, and the image path no longer
+  closes a playback core.
+- The other residuals above stand: pinned internals (fail closed at runtime now in every case),
+  conservative debts, wall-clock steps, unpaid-after-drop, pre-HELLO wait, seeder policy mismatch.
+
+### Commands
+
+- `npx vitest run packages/seeder packages/gateway packages/app-desktop/src/worker`, plus the
+  suites above one by one.
+- `npx vitest run --maxWorkers=2`: 174 files passed, 2 skipped; 2758 tests passed, 11 skipped.
+  `runtime-units.test.ts` timed out once under load in a package run and passed alone (31/31).
+- `NUTFLIX_REAL_MINT_URL=http://127.0.0.1:3399 npx vitest run
+  packages/gateway/src/__tests__/real-mint-swarm.integration.test.ts`: 4 passed (×5, and ×1 on
+  `:3397`).
+- `npx tsc -b --force`, eslint and prettier on every changed file, `npm run check:locked`,
+  `npm run lint:electron`: clean.
