@@ -4,9 +4,11 @@
  *   wallet   `CashuWallet` over `Nip60ProofStore` (the user's NIP-60 wallet on their relays,
  *            NIP-44 to self through the signer), keyed by the NIP-60 wallet key (kind 17375, held
  *            by the signer or in secure memory). The user's kind 10019 is published so creators'
- *            shares can reach them. Its journal (ADR 0014 and its amendment, issue #8) is a
- *            sealed file per identity in `journalDir` (`wallet-journal.ts`): every operation's
- *            outputs are on disk before its request reaches the mint, and what a crash cut off is
+ *            shares can reach them. Its mints are reached through `mint-transport.ts`
+ *            (`node:http(s)`, each request sent once: issue #8 fix round 2). Its journal (ADR 0014
+ *            and its amendment, issue #8) is a sealed file per identity in `journalDir`
+ *            (`wallet-journal.ts`): every operation's outputs are on disk before its request
+ *            reaches the mint, and what a crash cut off is
  *            settled at the next open (`recoverPending`, NUT-09). While entries are left, the
  *            plane settles them by itself (`SettleLoop`): a send or melt whose answer is unknown
  *            holds its inputs out of the balance, and they come back (or leave) once the mint can
@@ -58,6 +60,7 @@ import type { SessionId } from '../ipc/protocol.js';
 import type { HostMethodTable, RedeemResult } from '../ipc/worker-protocol.js';
 import { hostError } from './errors.js';
 import type { Logger } from './log.js';
+import { hostMintRequest } from './mint-transport.js';
 import { openWalletJournal } from './wallet-journal.js';
 import type { HostRequestHandlers } from './worker/supervisor.js';
 
@@ -73,7 +76,12 @@ export interface MoneyPlaneOptions {
   /** Settings' mints: a NEW wallet event lists them; the wallet also holds ecash there. */
   readonly defaultMints: () => readonly MintUrl[];
   readonly log: Logger;
-  /** Tests: the in-process `TestMint` transport. Default: the global `fetch` (the host has JIT). */
+  /**
+   * Tests: the in-process `TestMint` transport. Default: `hostMintRequest()` (`mint-transport.ts`),
+   * `node:http(s)` sending each request ONCE — never cashu-ts's own fetch transport, which retries
+   * swaps and melts at a NUT-19 mint (issue #8, fix round 2). An injected transport must not retry
+   * either: the wallet reads a coded answer as the mint's answer to its one request.
+   */
   readonly mintRequest?: RequestFn;
   /**
    * Where the sealed wallet journal lives (`<userData>/wallet`, created 0700). Required, so no
@@ -200,10 +208,13 @@ export class MoneyPlane {
         ...(o.now === undefined ? {} : { now: o.now }),
         ...(journal === undefined ? {} : { journal }),
       });
+      // One attempt per request (fix round 2): never cashu-ts's retrying fetch transport — not by
+      // default, and not for a mint an injected (test) transport leaves out.
+      const single = hostMintRequest();
       const wallet = new walletMod.CashuWallet({
-        mints: new walletMod.CashuMintConnections(
-          o.mintRequest === undefined ? {} : { request: o.mintRequest },
-        ),
+        mints: new walletMod.CashuMintConnections({
+          request: (mint) => o.mintRequest?.(mint) ?? single,
+        }),
         store,
         key: nip60.key,
         configuredMints: [...new Set([...nip60.mints, ...o.defaultMints()])],

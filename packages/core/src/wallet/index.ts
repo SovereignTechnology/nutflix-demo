@@ -56,6 +56,13 @@ export {
   type OpenNip60WalletOptions,
 } from './nip60-wallet.js';
 export {
+  httpModuleRawHttp,
+  type HttpModule,
+  type HttpModuleRequest,
+  type HttpModuleResponse,
+  type HttpModules,
+} from './http-module.js';
+export {
   cashuRequestFn,
   type CashuRequestOptions,
   type RawHttp,

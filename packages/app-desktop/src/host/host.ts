@@ -74,7 +74,10 @@ export interface HostOptions {
   /** Tests: the desktop signer's NIP-46 connector and KDF floor. */
   readonly nip46?: Nip46Connector;
   readonly signerCost?: signerMod.KdfCost;
-  /** Tests: the mint transport of the money plane (the in-process `TestMint`). */
+  /**
+   * Tests: the mint transport of the money plane (the in-process `TestMint`). Default: the money
+   * plane's own single-attempt `node:http(s)` transport (`mint-transport.ts`).
+   */
   readonly mintRequest?: MoneyPlaneOptions['mintRequest'];
   readonly timers?: Timers;
   readonly restart?: RestartPolicy;

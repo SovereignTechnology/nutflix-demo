@@ -11,10 +11,18 @@
  *   - held inputs out of the balance while the mint's answer is unknown, and spent exactly once;
  *   - (issue #8 review) held inputs come back by themselves once the wait is over (`SettleLoop`,
  *     the mint's own NUT-07 answer), and a retry of a melt whose change an earlier settle restored
- *     answers "paid" from the mint's quote state, without a second melt request.
+ *     answers "paid" from the mint's quote state, without a second melt request;
+ *   - (issue #8 fix round 2) a swap that executed, its answer lost, then a 429 on the retry — the
+ *     verifier's run on cdk-mintd lost the outputs: with a retrying stand-in transport and with
+ *     cashu-ts's own fetch transport, nothing is lost now; and the Node transport every production
+ *     wallet uses (`httpModuleRawHttp` under `cashuRequestFn`) sends a lost swap ONCE, even to a
+ *     mint that advertises NUT-19.
  */
-import { getPubKeyFromPrivKey } from '@cashu/cashu-ts';
-import { describe, expect, it, vi } from 'vitest';
+import * as nodeHttp from 'node:http';
+import * as nodeHttps from 'node:https';
+
+import { getPubKeyFromPrivKey, RateLimitError, type RequestFn } from '@cashu/cashu-ts';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import type {
   CashuP2pkPubkey,
@@ -27,6 +35,7 @@ import type {
 import { minimumCost } from '../../signer/keyfile.js';
 import { LocalSigner } from '../../signer/local.js';
 import { Nip60ProofStore, type Nip60Relays } from '../nip60.js';
+import { httpModuleRawHttp } from '../http-module.js';
 import { SealedJournal, type JournalFile } from '../nip60-journal.js';
 import { SettleLoop } from '../settle-loop.js';
 import { PENDING_SETTLE_AFTER_S } from '../spend.js';
@@ -280,5 +289,111 @@ describe.skipIf(MINT_URL === undefined)(
         expect(await w.checkSpent({ mint, proofs: await store.proofs(mint) })).not.toContain(true);
       },
     );
+  },
+);
+
+describe.skipIf(MINT_URL === undefined)(
+  `issue #8 fix round 2 on a real mint (${MINT_URL ?? 'NUTFLIX_REAL_MINT_URL unset'}): a 429 after a retry`,
+  () => {
+    const mint = MINT_URL!;
+
+    afterEach(() => {
+      vi.unstubAllGlobals();
+    });
+
+    /** Whether the mint lists POST /v1/swap as a NUT-19 cached endpoint (cdk-mintd does). */
+    async function swapCached(): Promise<boolean> {
+      const info = (await (await fetch(`${mint}/v1/info`)).json()) as {
+        nuts?: Record<string, { cached_endpoints?: { method?: string; path?: string }[] }>;
+      };
+      return (info.nuts?.['19']?.cached_endpoints ?? []).some(
+        (e) => e.method === 'POST' && e.path === '/v1/swap',
+      );
+    }
+
+    async function settled(w: CashuWallet, store: MemoryProofStore): Promise<void> {
+      expect(await store.pending(mint)).toEqual([]);
+      const [sent] = await w.history({ limit: 1, mint });
+      expect(sent).toMatchObject({ direction: 'out' });
+      expect(await w.balance(mint)).toBe(64 - (sent?.amount ?? 0));
+      expect(await w.checkSpent({ mint, proofs: await store.proofs(mint) })).not.toContain(true);
+    }
+
+    it('a retrying transport: the first swap executes and its answer is lost, the retry is answered 429 — the send completes from NUT-09', async () => {
+      const inner = lossy().request; // plain real HTTP (nothing armed)
+      let lose = false;
+      let rateLimited = 0;
+      const request: RequestFn = async <T>(args: Parameters<RequestFn>[0]): Promise<T> => {
+        if (lose && args.method === 'POST' && args.endpoint.endsWith('/v1/swap')) {
+          lose = false;
+          await inner(args); // attempt 1: the mint executes it; the answer is thrown away
+          rateLimited++;
+          throw new RateLimitError('429 Too Many Requests', 1000); // the retry, answered 429
+        }
+        return inner<T>(args);
+      };
+      const store = new MemoryProofStore();
+      const w = walletOver(store, request);
+      await fund(w, mint, 64);
+      lose = true;
+      const set = await w.send(3 as Sats, { p2pk: TO, mint });
+      expect(rateLimited).toBe(1);
+      expect(set.proofs.reduce((a, p) => a + p.amount, 0)).toBe(3);
+      await settled(w, store);
+    });
+
+    it('cashu-ts’s own fetch transport (the verifier’s run): the first POST /v1/swap is forwarded and its answer dropped, any retry answered 429 — nothing is lost', async () => {
+      const cached = await swapCached();
+      const real = globalThis.fetch;
+      const st = { armed: false, swapPosts: 0 };
+      vi.stubGlobal(
+        'fetch',
+        async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+          const url =
+            typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+          const method = (init?.method ?? 'GET').toUpperCase();
+          if (st.armed && method === 'POST' && new URL(url).pathname === '/v1/swap') {
+            st.swapPosts++;
+            if (st.swapPosts > 1)
+              return new Response('', { status: 429, headers: { 'Retry-After': '1' } });
+            const res = await real(input, init);
+            await res.text(); // executed at the mint…
+            throw new TypeError('fetch failed'); // …and the answer never arrives
+          }
+          return real(input, init);
+        },
+      );
+      const store = new MemoryProofStore();
+      const w = walletOver(store); // no request: cashu-ts's default transport
+      await fund(w, mint, 64);
+      st.armed = true;
+      const set = await w.send(3 as Sats, { p2pk: TO, mint });
+      // cdk-mintd advertises NUT-19: cashu-ts retried and met the 429. Nutshell does not: no retry.
+      expect(st.swapPosts).toBe(cached ? 2 : 1);
+      expect(set.proofs.reduce((a, p) => a + p.amount, 0)).toBe(3);
+      await settled(w, store);
+    });
+
+    it('the production Node transport (httpModuleRawHttp + cashuRequestFn) sends a lost swap once, NUT-19 or not, and the send completes', async () => {
+      const raw = httpModuleRawHttp({ http: nodeHttp, https: nodeHttps });
+      const st = { armed: false, swapPosts: 0 };
+      const http: RawHttp = async (req) => {
+        const res = await raw(req);
+        if (st.armed && req.method === 'POST' && req.url.endsWith('/v1/swap')) {
+          st.swapPosts++;
+          if (st.swapPosts === 1) throw new Error('socket hang up'); // executed; answer lost
+        }
+        return res;
+      };
+      const store = new MemoryProofStore();
+      const w = walletOver(store, cashuRequestFn(http));
+      await fund(w, mint, 64);
+      st.armed = true;
+      const set = await w.send(3 as Sats, { p2pk: TO, mint });
+      await new Promise((r) => setTimeout(r, 500)); // a retry would have arrived by now
+      expect(st.swapPosts).toBe(1);
+      expect(set.proofs.reduce((a, p) => a + p.amount, 0)).toBe(3);
+      await settled(w, store);
+    });
   },
 );
