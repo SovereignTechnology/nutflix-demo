@@ -390,7 +390,10 @@ describe('AutoTopUp — executes (issue #2)', () => {
     later(s);
     expect(await again.check(SECOND)).toBe('done');
     expect(s.asked.map((q) => q.target)).toEqual([TARGET, SECOND]);
-  });
+    // Round 5 (verifier, info): four real top-ups, two P2PK sends and a restart. It took
+    // 5.8-6.5 s alone on the round-4 code at load average ~21 on 8 cores (5.7-7.3 s on round 5's)
+    // and timed out at the default 5 s in the whole-suite run: an explicit 30 s, as for the caps.
+  }, 30_000);
 
   it('the settings changed while the question was open: the yes is remembered, nothing moves', async () => {
     const s = await setup({ fund: 20_000 });
