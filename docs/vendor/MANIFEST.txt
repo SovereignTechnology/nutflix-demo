@@ -76,3 +76,7 @@ pear-workers.md	0bf0243cbdf3047d	2026-09-04	https://raw.githubusercontent.com/ho
 protomux.md	8f7dda6314a3432f	2026-09-04	npm:protomux@3.11.0
 sodium-native.md	2b12854ad479dd94	2026-09-04	npm:sodium-native@5.1.0
 NIP-09.md	365b39e602bf7acf	2026-09-23	https://raw.githubusercontent.com/nostr-protocol/nips/master/09.md
+NUT-07.md	98c8b70a49c07cd3	2026-09-26	https://raw.githubusercontent.com/cashubtc/nuts/8bde3c0c3684430d852ab543ac8ca72913770dc0/07.md
+NUT-09.md	61b94b6a520c0b56	2026-09-26	https://raw.githubusercontent.com/cashubtc/nuts/8bde3c0c3684430d852ab543ac8ca72913770dc0/09.md
+NUT-13.md	b2ae002c8ef8bdce	2026-09-26	https://raw.githubusercontent.com/cashubtc/nuts/8bde3c0c3684430d852ab543ac8ca72913770dc0/13.md
+NUT-13-tests.md	51d0ca03a5517e0e	2026-09-26	https://raw.githubusercontent.com/cashubtc/nuts/8bde3c0c3684430d852ab543ac8ca72913770dc0/tests/13-tests.md
