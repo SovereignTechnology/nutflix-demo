@@ -731,9 +731,13 @@ describe('OnePeerRouter', () => {
       // so only the failover ticker can move it (`refresh()` runs no hotswap step).
       s1Budget = 4;
       const second = who === 'the same router' ? first : make();
+      const takenOver = Date.now();
       second.attachCore(w.viewer);
       second.refresh();
       expect(await within(got, STALL * 10)).not.toBeNull();
+      // Fix round 3: the quiet clock restarts at the takeover (no router heard a block land while
+      // it was parked), so the withholding seeder fails over one stallMs after it — not sooner.
+      expect(Date.now() - takenOver).toBeGreaterThanOrEqual(STALL);
       expect(second.stats().failovers).toBe(1);
       expect(failovers).toEqual([s0]);
       expect(w.downloads).toEqual([{ index: 2, from: s1 }]);
@@ -742,6 +746,59 @@ describe('OnePeerRouter', () => {
       // once remembered at the detach (in flight then), once as the cancel — the conservative
       // double count the review's self-review records for a detach followed by a re-attach.
       expect(second.debt(s0)).toBe(who === 'the same router' ? 2 : 1);
+    },
+  );
+
+  // Fix round 3 (independent verifier, 2026-09-25): while a core is parked no router listens to
+  // its `download` events, so the blocks a seeder kept delivering then were never recorded, and
+  // the ticker armed at the takeover judged that seeder silent and failed its blocks over (a
+  // cancel after sending: each one paid twice). Measured by the verifier: failovers 3, debt 3.
+  it.each(['the same router', 'another router'] as const)(
+    'a core parked while its seeder keeps delivering, taken over by %s: that seeder is not failed over',
+    async (who) => {
+      const STALL = 1000;
+      const N = 6;
+      const w = await world(N, 2);
+      const [s0] = w.remotes as [string, string];
+      let s1Budget = 0;
+      const make = (): OnePeerRouter => {
+        const router = new OnePeerRouter({
+          budget: (remote) => (remote === s0 ? N : s1Budget),
+          logger: silentLogger,
+          stallMs: STALL,
+        });
+        cleanups.push(() => {
+          router.close();
+          return Promise.resolve();
+        });
+        return router;
+      };
+      const first = make();
+      const detach = first.attachCore(w.viewer);
+      // Seeder 0 takes all six requests; its answers wait in the gate.
+      w.links[0]!.hold();
+      const got = Promise.all(Array.from({ length: N }, (_, i) => w.viewer.get(i)));
+      await until(() => w.uploads[0] === N, 5000, 'six requests at seeder 0');
+      // Parked with all six in flight; half a stallMs later its answers start to come, one every
+      // 400 ms (a slow link), and no router hears them land.
+      detach();
+      await sleep(STALL / 2);
+      w.links[0]!.releaseSlowly(400);
+      // Taken over just after a block landed: the next one is ~400 ms away, the ticker ticks every
+      // stallMs / 4, and every request is older than stallMs by then. Recorded nowhere, the
+      // parked deliveries made seeder 0 look silent since its requests went out.
+      await until(() => w.downloads.length >= 2, 5000, 'two blocks to land while parked');
+      s1Budget = N;
+      const second = who === 'the same router' ? first : make();
+      second.attachCore(w.viewer);
+      second.refresh();
+      await within(got, 10_000);
+      expect(second.stats().failovers).toBe(0);
+      expect(w.uploads).toEqual([N, 0]);
+      expect(w.downloads.map((d) => d.from)).toEqual(Array.from({ length: N }, () => s0));
+      // No cancel after sending. The same router still carries the six it remembered as lost at
+      // the detach (in flight then): the conservative double count the round-2 case pins too.
+      expect(second.debt(s0)).toBe(who === 'the same router' ? N : 0);
     },
   );
 
