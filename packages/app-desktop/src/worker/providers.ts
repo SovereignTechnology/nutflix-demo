@@ -43,6 +43,8 @@ export interface WorkerProviders {
    * down) — serving stops (a local cut, no ban) until a flush drains it. Real providers only.
    */
   readonly accepting?: () => boolean;
+  /** Release what the providers hold (the DLEQ thread). Real providers only. */
+  readonly close?: () => void;
 }
 
 export interface ProviderContext {

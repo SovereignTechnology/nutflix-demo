@@ -29,8 +29,14 @@ import type {
   WalletChangeEvent,
   WalletHistoryEntry,
 } from '../contracts/index.js';
-import { Spender, WalletError, type MintConnections, type WalletKey } from './spend.js';
-import { proofTotal, type ProofStore } from './store.js';
+import {
+  PENDING_SETTLE_AFTER_S,
+  Spender,
+  WalletError,
+  type MintConnections,
+  type WalletKey,
+} from './spend.js';
+import { heldSecrets, proofTotal, type ProofStore } from './store.js';
 
 // ---------------------------------------------------------------------------------------
 // Mint connections
@@ -40,6 +46,13 @@ import { proofTotal, type ProofStore } from './store.js';
  * One loaded cashu-ts `Wallet` per mint, created on first use. `request` overrides the HTTP
  * transport per mint (the in-process `TestMint`, or a host transport with its own policy).
  * `requireSigDleq`: a mint that advertises NUT-12 must return DLEQ proofs on every signature.
+ *
+ * Without `request` (or where it answers `undefined`), cashu-ts's OWN fetch transport is used,
+ * which RETRIES swaps, melts and mints at a mint advertising NUT-19. `spend.ts` reads a coded
+ * answer as the mint's answer to its one request (`isDefinitive`), so every production wallet
+ * passes a single-attempt transport for every mint: the desktop's `host/mint-transport.ts`, the
+ * daemons' `@sovit/seeder` `runtime/mint-http.ts` (issue #8 fix round 2). Only the opt-in
+ * real-mint tests use the default.
  */
 export class CashuMintConnections implements MintConnections {
   private readonly wallets = new Map<MintUrl, Promise<CashuTsWallet>>();
@@ -141,8 +154,17 @@ export class CashuWallet implements Wallet {
     return [...new Set([...(this.o.configuredMints ?? []), ...held])];
   }
 
+  /**
+   * What can be spent at `mint`: the proofs held, less those an unresolved journaled send or melt
+   * holds (ADR 0014 amendment, issue #8). Those come back when the mint says the operation never
+   * executed, or leave with it when it did — never counted twice, never forgotten.
+   */
   async balance(mint: MintUrl): Promise<Sats> {
-    return proofTotal(await this.o.store.proofs(mint)) as Sats;
+    const proofs = await this.o.store.proofs(mint);
+    const pending = this.o.store.pending === undefined ? [] : await this.o.store.pending(mint);
+    if (pending.length === 0) return proofTotal(proofs) as Sats;
+    const held = heldSecrets(pending);
+    return proofTotal(proofs.filter((p) => !held.has(p.secret))) as Sats;
   }
 
   async balances(): Promise<ReadonlyMap<MintUrl, Sats>> {
@@ -222,17 +244,23 @@ export class CashuWallet implements Wallet {
       readonly memo?: string;
     },
   ): Promise<LockedProofSet> {
-    const set = await this.spender.send(amount, opts);
-    await this.emitBalance(opts.mint);
-    return set;
+    // A failed send may still move the balance (its inputs held while the mint's answer is
+    // unknown, or reconciled away): the change event goes out either way.
+    try {
+      return await this.spender.send(amount, opts);
+    } finally {
+      await this.emitBalanceSafe(opts.mint);
+    }
   }
 
   async receive(
     set: LockedProofSet | { readonly mint: MintUrl; readonly proofs: readonly CashuProof[] },
   ): Promise<Sats> {
-    const got = await this.spender.receive(set);
-    await this.emitBalance(set.mint);
-    return got;
+    try {
+      return await this.spender.receive(set);
+    } finally {
+      await this.emitBalanceSafe(set.mint);
+    }
   }
 
   /** NUT-07 spent flags for a proof set (the seeder's creator-set check, security review F11). */
@@ -255,22 +283,62 @@ export class CashuWallet implements Wallet {
    * ADR 0014: settle the journal at every mint this wallet holds proofs or journaled operations
    * at — recover what a mint signed for an operation whose answer was lost. Run once at startup.
    * A mint that cannot be asked keeps its journal for the next operation there. Returns counts
-   * of operations recovered and still journaled.
+   * of operations recovered and still journaled — `left` counts every entry still in the journal,
+   * a skipped mint's too (one whose wallet does not load, or that no longer offers NUT-09): the
+   * settle loop reads `left < before` as progress (issue #8 fix round 2).
    */
   async recoverPending(): Promise<{ recovered: number; left: number }> {
     let recovered = 0;
     let left = 0;
+    const pendingAt = async (mint: MintUrl): Promise<number> =>
+      (await this.o.store.pending?.(mint))?.length ?? 0;
     for (const mint of await this.o.store.mints()) {
+      let before = 0;
+      let counted = false;
       try {
+        before = await pendingAt(mint);
         const r = await this.spender.recover(mint);
         recovered += r.recovered;
-        left += r.left;
-        if (r.recovered > 0) await this.emitBalance(mint);
+        const after = await pendingAt(mint);
+        left += after;
+        counted = true;
+        // Held inputs come back (or leave) as entries settle: the balance moves either way.
+        if (r.recovered > 0 || after !== before) await this.emitBalance(mint);
       } catch {
-        // unreachable now; every operation at this mint settles it first
+        // unreachable now (every operation at this mint settles it first): still journaled
+        if (!counted) left += before;
       }
     }
     return { recovered, left };
+  }
+
+  /**
+   * When the journal next needs a settle (issue #8 review: held inputs must come back without a
+   * restart). `count`: operations journaled; `next`: the earliest time one that is still young can
+   * be decided (`created + PENDING_SETTLE_AFTER_S`), `null` when none is; `overdue`: how many are
+   * past that already — a melt the mint still reports PENDING, or a mint that could not be asked —
+   * and are retried. `SettleLoop` (`settle-loop.ts`) plans `recoverPending` from this. Reads the
+   * store only; never asks a mint.
+   */
+  async settleSchedule(): Promise<{
+    readonly count: number;
+    readonly overdue: number;
+    readonly next: UnixSeconds | null;
+  }> {
+    const store = this.o.store;
+    if (store.pending === undefined) return { count: 0, overdue: 0, next: null };
+    const now = this.now();
+    let count = 0;
+    let overdue = 0;
+    let next: number | null = null;
+    for (const mint of await store.mints())
+      for (const op of await store.pending(mint)) {
+        count++;
+        const at = op.created + PENDING_SETTLE_AFTER_S;
+        if (at <= now) overdue++;
+        else if (next === null || at < next) next = at;
+      }
+    return { count, overdue, next: next === null ? null : (next as UnixSeconds) };
   }
 
   async meltQuote(mint: MintUrl, bolt11: string): Promise<MeltQuote> {
@@ -289,9 +357,11 @@ export class CashuWallet implements Wallet {
   }
 
   async melt(quote: MeltQuote): Promise<{ paid: boolean; preimage?: string; change: Sats }> {
-    const r = await this.spender.melt(quote);
-    await this.emitBalance(quote.mint);
-    return r;
+    try {
+      return await this.spender.melt(quote);
+    } finally {
+      await this.emitBalanceSafe(quote.mint);
+    }
   }
 
   async keyset(mint: MintUrl, keysetId: string): Promise<MintKeyset> {
@@ -340,6 +410,15 @@ export class CashuWallet implements Wallet {
       } catch {
         // a listener's failure is its own
       }
+    }
+  }
+
+  /** `emitBalance` for a `finally`: a failing read must not replace the operation's own error. */
+  private async emitBalanceSafe(mint: MintUrl): Promise<void> {
+    try {
+      await this.emitBalance(mint);
+    } catch {
+      // the next change event carries the balance
     }
   }
 

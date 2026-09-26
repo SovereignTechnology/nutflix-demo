@@ -40,7 +40,14 @@ import { WorkerSupervisor } from './worker/supervisor.js';
 import { MoneyPlane } from './money.js';
 import type { MoneyPlaneOptions } from './money.js';
 import type { WalletProvider } from './wallet.js';
-import { SwitchingWallet, createWalletProvider } from './wallet.js';
+import {
+  JOURNAL_UNREADABLE,
+  SwitchingWallet,
+  UnavailableWallet,
+  createWalletProvider,
+  unavailableReason,
+} from './wallet.js';
+import { WALLET_DIR } from './wallet-journal.js';
 import type { Nip46Connector } from './signer/desktop-signer.js';
 import { DesktopSigner } from './signer/desktop-signer.js';
 import { MainBridge } from './signer/main-bridge.js';
@@ -70,7 +77,10 @@ export interface HostOptions {
   /** Tests: the desktop signer's NIP-46 connector and KDF floor. */
   readonly nip46?: Nip46Connector;
   readonly signerCost?: signerMod.KdfCost;
-  /** Tests: the mint transport of the money plane (the in-process `TestMint`). */
+  /**
+   * Tests: the mint transport of the money plane (the in-process `TestMint`). Default: the money
+   * plane's own single-attempt `node:http(s)` transport (`mint-transport.ts`).
+   */
   readonly mintRequest?: MoneyPlaneOptions['mintRequest'];
   readonly timers?: Timers;
   readonly restart?: RestartPolicy;
@@ -297,6 +307,8 @@ export async function createHost(o: HostOptions): Promise<Host> {
       relays: () => settings.get().relays,
       defaultMints: () => settings.get().defaultMints,
       log: log.child('money'),
+      // ADR 0014 amendment (issue #8): the wallet journal, sealed, per identity.
+      journalDir: join(o.userData, WALLET_DIR),
       ...(create ? { createWallet: true } : {}),
       ...(o.mintRequest === undefined ? {} : { mintRequest: o.mintRequest }),
       ...(o.now === undefined ? {} : { now: o.now }),
@@ -329,7 +341,7 @@ export async function createHost(o: HostOptions): Promise<Host> {
       swap: async (change) => {
         const run = async (): Promise<void> => {
           await change();
-          switching.set(flow.money()?.wallet);
+          switching.set(flow.money()?.wallet, unavailableReason(flow.moneyError()));
           if ((flow.money()?.mints.length ?? 1) === 0)
             log.warn('the wallet lists no mints: payments stay off until one is added in Settings');
         };
@@ -348,6 +360,7 @@ export async function createHost(o: HostOptions): Promise<Host> {
   // An injected signer (tests; never with --dev-mocks) opens its money plane once, here.
   const injected = flags.devMocks || signerFlow !== undefined ? undefined : identity.signer();
   let fixedMoney: MoneyPlane | undefined;
+  let fixedMoneyError: string | null = null;
   if (injected !== undefined)
     try {
       fixedMoney = await openMoney(injected, false);
@@ -355,6 +368,7 @@ export async function createHost(o: HostOptions): Promise<Host> {
       // The code prefix only (`wallet-unreadable`, `relay-down`, …): never a key or a proof.
       const reason =
         err instanceof Error ? (/^[a-z-]+(?=:)/.exec(err.message)?.[0] ?? err.name) : 'unknown';
+      fixedMoneyError = reason;
       log.error('the wallet could not be opened: payments stay unavailable', { reason });
     }
   if (fixedMoney?.mints.length === 0)
@@ -366,7 +380,9 @@ export async function createHost(o: HostOptions): Promise<Host> {
     signerFlow !== undefined
       ? { kind: 'real', wallet: switching }
       : fixedMoney === undefined
-        ? createWalletProvider(flags.devMocks)
+        ? fixedMoneyError === 'journal-unreadable'
+          ? { kind: 'unavailable', wallet: new UnavailableWallet(JOURNAL_UNREADABLE) }
+          : createWalletProvider(flags.devMocks)
         : { kind: 'real', wallet: fixedMoney.wallet };
   // Issue #2: auto top-ups execute with the user's REAL wallet only, behind the persisted
   // ledger's caps and the first-funding question in main's prompt window.

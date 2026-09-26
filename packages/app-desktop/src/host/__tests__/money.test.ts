@@ -65,6 +65,7 @@ async function rig(
   let t = 1_757_000_000;
   const plane = await MoneyPlane.open({
     signer,
+    journalDir: null, // in memory: these tests are not about the journal
     pool,
     relays: () => [{ url: RELAY, read: true, write: true }],
     defaultMints: () => [MINT],
@@ -120,6 +121,7 @@ describe('MoneyPlane: the NIP-60 wallet', () => {
     });
     const again = await MoneyPlane.open({
       signer: a.signer,
+      journalDir: null, // in memory: these tests are not about the journal
       pool,
       relays: () => [{ url: RELAY, read: true, write: true }],
       defaultMints: () => [MINT],
@@ -135,6 +137,7 @@ describe('MoneyPlane: the NIP-60 wallet', () => {
     await expect(
       MoneyPlane.open({
         signer: other,
+        journalDir: null, // in memory: these tests are not about the journal
         pool,
         relays: () => [{ url: RELAY, read: true, write: true }],
         defaultMints: () => [MINT],

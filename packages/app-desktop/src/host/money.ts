@@ -4,7 +4,16 @@
  *   wallet   `CashuWallet` over `Nip60ProofStore` (the user's NIP-60 wallet on their relays,
  *            NIP-44 to self through the signer), keyed by the NIP-60 wallet key (kind 17375, held
  *            by the signer or in secure memory). The user's kind 10019 is published so creators'
- *            shares can reach them.
+ *            shares can reach them. Its mints are reached through `mint-transport.ts`
+ *            (`node:http(s)`, each request sent once: issue #8 fix round 2). Its journal (ADR 0014
+ *            and its amendment, issue #8) is a sealed file per identity in `journalDir`
+ *            (`wallet-journal.ts`): every operation's outputs are on disk before its request
+ *            reaches the mint, and what a crash cut off is
+ *            settled at the next open (`recoverPending`, NUT-09). While entries are left, the
+ *            plane settles them by itself (`SettleLoop`): a send or melt whose answer is unknown
+ *            holds its inputs out of the balance, and they come back (or leave) once the mint can
+ *            say — with no restart and no other payment needed. A journal that does not open
+ *            refuses the whole wallet — loudly, and the file is kept (it may be money).
  *   viewer   `RealPaymentEngine` (viewer side) building OUR PAYs.
  *   seller   the hooks the worker's seeder engine calls: keysets (rate-limited), redeem, NUT-07
  *            checks, nutzaps.
@@ -51,6 +60,8 @@ import type { SessionId } from '../ipc/protocol.js';
 import type { HostMethodTable, RedeemResult } from '../ipc/worker-protocol.js';
 import { hostError } from './errors.js';
 import type { Logger } from './log.js';
+import { hostMintRequest } from './mint-transport.js';
+import { openWalletJournal } from './wallet-journal.js';
 import type { HostRequestHandlers } from './worker/supervisor.js';
 
 type RequestFn = NonNullable<
@@ -65,8 +76,19 @@ export interface MoneyPlaneOptions {
   /** Settings' mints: a NEW wallet event lists them; the wallet also holds ecash there. */
   readonly defaultMints: () => readonly MintUrl[];
   readonly log: Logger;
-  /** Tests: the in-process `TestMint` transport. Default: the global `fetch` (the host has JIT). */
+  /**
+   * Tests: the in-process `TestMint` transport. Default: `hostMintRequest()` (`mint-transport.ts`),
+   * `node:http(s)` sending each request ONCE — never cashu-ts's own fetch transport, which retries
+   * swaps and melts at a NUT-19 mint (issue #8, fix round 2). An injected transport must not retry
+   * either: the wallet reads a coded answer as the mint's answer to its one request.
+   */
   readonly mintRequest?: RequestFn;
+  /**
+   * Where the sealed wallet journal lives (`<userData>/wallet`, created 0700). Required, so no
+   * caller loses durability by leaving it out: `null` (tests only) keeps the journal in memory,
+   * where a crash loses an operation whose answer was lost.
+   */
+  readonly journalDir: string | null;
   /**
    * Make a NEW wallet key when the relays hold none — only for an explicit "create my wallet".
    * Default false: at startup a miss may just be unreachable relays, and creating then would
@@ -81,6 +103,8 @@ export interface MoneyPlaneOptions {
    * rejected promise is swallowed.
    */
   readonly onPayment?: (mint: MintUrl) => unknown;
+  /** Tests: the journal settle loop's timer (default `setTimeout`, unref'd). */
+  readonly settleTimer?: walletMod.SettleTimer;
 }
 
 interface SessionBudget {
@@ -104,12 +128,24 @@ export class MoneyPlane {
   readonly mints: readonly MintUrl[];
   /** How the wallet key is held (the UI must say which, build-plan §3). */
   readonly mode: 'signer' | 'memory';
+  /**
+   * The startup settle of a journal a crash left entries in (ADR 0014 amendment): its counts, or
+   * `null` when there was nothing to settle (or it failed; the next payment retries).
+   */
+  recovery: Promise<{ readonly recovered: number; readonly left: number } | null> =
+    Promise.resolve(null);
+  /**
+   * Settles the journal whenever an entry can be decided (issue #8 review, finding 1): held
+   * inputs come back after `PENDING_SETTLE_AFTER_S` even when nothing else runs at that mint.
+   */
+  readonly settles: walletMod.SettleLoop;
   private readonly sessions = new Map<SessionId, SessionBudget>();
   private readonly creators = new Map<string, NostrPubkey>();
   private readonly viewer: payment.RealPaymentEngine;
   private readonly keyset: (mint: MintUrl, id: string) => Promise<MintKeyset | undefined>;
   private readonly now: () => UnixSeconds;
   private readonly closeKey: () => void;
+  private readonly closeJournal: () => void;
   private closed = false;
 
   private constructor(
@@ -118,6 +154,7 @@ export class MoneyPlane {
       readonly wallet: walletMod.CashuWallet;
       readonly pubkey: NostrPubkey;
       readonly nip60: walletMod.Nip60Wallet;
+      readonly journal: walletMod.SealedJournal | undefined;
     },
   ) {
     this.wallet = parts.wallet;
@@ -127,6 +164,9 @@ export class MoneyPlane {
     this.mode = parts.nip60.mode;
     this.closeKey = () => {
       parts.nip60.close();
+    };
+    this.closeJournal = () => {
+      parts.journal?.close();
     };
     this.now = o.now ?? ((): UnixSeconds => Math.floor(Date.now() / 1000) as UnixSeconds);
     this.viewer = new payment.RealPaymentEngine({
@@ -142,6 +182,15 @@ export class MoneyPlane {
       now: this.now,
     });
     this.keyset = walletMod.guardedKeyset((m, id) => this.wallet.keyset(m, id));
+    this.settles = new walletMod.SettleLoop({
+      wallet: this.wallet,
+      now: this.now,
+      ...(o.settleTimer === undefined ? {} : { timer: o.settleTimer }),
+      onSettled: (r) => {
+        if (r.recovered > 0)
+          o.log.info('wallet journal settled', { recovered: r.recovered, left: r.left });
+      },
+    });
   }
 
   /** Open the user's NIP-60 wallet with `signer` and publish their kind 10019. */
@@ -155,22 +204,51 @@ export class MoneyPlane {
       ...(o.createWallet === true ? { create: true } : {}),
       ...(o.now === undefined ? {} : { now: o.now }),
     });
+    let journal: walletMod.SealedJournal | undefined;
     try {
+      // Sealed to this identity; a file that does not open refuses the wallet (and is kept).
+      if (o.journalDir !== null)
+        journal = await openWalletJournal({ dir: o.journalDir, signer: o.signer, pubkey });
       const store = await walletMod.Nip60ProofStore.load({
         signer: o.signer,
         relays,
         ...(o.now === undefined ? {} : { now: o.now }),
+        ...(journal === undefined ? {} : { journal }),
       });
+      // One attempt per request (fix round 2): never cashu-ts's retrying fetch transport — not by
+      // default, and not for a mint an injected (test) transport leaves out.
+      const single = hostMintRequest();
       const wallet = new walletMod.CashuWallet({
-        mints: new walletMod.CashuMintConnections(
-          o.mintRequest === undefined ? {} : { request: o.mintRequest },
-        ),
+        mints: new walletMod.CashuMintConnections({
+          request: (mint) => o.mintRequest?.(mint) ?? single,
+        }),
         store,
         key: nip60.key,
         configuredMints: [...new Set([...nip60.mints, ...o.defaultMints()])],
         ...(o.now === undefined ? {} : { now: o.now }),
       });
-      const plane = new MoneyPlane(o, { wallet, pubkey, nip60 });
+      const plane = new MoneyPlane(o, { wallet, pubkey, nip60, journal });
+      // What a crash cut off (a request sent, its answer never seen) is settled now: NUT-09
+      // restores what the mint signed; every operation at a mint settles it first anyway.
+      if ((journal?.initial.ops.length ?? 0) > 0)
+        plane.recovery = wallet.recoverPending().then(
+          (r) => {
+            o.log.info('wallet journal settled after a restart', {
+              recovered: r.recovered,
+              left: r.left,
+            });
+            return r;
+          },
+          () => {
+            o.log.warn('wallet journal not settled yet (it is retried at the next payment)');
+            return null;
+          },
+        );
+      // From then on, entries settle by themselves when the mint can decide them (after the
+      // startup settle, so the two do not ask the mint twice).
+      void plane.recovery.then(() => {
+        plane.settles.start();
+      });
       // Where the user takes nutzaps: creators' shares of their own videos (best effort).
       walletMod
         .publishNutzapInfo({
@@ -188,6 +266,7 @@ export class MoneyPlane {
       return plane;
     } catch (err) {
       nip60.close();
+      journal?.close();
       throw err;
     }
   }
@@ -252,12 +331,18 @@ export class MoneyPlane {
     return this.closed ? undefined : this.wallet;
   }
 
-  /** Wipe a wallet key held in memory; later calls reject. */
+  /**
+   * Wipe a wallet key held in memory and the journal key; later calls reject, and an operation
+   * still in flight can journal nothing more (its entry, already on disk, is settled at the next
+   * open).
+   */
   close(): void {
     if (this.closed) return;
     this.closed = true;
     this.sessions.clear();
+    this.settles.stop();
     this.closeKey();
+    this.closeJournal();
   }
 
   // ---- viewer ----------------------------------------------------------------------------

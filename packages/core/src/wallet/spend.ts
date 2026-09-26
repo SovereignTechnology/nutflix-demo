@@ -18,10 +18,14 @@
  *     reached the mint, the inputs' state is asked (NUT-07): unspent inputs stay in the wallet,
  *     spent ones are dropped and the loss is reported by count and amount.
  *   - **A lost response loses nothing (ADR 0014, security review F31).** Where the store keeps a
- *     journal and the mint supports NUT-09, a send, receive or mint writes its outputs to the
- *     store BEFORE the request goes out; if the answer never arrives, the outputs the mint signed
- *     are restored (NUT-09) and committed as if it had. A retry of the same receive or mint reuses
- *     the journaled outputs, so a mint that did execute answers "already signed", never twice.
+ *     journal and the mint supports NUT-09, a send, receive, mint or melt writes its outputs to
+ *     the store BEFORE the request goes out; if the answer never arrives, the outputs the mint
+ *     signed are restored (NUT-09) and committed as if it had. A retry of the same receive or mint
+ *     reuses the journaled outputs, so a mint that did execute answers "already signed", never
+ *     twice. A melt's journaled outputs are its NUT-08 change blanks (ADR 0014 amendment).
+ *   - **Held inputs are nobody's.** While a journaled send or melt is unresolved, its inputs stay
+ *     out of every new selection (and out of the balance, `wallet.ts`) until the mint says what
+ *     became of them — they are neither spent twice nor forgotten.
  *   - **Nothing secret in an error.** Messages carry a code and amounts, never a proof.
  *
  * No cryptography here: blinding, signatures, DLEQ and P2PK witnesses are cashu-ts calls, and a
@@ -34,6 +38,8 @@ import {
   hasValidDleq,
   OutputData,
   schnorrVerifyMessage,
+  StaleKeysetError,
+  type MeltPreview,
   type MeltQuoteBolt11Response,
   type MintQuoteBolt11Response,
   type OutputConfig,
@@ -57,6 +63,7 @@ import type {
 } from '../contracts/index.js';
 import { checkPayLock, PAY1_TAG } from '../payment/lock.js';
 import {
+  heldSecrets,
   proofTotal,
   type PendingOp,
   type PendingOutput,
@@ -242,11 +249,10 @@ export class Spender {
     return this.exclusive(opts.mint, async () => {
       const w = await this.ctx.mints.wallet(opts.mint);
       const journal = this.journaling(w);
-      // Proofs a pending send may have spent stay out of the selection until it is settled.
-      const busy = new Set<string>();
-      if (journal)
-        for (const op of (await this.settle(opts.mint, w)).left)
-          for (const p of op.spends) busy.add(p.secret);
+      // Proofs a pending send or melt may have spent stay out of the selection until it is settled.
+      const busy = journal
+        ? heldSecrets((await this.settle(opts.mint, w)).left)
+        : new Set<string>();
       const held = (await this.ctx.store.proofs(opts.mint))
         .filter((p) => !busy.has(p.secret))
         .map(toCashu);
@@ -381,7 +387,7 @@ export class Spender {
       // the same outputs.
       const key = inputs.map((p) => p.secret);
       const { left, recovered } = await this.settle(set.mint, w);
-      const done = recovered.get(keyOf(key));
+      const done = recovered.get(opKey('receive', key));
       if (done !== undefined) return done as Sats;
       const prior = left.find((o) => o.kind === 'receive' && keyOf(o.key) === keyOf(key));
       let preview: Awaited<ReturnType<CashuTsWallet['prepareSwapToReceive']>>;
@@ -407,6 +413,11 @@ export class Spender {
   /**
    * NUT-05 melt: pay `quote` from the wallet's proofs at its mint. Change (NUT-08) comes back as
    * fresh proofs. The quote is re-read from the mint, so the amount paid is the mint's own.
+   *
+   * Journaled (ADR 0014 amendment, issue #8) where the store keeps a journal, the mint supports
+   * NUT-09 and there is change to come back: the inputs and the NUT-08 blanks are written before
+   * the request. An answer that never arrives, or a melt the mint reports PENDING, leaves the
+   * inputs held and the blanks journaled; a later settle restores the change the mint signed.
    */
   melt(quote: MeltQuote): Promise<{ paid: boolean; preimage?: string; change: Sats }> {
     return this.exclusive(quote.mint, async () => {
@@ -430,10 +441,33 @@ export class Spender {
           'the mint asks a larger fee reserve than the quote that was shown',
         );
       const need = q.amount.add(q.fee_reserve);
-      const busy = new Set<string>();
-      if (this.journaling(w))
-        for (const op of (await this.settle(quote.mint, w)).left)
-          for (const p of op.spends) busy.add(p.secret);
+      const journal = this.journaling(w);
+      const memo = 'melt to Lightning';
+      let busy = new Set<string>();
+      if (journal) {
+        const { left, recovered } = await this.settle(quote.mint, w);
+        // An earlier melt of this quote whose answer was lost, recovered by this settle (a melt
+        // entry only: another kind's key never answers for a melt).
+        const done = recovered.get(opKey('melt', [quote.quoteId]));
+        if (done !== undefined) return { paid: true, change: done as Sats };
+        if (left.some((o) => o.kind === 'melt' && keyOf(o.key) === keyOf([quote.quoteId])))
+          throw new WalletError(
+            'mint-error',
+            'an earlier melt of this quote is still unresolved at the mint',
+          );
+        busy = heldSecrets(left);
+      }
+      // Already paid (by an earlier melt of ours whose change an earlier settle restored, e.g.
+      // the startup one): the invoice IS paid — say so, never "melt failed", and send nothing.
+      // Its change, if any, is already in the wallet; the history has its line.
+      if (q.state === 'PAID') {
+        const preimage = q.payment_preimage;
+        return {
+          paid: true,
+          ...(typeof preimage === 'string' && preimage.length > 0 ? { preimage } : {}),
+          change: 0 as Sats,
+        };
+      }
       const held = (await this.ctx.store.proofs(quote.mint))
         .filter((p) => !busy.has(p.secret))
         .map(toCashu);
@@ -449,17 +483,63 @@ export class Spender {
       if (selected.length === 0)
         throw new WalletError('insufficient-funds', 'not enough sats at this mint');
       let res: Awaited<ReturnType<CashuTsWallet['meltProofsBolt11']>>;
-      try {
-        res = await w.meltProofsBolt11(q, selected);
-      } catch (e) {
-        await this.reconcile(quote.mint, w, selected);
-        throw new WalletError('mint-error', `melt failed (${errorName(e)})`);
+      let op: PendingOp | undefined;
+      if (!journal) {
+        try {
+          res = await w.meltProofsBolt11(q, selected);
+        } catch (e) {
+          await this.reconcile(quote.mint, w, selected);
+          throw new WalletError('mint-error', `melt failed (${errorName(e)})`);
+        }
+      } else {
+        let preview: MeltPreview<MeltQuoteBolt11Response>;
+        try {
+          preview = await w.prepareMelt('bolt11', q, selected);
+        } catch (e) {
+          throw new WalletError('mint-error', `melt failed (${errorName(e)})`);
+        }
+        // No blanks (no change can come back): nothing to restore, so nothing to journal.
+        if (preview.outputData.length > 0) {
+          op = this.newOp(
+            'melt',
+            quote.mint,
+            [quote.quoteId],
+            preview.outputData,
+            [],
+            preview.inputs.map(fromCashu),
+          );
+          await this.ctx.store.commit({ mint: quote.mint, spent: [], added: [], begin: op });
+        }
+        try {
+          res = await w.completeMelt(preview);
+        } catch (e) {
+          if (op === undefined || (isDefinitive(e) && !isAlreadySigned(e))) {
+            // Refused by the mint (or not journaled): what is still unspent stays.
+            if (op !== undefined) await this.drop(op);
+            await this.reconcile(quote.mint, w, selected);
+            throw new WalletError('mint-error', `melt failed (${errorName(e)})`);
+          }
+          // Maybe executed with the answer lost: the change the mint signed is restored now; if
+          // none is yet, the inputs stay held and a later settle finds out (ADR 0014 amendment).
+          const r = await this.resolveSafe(w, op, true, memo);
+          if (r.state === 'executed')
+            return { paid: true, change: proofTotal(r.keep.map(fromCashu)) as Sats };
+          throw new WalletError(
+            'mint-error',
+            `melt outcome unknown (${errorName(e)}): its inputs are held until the mint answers`,
+          );
+        }
       }
       const change = res.change.map(fromCashu);
       const paid = res.quote.state === 'PAID';
       if (!paid) {
+        // In flight (PENDING): the inputs are the mint's until it settles; the change it will
+        // sign then is journaled, so the entry stays and a later settle resolves it.
+        if (op !== undefined && res.quote.state === 'PENDING')
+          return { paid: false, change: 0 as Sats };
         // Not paid: the mint may or may not have invalidated the inputs (pending, failed).
         // Keep what is still unspent, drop what is gone, pay nothing out of the history.
+        if (op !== undefined) await this.drop(op);
         await this.reconcile(quote.mint, w, selected);
         return { paid: false, change: 0 as Sats };
       }
@@ -468,7 +548,8 @@ export class Spender {
         mint: quote.mint,
         spent: selected.map(fromCashu),
         added: change,
-        history: { direction: 'out', amount: spentTotal as Sats, memo: 'melt to Lightning' },
+        history: { direction: 'out', amount: spentTotal as Sats, memo },
+        ...(op === undefined ? {} : { settle: [op.id] }),
       });
       const preimage = res.quote.payment_preimage;
       return {
@@ -505,7 +586,7 @@ export class Spender {
       if (journal) {
         // A quote whose mint answer was lost is recovered, or minted again with the same outputs.
         const { left, recovered } = await this.settle(quote.mint, w);
-        const done = recovered.get(keyOf([quote.quoteId]));
+        const done = recovered.get(opKey('mint', [quote.quoteId]));
         if (done !== undefined) return done as Sats;
         prior = left.find((o) => o.kind === 'mint' && keyOf(o.key) === keyOf([quote.quoteId]));
       }
@@ -627,7 +708,7 @@ export class Spender {
     return this.exclusive(quote.mint, async () => {
       const w = await this.ctx.mints.wallet(quote.mint);
       if (!this.journaling(w)) return null;
-      const got = (await this.settle(quote.mint, w)).recovered.get(keyOf([quote.quoteId]));
+      const got = (await this.settle(quote.mint, w)).recovered.get(opKey('mint', [quote.quoteId]));
       return got === undefined ? null : (got as Sats);
     });
   }
@@ -712,7 +793,8 @@ export class Spender {
     const ops = this.ctx.store.pending === undefined ? [] : await this.ctx.store.pending(mint);
     for (const op of ops) {
       const r = await this.resolveSafe(w, op, false);
-      if (r.state === 'executed') recovered.set(keyOf(op.key), proofTotal(r.keep.map(fromCashu)));
+      if (r.state === 'executed')
+        recovered.set(opKey(op.kind, op.key), proofTotal(r.keep.map(fromCashu)));
       else if (r.state !== 'absent') left.push(op);
     }
     return { left, recovered };
@@ -753,11 +835,15 @@ export class Spender {
         added: keep,
         settle: [op.id],
         history:
-          op.kind === 'send'
+          op.kind === 'send' || op.kind === 'melt'
             ? {
                 direction: 'out',
                 amount: Math.max(0, proofTotal(op.spends) - kept) as Sats,
-                memo: memo ?? 'P2PK send (answer lost, change recovered)',
+                memo:
+                  memo ??
+                  (op.kind === 'send'
+                    ? 'P2PK send (answer lost, change recovered)'
+                    : 'melt to Lightning (change recovered)'),
               }
             : {
                 direction: 'in',
@@ -767,7 +853,10 @@ export class Spender {
       });
       return { state: 'executed', keep: got.keep, send: got.send };
     }
-    if (fresh || this.now() - op.created < PENDING_SETTLE_AFTER_S) return { state: 'waiting' };
+    if (fresh) return { state: 'waiting' };
+    const young = this.now() - op.created < PENDING_SETTLE_AFTER_S;
+    if (op.kind === 'melt') return this.resolveMelt(w, op, young);
+    if (young) return { state: 'waiting' };
     if (op.spends.length === 0) {
       await this.drop(op);
       return { state: 'absent' };
@@ -796,8 +885,44 @@ export class Spender {
   }
 
   /**
+   * A journaled melt of which the mint signed no change (yet): its inputs say what happened
+   * (NUT-07). PENDING — the payment is in flight: wait, however long. All SPENT after the wait —
+   * it paid and no change was signed (none was due): committed as paid. Otherwise, after the wait,
+   * like a send the mint never saw: the entry goes, what is still unspent stays.
+   */
+  private async resolveMelt(w: CashuTsWallet, op: PendingOp, young: boolean): Promise<Resolution> {
+    const states = await w.checkProofsStates(
+      op.spends.map((p) => ({ secret: p.secret, id: p.id })),
+    );
+    if (states.length !== op.spends.length) return { state: 'unknown' };
+    if (states.some((st) => st.state === 'PENDING') || young) return { state: 'waiting' };
+    const gone = op.spends.filter((_p, i) => states[i]?.state === 'SPENT');
+    const paid = gone.length === op.spends.length && gone.length > 0;
+    await this.ctx.store.commit({
+      mint: op.mint,
+      spent: gone,
+      added: [],
+      settle: [op.id],
+      ...(gone.length === 0
+        ? {}
+        : {
+            history: {
+              direction: 'out' as const,
+              amount: proofTotal(gone) as Sats,
+              memo: paid
+                ? 'melt to Lightning (settled after the answer, no change)'
+                : `lost in a failed mint operation (${String(gone.length)} proofs)`,
+            },
+          }),
+    });
+    return paid ? { state: 'executed', keep: [], send: [] } : { state: 'absent' };
+  }
+
+  /**
    * NUT-09: the proofs the mint signed of `op`'s outputs (cashu-ts unblinds them and checks the
-   * DLEQ where the mint sent one). `null` when the mint cannot be asked.
+   * DLEQ where the mint sent one). `null` when the mint cannot be asked. A melt's outputs are
+   * NUT-08 blanks: the mint assigns their amounts, so a signature's amount is the mint's (its
+   * key for that amount checks the DLEQ and unblinds it), where every other output's must match.
    */
   private async restoreOp(w: CashuTsWallet, op: PendingOp): Promise<Restored | null> {
     const outs = [...op.keep, ...op.send].map(fromPending);
@@ -815,6 +940,7 @@ export class Spender {
       throw new WalletError('bad-mint-response', 'restore answered a malformed list');
     // The live answers' rule (cashu-ts `requireSigDleq`): a NUT-12 mint signs with a DLEQ.
     const dleq = supports(w, 12);
+    const blanks = op.kind === 'melt';
     const byB = new Map<string, SerializedBlindedSignature>();
     res.outputs.forEach((o, i) => {
       const sig = res.signatures[i];
@@ -825,7 +951,8 @@ export class Spender {
       if (sig === undefined) return null;
       if (
         sig.id !== o.blindedMessage.id ||
-        Amount.from(sig.amount).toNumber() !== Amount.from(o.blindedMessage.amount).toNumber() ||
+        (!blanks &&
+          Amount.from(sig.amount).toNumber() !== Amount.from(o.blindedMessage.amount).toNumber()) ||
         (dleq && sig.dleq === undefined)
       )
         throw new WalletError('bad-mint-response', 'a restored signature does not match');
@@ -879,6 +1006,11 @@ function keyOf(key: readonly string[]): string {
   return JSON.stringify([...key].sort());
 }
 
+/** A recovered operation's identity: its kind and its keys (a mint quote never answers a melt). */
+function opKey(kind: PendingOp['kind'], key: readonly string[]): string {
+  return `${kind}:${keyOf(key)}`;
+}
+
 function fromPending(o: PendingOutput): OutputData {
   return OutputData.deserialize({ ...o, blindedMessage: { ...o.blindedMessage } });
 }
@@ -921,8 +1053,30 @@ function supports(w: CashuTsWallet, nut: 9 | 12): boolean {
   }
 }
 
-/** The mint answered with an error code: it refused the request, nothing executed. */
+/**
+ * The mint refused the request; nothing executed: it answered with an error code; or cashu-ts
+ * wrapped that coded answer — a keyset refusal (12xxx) comes back as a `StaleKeysetError` whose
+ * `cause` is the coded error. Only that wrapper: a coded `cause` under any other error is NOT a
+ * refusal (cashu-ts's `MeltChangeError` means the melt completed).
+ *
+ * A coded answer is the mint's answer to OUR request only when the transport sends each request
+ * once. Every production transport does (issue #8, fix round 2): the desktop money plane's and the
+ * daemons' are `cashuRequestFn` over Node http(s), which never retries, and cashu-ts itself sends a
+ * swap, melt or mint once over a custom transport (`withStaleKeysetRepair` does not resend; the
+ * NUT-20 legacy fallback resends only after a coded 20008 refusal). cashu-ts's OWN fetch transport
+ * retries NUT-19 cached endpoints, and a retry's answer says nothing about the first attempt — it
+ * is used by no production wallet.
+ *
+ * A 429 (`RateLimitError`) is NOT a refusal: a rate limiter may answer the retry of a request that
+ * executed, its answer lost (fix round 2: funds lost on cdk-mintd, where a retrying transport met a
+ * 429 after the swap had run). It is resolved like any lost answer — held, then NUT-09 / NUT-07.
+ */
 function isDefinitive(e: unknown): boolean {
+  if (hasCode(e)) return true;
+  return e instanceof StaleKeysetError && hasCode(e.cause);
+}
+
+function hasCode(e: unknown): boolean {
   return typeof e === 'object' && e !== null && typeof (e as { code?: unknown }).code === 'number';
 }
 

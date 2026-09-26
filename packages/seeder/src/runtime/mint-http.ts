@@ -7,8 +7,11 @@
  * Loaded through `createRequire`, like the gateway's `node:http` (security review F16): an ESM
  * import builds the builtin's facade by reading every export, lazy getters included.
  *
- * Bounded: one timer for the whole exchange (connect to last byte), a response size cap, no
- * redirects (a 3xx comes back as a status for `cashuRequestFn` to refuse).
+ * The implementation is `@sovit/core`'s `httpModuleRawHttp` (moved there in issue #8 fix round 2,
+ * so the desktop host's money plane uses the same one): bounded — one timer for the whole exchange
+ * (connect to last byte), a response size cap, no redirects (a 3xx comes back as a status for
+ * `cashuRequestFn` to refuse) — and single-attempt: a request is sent once, never retried (the
+ * wallet's rule for a coded answer depends on it, `spend.ts` `isDefinitive`).
  */
 import { createRequire } from 'node:module';
 import type * as NodeHttp from 'node:http';
@@ -20,80 +23,7 @@ const load = createRequire(import.meta.url);
 const http = load('node:http') as typeof NodeHttp;
 const https = load('node:https') as typeof NodeHttps;
 
-function flatten(h: NodeHttp.IncomingHttpHeaders): Record<string, string | undefined> {
-  const out: Record<string, string | undefined> = {};
-  for (const [k, v] of Object.entries(h))
-    out[k.toLowerCase()] = Array.isArray(v) ? v.join(', ') : v;
-  return out;
-}
-
-export const nodeRawHttp: walletMod.RawHttp = (r) =>
-  new Promise((resolve, reject) => {
-    let url: URL;
-    try {
-      url = new URL(r.url);
-    } catch {
-      reject(new Error('not a URL'));
-      return;
-    }
-    const mod = url.protocol === 'https:' ? https : url.protocol === 'http:' ? http : null;
-    if (mod === null) {
-      reject(new Error('a mint URL must be http(s)'));
-      return;
-    }
-    let settled = false;
-    // Settle FIRST, then tear the socket down without an error argument: once the response has
-    // started, `destroy(err)` does not reach these handlers (the error is unhandled and `end`
-    // still fires, with a truncated body).
-    const fail = (err: Error): void => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      reject(err);
-      req.destroy();
-    };
-    const req = mod.request(
-      url,
-      {
-        method: r.method,
-        headers: {
-          ...r.headers,
-          ...(r.body === undefined ? {} : { 'Content-Length': String(Buffer.byteLength(r.body)) }),
-        },
-        ...(r.signal ? { signal: r.signal } : {}),
-      },
-      (res) => {
-        const chunks: Buffer[] = [];
-        let size = 0;
-        res.on('data', (c: Buffer) => {
-          if (settled) return;
-          size += c.length;
-          if (size > r.maxBytes) {
-            fail(new Error(`the response is larger than ${String(r.maxBytes)} bytes`));
-            return;
-          }
-          chunks.push(c);
-        });
-        res.on('end', () => {
-          if (settled) return;
-          settled = true;
-          clearTimeout(timer);
-          resolve({
-            status: res.statusCode ?? 0,
-            headers: flatten(res.headers),
-            body: Buffer.concat(chunks).toString('utf8'),
-          });
-        });
-        res.on('error', fail);
-      },
-    );
-    const timer = setTimeout(() => {
-      fail(new Error(`timed out after ${String(r.timeoutMs)} ms`));
-    }, r.timeoutMs);
-    req.on('error', fail);
-    if (r.body !== undefined) req.write(r.body);
-    req.end();
-  });
+export const nodeRawHttp: walletMod.RawHttp = walletMod.httpModuleRawHttp({ http, https });
 
 /** The cashu-ts request function every mint of the daemon's wallet uses. */
 export function nodeMintRequest(): ReturnType<typeof walletMod.cashuRequestFn> {

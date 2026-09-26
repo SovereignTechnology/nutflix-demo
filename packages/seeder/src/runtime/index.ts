@@ -63,7 +63,10 @@ export interface SeederRuntimeOptions {
   /** `$CREDENTIALS_DIRECTORY` (systemd). */
   readonly credentialsDirectory: string | undefined;
   readonly logger: Logger;
-  /** Tests: the in-process `TestMint` transport. Default: `node:http(s)` to the mint (`mint-http.ts`). */
+  /**
+   * Tests: the in-process `TestMint` transport (a mint it answers `undefined` for gets the
+   * default). Default: `node:http(s)` to the mint (`mint-http.ts`), one attempt per request.
+   */
   readonly mintRequest?: RequestFn;
   /** Tests: a `FakeRelayPool`. Default: a real relay pool over `ws`. */
   readonly pool?: nostr.PoolLike;
@@ -250,9 +253,11 @@ export async function createNodeRuntime(o: NodeRuntimeOptions): Promise<SeederRu
       selfCipher(identity.signer, identity.pubkey),
     );
     if (store.migrated) log.warn('wallet file was unencrypted — resealed to this node’s key');
+    // One attempt per request (issue #8 fix round 2; `spend.ts` `isDefinitive`): never cashu-ts's
+    // retrying fetch transport, also for a mint an injected (test) transport leaves out.
     const httpRequest = nodeMintRequest();
     const mints = new walletMod.CashuMintConnections({
-      request: o.mintRequest ?? (() => httpRequest),
+      request: (m) => o.mintRequest?.(m) ?? httpRequest,
     });
     const wallet = new walletMod.CashuWallet({
       mints,

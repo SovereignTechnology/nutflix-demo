@@ -100,24 +100,34 @@ afterEach(async () => {
 
 function setup(o: {
   keychain?: boolean;
-  wallet?: 'exists' | 'missing';
+  /** `journal-broken`: the wallet journal does not open (ADR 0014 amendment, issue #8). */
+  wallet?: 'exists' | 'missing' | 'journal-broken';
   nip46?: Nip46Connector;
   main?: FakeMain;
   now?: () => number;
-}): { main: FakeMain; signer: DesktopSigner; opened: Opened[]; swaps: number[] } {
+}): {
+  main: FakeMain;
+  signer: DesktopSigner;
+  opened: Opened[];
+  swaps: number[];
+  log: ReturnType<typeof memoryLogger>;
+} {
   const main = o.main ?? new FakeMain();
   const bridge = new MainBridge({ post: main.post });
   main.bridge = bridge;
   const opened: Opened[] = [];
   const swaps: number[] = [];
   let walletExists = o.wallet !== 'missing';
+  const log = memoryLogger('debug');
   const signer = new DesktopSigner({
     dir: join(userData, 'signer'),
     bridge,
     keychain: o.keychain === true,
-    log: memoryLogger('debug'),
+    log,
     cost: signerMod.minimumCost(),
     openMoney: (s, create) => {
+      if (o.wallet === 'journal-broken')
+        return Promise.reject(new Error('journal-unreadable: the journal does not verify'));
       if (!create && !walletExists)
         return Promise.reject(new Error('no-wallet: no NIP-60 wallet event was found'));
       walletExists = true;
@@ -138,7 +148,7 @@ function setup(o: {
     ...(o.nip46 === undefined ? {} : { nip46: o.nip46 }),
     ...(o.now === undefined ? {} : { now: o.now }),
   });
-  return { main, signer, opened, swaps };
+  return { main, signer, opened, swaps, log };
 }
 
 /** Answers for a first-time local key: `method`, `flow`, then the passphrase (and nsec). */
@@ -177,6 +187,25 @@ const code = async (p: Promise<unknown>): Promise<string> => {
 };
 
 describe('DesktopSigner — local key', () => {
+  // Issue #8 (ADR 0014 amendment): a wallet journal that does not open refuses the wallet —
+  // loudly (an error line, and the reason the host shows instead of "no wallet"), never by
+  // offering to create a new wallet over it.
+  it('a journal that does not open: no money plane, the reason kept, logged as an error, no create prompt', async () => {
+    const { main, signer, log } = setup({ wallet: 'journal-broken' });
+    main.script = localScript('passphrase', 'generate');
+    const st = await signer.connect({ kind: 'local' });
+    expect(st).toMatchObject({ kind: 'local', locked: false });
+    expect(signer.money()).toBeUndefined();
+    expect(signer.moneyError()).toBe('journal-unreadable');
+    expect(main.asked.map((f) => f.kind)).not.toContain('create-wallet');
+    expect(log.lines.some((l) => l.level === 'error' && l.msg.includes('wallet journal'))).toBe(
+      true,
+    );
+    // Locking forgets it (a later unlock tries again).
+    await signer.lock();
+    expect(signer.moneyError()).toBeNull();
+  });
+
   it('generate + passphrase: a 0600 key file in a 0700 dir, unlocked, a new wallet at once', async () => {
     const { main, signer, opened } = setup({});
     main.script = localScript('passphrase', 'generate');

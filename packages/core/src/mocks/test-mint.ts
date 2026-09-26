@@ -79,6 +79,16 @@ export interface TestMintOptions {
   readonly nut09?: boolean;
   /** Simulated Lightning shared with other TestMints: their melts pay this mint's invoices. */
   readonly lightning?: TestLightning;
+  /**
+   * NUT-19 cached responses, advertised in `/v1/info` only (default off; cdk-mintd advertises it,
+   * Nutshell does not by default). This mint caches nothing: the option exists so a test can show
+   * what a client does when a mint advertises it — cashu-ts's own fetch transport then RETRIES a
+   * cached endpoint after a network error (issue #8, fix round 2).
+   */
+  readonly nut19?: {
+    readonly ttl: number;
+    readonly cachedEndpoints: readonly { readonly method: 'GET' | 'POST'; readonly path: string }[];
+  };
 }
 
 /**
@@ -133,6 +143,7 @@ export class TestMint {
   private readonly feeReserve: number;
   private readonly nut20: boolean;
   private readonly nut09: boolean;
+  private readonly nut19: TestMintOptions['nut19'];
   /** B_ → the signature the mint gave it (NUT-09 restore; an output is never signed twice). */
   private readonly promises = new Map<string, SerializedBlindedSignature>();
   /** hex(Y) of every spent proof. */
@@ -157,6 +168,7 @@ export class TestMint {
     this.feeReserve = o.feeReserve ?? 0;
     this.nut20 = o.nut20 ?? true;
     this.nut09 = o.nut09 ?? true;
+    this.nut19 = o.nut19;
     const pair = createNewMintKeys(16, o.seed, { unit: 'sat', input_fee_ppk: this.inputFeePpk });
     this.keysetId = pair.keysetId;
     this.pub = pair.pubKeys;
@@ -312,6 +324,14 @@ export class TestMint {
         '12': { supported: true },
         ...(this.nut09 ? { '9': { supported: true } } : {}),
         ...(this.nut20 ? { '20': { supported: true } } : {}),
+        ...(this.nut19 === undefined
+          ? {}
+          : {
+              '19': {
+                ttl: this.nut19.ttl,
+                cached_endpoints: this.nut19.cachedEndpoints.map((e) => ({ ...e })),
+              },
+            }),
       },
     };
   }

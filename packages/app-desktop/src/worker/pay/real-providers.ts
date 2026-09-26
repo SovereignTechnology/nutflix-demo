@@ -15,7 +15,9 @@
  *            `pending.json` is migrated), and accepted secrets in `seen.jsonl`. The proofs in
  *            both are P2PK-locked to our wallet key or the creator's, so a copy of the files
  *            spends nothing. At `WORKER_MAX_PENDING_PAYS` queued PAYs (a mint down) the
- *            worker stops serving until a flush drains the queue.
+ *            worker stops serving until a flush drains the queue. A PAY's DLEQ checks run
+ *            off this event loop (security review F5, issue #8 d): on a `Bare.Thread`
+ *            (`dleq-thread.ts`), or inline in small chunks where there is none.
  */
 import type {
   CoreKeyHex,
@@ -34,6 +36,7 @@ import type { SessionId } from '../../ipc/protocol.js';
 import type { HostMethod, HostMethodTable, WorkerInit } from '../../ipc/worker-protocol.js';
 import type { StateFs } from '../runtime.js';
 import type { WorkerProviders } from '../providers.js';
+import { dleqVerifier, type DleqVerifier, type SpawnDleqThread } from './dleq-thread.js';
 
 export type HostRequester = <M extends HostMethod>(
   m: M,
@@ -64,6 +67,8 @@ export interface RealProviderOptions {
   readonly logger: Logger;
   /** The serving cap (default `WORKER_MAX_PENDING_PAYS`; 0 never serves — fails closed). */
   readonly maxPendingPays?: number;
+  /** The runtime's DLEQ thread (issue #8 d); without one the checks run inline, chunked. */
+  readonly dleqThread?: SpawnDleqThread;
 }
 
 /** What a failed redeem looks like to the engine: `code: 'spent'` marks a double-spend. */
@@ -140,6 +145,8 @@ function loadPending(state: StateFs, path: string): payment.PendingPay[] {
 
 export interface RealProviders extends WorkerProviders {
   readonly engine: payment.RealPaymentEngine;
+  /** The seller engine's off-loop DLEQ checks (issue #8 d). */
+  readonly dleq: DleqVerifier;
 }
 
 /** Build the real providers. Throws when the pending-PAY file cannot be trusted. */
@@ -183,6 +190,13 @@ export function realProviders(o: RealProviderOptions): RealProviders {
   seen.restore(seenFile.load());
 
   const { payments, request } = o;
+  // F5 on the desktop (issue #8 d): a PAY's DLEQ checks leave this event loop, which serves
+  // every peer's blocks and pay/1; a thread failure means chunked inline checks, never acceptance.
+  const dleq = dleqVerifier({
+    spawn: o.dleqThread,
+    verify: (proof, keyset) => payment.proofDleqOk(proof, keyset),
+    logger: log,
+  });
   const engine = new payment.RealPaymentEngine({
     config: {
       windowBlocks: DEFAULT_WINDOW_BLOCKS,
@@ -193,6 +207,7 @@ export function realProviders(o: RealProviderOptions): RealProviders {
       flushEveryMs: 60_000,
     },
     seen,
+    dleq: dleq.verify,
     keyset: async (mint: MintUrl, id: string): Promise<MintKeyset | undefined> =>
       (await request('seller.keyset', { mint, id })) ?? undefined,
     redeem: async (set) => {
@@ -242,6 +257,7 @@ export function realProviders(o: RealProviderOptions): RealProviders {
 
   return {
     engine,
+    dleq,
     seederEngine: engine,
     accepting: () => engine.pendingCount() < (o.maxPendingPays ?? WORKER_MAX_PENDING_PAYS),
     pay: (range, seeder, policy: PricePolicy, opts) => {
@@ -283,5 +299,9 @@ export function realProviders(o: RealProviderOptions): RealProviders {
     pubkey: payments.pubkey,
     creditBlocks: DEFAULT_WINDOW_BLOCKS,
     loopbackOnly: false,
+    close: () => {
+      // Never blocks: the thread is joined in the background once it says it is leaving.
+      void dleq.close();
+    },
   };
 }

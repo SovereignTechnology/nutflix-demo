@@ -17,15 +17,18 @@ import { hostError } from '../errors.js';
 
 const POSIX = process.platform !== 'win32';
 
-/** Create `dir` (0700) if needed; refuse a symlink or non-directory; tighten a loose mode. */
-export async function ensurePrivateDir(dir: string): Promise<void> {
+/**
+ * Create `dir` (0700) if needed; refuse a symlink or non-directory; tighten a loose mode. `what`
+ * names it in errors (never the path).
+ */
+export async function ensurePrivateDir(dir: string, what = 'the signer directory'): Promise<void> {
   await mkdir(dir, { recursive: true, mode: 0o700 });
   const st = await lstat(dir);
   if (st.isSymbolicLink() || !st.isDirectory())
-    throw hostError('forbidden', 'the signer directory is not a plain directory');
+    throw hostError('forbidden', `${what} is not a plain directory`);
   if (POSIX) {
     if (typeof process.getuid === 'function' && st.uid !== process.getuid())
-      throw hostError('forbidden', 'the signer directory belongs to another user');
+      throw hostError('forbidden', `${what} belongs to another user`);
     if ((st.mode & 0o077) !== 0) await chmod(dir, 0o700);
   }
 }
