@@ -48,7 +48,7 @@ interface RawPeer {
 interface RawCore extends RoutableCore {
   readonly length: number;
   readonly peers: readonly RawPeer[];
-  readonly replicator: { readonly stats: { readonly hotswaps: number } };
+  readonly replicator: { readonly stats: { readonly hotswaps: number }; updateAll?(): void };
   ready(): Promise<void>;
   append(blocks: Uint8Array[]): Promise<unknown>;
   get(index: number, opts?: { timeout?: number }): Promise<Uint8Array | null>;
@@ -436,6 +436,64 @@ describe('OnePeerRouter', () => {
     expect(r.isStalled(stalledRemote!)).toBe(false);
     expect(w.downloads.filter((d) => d.index === 2)).toHaveLength(1);
     expect(w.downloads).toHaveLength(3);
+  });
+
+  // Fix round 4 (test lens, INFO): the end-to-end "never raced" cases never consulted the hotswap
+  // queue — each seeder's credit was always full, so hypercore had no spare peer to race with —
+  // and a queue that offered every in-flight block at once stayed green there. Here a seeder with
+  // SPARE capacity sits beside one withholding the blocks it was asked: hypercore consults the
+  // queue for the spare peer on every pass, and nothing may be asked of it before stallMs.
+  it('a spare seeder beside one holding blocks in flight: the queue is consulted and races nothing (each block sent once, no failover before stallMs)', async () => {
+    const N = 8;
+    const w = await world(N, 2);
+    const r = routed(w.viewer, { budget: unlimited, stallMs: 60_000 });
+    const holder = w.links[0]!;
+    holder.hold();
+    const gets = Array.from({ length: N }, (_, i) => w.viewer.get(i));
+    await until(() => (w.uploads[0] ?? 0) > 0, 5000, 'seeder 0 to take requests');
+    // Seeder 1 has spare capacity the whole time: hypercore runs the hotswap step for it.
+    for (let i = 0; i < 10; i++) {
+      w.viewer.replicator.updateAll?.();
+      await sleep(30);
+    }
+    const held = w.uploads[0] ?? 0;
+    expect(held).toBeGreaterThan(0);
+    holder.release();
+    await Promise.all(gets);
+    await sleep(100);
+    expect(r.stats()).toMatchObject({ failovers: 0, raced: 0 });
+    expect(w.downloads).toHaveLength(N);
+    expect([...perIndex(w.downloads).values()].every((c) => c === 1)).toBe(true);
+    // Nothing was asked twice: what the seeders sent is what the viewer received.
+    expect((w.uploads[0] ?? 0) + (w.uploads[1] ?? 0)).toBe(N);
+  });
+
+  // Fix round 4 (cross-lane review, HIGH): an image read probes a seeder one block at a time
+  // until it has served the core free (`SeederCredit.probing`).
+  it('the probe option: a probed peer is asked ONE block of the core at a time, within its credit; a throwing probe probes; off again, it pipelines', async () => {
+    let probe: () => boolean = () => true;
+    const w = await world(12, 1);
+    const r = routed(w.viewer, { budget: () => 8, probe: () => probe() });
+    const peer = w.viewer.peers[0]!;
+    const remote = w.remotes[0]!;
+    expect(peer.getMaxInflight()).toBe(peer.inflight + 1);
+    let worst = 0;
+    const sample = setInterval(() => {
+      worst = Math.max(worst, (w.uploads[0] ?? 0) - w.downloads.length);
+    }, 1);
+    try {
+      await Promise.all(Array.from({ length: 6 }, (_, i) => w.viewer.get(i)));
+    } finally {
+      clearInterval(sample);
+    }
+    expect(w.downloads).toHaveLength(6);
+    expect(worst).toBeLessThanOrEqual(1);
+    probe = () => {
+      throw new Error('ledger bug');
+    };
+    expect(peer.getMaxInflight()).toBe(peer.inflight + 1);
+    probe = () => false;
+    expect(peer.getMaxInflight()).toBe(peer.inflight + 8 - r.used(remote));
   });
 
   it('after a failover the replacement seeder vanishes too: the block goes to a third one, never stuck', async () => {

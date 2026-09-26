@@ -192,6 +192,11 @@ export class Gateway {
       seederBatch: (noiseHex) => this.seeders.seederBatch(noiseHex),
       ownMints: config.acceptedMints,
       policyFor: deps.upstreamPolicy ?? manifestPolicyResolver(() => this.upstreamPolicies),
+      // Fix round 4: blocks whose PAY can never be built settle as unpaid (the seeder's credit
+      // keeps them), instead of holding pool units for ever.
+      onUnpayable: (noiseHex, range) => {
+        this.settler.settleUnpaid(noiseHex, range);
+      },
     });
     this.bridge = new WsBridge({ seeder, limits: config.ws, logger: this.log });
     this.blossom = new BlossomHandler({
@@ -258,6 +263,10 @@ export class Gateway {
         policy: gatewayPolicy(config),
         flushEveryBlocks: config.flushEveryBlocks,
         flushEveryMs: config.flushEveryMs,
+        // Fix round 4: a core's PRICE precedes its first counted block, as on every seeder this
+        // repository builds — a desktop viewer reading an image learns the core is sold before
+        // our window would cut it. Our HELLO price is exact, so it only repeats it per core.
+        announceCorePrices: true,
       },
       {
         engine: deps.seederEngine,

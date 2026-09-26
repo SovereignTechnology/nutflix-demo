@@ -295,7 +295,9 @@ describe('ViewerPayer', () => {
     expect(r.proto.sent).toHaveLength(1);
   });
 
-  it('F5 batching: PAYs cover half the credit pool, not one block each', async () => {
+  // Fix round 4 (test lens): the title said "half the credit pool"; since issue #8 a PAY batches
+  // half the SEEDER's window (the body and its comment already said so).
+  it("F5 batching: PAYs cover half the seeder's window, not one block each", async () => {
     const r = rig(undefined, 8);
     // Issue #8: the batch is half the SEEDER's window (8 here), no longer half the pool.
     r.proto.hello({ windowBlocks: 8 });
@@ -323,6 +325,49 @@ describe('ViewerPayer', () => {
     r.proto.ack(0, 0);
     await w.promise; // block 0's unit came back and went to the waiter
     expect(r.credit.holds(r.key, 1)).toBe(true);
+  });
+
+  // Fix round 4 (cross-lane review, gateway payer): a core whose play session is gone could
+  // never be paid, and its blocks stayed owed for ever — holding pool units and the seeder's
+  // credit — while the PAY failure also stopped every other core of that seeder.
+  it("a core whose session is gone: its blocks settle as UNPAID, explicitly (the seeder's credit keeps them), and the seeder's other cores are still paid", async () => {
+    const engine = new mocks.MockPaymentEngine();
+    const credit = new CreditPool(8);
+    const gone = fakeCore(1);
+    const live = fakeCore(2);
+    const goneKey = toHex(gone.key);
+    const liveKey = toHex(live.key);
+    const payer = new ViewerPayer({
+      pay: (r, s, p) =>
+        r.core === goneKey
+          ? Promise.reject(new Error('session-closed: no open play session for this core'))
+          : engine.pay(r, s, p),
+      ownMints: [mocks.MINTS.a],
+      credit,
+      logger: silentLogger,
+      policyFor: () => policy,
+    });
+    payer.attachCore(gone);
+    payer.attachCore(live);
+    const proto = new FakeProto();
+    payer.attachPeer(NOISE, proto);
+    proto.hello({ windowBlocks: 8 });
+    credit.tryAcquire(goneKey, 0);
+    gone.emit('download', 0, 65_536, { remotePublicKey: peerKey });
+    await payer.flush();
+    // Settled (the pool unit is back), counted unpaid against that seeder for good.
+    expect(credit.holds(goneKey, 0)).toBe(false);
+    expect(payer.stats().owed).toBe(0);
+    expect(payer.seeders.stats().unpaid).toBe(1);
+    expect(payer.seeders.budget(NOISE, liveKey)).toBe(8 - 1);
+    for (const i of [0, 1, 2, 3]) {
+      credit.tryAcquire(liveKey, i);
+      live.emit('download', i, 65_536, { remotePublicKey: peerKey });
+    }
+    await payer.flush();
+    expect(proto.sent.map((m) => [m.range.core, m.range.fromBlock, m.range.toBlock])).toEqual([
+      [liveKey, 0, 3],
+    ]);
   });
 
   it("F5 batching counts a seeder's blocks across cores (its window does)", async () => {

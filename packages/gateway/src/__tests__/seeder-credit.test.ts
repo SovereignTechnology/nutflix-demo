@@ -318,6 +318,105 @@ describe('SeederCredit — the budget per seeder (issue #8)', () => {
   });
 });
 
+// Fix round 4 (cross-lane review, HIGH): `image.fetch` read any core a thumbnail URL named —
+// outside the router, unpaid — so every honest seeder of a PAID core it named counted those blocks
+// and banned the viewer at window+1. Image cores are now routed too, in "image" mode:
+//   - a pay/1 seeder is asked only what its bare window can hold beside everything else it may
+//     count (owed, lost, in flight: the router adds those), so it is never overrun;
+//   - one block at a time until it has served one WITHOUT a PRICE for the core first (a seeder
+//     that counts a core's blocks announces its price before the first one): then it serves the
+//     core free, and nothing it serves there is ever counted against its credit (browsing never
+//     erodes playback);
+//   - a seeder that sent a PRICE for it is never asked for it again, and what it delivered after
+//     that PRICE is unpaid for good (browsing never spends sats).
+describe('SeederCredit — image cores (fix round 4)', () => {
+  const IMG = 'd3'.repeat(32) as CoreKeyHex;
+  function imageRig() {
+    const r = rig();
+    const img = fakeCore(IMG);
+    const verdicts: [string, string][] = [];
+    const detach = r.credit.attachImageCore(img);
+    r.credit.onImageVerdict((core, verdict) => verdicts.push([core, verdict]));
+    const got = (i: number, from: string): void => {
+      img.emit('download', i, 1024, { remotePublicKey: hexBytes(from) });
+    };
+    return { ...r, img, got, detach, verdicts };
+  }
+
+  it('a pay/1 seeder: its bare window less what it may already count, asked one block at a time until it serves free; no pay/1 link, no HELLO: nothing', () => {
+    const r = imageRig();
+    expect(r.credit.budget(B, IMG)).toBe(NO_PAY_INFLIGHT); // no pay/1 on that connection
+    const a = r.link(A);
+    expect(r.credit.budget(A, IMG)).toBe(0); // no HELLO: its window is unknown
+    a.proto.remoteHello(helloFrom(pubkey('a'), { windowBlocks: 4 }));
+    expect(r.credit.budget(A, IMG)).toBe(4);
+    expect(r.credit.probing(A, IMG)).toBe(true);
+    r.download(0, A); // a paid block owed on CORE: it counts at the seeder too
+    expect(r.credit.budget(A, IMG)).toBe(3);
+    // Its first image block came with no PRICE: it serves this core free.
+    r.got(0, A);
+    expect(r.credit.probing(A, IMG)).toBe(false);
+    expect(r.verdicts).toEqual([[IMG, 'free']]);
+    for (let i = 1; i < 40; i++) r.got(i, A);
+    // Honest free image blocks never come off its credit — neither for images nor for playback.
+    expect(r.credit.stats().unpaid).toBe(0);
+    expect(r.credit.budget(A, CORE)).toBe(4 - 1);
+    expect(r.credit.budget(A, IMG)).toBe(3);
+  });
+
+  it('a seeder that PRICEs the core: never asked for it again, and what it delivered after its PRICE is unpaid for good — its playback credit shrinks, it is never overrun', () => {
+    const r = imageRig();
+    const a = r.link(A);
+    a.proto.remoteHello(helloFrom(pubkey('a'), { windowBlocks: 4 }));
+    a.proto.remotePrice({
+      type: 'PRICE',
+      core: IMG,
+      satsPerBlock: 2 as Sats,
+      effectiveFromBlock: 0,
+    });
+    expect(r.credit.budget(A, IMG)).toBe(0);
+    r.got(0, A); // the probe block that was in flight: it counted it
+    expect(r.credit.stats().unpaid).toBe(1);
+    expect(r.credit.budget(A, CORE)).toBe(4 - 1);
+    expect(r.verdicts).toEqual([[IMG, 'priced']]);
+    // Another seeder of it is still probed (it may serve it free).
+    const b = r.link(B);
+    b.proto.remoteHello(helloFrom(pubkey('b'), { windowBlocks: 4 }));
+    expect(r.credit.budget(B, IMG)).toBe(4);
+    expect(r.credit.probing(B, IMG)).toBe(true);
+    // A reconnect of A: still never asked for it (what it priced is remembered per seeder).
+    a.detach();
+    const a2 = r.link(A);
+    a2.proto.remoteHello(helloFrom(pubkey('a'), { windowBlocks: 4 }));
+    expect(r.credit.budget(A, IMG)).toBe(0);
+  });
+
+  it('a PRICE for a core that is not being read as an image changes nothing (a paid core is the settler’s)', () => {
+    const r = imageRig();
+    const a = r.link(A);
+    a.proto.remoteHello(helloFrom(pubkey('a'), { windowBlocks: 4 }));
+    a.proto.remotePrice({
+      type: 'PRICE',
+      core: CORE,
+      satsPerBlock: 2 as Sats,
+      effectiveFromBlock: 0,
+    });
+    expect(r.credit.budget(A, CORE)).toBe(4);
+    expect(r.credit.budget(A, IMG)).toBe(4);
+    expect(r.credit.probing(A, IMG)).toBe(true);
+    expect(r.verdicts).toEqual([]);
+  });
+
+  it('the last detach stops treating it as an image core', () => {
+    const r = imageRig();
+    const a = r.link(A);
+    a.proto.remoteHello(helloFrom(pubkey('a'), { windowBlocks: 4 }));
+    r.detach();
+    expect(r.credit.probing(A, IMG)).toBe(false);
+    expect(r.credit.budget(A, IMG)).toBe(NO_PAY_INFLIGHT);
+  });
+});
+
 describe('CreditSettler — what settled without a payment (issue #8)', () => {
   it('reports rejected PAYs and blocks owed to a peer that went away; linked / owedBy per peer', () => {
     const r = rig();

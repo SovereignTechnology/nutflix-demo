@@ -13,7 +13,7 @@ import { mocks } from '@sovit/core';
 import type { CoreKeyHex, PayMessage, PricePolicy, Sats } from '@sovit/core';
 import { Seeder, nodeCrypto, nodeFs, toHex } from '@sovit/seeder';
 
-import { UpstreamPayer, manifestPolicyResolver } from '../upstream/payer.js';
+import { MAX_PAY_FAILURES, UpstreamPayer, manifestPolicyResolver } from '../upstream/payer.js';
 import { FakePayProtocol, helloFrom } from './fake-pay-protocol.js';
 import {
   BLOCK,
@@ -517,5 +517,115 @@ describe('UpstreamPayer (integration): gateway pulls from a real upstream seeder
     expect(byCore.get(CORE_A)).toBe(creator);
     expect(byCore.has(CORE_B)).toBe(false);
     expect(payer.stats().skippedNoPolicy).toBeGreaterThanOrEqual(1);
+  });
+});
+
+// Cross-lane review, fix round 4 (HIGH, gateway payer): one core's PAY failure used to abort
+// `payPending` for the whole peer — `state.pending` is walked in insertion order and a stuck core
+// first in it threw before any later core was reached, so a seeder's other cores (the video
+// playing now) were never paid and its window filled for good. The reviewer's probe: an engine
+// rejecting CORE_A, one CORE_A block pending, then 4 CORE_B blocks under a per-seeder batch of 2
+// → 0 PAYs (the control run without the stuck block paid CORE_B [0..3]).
+describe('UpstreamPayer — a PAY that cannot be built (fix round 4)', () => {
+  function failing(
+    fail: (core: CoreKeyHex) => Error | null,
+    opts: { readonly batch?: number } = {},
+  ) {
+    const engine = new mocks.MockPaymentEngine({ mode: 'honest' });
+    const log = capturedLogger();
+    const calls: CoreKeyHex[] = [];
+    const unpayable: { noise: string; core: CoreKeyHex; from: number; to: number }[] = [];
+    const perCore = new Map<CoreKeyHex, PricePolicy>([
+      [CORE_A, basePolicy(MANIFEST_PRICE)],
+      [CORE_B, basePolicy(MANIFEST_PRICE)],
+    ]);
+    const payer = new UpstreamPayer({
+      engine: {
+        pay: (range, seeder, policy, o) => {
+          calls.push(range.core);
+          const err = fail(range.core);
+          return err === null ? engine.pay(range, seeder, policy, o) : Promise.reject(err);
+        },
+        spent: () => engine.spent(),
+      },
+      logger: log.logger,
+      payEveryBlocks: 1,
+      tailMs: 0,
+      seederBatch: () => ({ batch: opts.batch ?? 2, atCap: false }),
+      ownMints: [MINT_A, MINT_B],
+      policyFor: manifestPolicyResolver(() => perCore),
+      onUnpayable: (noise, range) => {
+        unpayable.push({ noise, core: range.core, from: range.fromBlock, to: range.toBlock });
+      },
+    });
+    const protocol = new FakePayProtocol({ autoAck: true });
+    payer.attachPeer(NOISE, protocol);
+    protocol.remoteHello(hello());
+    return { payer, protocol, log, calls, unpayable };
+  }
+  const ranges = (p: FakePayProtocol): [CoreKeyHex, number, number][] =>
+    p.sentPays.map((m) => [m.range.core, m.range.fromBlock, m.range.toBlock]);
+
+  it("the reviewer's probe: a core whose session is gone does not keep the seeder's other cores unpaid, and its blocks are settled as unpaid, explicitly", async () => {
+    const r = failing((core) =>
+      core === CORE_A ? new Error('session-closed: no open play session for this core') : null,
+    );
+    r.payer.onDownload(CORE_A, 0, NOISE);
+    await r.payer.flush();
+    for (let i = 0; i < 4; i++) r.payer.onDownload(CORE_B, i, NOISE);
+    await r.payer.flush();
+    const b = ranges(r.protocol).filter(([c]) => c === CORE_B);
+    expect(b.flatMap(([, f, t]) => Array.from({ length: t - f + 1 }, (_, k) => f + k))).toEqual([
+      0, 1, 2, 3,
+    ]);
+    // CORE_A's block: reported once as never to be paid (the settler keeps it off the seeder's
+    // credit for good), never retried, never paid.
+    expect(r.unpayable).toEqual([{ noise: NOISE, core: CORE_A, from: 0, to: 0 }]);
+    expect(r.calls.filter((c) => c === CORE_A)).toHaveLength(1);
+    expect(r.payer.stats().unpayableBlocks).toBe(1);
+    r.payer.onDownload(CORE_A, 0, NOISE); // a re-download of an abandoned block owes nothing new
+    await r.payer.flush();
+    expect(r.calls.filter((c) => c === CORE_A)).toHaveLength(1);
+  });
+
+  it('a transient failure keeps the blocks owed and is retried at the next flush; the other cores are paid meanwhile', async () => {
+    let down = true;
+    const r = failing((core) =>
+      core === CORE_A && down ? new Error('backend-down: the host is busy') : null,
+    );
+    r.payer.onDownload(CORE_A, 0, NOISE);
+    r.payer.onDownload(CORE_B, 0, NOISE);
+    await r.payer.flush();
+    expect(ranges(r.protocol)).toEqual([[CORE_B, 0, 0]]);
+    expect(r.unpayable).toEqual([]);
+    down = false;
+    await r.payer.flush();
+    expect(ranges(r.protocol)).toEqual([
+      [CORE_B, 0, 0],
+      [CORE_A, 0, 0],
+    ]);
+  });
+
+  it('a core that keeps failing is given up after MAX_PAY_FAILURES attempts (settled as unpaid, not retried for ever)', async () => {
+    const r = failing((core) => (core === CORE_A ? new Error('internal: boom') : null));
+    r.payer.onDownload(CORE_A, 0, NOISE);
+    for (let i = 0; i < MAX_PAY_FAILURES + 2; i++) await r.payer.flush();
+    expect(r.calls.filter((c) => c === CORE_A)).toHaveLength(MAX_PAY_FAILURES);
+    expect(r.unpayable).toEqual([{ noise: NOISE, core: CORE_A, from: 0, to: 0 }]);
+  });
+
+  it('the failure is logged by its outcome code only — no core, no peer, no message text', async () => {
+    const r = failing((core) =>
+      core === CORE_A ? new Error(`forbidden: the PAY covers ${'ab'.repeat(32)}`) : null,
+    );
+    r.payer.onDownload(CORE_A, 0, NOISE);
+    await r.payer.flush();
+    const rec = r.log.records.find((x) => x.msg.includes('could not be built'));
+    expect(rec).toBeDefined();
+    expect(JSON.stringify(rec)).not.toContain('ab'.repeat(32));
+    expect(JSON.stringify(rec)).not.toContain(NOISE);
+    expect(JSON.stringify(rec)).not.toContain(CORE_A);
+    expect(JSON.stringify(rec)).toContain('forbidden');
+    expect(r.unpayable).toEqual([{ noise: NOISE, core: CORE_A, from: 0, to: 0 }]);
   });
 });

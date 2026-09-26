@@ -42,6 +42,9 @@ import type {
 } from '@sovit/core';
 import type Hypercore from 'hypercore';
 import { CreditSettler, SeederCredit, UpstreamPayer } from '@sovit/gateway/upstream';
+import type { ImageVerdict } from '@sovit/gateway/upstream';
+
+export type { ImageVerdict };
 import type { Logger } from '@sovit/seeder';
 
 import type { CreditPool } from '../playback/credit.js';
@@ -68,6 +71,19 @@ export interface ViewerPayerOptions {
   readonly onPaid?: (e: PaidEvent) => void;
   /** A request unanswered this long moves to another seeder (`OnePeerRouter`; tests shorten it). */
   readonly stallMs?: number;
+  /**
+   * Fix round 4: what a seeder said about a core read as an image — `priced` (it sent a PRICE for
+   * it: a sold core, never downloaded for browsing) or `free` (it served a block with no PRICE
+   * first). The first of each per core (`SeederCredit.onImageVerdict`).
+   */
+  readonly onImageVerdict?: (core: CoreKeyHex, verdict: ImageVerdict) => void;
+}
+
+/** How often `drain` looks again while a tail settles. */
+const DRAIN_POLL_MS = 25;
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function proofSum(msg: PayMessage): number {
@@ -116,6 +132,11 @@ export class ViewerPayer {
       logger: o.logger,
       ...(o.stallMs !== undefined ? { stallMs: o.stallMs } : {}),
     });
+    const onVerdict = o.onImageVerdict;
+    if (onVerdict !== undefined)
+      this.seeders.onImageVerdict((core, v) => {
+        onVerdict(core as CoreKeyHex, v);
+      });
     this.upstream = new UpstreamPayer({
       engine,
       logger: o.logger,
@@ -127,6 +148,11 @@ export class ViewerPayer {
       seederBatch: (noiseHex) => this.seeders.seederBatch(noiseHex),
       ownMints: o.ownMints,
       policyFor: (core, hello) => this.resolvePolicy(core, hello),
+      // Fix round 4: a PAY that can never be built (the core's play session is gone) settles
+      // its blocks as unpaid, explicitly — the seeder still counts them, so its credit does too.
+      onUnpayable: (noiseHex, range) => {
+        this.settler.settleUnpaid(noiseHex, range);
+      },
     });
   }
 
@@ -166,9 +192,49 @@ export class ViewerPayer {
     };
   }
 
+  /**
+   * Fix round 4 (ADR 0015 × F33): route a core read for DISPLAY only — an image in a creator's
+   * profile core, never paid. Each pay/1 seeder is asked only what its window can hold beside what
+   * it may already count, one block at a time until it has served the core free, and never again
+   * once it PRICEd it (`SeederCredit.attachImageCore`). Not watched by the payer or the settler:
+   * nothing is ever paid for it. Throws `RoutingUnsupported` like `attachCore`. Returns a detach.
+   */
+  attachImageCore(core: Hypercore): () => void {
+    return this.seeders.attachImageCore(core);
+  }
+
   /** Pay every pending tail now (session close, shutdown, tests). */
   flush(): Promise<void> {
     return this.upstream.flush();
+  }
+
+  /**
+   * Fix round 4: pay `core`'s tail (every core's without one) and wait, at most `ms`, until what
+   * was downloaded of it is SETTLED — every PAY ACKed, nothing of it owed, no request of it still
+   * in flight (a block that lands meanwhile is paid too). Session close and shutdown call it while
+   * the play session still authorises PAYs. Never rejects; `true` when everything settled in time.
+   */
+  async drain(ms: number, core?: CoreKeyHex): Promise<boolean> {
+    const until = Date.now() + Math.max(0, ms);
+    for (;;) {
+      const left = until - Date.now();
+      // A PAY is built by the host: a flush waits on it, so the wait is bounded too.
+      const flushed = await Promise.race([
+        this.upstream.flush().then(
+          () => true,
+          () => true,
+        ),
+        sleep(Math.max(0, left)).then(() => false),
+      ]);
+      if (flushed && this.settled(core)) return true;
+      if (Date.now() >= until) return false;
+      await sleep(Math.min(DRAIN_POLL_MS, Math.max(0, until - Date.now())));
+    }
+  }
+
+  /** Nothing of `core` (of any core without one) owed, and nothing of it in flight. */
+  private settled(core?: CoreKeyHex): boolean {
+    return this.settler.owedOn(core) === 0 && this.seeders.router.inflightOn(core) === 0;
   }
 
   /** Stop routing and paying (shutdown, after `flush()`): timers and hooks go. */

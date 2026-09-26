@@ -23,6 +23,14 @@
  *     into the next PAY (fewer PAYs, fewer DLEQ checks at the seeder — F5).
  *   - A rejected PAY is never re-sent: the seeder set is locked to the seeder, so a seeder that
  *     "rejects" and keeps the proofs must not be paid twice for the same blocks.
+ *   - **A PAY that cannot be built stops only its own core (fix round 4).** `engine.pay` failing
+ *     for one core (the desktop host refusing a core whose play session is gone, a wallet
+ *     error) is logged by its outcome code alone and the peer's other cores are paid as usual.
+ *     A core whose session is gone (`session-closed`) or whose PAY the host refuses for good
+ *     (`forbidden`), or that failed `MAX_PAY_FAILURES` times in a row, gives its blocks up:
+ *     they are never paid, and `onUnpayable` reports them so the downloader settles them as
+ *     unpaid, explicitly (the seeder still counts them against its window). Any other failure
+ *     keeps them owed; they are retried at the next forced pass (the tail timer, `flush()`).
  *
  * Only peers that sent a verified `HELLO` (protocol `open`) are paid; blocks downloaded before
  * it are counted and become payable the moment it arrives. Every `BlockRange` carries `core`
@@ -33,6 +41,7 @@ import type {
   CoreKeyHex,
   HelloMessage,
   MintUrl,
+  PayMessage,
   PaymentEngineViewer,
   PayProtocol,
   PricePolicy,
@@ -55,6 +64,22 @@ export type UpstreamPolicyResolver = (
 
 /** How long a short tail waits for more blocks before it is paid anyway. */
 export const DEFAULT_TAIL_MS = 2000;
+/** Consecutive failures to build a PAY for one core before its blocks are given up. */
+export const MAX_PAY_FAILURES = 3;
+/** Outcome codes after which a core's blocks can never be paid: they are given up at once. */
+const FINAL_OUTCOMES: ReadonlySet<string> = new Set(['session-closed', 'forbidden']);
+
+/**
+ * The outcome code of a failed `engine.pay` (`<code>: …` errors, or a `code` field), for logs
+ * and decisions — never the message, which may name a core or a peer. `error` when unknown.
+ */
+export function payOutcome(err: unknown): string {
+  const code = (err as { code?: unknown } | null)?.code;
+  if (typeof code === 'string' && /^[a-z][a-z-]{0,39}$/.test(code)) return code;
+  const msg = err instanceof Error ? err.message : '';
+  const m = /^([a-z][a-z-]{0,39}):/.exec(msg);
+  return m?.[1] ?? 'error';
+}
 
 export interface UpstreamPayerOptions {
   readonly engine: PaymentEngineViewer;
@@ -83,6 +108,12 @@ export interface UpstreamPayerOptions {
   /** Mints the gateway can pay with; the first one the seeder also accepts is used. */
   readonly ownMints: readonly MintUrl[];
   readonly policyFor: UpstreamPolicyResolver;
+  /**
+   * Blocks of `range` downloaded from `noiseHex` will never be paid (their PAY cannot be built:
+   * see the module comment). The downloader settles them as UNPAID (`CreditSettler.settleUnpaid`)
+   * so the seeder's credit keeps them for good. Called once per range given up.
+   */
+  readonly onUnpayable?: (noiseHex: string, range: BlockRange) => void;
 }
 
 interface PriceOverride {
@@ -111,6 +142,13 @@ interface PeerState {
   readonly carry: Map<CoreKeyHex, number>;
   /** core → the PAY awaiting its ACK (at most one per core). */
   readonly inflight: Map<CoreKeyHex, InFlight>;
+  /**
+   * core → consecutive failures to build its PAY, and the `epoch` of the last one: it is retried
+   * once per `flush()` / tail timer (a new epoch), not on every pass the other cores cause.
+   */
+  readonly failures: Map<CoreKeyHex, { readonly n: number; readonly epoch: number }>;
+  /** Bumped by every `flush()` and tail-timer fire (see `failures`). */
+  epoch: number;
   /** `flush()` is draining: runs unlocked by an ACK are paid however short. */
   draining: boolean;
   /**
@@ -135,6 +173,10 @@ export interface UpstreamPayerStats {
   readonly skippedNoPolicy: number;
   /** PAYs not sent because the seeder asked more than the manifest price. */
   readonly skippedOverpriced: number;
+  /** PAYs that could not be built (`engine.pay` failed). */
+  readonly payFailures: number;
+  /** Blocks given up: their PAY could not be built for good (settled as unpaid). */
+  readonly unpayableBlocks: number;
 }
 
 /** Read through a function so TS's property narrowing does not survive the `await`s. */
@@ -167,6 +209,7 @@ export class UpstreamPayer {
   private readonly policyFor: UpstreamPolicyResolver;
   private readonly credit: UpstreamPayerOptions['credit'];
   private readonly seederBatch: UpstreamPayerOptions['seederBatch'];
+  private readonly onUnpayable: UpstreamPayerOptions['onUnpayable'];
   private readonly tailMs: number;
   private readonly offPressure: () => void;
   private readonly peers = new Map<string, PeerState>();
@@ -177,6 +220,8 @@ export class UpstreamPayer {
     acksRejected: 0,
     skippedNoPolicy: 0,
     skippedOverpriced: 0,
+    payFailures: 0,
+    unpayableBlocks: 0,
   };
 
   constructor(o: UpstreamPayerOptions) {
@@ -187,6 +232,7 @@ export class UpstreamPayer {
     this.policyFor = o.policyFor;
     this.credit = o.credit;
     this.seederBatch = o.seederBatch;
+    this.onUnpayable = o.onUnpayable;
     this.tailMs = o.tailMs ?? DEFAULT_TAIL_MS;
     // Pressure: pay whatever is held so the pool can refill.
     this.offPressure =
@@ -240,6 +286,8 @@ export class UpstreamPayer {
       paid: new Map(),
       carry: new Map(),
       inflight: new Map(),
+      failures: new Map(),
+      epoch: 0,
       draining: false,
       due: false,
       tailTimer: null,
@@ -341,6 +389,7 @@ export class UpstreamPayer {
     const t = setTimeout(() => {
       state.tailTimer = null;
       if (state.closed) return;
+      state.epoch++;
       state.due = true;
       this.schedule(state, true);
     }, ms);
@@ -364,6 +413,7 @@ export class UpstreamPayer {
       if (!s) continue;
       s.draining = true;
       s.due = true;
+      s.epoch++;
       try {
         this.schedule(s, true);
         // ACKs that arrive while we wait schedule more work on the same chain: follow it.
@@ -418,16 +468,29 @@ export class UpstreamPayer {
         });
         continue;
       }
+      // A core whose last PAY could not be built is retried once per `flush()` / tail timer, not
+      // on every pass the other cores' blocks and ACKs cause.
+      const failed = state.failures.get(core);
+      if (failed !== undefined && (!force || failed.epoch === state.epoch)) continue;
       const carryIn = state.carry.get(core) ?? 0;
       const amount = (range.toBlock - range.fromBlock + 1) * policy.satsPerBlock;
       const carryOut = payment.splitPay(amount, policy.split, carryIn).carryOut;
-      const msg = await this.engine.pay(
-        range,
-        { pubkey: hello.pubkey, p2pk: hello.p2pk, mint },
-        policy,
-        { carryIn },
-      );
+      let msg: PayMessage;
+      try {
+        msg = await this.engine.pay(
+          range,
+          { pubkey: hello.pubkey, p2pk: hello.p2pk, mint },
+          policy,
+          { carryIn },
+        );
+      } catch (err) {
+        // Fix round 4: this core only — the peer's other cores are paid as usual.
+        if (isClosed(state)) return;
+        this.payFailed(state, core, set, range, payOutcome(err));
+        continue;
+      }
       if (isClosed(state)) return;
+      state.failures.delete(core);
       state.inflight.set(core, { fromBlock: range.fromBlock, toBlock: range.toBlock, carryOut });
       state.protocol.sendPay(msg);
       this.counters.pays++;
@@ -451,6 +514,58 @@ export class UpstreamPayer {
     let left = 0;
     for (const set of state.pending.values()) left += set.size;
     if (left === 0) state.due = false;
+  }
+
+  /**
+   * `engine.pay` failed for `range` of `core` with outcome `code` (see the module comment): give
+   * the blocks up when they can never be paid, else keep them owed for the next forced pass.
+   */
+  private payFailed(
+    state: PeerState,
+    core: CoreKeyHex,
+    set: Set<number>,
+    range: BlockRange,
+    code: string,
+  ): void {
+    this.counters.payFailures++;
+    const n = (state.failures.get(core)?.n ?? 0) + 1;
+    const final = FINAL_OUTCOMES.has(code) || n >= MAX_PAY_FAILURES;
+    // The outcome code only: the message may name a core, a peer or a range.
+    this.log.warn('a PAY could not be built — that core is skipped', {
+      outcome: code,
+      givenUp: final,
+    });
+    if (!final) {
+      state.failures.set(core, { n, epoch: state.epoch });
+      return;
+    }
+    state.failures.delete(core);
+    // A core whose session is gone: none of its pending blocks can be paid any more.
+    const give: BlockRange[] =
+      code === 'session-closed'
+        ? contiguousRuns([...set].sort((a, b) => a - b)).map(([fromBlock, toBlock]) => ({
+            core,
+            fromBlock,
+            toBlock,
+          }))
+        : [range];
+    let paidSet = state.paid.get(core);
+    if (!paidSet) {
+      paidSet = new Set();
+      state.paid.set(core, paidSet);
+    }
+    for (const r of give) {
+      for (let i = r.fromBlock; i <= r.toBlock; i++) {
+        set.delete(i);
+        paidSet.add(i); // never paid: a re-download owes nothing new
+      }
+      this.counters.unpayableBlocks += r.toBlock - r.fromBlock + 1;
+      try {
+        this.onUnpayable?.(state.noiseHex, r);
+      } catch {
+        // the listener's failure is its own
+      }
+    }
   }
 
   private splitAtPrice(state: PeerState, r: BlockRange): BlockRange[] {
@@ -516,11 +631,13 @@ export {
   type SettleListener,
 } from './settle.js';
 export {
+  MAX_IMAGE_VERDICTS_PER_SEEDER,
   MAX_POOL_CREDIT,
   MAX_REMEMBERED_SEEDERS,
   MAX_SEEDER_CREDIT,
   NO_PAY_INFLIGHT,
   SeederCredit,
+  type ImageVerdict,
   type SeederBatch,
   type SeederCreditOptions,
   type SeederCreditStats,
