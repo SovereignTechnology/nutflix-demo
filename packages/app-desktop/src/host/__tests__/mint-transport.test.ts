@@ -211,6 +211,8 @@ describe('the money plane’s default mint transport sends each request once (fi
       expect(await plane.wallet.inputFeePpk(url)).toBe(0);
       // cashu-ts's fetch transport sends `Accept: application/json, text/plain, */*` and a
       // User-Agent; the host's (`cashuRequestFn`) sends `Accept: application/json` and none.
+      // Core's own default since fix round 3, `cashuRequestFn` over `fetch`, adds Node's
+      // `User-Agent: node`, so this also tells the host transport from that one.
       expect(st.headers.length).toBeGreaterThan(0);
       expect(st.headers.every((h) => h.accept === 'application/json' && h.ua === undefined)).toBe(
         true,

@@ -55,6 +55,7 @@ export {
   type Nip60Wallet,
   type OpenNip60WalletOptions,
 } from './nip60-wallet.js';
+export { fetchRawHttp, type FetchFn } from './fetch-http.js';
 export {
   httpModuleRawHttp,
   type HttpModule,

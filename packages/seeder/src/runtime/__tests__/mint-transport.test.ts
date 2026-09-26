@@ -6,7 +6,10 @@
  *
  * The two are told apart by their headers: cashu-ts's fetch transport sends
  * `Accept: application/json, text/plain, *\/*` and a `User-Agent`; `cashuRequestFn` sends
- * `Accept: application/json` and none.
+ * `Accept: application/json` and none. Since fix round 3 core's own default for such a mint is
+ * `cashuRequestFn` over `fetch` — single-attempt too, but `fetch` is undici, WebAssembly, which
+ * crashes the daemon under `--jitless` — and Node's `fetch` adds `User-Agent: node`, so the check
+ * below still tells `node:http` from it.
  */
 import { mkdir, mkdtemp, rm, writeFile, chmod } from 'node:fs/promises';
 import { createServer } from 'node:http';
