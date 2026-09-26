@@ -76,3 +76,19 @@ price keeps images out of the payment path entirely.
 - Residual: a profile core is publicly readable by anyone who knows its key, which is by
   design. The daemon and gateway serve free cores only if something opens them (they seed only
   local content today).
+
+## Amendment 2026-09-26 — seeders say "free" (Cameron)
+
+The cross-lane review found that a thumbnail URL naming a paid video's core made `image.fetch`
+download it unpaid, so that video's honest seeders banned the viewer; the interim probe (one
+block per seeder, stop on `PRICE`) still left one unpaid block per seeder, which a restart turned
+into a ban. Cameron's answer: **seeders say "free" per core, and viewers fetch image blocks only
+from seeders that said so.**
+
+- pay/1 `PRICE` gains `free` (contracts v6, additive): `free: true` means the seeder serves that
+  core outside payment — it counts nothing for it and never cuts for it (`satsPerBlock` 0).
+- Normative for every seeder: before the first block of a core to a peer, send that core's
+  `PRICE` — priced, or `free` for a core it serves outside payment.
+- A viewer's image read asks a peer for blocks only after that peer's `PRICE { free: true }` for
+  the core; silence or a price means the peer is never asked. No probe, nothing counted.
+  Images held only by older or third-party seeders show the placeholder.

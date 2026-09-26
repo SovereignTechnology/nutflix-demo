@@ -87,13 +87,15 @@ contained **only** interfaces, re-exports and tests (`MockPaymentEngine` lives i
 `packages/core/src/mocks/`, outside the lock). Stage 2 implemented them (2026-09-23); every
 later diff is read by the owner (CODEOWNERS), and `scripts/check-locked-dirs.sh` fails any
 change that makes them log anything or import from outside the audited libraries
-(`@cashu/cashu-ts`, `nostr-tools`, `sodium-universal`, `compact-encoding`, `@sovit/core`).
+(`@cashu/cashu-ts`, `nostr-tools`, `sodium-universal`, `compact-encoding`, `@sovit/core`, and
+`@scure/bip39` for the NUT-13 recovery phrase — ADR 0016 D4, Cameron 2026-09-25).
 
 ```
 packages/core/src/payment/
 packages/core/src/signer/
 packages/core/src/pay-protocol/
 packages/core/src/wallet/spend.ts
+packages/core/src/wallet/seed.ts
 packages/gateway/src/auth/
 ```
 

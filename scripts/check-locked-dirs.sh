@@ -11,7 +11,8 @@
 #      logs at all (callers log outcomes, never inputs).
 #   2. No model writes crypto. Imports from outside the package come only from the libraries
 #      the audit surface is a thin wrapper over (cashu-ts, nostr-tools, sodium-universal,
-#      compact-encoding) or from @sovit/core itself. A new dependency here — or a direct
+#      compact-encoding, and @scure/bip39 for the NUT-13 phrase — ADR 0016 D4) or from
+#      @sovit/core itself. A new dependency here — or a direct
 #      curve/hash library such as @noble/* or node:crypto — is a reviewed change to this list.
 #
 # LOCKED_DIRS_UNLOCKED, which Stage 2 used to skip the old interface-only rule, is ignored.
@@ -25,6 +26,7 @@ LOCKED=(
   packages/core/src/signer
   packages/core/src/pay-protocol
   packages/core/src/wallet/spend.ts
+  packages/core/src/wallet/seed.ts
   packages/gateway/src/auth
 )
 
@@ -34,6 +36,8 @@ ALLOWED_IMPORTS=(
   nostr-tools/
   sodium-universal
   compact-encoding
+  @scure/bip39
+  @scure/bip39/
   @sovit/core
 )
 

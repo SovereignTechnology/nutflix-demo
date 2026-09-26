@@ -134,3 +134,28 @@ v6 ships without it. The router is correct without it, only conservative.
 - **Gateway lookahead.** `Gateway.readUpstreamBlob`'s default lookahead is fixed at
   `upstream.creditBlocks − 1`. It does not follow the pool, which any connected `pay/1` peer's
   HELLO can grow.
+
+## Amendment 2026-09-26 — the seeder's count, and paying an old tail (Cameron)
+
+The cross-lane review showed the "per-process debts" residual is routine, not rare: blocks
+delivered but unpaid when a session closes, the app quits or crashes (or, before the image
+fix, one probe block) stay counted by the seeder for good, and the viewer's next run, starting
+from zero, overruns that seeder and is banned. Cameron's answers:
+
+- **The seeder reports; the viewer pays.** pay/1 gains, additively in contracts v6:
+  - `OWED` (seeder → viewer), sent once both HELLOs verify, one per core where the seeder
+    still counts unpaid blocks for this viewer's HELLO pubkey: the core and its unpaid block
+    ranges (bounded in count and total);
+  - `ACK.outstanding`: after applying a PAY, the blocks of that core the seeder still counts
+    for this viewer.
+  The viewer's per-seeder credit starts from what the seeder reports (it never asks beyond
+  window minus the reported count), and on reconnect it pays the reported old blocks — but only
+  those its own durable record says it received from that seeder (by HELLO pubkey) on that core,
+  at the terms it recorded when it played them, within a budget the host authorised for that
+  session's tail. A seeder that claims more than the viewer's record is respected (no request
+  beyond its window) and never paid for the difference.
+- **Failover delay stays 4 s.**
+
+Implemented on `stage-3/owed-seeder` (seeder side: codec, engine, announcements) and
+`stage-3/owed-viewer` (viewer side: credit, payer, the worker's record, the host's tail
+authorisations).

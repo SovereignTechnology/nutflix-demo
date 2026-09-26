@@ -6,6 +6,7 @@
 /packages/core/src/signer/           @cam
 /packages/core/src/pay-protocol/     @cam
 /packages/core/src/wallet/spend.ts   @cam
+/packages/core/src/wallet/seed.ts    @cam
 /packages/gateway/src/auth/          @cam
 # The threat model is normative for the adversary suite.
 /SECURITY.md                         @cam

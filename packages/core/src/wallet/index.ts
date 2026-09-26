@@ -77,3 +77,21 @@ export {
   signerWalletKey,
   type CashuWalletOptions,
 } from './wallet.js';
+export {
+  RECOVERY_D_PREFIX,
+  RECOVERY_RELAY_KIND,
+  type CounterState,
+  type CounterStore,
+  type RecoveryEntropy,
+  type RecoveryPhraseProblem,
+  type RecoveryPhrases,
+  type RecoveryRelayCopy,
+  type RecoverySeed,
+  type ReissuePlan,
+  type ReissueResult,
+  type RestoreOutcome,
+  type RestoreProgress,
+  type RestoreReport,
+  type SeededWallet,
+  type SeedMaterial,
+} from './recovery-api.js';

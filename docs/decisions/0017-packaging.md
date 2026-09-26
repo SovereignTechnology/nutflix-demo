@@ -544,3 +544,9 @@ lane's allowlist. Enabling it takes one `include:` line, proposed in `docs/lanes
     feature names is specific to each Chromium version and cannot be checked here without
     launching Electron. Refuse named features (which list?), refuse the switches outright, or
     leave them?
+
+## Amendment 2026-09-26 — a sixth fuse (Cameron)
+
+`GrantFileProtocolExtraPrivileges` is turned **off** as well (Cameron, 2026-09-26): the app never
+loads `file://`, so the privileges are defence-in-depth only. The build's fuse read-back checks
+all six.

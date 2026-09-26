@@ -44,7 +44,7 @@ if [[ -f .lane ]]; then
 fi
 
 # ---- rule 3: locked directories ---------------------------------------------------
-if grep -qE '^(packages/core/src/(payment|signer|pay-protocol)/|packages/core/src/wallet/spend\.ts|packages/gateway/src/auth/)' <<<"$staged"; then
+if grep -qE '^(packages/core/src/(payment|signer|pay-protocol)/|packages/core/src/wallet/(spend|seed)\.ts|packages/gateway/src/auth/)' <<<"$staged"; then
   bash scripts/check-locked-dirs.sh
 fi
 
