@@ -1,7 +1,8 @@
 /**
  * Packaging driver (issue #6, ADR 0017). Stages the app (stage.ts), registers the Forge config
  * for the staged directory, and runs Electron Forge. Everything lands under
- * `packages/app-desktop/out/` (gitignored). Needs `npm run build` first.
+ * `packages/app-desktop/out/` (gitignored). Needs `npm run build` first: staging refuses a
+ * build older than its sources (stage.ts `assertCurrentBuild`, cross-lane review round 4).
  *
  *   node packaging/cli.ts stage   [--platform p] [--arch a]
  *   node packaging/cli.ts package [--platform p] [--arch a]

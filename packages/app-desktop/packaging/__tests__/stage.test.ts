@@ -3,6 +3,7 @@
  * unpacked. (The staged worker actually booting under the real Bare, through the staged
  * bare-sidecar and the host's supervisor, is src/host/__tests__/packaged-worker.integration.test.ts.)
  */
+import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import {
   chmodSync,
@@ -29,12 +30,16 @@ import {
   PROMPT_FILES,
   RENDERER_FILES,
 } from '../identity.ts';
+import { runtimeClosure, type Lockfile } from '../closure.ts';
+import { NOT_SHIPPED } from '../identity.ts';
 import {
+  BUNDLE_SOURCES,
   PKG_DIR,
   REPO_ROOT,
   StageError,
   WORKER_BOOT_SOURCE,
   assertReplaceable,
+  builtFromWorkspaces,
   copyPackage,
   normalizeModes,
   npmFilter,
@@ -224,6 +229,42 @@ describe('stageApp', () => {
     expect(m).not.toMatch(/node_modules/);
   });
 
+  it("the host bundle carries none of core's test doubles, stubs in their place, and loads in plain Node (round 4)", () => {
+    const h = readFileSync(join(a.out, 'host', 'main.js'), 'utf8');
+    // Real core is inlined (the money plane)…
+    expect(h).toMatch(/^\/\/ \.\.\/core\/dist\/wallet\/transport\.js$/m);
+    // …its test doubles are not: no module of core's mocks/, no FakeRelayPool, only the stubs.
+    expect(h).not.toMatch(/^\/\/ \.\.\/core\/dist\/(?:mocks\/|nostr\/fake-relay\.js)/m);
+    for (const c of [
+      'TestMint',
+      'TestLightning',
+      'MockWallet',
+      'MockPaymentEngine',
+      'MockNetworkAdapter',
+      'FakeRelayPool',
+    ]) {
+      expect(h, c).not.toMatch(new RegExp(`\\bclass ${c}\\b`));
+      // (esbuild renames the second stub's helper to `__nfRefused2`.)
+      expect(h, c).toMatch(new RegExp(`\\bvar ${c} = __nfRefused\\d*\\("${c}"\\);`));
+    }
+    expect(h).toContain('// nutflix-packaged-test-double:mocks/index.js');
+    expect(h).toContain('// nutflix-packaged-test-double:nostr/fake-relay.js');
+    expect(h).not.toContain(REPO_ROOT);
+    // Its top level runs (no stub is touched at load) and exports the entry main.ts has.
+    const url = JSON.stringify(pathToFileURL(join(a.out, 'host', 'main.js')).href);
+    const r = spawnSync(
+      process.execPath,
+      [
+        '--input-type=module',
+        '-e',
+        `const m = await import(${url}); console.log(Object.keys(m).join());`,
+      ],
+      { encoding: 'utf8', timeout: 60_000 },
+    );
+    expect(r.stderr).toBe('');
+    expect(r.stdout.trim()).toBe('runHost');
+  });
+
   it('node_modules: workspace packages as real dirs without tests/maps/types; one platform’s prebuilds; no pear-runtime', () => {
     const files = walk(join(a.out, 'node_modules'));
     const sovit = files.filter((f) => f.startsWith('@sovit/'));
@@ -287,6 +328,45 @@ describe('stageApp', () => {
     await expect(
       stageApp({ out: join(tmp, 'c'), platform: 'linux', arch: 'x64', pkgDir: pkg }),
     ).rejects.toThrow(/npm run build/);
+  });
+});
+
+describe('the build the stage copies must be current (cross-lane review, round 4)', () => {
+  it('checks every workspace package the app is built from: core, gateway, seeder shipped; ui bundled', () => {
+    const lock = JSON.parse(readFileSync(join(REPO_ROOT, 'package-lock.json'), 'utf8')) as Lockfile;
+    const workspace = 'packages/app-desktop';
+    const packages = runtimeClosure(lock, {
+      workspace,
+      exclude: Object.keys(NOT_SHIPPED),
+      platform: 'linux',
+      arch: 'x64',
+    });
+    expect(builtFromWorkspaces(lock, workspace, packages)).toEqual({
+      shipped: ['packages/core', 'packages/gateway', 'packages/seeder'],
+      bundled: ['packages/ui'],
+    });
+  });
+
+  it('BUNDLE_SOURCES covers every entry point and every file scripts/bundle.ts copies from this package', () => {
+    const script = readFileSync(join(PKG_DIR, 'scripts', 'bundle.ts'), 'utf8');
+    const entries = [...script.matchAll(/entryPoints:\s*\['([^']+)'\]/g)].map((m) => m[1] ?? '');
+    const copies = [...script.matchAll(/copyFile\(\s*join\(pkg,\s*((?:'[^']+',?\s*)+)\)/g)].map(
+      (m) => [...(m[1] ?? '').matchAll(/'([^']+)'/g)].map((x) => x[1]).join('/'),
+    );
+    expect(entries.sort()).toEqual([
+      'src/preload/preload.ts',
+      'src/preload/prompt-preload.ts',
+      'src/renderer/main.tsx',
+      'src/renderer/prompt/prompt.ts',
+    ]);
+    expect(copies.length).toBe(4); // index.html, shell.css, prompt.html, prompt.css
+    for (const f of [...entries, ...copies])
+      expect(
+        BUNDLE_SOURCES.some((d) => f.startsWith(`${d}/`)),
+        f,
+      ).toBe(true);
+    // The fifth copy is @sovit/ui's stylesheet: a bundled workspace, checked as one.
+    expect(script).toMatch(/require\.resolve\('@sovit\/ui\/ui\.css'\)/);
   });
 });
 

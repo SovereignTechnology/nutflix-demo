@@ -20,11 +20,13 @@
  *                             target platform only, workspace packages as real directories
  *
  * `worker/` and `node_modules/` are unpacked from the asar (identity.ts `UNPACKED_DIRS`).
- * Needs `npm run build` first (tsc, ui css, scripts/bundle.ts). Never writes outside `out`.
+ * Needs `npm run build` first (tsc, ui css, scripts/bundle.ts), and refuses to stage when that
+ * build is older than its sources (`assertCurrentBuild`). Never writes outside `out`.
  *
  *   node packaging/stage.ts [--out <dir>] [--platform <p>] [--arch <a>]
  */
 import { build, type Metafile, type Plugin } from 'esbuild';
+import ts from 'typescript';
 import {
   chmodSync,
   copyFileSync,
@@ -33,6 +35,7 @@ import {
   mkdirSync,
   readFileSync,
   readdirSync,
+  realpathSync,
   rmSync,
   statSync,
   writeFileSync,
@@ -40,7 +43,13 @@ import {
 import { dirname, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
-import { keepPrebuild, runtimeClosure, type ClosureEntry, type Lockfile } from './closure.ts';
+import {
+  keepPrebuild,
+  resolveFrom,
+  runtimeClosure,
+  type ClosureEntry,
+  type Lockfile,
+} from './closure.ts';
 import {
   APP,
   NOT_SHIPPED,
@@ -132,6 +141,86 @@ const d6FirstImport: Plugin = {
     }));
   },
 };
+
+/**
+ * Cross-lane review (round 4, INFO): core's test doubles stay out of the PACKAGED host bundle,
+ * the process that holds the wallet. core's barrel re-exports them (`export * as mocks`,
+ * `nostr.FakeRelayPool`), so the bundler cannot drop them; the host reaches them only behind
+ * `--dev-mocks` / `--dev-fixtures`, which a packaged main refuses (exit 78). Each module here
+ * (a path in core's dist/) is bundled as a stub with the same export names, every one a value
+ * that throws when touched. The dev host (tsc output, run from dist/) keeps the real ones, and
+ * so does the worker's copy of core in node_modules/.
+ */
+export const HOST_TEST_DOUBLES = ['mocks/index.js', 'nostr/fake-relay.js'] as const;
+const TEST_DOUBLE_NS = 'nutflix-packaged-test-double';
+
+/** The stub module for a test double that exports `names`. */
+export function testDoubleStub(names: readonly string[]): string {
+  const bad = names.filter(
+    (n) => !/^[A-Za-z_$][\w$]*$/.test(n) || n === 'default' || n === '__nfRefused',
+  );
+  if (bad.length > 0) fail(`cannot stub a test double exporting ${bad.join(', ')}`);
+  return [
+    "// packaging/stage.ts: core's test doubles are not in a packaged build (reached only behind",
+    '// --dev-mocks / --dev-fixtures, which a packaged build refuses). Touching one throws.',
+    'const __nfRefused = (name) => {',
+    '  const fail = () => {',
+    "    throw new Error(`${name}: core's test doubles are not in a packaged build`);",
+    '  };',
+    '  const traps = { get: fail, set: fail, has: fail, deleteProperty: fail, ownKeys: fail,',
+    '    defineProperty: fail, getOwnPropertyDescriptor: fail, apply: fail, construct: fail };',
+    '  return new Proxy(function () {}, traps);',
+    '};',
+    ...[...names].sort().map((n) => `export const ${n} = __nfRefused(${JSON.stringify(n)});`),
+    '',
+  ].join('\n');
+}
+
+/** Every name a module exports (its `export *` followed), as esbuild sees it. */
+async function exportNames(file: string): Promise<string[]> {
+  const r = await build({
+    entryPoints: [file],
+    bundle: true,
+    write: false,
+    metafile: true,
+    format: 'esm',
+    platform: 'neutral',
+    packages: 'external',
+    outfile: 'exports.js',
+    logLevel: 'silent',
+  });
+  return [...(Object.values(r.metafile.outputs)[0]?.exports ?? [])];
+}
+
+/**
+ * Bundles each of `coreDist`'s HOST_TEST_DOUBLES as its stub (see there). The stub's module
+ * path is the relative name (`mocks/index.js`), never the build machine's absolute path: it
+ * appears in the bundle as a path comment, and the staged tree must not depend on where the
+ * repo is checked out.
+ */
+function stubTestDoubles(coreDist: string): Plugin {
+  const targets = new Map<string, string>();
+  for (const m of HOST_TEST_DOUBLES) {
+    const p = join(coreDist, m);
+    if (existsSync(p)) targets.set(realpathSync(p), m);
+  }
+  return {
+    name: 'packaged-host-no-test-doubles',
+    setup(b) {
+      b.onResolve({ filter: /^\.{1,2}\// }, (args) => {
+        const abs = resolve(args.resolveDir, args.path);
+        const m = targets.get(abs);
+        return m === undefined
+          ? undefined
+          : { path: m, namespace: TEST_DOUBLE_NS, pluginData: { file: abs } };
+      });
+      b.onLoad({ filter: /.*/, namespace: TEST_DOUBLE_NS }, async (args) => ({
+        contents: testDoubleStub(await exportNames((args.pluginData as { file: string }).file)),
+        loader: 'js',
+      }));
+    },
+  };
+}
 
 /** Whether an installed package carries native code (then the host bundle leaves it external). */
 function isNative(dir: string): boolean {
@@ -248,6 +337,198 @@ export function assertReplaceable(out: string): void {
     fail(`${out} is not empty and is not a previous stage: refusing to delete it`);
 }
 
+// ---- the build the stage copies must be current (cross-lane review, round 4) -------------
+//
+// The stage compiles main, the host and the worker glue from src/, but it SHIPS two things it
+// never compiles: every workspace package's dist/ (tsc output: copied into node_modules/ for the
+// worker, and inlined into the host bundle through the package exports) and scripts/bundle.ts's
+// output (renderer, prompt, preloads). With core's melt timeout changed in src/ and no rebuild,
+// staging succeeded and both copies carried the old value (the reviewer's mutation). So staging
+// refuses a build older than its sources; it never runs the build, so it writes only `out`.
+
+/** TypeScript's "A non-dry build would build project '{0}'" (diagnostic 6357). */
+export const TSC_WOULD_BUILD = 6357;
+
+/**
+ * What scripts/bundle.ts reads from this package: the trees of its four entry points
+ * (src/renderer/main.tsx, src/renderer/prompt/prompt.ts, src/preload/{preload,prompt-preload}.ts,
+ * with the src/ipc they import) and the pages and stylesheets it copies. Pinned against the
+ * script by a test.
+ */
+export const BUNDLE_SOURCES = ['src/renderer', 'src/preload', 'src/ipc', 'static'] as const;
+
+/**
+ * The workspace packages the staged app is built from, repo-relative: `shipped` are the
+ * closure's (their dist/ is copied into node_modules/ and inlined into the host bundle),
+ * `bundled` the NOT_SHIPPED roots that are workspace links (inlined into renderer/app.js by
+ * scripts/bundle.ts, with the stylesheet it copies: @sovit/ui).
+ */
+export function builtFromWorkspaces(
+  lock: Lockfile,
+  workspace: string,
+  packages: readonly ClosureEntry[],
+): { readonly shipped: string[]; readonly bundled: string[] } {
+  const shipped = new Set(packages.filter((p) => p.workspace).map((p) => p.source));
+  const bundled = new Set<string>();
+  for (const name of Object.keys(NOT_SHIPPED)) {
+    const at = resolveFrom(lock, workspace, name);
+    const e = at === undefined ? undefined : lock.packages[at];
+    if (e?.link === true && e.resolved !== undefined) bundled.add(e.resolved);
+  }
+  return { shipped: [...shipped].sort(), bundled: [...bundled].sort() };
+}
+
+/**
+ * `tsc -b --dry` over `configs` through TypeScript's own API (nothing is written): the status
+ * lines of the projects a real build would REBUILD — its dist/ is not the output of its current
+ * sources, or its last build had errors. A project whose sources were only touched ("would
+ * update timestamps") is current. A config that cannot be read fails.
+ */
+export function staleTscProjects(configs: readonly string[]): string[] {
+  if (configs.length === 0) return [];
+  const stale: string[] = [];
+  const errors: string[] = [];
+  const text = (d: ts.Diagnostic): string => ts.flattenDiagnosticMessageText(d.messageText, ' ');
+  const host = ts.createSolutionBuilderHost(
+    ts.sys,
+    undefined,
+    (d) => {
+      errors.push(text(d));
+    },
+    (d) => {
+      if (d.code === TSC_WOULD_BUILD) stale.push(text(d));
+    },
+  );
+  const status = ts.createSolutionBuilder(host, [...configs], { dry: true }).build();
+  if (errors.length > 0 || status !== ts.ExitStatus.Success)
+    fail(
+      `cannot tell whether the workspace builds are current: ${errors.join('; ') || `tsc -b --dry exited ${String(status)}`}`,
+    );
+  return stale;
+}
+
+/** Every file a package.json points at: `main`, and each string target under `exports`. */
+export function entryTargets(pj: {
+  readonly main?: unknown;
+  readonly exports?: unknown;
+}): string[] {
+  const out = new Set<string>();
+  const walk = (v: unknown): void => {
+    if (typeof v === 'string') out.add(v);
+    else if (v !== null && typeof v === 'object') for (const x of Object.values(v)) walk(x);
+  };
+  if (typeof pj.main === 'string') out.add(pj.main);
+  walk(pj.exports);
+  return [...out].sort();
+}
+
+/** Not an input of any build output: tests, snapshots, stories. */
+function isBuildInput(rel: string): boolean {
+  const parts = rel.split('/');
+  if (parts.includes('__tests__') || parts.includes('node_modules')) return false;
+  return !/\.(?:test|spec|stories)\.[cm]?[jt]sx?$/.test(parts.at(-1) ?? '');
+}
+
+interface Newest {
+  readonly path: string;
+  readonly mtimeMs: number;
+}
+
+/**
+ * The most recently modified build input under `dir` (optionally only `*<ext>`), or undefined
+ * when there is none or `dir` is absent. Symlinks are not followed.
+ */
+export function newestInput(dir: string, ext?: string): Newest | undefined {
+  let best: Newest | undefined;
+  const walk = (rel: string): void => {
+    const p = rel === '' ? dir : join(dir, rel);
+    const st = lstatSync(p);
+    if (st.isDirectory()) {
+      for (const name of readdirSync(p).sort()) {
+        const child = rel === '' ? name : `${rel}/${name}`;
+        if (isBuildInput(child)) walk(child);
+      }
+    } else if (st.isFile() && (ext === undefined || rel.endsWith(ext))) {
+      if (best === undefined || st.mtimeMs > best.mtimeMs) best = { path: p, mtimeMs: st.mtimeMs };
+    }
+  };
+  if (existsSync(dir)) walk('');
+  return best;
+}
+
+export interface CurrentBuildOptions {
+  readonly pkg: string;
+  readonly root: string;
+  /** Repo-relative workspace directories (`builtFromWorkspaces`). */
+  readonly shipped: readonly string[];
+  readonly bundled: readonly string[];
+}
+
+/**
+ * Refuses (StageError) unless the build the stage copies is at least as new as its sources:
+ *
+ *   1. every workspace package the app is built from: `tsc -b --dry` would rebuild none of them,
+ *      and each shipped one has the files its package.json points at;
+ *   2. their CSS built beside tsc (@sovit/ui's build:css, dist/*.css): each file at least as new
+ *      as the package's newest src CSS;
+ *   3. scripts/bundle.ts's output that the stage copies: each file at least as new as the newest
+ *      file under BUNDLE_SOURCES and the bundled packages' src/ (tests and stories excluded).
+ *
+ * (2) and (3) compare mtimes: `npm run build` rewrites every one of those files each run, so a
+ * refusal clears after it. The remedy is `npm run build` (for outputs deleted by hand,
+ * `npx tsc -b --force` first).
+ */
+export function assertCurrentBuild(o: CurrentBuildOptions): void {
+  const rel = (p: string): string => relative(o.root, p).split(sep).join('/');
+  const remedy = 'run `npm run build` (tsc, ui css, bundle) first';
+  const workspaces = [...new Set([...o.shipped, ...o.bundled])].sort();
+  const configs = workspaces.map((w) => {
+    const c = join(o.root, w, 'tsconfig.json');
+    if (!existsSync(c)) fail(`${w} has no tsconfig.json: cannot tell whether its dist/ is current`);
+    return c;
+  });
+  const stale = staleTscProjects(configs);
+  if (stale.length > 0)
+    fail(`a workspace build is older than its sources (${stale.join('; ')}): ${remedy}`);
+  // tsc's dry run trusts its .tsbuildinfo and does not notice outputs deleted by hand (it
+  // reports "up to date", and so would `tsc -b`); a shipped package must have its entry points.
+  for (const w of o.shipped) {
+    const pj = JSON.parse(readFileSync(join(o.root, w, 'package.json'), 'utf8')) as {
+      main?: unknown;
+      exports?: unknown;
+    };
+    for (const t of entryTargets(pj))
+      if (!existsSync(join(o.root, w, t)))
+        fail(
+          `${w}/${t.replace(/^\.\//, '')} is missing: run \`npx tsc -b --force\`, then \`npm run build\``,
+        );
+  }
+  for (const w of workspaces) {
+    const css = newestInput(join(o.root, w, 'src'), '.css');
+    const dist = join(o.root, w, 'dist');
+    if (css === undefined || !existsSync(dist)) continue;
+    for (const f of readdirSync(dist).sort())
+      if (f.endsWith('.css') && statSync(join(dist, f)).mtimeMs < css.mtimeMs)
+        fail(`${w}/dist/${f} is older than ${rel(css.path)}: ${remedy}`);
+  }
+  let newest: Newest | undefined;
+  for (const dir of [
+    ...BUNDLE_SOURCES.map((d) => join(o.pkg, d)),
+    ...o.bundled.map((w) => join(o.root, w, 'src')),
+  ]) {
+    const n = newestInput(dir);
+    if (n !== undefined && (newest === undefined || n.mtimeMs > newest.mtimeMs)) newest = n;
+  }
+  if (newest === undefined) return;
+  for (const f of [
+    ...RENDERER_FILES.map((n) => `renderer/${n}`),
+    ...PROMPT_FILES.map((n) => `prompt/${n}`),
+    ...PRELOAD_FILES,
+  ])
+    if (statSync(join(o.pkg, 'dist', f)).mtimeMs < newest.mtimeMs)
+      fail(`dist/${f} is older than ${rel(newest.path)}: ${remedy}`);
+}
+
 export async function stageApp(o: StageOptions): Promise<StageReport> {
   const pkg = o.pkgDir ?? PKG_DIR;
   const root = o.repoRoot ?? REPO_ROOT;
@@ -260,6 +541,19 @@ export async function stageApp(o: StageOptions): Promise<StageReport> {
   ])
     if (!existsSync(join(dist, f)))
       fail(`dist/${f} is missing: run \`npm run build\` (tsc, ui css, bundle) first`);
+
+  // The closure decides what ships (and, below, what the host may leave external).
+  const lock = JSON.parse(readFileSync(join(root, 'package-lock.json'), 'utf8')) as Lockfile;
+  const workspace = relative(root, pkg).split(sep).join('/');
+  const packages = runtimeClosure(lock, {
+    workspace,
+    exclude: Object.keys(NOT_SHIPPED),
+    platform: o.platform,
+    arch: o.arch,
+  });
+  // Before `out` is touched: a refused stage leaves the previous one in place.
+  assertCurrentBuild({ pkg, root, ...builtFromWorkspaces(lock, workspace, packages) });
+
   assertReplaceable(out);
   rmSync(out, { recursive: true, force: true });
   mkdirSync(out, { recursive: true });
@@ -313,13 +607,6 @@ export async function stageApp(o: StageOptions): Promise<StageReport> {
     fail(`main bundle may only contain src/main and src/ipc:\n  ${mainBad.join('\n  ')}`);
 
   // ---- node_modules (the closure decides what the host may leave external) ---------------
-  const lock = JSON.parse(readFileSync(join(root, 'package-lock.json'), 'utf8')) as Lockfile;
-  const packages = runtimeClosure(lock, {
-    workspace: relative(root, pkg).split(sep).join('/'),
-    exclude: Object.keys(NOT_SHIPPED),
-    platform: o.platform,
-    arch: o.arch,
-  });
   const stats: CopyStats = { files: 0, bytes: 0 };
   const natives = new Set<string>();
   for (const p of packages) {
@@ -339,6 +626,8 @@ export async function stageApp(o: StageOptions): Promise<StageReport> {
   }
 
   // ---- host ----------------------------------------------------------------------------
+  const core = packages.find((p) => p.workspace && p.name === '@sovit/core');
+  const coreDist = core === undefined ? undefined : join(root, core.source, 'dist');
   const hostBuild = await build({
     absWorkingDir: pkg,
     entryPoints: ['src/host/main.ts'],
@@ -360,6 +649,7 @@ export async function stageApp(o: StageOptions): Promise<StageReport> {
     legalComments: 'eof',
     metafile: true,
     logLevel: 'warning',
+    plugins: coreDist === undefined ? [] : [stubTestDoubles(coreDist)],
   });
   const hostInputs = inputsOf(hostBuild.metafile, pkg);
   const hostBad = hostInputs.filter(
@@ -373,6 +663,16 @@ export async function stageApp(o: StageOptions): Promise<StageReport> {
     fail(
       `host bundle may not contain worker/main/renderer code or native packages:\n  ${hostBad.join('\n  ')}`,
     );
+  // Fail closed if a test double got in anyway (another import path, a renamed module).
+  if (coreDist !== undefined) {
+    const doubles = hostInputs.filter(
+      (p) =>
+        p.startsWith(join(coreDist, 'mocks') + sep) ||
+        HOST_TEST_DOUBLES.some((m) => p === join(coreDist, m)),
+    );
+    if (doubles.length > 0)
+      fail(`host bundle may not contain core's test doubles:\n  ${doubles.join('\n  ')}`);
+  }
 
   // ---- renderer, prompt, preloads (scripts/bundle.ts output) -----------------------------
   mkdirSync(join(out, 'renderer'), { recursive: true });
