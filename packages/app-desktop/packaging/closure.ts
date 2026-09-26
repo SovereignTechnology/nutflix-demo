@@ -151,6 +151,16 @@ export function runtimeClosure(lock: Lockfile, o: ClosureOptions): ClosureEntry[
       throw new ClosureError(
         `${job.via} needs ${job.name}, but the lockfile marks ${found} dev-only`,
       );
+    // The staged app IS this workspace, so a copy npm nested under it
+    // (`packages/app-desktop/node_modules/x`) would have to become the app's top-level
+    // `node_modules/x` — where the root-hoisted `x` other packages resolve may already sit, at
+    // another version. Mapping it through the workspace's link instead would put it where
+    // nothing resolves it, and the hoisted version would load silently. Refuse (independent
+    // review of the packaging lane); today's lockfile has no such entry.
+    if (source.startsWith(`${o.workspace}/${NM}`))
+      throw new ClosureError(
+        `${found} is nested under ${o.workspace}, the app being staged: its dependencies must be hoisted to the root node_modules (npm dedupe), or staging would ship the wrong version`,
+      );
     if (out.has(source)) continue;
     out.set(source, {
       source,

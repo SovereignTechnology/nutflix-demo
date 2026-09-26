@@ -129,3 +129,22 @@ export function sandboxBypassSwitch(commandLine: {
 }): string | undefined {
   return SANDBOX_BYPASS_SWITCHES.find((s) => commandLine.hasSwitch(s));
 }
+
+/**
+ * Chromium's DevTools-protocol switches (independent review of the packaging lane, issue #6).
+ * The fuses close Node's `--inspect` and `NODE_OPTIONS` (ADR 0017 §4), but not these: with
+ * either, a wrapper script or an edited `.desktop` line exposes CDP, which drives the renderer
+ * holding the preload API and the prompt window. A PACKAGED build refuses them in main (exit
+ * 78) before Chromium reads them (main runs before the DevTools server starts). A dev build
+ * keeps them: the e2e harness (Playwright) attaches through `--remote-debugging-port`.
+ */
+export const REMOTE_DEBUGGING_SWITCHES = [
+  'remote-debugging-port',
+  'remote-debugging-pipe',
+] as const;
+
+export function remoteDebuggingSwitch(commandLine: {
+  hasSwitch(name: string): boolean;
+}): string | undefined {
+  return REMOTE_DEBUGGING_SWITCHES.find((s) => commandLine.hasSwitch(s));
+}

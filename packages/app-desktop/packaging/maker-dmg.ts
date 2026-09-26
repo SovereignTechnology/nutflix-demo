@@ -9,7 +9,7 @@
  * Runs on macOS only; configured and unit-tested here, never built on Linux.
  */
 import { execFile } from 'node:child_process';
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync } from 'node:fs';
+import { mkdtempSync, rmSync, symlinkSync } from 'node:fs';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
 
@@ -20,6 +20,8 @@ const run = promisify(execFile);
 
 export interface MakerDmgConfig {
   readonly productName: string;
+  /** Tests only: runs each command instead of `execFile` (the config in forge-config.ts never sets it). */
+  readonly exec?: (cmd: string, args: readonly string[]) => Promise<unknown>;
 }
 
 export interface Command {
@@ -70,9 +72,13 @@ export class MakerDmg extends MakerBase<MakerDmgConfig> {
     const v = (packageJSON as { version?: unknown }).version;
     const version = typeof v === 'string' ? v : '0.0.0';
     const outDir = join(makeDir, 'dmg', targetArch);
-    mkdirSync(outDir, { recursive: true });
+    // Emptied first, as Forge's own makers do (squirrel, deb): an older .dmg left here would
+    // otherwise sit beside this one in out/make (independent review of the packaging lane).
+    await this.ensureDirectory(outDir);
     const out = join(outDir, `${name}-${version}-${targetArch}.dmg`);
     const srcFolder = mkdtempSync(join(outDir, '.dmg-src-'));
+    const exec =
+      this.config.exec ?? ((cmd: string, args: readonly string[]) => run(cmd, [...args]));
     try {
       symlinkSync('/Applications', join(srcFolder, 'Applications'));
       for (const c of dmgCommands({
@@ -81,7 +87,7 @@ export class MakerDmg extends MakerBase<MakerDmgConfig> {
         volumeName: name,
         out,
       }))
-        await run(c.cmd, [...c.args]);
+        await exec(c.cmd, c.args);
     } finally {
       rmSync(srcFolder, { recursive: true, force: true });
     }

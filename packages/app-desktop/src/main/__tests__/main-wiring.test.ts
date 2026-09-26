@@ -42,9 +42,19 @@ const fx = vi.hoisted(() => {
     opened: [] as string[],
     /** `app.isPackaged` (F21: a packaged build refuses the dev flags). */
     packaged: false,
+    /** Issue #6: what main ran through `execFileSync` (Squirrel's Update.exe only). */
+    execs: [] as { file: string; args: string[]; opts: Record<string, unknown> }[],
   };
   return state;
 });
+
+// Issue #6 (Squirrel.Windows): main runs `..\Update.exe` through execFileSync; record it here.
+vi.mock('node:child_process', () => ({
+  execFileSync: (file: string, args: string[], opts: Record<string, unknown>) => {
+    fx.execs.push({ file, args, opts });
+    return Buffer.alloc(0);
+  },
+}));
 
 vi.mock('electron', () => {
   const on =
@@ -227,6 +237,7 @@ beforeEach(() => {
   fx.keychainBackend = 'gnome_libsecret';
   fx.opened.length = 0;
   fx.packaged = false;
+  fx.execs.length = 0;
   fx.appListeners.clear();
   fx.protocols.clear();
   fx.ipc.clear();
@@ -284,6 +295,108 @@ describe('main.ts wiring (fake electron)', () => {
     await boot(['--user-data-dir=/tmp/nf-packaged']);
     expect(fx.exitCode).toBeUndefined();
     expect(fx.forks[0]?.args).not.toContain('--dev-mocks');
+  });
+
+  it.each(['remote-debugging-port', 'remote-debugging-pipe'])(
+    'a packaged build refuses --%s (exit 78, nothing registered); a dev build keeps it (issue #6)',
+    async (sw) => {
+      fx.packaged = true;
+      fx.switches.add(sw);
+      process.argv = [argv[0] ?? 'node', 'dist/main/main.js'];
+      await expect(import('../main.js')).rejects.toThrow(/remote debugging/);
+      expect(fx.exitCode).toBe(78);
+      expect(fx.order).toEqual([]);
+      expect(fx.protocols.size).toBe(0);
+      expect(fx.forks).toHaveLength(0);
+      // The dev build (the e2e harness attaches through it) starts.
+      vi.resetModules();
+      fx.packaged = false;
+      fx.exitCode = undefined;
+      await boot();
+      expect(fx.exitCode).toBeUndefined();
+      expect(fx.forks).toHaveLength(1);
+    },
+  );
+
+  describe('Squirrel.Windows lifecycle (issue #6, ADR 0017 §5)', () => {
+    const real = {
+      platform: Object.getOwnPropertyDescriptor(process, 'platform'),
+      execPath: Object.getOwnPropertyDescriptor(process, 'execPath'),
+    };
+    const EXE = 'C:\\Users\\u\\AppData\\Local\\nutflix\\app-0.1.0\\nutflix.exe';
+    const asWindows = (): void => {
+      Object.defineProperty(process, 'platform', { value: 'win32', configurable: true });
+      Object.defineProperty(process, 'execPath', { value: EXE, configurable: true });
+    };
+    afterEach(() => {
+      if (real.platform) Object.defineProperty(process, 'platform', real.platform);
+      if (real.execPath) Object.defineProperty(process, 'execPath', real.execPath);
+    });
+
+    it.each([
+      ['--squirrel-install', '--createShortcut=nutflix.exe'],
+      ['--squirrel-updated', '--createShortcut=nutflix.exe'],
+      ['--squirrel-uninstall', '--removeShortcut=nutflix.exe'],
+    ])(
+      'packaged win32 %s: runs ..\\Update.exe %s (no shell), exits 0 before anything else',
+      async (flag, shortcut) => {
+        fx.packaged = true;
+        asWindows();
+        // Even beside a sandbox-bypass switch: the hook never gets as far as Chromium content.
+        fx.switches.add('no-sandbox');
+        // A packaged app's argv has no app path: Squirrel's flag is argv[1].
+        process.argv = [EXE, flag, '0.1.0'];
+        await expect(import('../main.js')).rejects.toThrow(/Squirrel/);
+        expect(fx.exitCode).toBe(0);
+        expect(fx.execs).toHaveLength(1);
+        expect(fx.execs[0]?.file).toBe('C:\\Users\\u\\AppData\\Local\\nutflix\\Update.exe');
+        expect(fx.execs[0]?.args).toEqual([shortcut]);
+        expect(fx.execs[0]?.opts).toMatchObject({ windowsHide: true, timeout: 10_000 });
+        expect(fx.execs[0]?.opts).not.toHaveProperty('shell');
+        // Nothing else ran: no sandbox setup, no schemes, no protocols, no window, no host.
+        expect(fx.order).toEqual([]);
+        expect(fx.protocols.size).toBe(0);
+        expect(fx.windows).toHaveLength(0);
+        expect(fx.forks).toHaveLength(0);
+      },
+    );
+
+    it('packaged win32 --squirrel-obsolete exits without running anything', async () => {
+      fx.packaged = true;
+      asWindows();
+      process.argv = [EXE, '--squirrel-obsolete', '0.1.0'];
+      await expect(import('../main.js')).rejects.toThrow(/Squirrel/);
+      expect(fx.exitCode).toBe(0);
+      expect(fx.execs).toEqual([]);
+      expect(fx.forks).toHaveLength(0);
+    });
+
+    it('--squirrel-firstrun starts the app normally', async () => {
+      fx.packaged = true;
+      asWindows();
+      process.argv = [EXE, '--squirrel-firstrun'];
+      await import('../main.js');
+      fx.ready?.();
+      await new Promise<void>((r) => {
+        setTimeout(r, 0);
+      });
+      expect(fx.exitCode).toBeUndefined();
+      expect(fx.execs).toEqual([]);
+      expect(fx.forks).toHaveLength(1);
+    });
+
+    it('elsewhere (Linux, or a dev build) --squirrel-install is an ignored flag', async () => {
+      fx.packaged = true;
+      process.argv = ['/opt/Nutflix/nutflix', '--squirrel-install', '0.1.0'];
+      await import('../main.js');
+      fx.ready?.();
+      await new Promise<void>((r) => {
+        setTimeout(r, 0);
+      });
+      expect(fx.exitCode).toBeUndefined();
+      expect(fx.execs).toEqual([]);
+      expect(fx.forks).toHaveLength(1);
+    });
   });
 
   it.each(['no-sandbox', 'disable-gpu-sandbox', 'no-zygote'])(

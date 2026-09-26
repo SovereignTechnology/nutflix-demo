@@ -27,6 +27,7 @@ import { dirname, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
+import { appArchive } from '../../ipc/asar-path.js';
 import type { WorkerProcess } from '../worker/supervisor.js';
 import { WorkerRuntimeError, loadSidecar } from '../worker/sidecar.js';
 
@@ -74,6 +75,12 @@ afterEach(() => {
 
 /** The host bundle's URL inside the (simulated) archive. */
 const hostUrl = (): string => pathToFileURL(join(resources, 'app.asar', 'host', 'main.js')).href;
+/**
+ * The app's own archive (`appArchive(process.resourcesPath)` in the host). Independent review
+ * of the packaging lane: loadSidecar now takes it instead of guessing from the first `*.asar`
+ * path segment, so every packaged case passes it.
+ */
+const archive = (): string => join(resources, 'app.asar');
 
 describe('loadSidecar — packaged (inside app.asar)', () => {
   it.runIf(posix)('refuses a Bare binary that is not executable, and never chmods it', () => {
@@ -81,6 +88,7 @@ describe('loadSidecar — packaged (inside app.asar)', () => {
     expect(() =>
       loadSidecar({
         moduleUrl: hostUrl(),
+        appArchive: archive(),
         checkExecutable: (p) => {
           checked.push(p);
           const r = spawnSync('test', ['-x', p]);
@@ -100,6 +108,7 @@ describe('loadSidecar — packaged (inside app.asar)', () => {
       chmodSync(fakeBinary, 0o755);
       const Sidecar = loadSidecar({
         moduleUrl: hostUrl(),
+        appArchive: archive(),
         checkExecutable: (p) => {
           const r = spawnSync('test', ['-x', p]);
           if (r.status !== 0) throw new Error('EACCES');
@@ -120,24 +129,37 @@ describe('loadSidecar — packaged (inside app.asar)', () => {
 
 describe('loadSidecar — packaged, default check (what the host uses)', () => {
   it.runIf(posix)('refuses the non-executable runtime with fs.accessSync(X_OK), no chmod', () => {
-    expect(() => loadSidecar({ moduleUrl: hostUrl() })).toThrow(WorkerRuntimeError);
+    expect(() => loadSidecar({ moduleUrl: hostUrl(), appArchive: archive() })).toThrow(
+      WorkerRuntimeError,
+    );
     expect(statSync(fakeBinary).mode & 0o777).toBe(0o644);
     chmodSync(fakeBinary, 0o755);
-    expect(typeof loadSidecar({ moduleUrl: hostUrl() })).toBe('function');
+    expect(typeof loadSidecar({ moduleUrl: hostUrl(), appArchive: archive() })).toBe('function');
   });
 });
 
 describe('loadSidecar — dev build (not in an archive)', () => {
   it('loads the workspace bare-sidecar and leaves the executable check to it (upstream behaviour)', () => {
     let called = 0;
+    const check = (): void => {
+      called++;
+      throw new Error('must not be asked in a dev build');
+    };
     const Sidecar = loadSidecar({
       moduleUrl: import.meta.url,
-      checkExecutable: () => {
-        called++;
-        throw new Error('must not be asked in a dev build');
-      },
+      appArchive: undefined,
+      checkExecutable: check,
     });
     expect(Sidecar).toBe(req('bare-sidecar'));
+    // Under the dev Electron the host has a resources path of its own, but this module is not
+    // inside that archive: still a dev build.
+    expect(
+      loadSidecar({
+        moduleUrl: import.meta.url,
+        appArchive: appArchive(join(root, 'electron', 'dist', 'resources')),
+        checkExecutable: check,
+      }),
+    ).toBe(req('bare-sidecar'));
     expect(called).toBe(0);
   });
 });

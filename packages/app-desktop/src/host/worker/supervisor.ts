@@ -51,6 +51,15 @@ export interface WorkerProcess {
 
 export type SpawnWorker = (entry: string, args: readonly string[]) => WorkerProcess;
 
+/**
+ * The packaged Bare runtime cannot be used as installed (never repaired at runtime; thrown by
+ * `loadSidecar`, issue #6). Its message is a constant sentence of ours with no path in it, so
+ * the supervisor logs it when a spawn fails — the one error text it lets through.
+ */
+export class WorkerRuntimeError extends Error {
+  override readonly name = 'WorkerRuntimeError' as const;
+}
+
 export type WorkerState = 'idle' | 'starting' | 'ready' | 'down' | 'failed' | 'stopped';
 
 type HostHandler<M extends HostMethod> = (
@@ -265,8 +274,15 @@ export class WorkerSupervisor {
     let proc: WorkerProcess;
     try {
       proc = this.o.spawn(this.o.entry, this.o.args ?? []);
-    } catch {
-      this.log.error('could not spawn the media worker');
+    } catch (err) {
+      // Allow-list: only a WorkerRuntimeError's reason is logged (a constant sentence of ours,
+      // e.g. "reinstall the app"); any other error's text could carry a path and is dropped.
+      if (err instanceof WorkerRuntimeError)
+        this.log.error('could not spawn the media worker', {
+          error: err.name,
+          reason: err.message,
+        });
+      else this.log.error('could not spawn the media worker');
       this.onDeath(gen, 'spawn failed');
       return;
     }

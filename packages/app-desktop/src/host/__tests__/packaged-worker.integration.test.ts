@@ -15,7 +15,7 @@
  */
 import { spawnSync } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
-import { accessSync, constants, existsSync, statSync } from 'node:fs';
+import { accessSync, constants, existsSync, realpathSync, statSync } from 'node:fs';
 import { mkdtemp, rm } from 'node:fs/promises';
 import http from 'node:http';
 import { tmpdir } from 'node:os';
@@ -25,6 +25,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import type { VideoManifest } from '@sovit/core';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
+import { appArchive } from '../../ipc/asar-path.js';
 import type { SessionId } from '../../ipc/protocol.js';
 import { WORKER_V, type WorkerEvent } from '../../ipc/worker-protocol.js';
 import { memoryLogger } from '../log.js';
@@ -104,6 +105,8 @@ describe('the packaged worker (staged tree, real bare, real supervisor)', () => 
     async () => {
       const Sidecar = loadSidecar({
         moduleUrl: pathToFileURL(join(resources, 'app.asar', 'host', 'main.js')).href,
+        // What the packaged host computes: appArchive(process.resourcesPath, realpathSync).
+        appArchive: appArchive(resources, realpathSync),
         checkExecutable: (p) => {
           accessSync(p, constants.X_OK);
         },

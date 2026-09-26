@@ -30,6 +30,12 @@ export const TARGETS = ['squirrel', 'dmg', 'deb', 'appimage'] as const;
 export type Target = (typeof TARGETS)[number];
 
 export interface ForgeConfigOptions {
+  /**
+   * The app version being built (the staged package.json's). Every artifact name carries it,
+   * the Squirrel `Setup.exe` included, so scripts/release-manifest.mjs can refuse a stale
+   * artifact of another version left in `out/make` (independent review of the packaging lane).
+   */
+  readonly version: string;
   /** Electron's own sha256 list (node_modules/electron/checksums.json): every zip is checked. */
   readonly electronChecksums: Readonly<Record<string, string>>;
   /** Where the pinned AppImage runtime file(s) are. */
@@ -46,7 +52,12 @@ function stripDevDependencies(buildPath: string): void {
   writeFileSync(file, `${JSON.stringify(pj, null, 2)}\n`);
 }
 
+/** A version as artifact names carry it (no separators, spaces or shell characters). */
+const VERSION = /^[0-9A-Za-z.+-]{1,64}$/;
+
 export function makers(o: ForgeConfigOptions): ForgeConfigMaker[] {
+  if (!VERSION.test(o.version))
+    throw new Error(`not a plain version: ${JSON.stringify(o.version)}`);
   const want = new Set<Target>(o.targets ?? TARGETS);
   const all: Record<Target, ForgeConfigMaker> = {
     squirrel: new MakerSquirrel({
@@ -54,7 +65,8 @@ export function makers(o: ForgeConfigOptions): ForgeConfigMaker[] {
       authors: APP.author,
       description: APP.description,
       exe: `${APP.name}.exe`,
-      setupExe: `${APP.productName}-Setup.exe`,
+      // Forge's default (`Nutflix-<v> Setup.exe`) has a space, which a release name may not.
+      setupExe: `${APP.productName}-${o.version}-Setup.exe`,
       noMsi: true,
     }),
     dmg: new MakerDmg({ productName: APP.productName }),
@@ -72,9 +84,11 @@ export function makers(o: ForgeConfigOptions): ForgeConfigMaker[] {
         categories: ['AudioVideo', 'Video', 'Network'],
         // Studio uploads transcode with the system ffmpeg (worker/ffmpeg.ts).
         recommends: ['ffmpeg'],
-        // No maintainer scripts: making Chromium's sandbox start on Ubuntu ≥ 24 needs root on the
-        // user's machine (a SUID chrome-sandbox or an AppArmor userns profile) — ADR 0017, a
-        // decision for Cameron. Never --no-sandbox.
+        // No maintainer scripts. Chromium's sandbox starts on Ubuntu ≥ 24 because the package
+        // itself ships `/usr/lib/nutflix/chrome-sandbox` setuid root (4755):
+        // electron-installer-common sets that mode while staging, and dpkg installs it as
+        // packaged. That SUID helper is Chromium's standard Linux layout, and an open question
+        // for Cameron (ADR 0017 §7). Never --no-sandbox.
       },
     }),
     appimage: new MakerAppImage({

@@ -7,10 +7,12 @@
 //   2. it was signed by the SovTech key (npub1s0vtech…) — no other key is accepted, and there
 //      is deliberately no option to accept one;
 //   3. it is a desktop release notice: kind 30071, `d` = nutflix-desktop, and its `artifact`
-//      tags, content (the SHA256SUMS text) and `x` (sha256 of that text) agree;
+//      tags, content (the SHA256SUMS text), `x` (sha256 of that text), `files` (the count) and
+//      `size` (the total) agree; `commit`, when present, is a full 40-hex sha;
 //   4. each file you name (or, with --all, every artifact of the release) is listed, and its
 //      size and sha256 match.
-// It prints the release's version and signing date: an OLDER genuine release also verifies (a
+// It prints the release's version, commit and creation date (the event's `created_at`: when
+// the manifest was made, before it was signed): an OLDER genuine release also verifies (a
 // signature cannot say "latest"), so compare them with the current notice (kind 30071,
 // d = nutflix-desktop) on the relays before trusting a download to be current.
 //
@@ -20,7 +22,7 @@
 //
 // It reads the files and the event; it contacts nothing.
 import { createHash } from 'node:crypto';
-import { lstatSync, readFileSync } from 'node:fs';
+import { closeSync, fstatSync, lstatSync, openSync, readSync } from 'node:fs';
 import { basename, join } from 'node:path';
 import process from 'node:process';
 import { pathToFileURL } from 'node:url';
@@ -103,9 +105,39 @@ export function checkEvent(input, trustedPubkey) {
     refuse('the event x tag is not the sha256 of its content');
   if (one('files') !== String(artifacts.length))
     refuse('the files tag does not match the artifact count');
+  if (one('size') !== String(artifacts.reduce((n, a) => n + a.bytes, 0)))
+    refuse("the size tag does not match the artifacts' total");
   const version = one('version');
   if (!/^[0-9A-Za-z.+-]{1,64}$/.test(version)) refuse('malformed version tag');
-  return { artifacts, version, createdAt: ev.created_at };
+  const commits = tag('commit');
+  if (commits.length > 1) refuse('the event has more than one commit tag');
+  const commit = commits[0]?.[1];
+  if (commits.length === 1 && (typeof commit !== 'string' || !/^[0-9a-f]{40}$/.test(commit)))
+    refuse('malformed commit tag (want a full 40-hex git sha)');
+  return { artifacts, version, commit, createdAt: ev.created_at };
+}
+
+/**
+ * The event file's text, read through one descriptor: it must be a regular file (a FIFO or a
+ * device such as /dev/zero would never end) of at most MAX_EVENT_BYTES — bytes actually read,
+ * so a symlink is measured by its target and a growing file cannot slip past the limit.
+ */
+export function readEventFile(path) {
+  const fd = openSync(path, 'r');
+  try {
+    if (!fstatSync(fd).isFile()) refuse('the event file is not a regular file');
+    const buf = Buffer.alloc(MAX_EVENT_BYTES + 1);
+    let n = 0;
+    for (;;) {
+      const got = readSync(fd, buf, n, buf.length - n, null);
+      if (got === 0) break;
+      n += got;
+      if (n > MAX_EVENT_BYTES) refuse('the event file is too large');
+    }
+    return buf.subarray(0, n).toString('utf8');
+  } finally {
+    closeSync(fd);
+  }
 }
 
 /**
@@ -118,7 +150,7 @@ export async function verifyRelease(
   ev,
   { files = [], allDir, trustedPubkey = sovtechPubkeyHex() },
 ) {
-  const { artifacts, version, createdAt } = checkEvent(ev, trustedPubkey);
+  const { artifacts, version, commit, createdAt } = checkEvent(ev, trustedPubkey);
   const byName = new Map(artifacts.map((a) => [a.name, a]));
   const targets = [];
   if (allDir !== undefined) {
@@ -146,7 +178,7 @@ export async function verifyRelease(
     if (got.sha256 !== a.sha256) refuse(`${a.name}: sha256 does not match the signed release`);
     ok.push(a);
   }
-  return { version, createdAt, files: ok };
+  return { version, commit, createdAt, files: ok };
 }
 
 export async function run(argv) {
@@ -163,19 +195,22 @@ export async function run(argv) {
     else files.push(rest[i]);
   }
   if (allDir !== undefined && files.length > 0) refuse('give files or --all <dir>, not both');
-  if (lstatSync(eventPath).size > MAX_EVENT_BYTES) refuse('the event file is too large');
+  const text = readEventFile(eventPath);
   let ev;
   try {
-    ev = JSON.parse(readFileSync(eventPath, 'utf8'));
+    ev = JSON.parse(text);
   } catch {
     refuse('the event file is not JSON');
   }
   const r = await verifyRelease(ev, { files, allDir });
   for (const a of r.files) process.stdout.write(`OK  ${a.sha256}  ${a.name}\n`);
   // A genuine OLD release verifies too (a signature cannot say "latest"): show which one it is,
-  // so it can be compared with the current release notice on the relays.
+  // so it can be compared with the current release notice on the relays. `created_at` is when
+  // the manifest was made (the signer signs it as given), so it is labelled "created".
+  const when = new Date(Number(r.createdAt) * 1000);
+  const created = Number.isNaN(when.getTime()) ? 'unknown' : when.toISOString();
   process.stdout.write(
-    `release ${r.version}, signed ${new Date(r.createdAt * 1000).toISOString()}\n`,
+    `release ${r.version}${r.commit === undefined ? '' : ` (commit ${r.commit})`}, created ${created}\n`,
   );
   process.stdout.write(
     `release-verify: ${String(r.files.length)} file(s) match the release signed by the SovTech key\n`,

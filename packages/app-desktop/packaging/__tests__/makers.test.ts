@@ -12,6 +12,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  readdirSync,
   rmSync,
   writeFileSync,
 } from 'node:fs';
@@ -217,6 +218,38 @@ describe('MakerDmg', () => {
     expect(() =>
       dmgCommands({ app: '/a', srcFolder: '/s', volumeName: '../x', out: '/o' }),
     ).toThrow();
+  });
+
+  it('empties its output directory first, then runs ditto and hdiutil (independent review)', async () => {
+    const makeDir = join(root, 'make');
+    const outDir = join(makeDir, 'dmg', 'arm64');
+    mkdirSync(outDir, { recursive: true });
+    writeFileSync(join(outDir, 'Nutflix-0.0.9-arm64.dmg'), 'stale');
+    const ran: { cmd: string; args: readonly string[] }[] = [];
+    const m = new MakerDmg({
+      productName: 'Nutflix',
+      exec: (cmd, args) => {
+        ran.push({ cmd, args });
+        return Promise.resolve();
+      },
+    });
+    await m.prepareConfig('arm64');
+    const [out] = await m.make({
+      dir: join(root, 'packaged'),
+      makeDir,
+      appName: 'Nutflix',
+      targetPlatform: 'darwin',
+      targetArch: 'arm64',
+      forgeConfig: {} as MakerOptions['forgeConfig'],
+      packageJSON: { version: '0.1.0' },
+    });
+    expect(out).toBe(join(outDir, 'Nutflix-0.1.0-arm64.dmg'));
+    expect(existsSync(join(outDir, 'Nutflix-0.0.9-arm64.dmg'))).toBe(false);
+    expect(ran.map((r) => r.cmd)).toEqual(['ditto', 'hdiutil']);
+    expect(ran[0]?.args[0]).toBe(join(root, 'packaged', 'Nutflix.app'));
+    expect(ran[1]?.args.at(-1)).toBe(out);
+    // The scratch source folder is gone.
+    expect(readdirSync(outDir)).toEqual([]);
   });
 
   it('only runs on macOS', () => {

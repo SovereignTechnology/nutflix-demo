@@ -17,24 +17,28 @@
  * error and nothing is `chmod`ed. A dev build keeps upstream behaviour (its `node_modules` is
  * writable, and npm may drop the mode bit).
  */
-import { accessSync, constants } from 'node:fs';
+import { accessSync, constants, realpathSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { asarUnpacked } from '../../ipc/asar-path.js';
-import type { SpawnWorker, WorkerProcess } from './supervisor.js';
+import { appArchive, asarUnpacked } from '../../ipc/asar-path.js';
+import { WorkerRuntimeError, type SpawnWorker, type WorkerProcess } from './supervisor.js';
+
+// Defined beside the supervisor (which logs its message when a spawn fails); re-exported here,
+// where it is thrown.
+export { WorkerRuntimeError };
 
 type SidecarCtor = new (entry: string, args?: string[]) => WorkerProcess;
-
-/** The packaged Bare runtime cannot be used as installed (never repaired at runtime). */
-export class WorkerRuntimeError extends Error {
-  override readonly name = 'WorkerRuntimeError' as const;
-}
 
 export interface SidecarLoader {
   /** The URL of the module doing the loading (`import.meta.url`: the host bundle when packaged). */
   readonly moduleUrl: string;
+  /**
+   * The app's own archive, `<process.resourcesPath>/app.asar` (`appArchive`); `undefined`
+   * outside Electron. Only a `moduleUrl` inside THIS archive counts as packaged.
+   */
+  readonly appArchive: string | undefined;
   /**
    * Throws when `path` is not executable by this process. Defaults to `fs.accessSync(path,
    * X_OK)`; only tests replace it.
@@ -48,13 +52,13 @@ function isExecutable(path: string): void {
 
 /**
  * Resolves `bare-sidecar` for this install and returns its constructor. In a packaged build
- * (`moduleUrl` inside an asar archive) it resolves from the unpacked tree and REFUSES a Bare
+ * (`moduleUrl` inside the app's archive) it resolves from the unpacked tree and REFUSES a Bare
  * binary that is not executable, before `bare-sidecar` itself is loaded (so its `chmod` never
  * runs); the path checked is the one `bare-sidecar` resolves (same `require-asset` call).
  */
 export function loadSidecar(o: SidecarLoader): SidecarCtor {
   const here = fileURLToPath(o.moduleUrl);
-  const unpacked = asarUnpacked(here);
+  const unpacked = asarUnpacked(here, o.appArchive);
   const req = createRequire(unpacked ?? here);
   if (unpacked !== undefined) {
     const pkgDir = dirname(req.resolve('bare-sidecar/package'));
@@ -77,7 +81,11 @@ export function loadSidecar(o: SidecarLoader): SidecarCtor {
 let ctor: SidecarCtor | undefined;
 
 function sidecar(): SidecarCtor {
-  ctor ??= loadSidecar({ moduleUrl: import.meta.url });
+  ctor ??= loadSidecar({
+    moduleUrl: import.meta.url,
+    // Electron gives the utilityProcess `process.resourcesPath` too; plain Node does not.
+    appArchive: appArchive((process as { resourcesPath?: unknown }).resourcesPath, realpathSync),
+  });
   return ctor;
 }
 

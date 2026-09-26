@@ -12,9 +12,16 @@
 // by Cameron, through the SovTech key's NIP-46 signer (Bunker46); `id` and `sig` stay empty
 // until then. scripts/release-verify.mjs checks a signed event against downloaded files.
 //
+// ONE event per release, over every platform's artifacts: kind 30071 is addressable, so relays
+// keep one event per key + kind + `d`, and a per-platform event would replace the others
+// (independent review of the packaging lane). The CI's final `desktop-release` job gathers the
+// platform jobs' artifacts and runs this once.
+//
 // Event shape (verified field by field by release-verify.mjs):
 //   kind       30071
 //   pubkey     SOVTECH_PUBKEY_HEX (the signer sets/keeps it; a different key fails verify)
+//   created_at when the manifest was made (now), never the commit time: a corrected manifest
+//              for the same commit must be NEWER than the one it replaces on the relays
 //   tags       ["d","nutflix-desktop"] ["version",v] ["commit",sha]? ["x",sha256(content)]
 //              ["files",n] ["size",total] then ["artifact",name,sha256,bytes] per file
 //   content    the SHA256SUMS text
@@ -22,12 +29,17 @@
 // Only node:crypto sha256 and nostr-tools' nip19 decoder are used (no crypto of our own).
 //
 // Usage:
-//   node scripts/release-manifest.mjs <artifact|dir>... [--out <dir>] [--version <v>]
-//        [--commit <sha>] [--created-at <unix>]
+//   node scripts/release-manifest.mjs [--made <list>]... [<artifact|dir>...] [--out <dir>]
+//        [--version <v>] [--commit <sha>] [--created-at <unix>]
+//   --made names an `out/make/<platform>-<arch>.artifacts.json` list, written by
+//   `packaging/cli.ts make`: exactly the artifacts THAT make produced (the preferred input).
 //   A directory contributes every file under it with a release extension (.deb .AppImage
 //   .dmg .exe .msix .zip .rpm); anything else is skipped (and listed on stderr).
-//   --out defaults to the current directory; --version to @sovit/app-desktop's version;
-//   --commit to `git rev-parse HEAD`; --created-at to $SOURCE_DATE_EPOCH, else now.
+//   Every artifact name must carry the version (`Nutflix-0.1.0-x64.AppImage`,
+//   `nutflix_0.1.0_amd64.deb`, `Nutflix-0.1.0-Setup.exe` …), so a stale artifact of another
+//   version left in out/make is refused, not signed.
+//   --out defaults to packages/app-desktop/out/release (gitignored); --version to
+//   @sovit/app-desktop's version; --commit to `git rev-parse HEAD`; --created-at to now.
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import {
@@ -36,6 +48,7 @@ import {
   mkdirSync,
   readFileSync,
   readdirSync,
+  statSync,
   writeFileSync,
 } from 'node:fs';
 import { basename, dirname, join, resolve } from 'node:path';
@@ -60,6 +73,24 @@ export function sovtechPubkeyHex() {
 
 export const RELEASE_EXTENSIONS = ['.deb', '.AppImage', '.dmg', '.exe', '.msix', '.zip', '.rpm'];
 
+/** packaging/identity.ts MADE_LIST_SCHEMA / MADE_LIST_SUFFIX (pinned together by a test). */
+export const MADE_LIST_SCHEMA = 'nutflix-made/1';
+export const MADE_LIST_SUFFIX = '.artifacts.json';
+/** A made list is a few hundred bytes; anything bigger is not one. */
+const MAX_MADE_LIST_BYTES = 64 * 1024;
+
+/** Where the manifest goes by default: under packages/app-desktop/out/ (gitignored). */
+export const DEFAULT_OUT = join(
+  dirname(fileURLToPath(import.meta.url)),
+  '..',
+  'packages',
+  'app-desktop',
+  'out',
+  'release',
+);
+
+const VERSION = /^[0-9A-Za-z.+-]{1,64}$/;
+
 /**
  * Artifact names end up in `sha256sum` lines, event tags and file lookups: no path separators,
  * no whitespace or control characters, no leading dot, bounded.
@@ -79,18 +110,23 @@ export async function sha256File(path) {
   return { sha256: h.digest('hex'), bytes };
 }
 
-/** Expands the positional inputs into artifact paths; symlinks and odd entries are refused. */
-export function collectArtifacts(inputs, skipped = []) {
+/**
+ * Expands inputs into artifact paths; symlinks and odd entries are refused. `filter`: skip
+ * (and report) files without a release extension — always inside a directory, and for every
+ * entry of a made list (Squirrel's list also names RELEASES and the .nupkg).
+ */
+export function collectArtifacts(inputs, skipped = [], filter = false) {
   const out = [];
   const visit = (p, fromDir) => {
     const st = lstatSync(p);
     if (st.isSymbolicLink()) throw new Error(`symlinks are not release artifacts: ${p}`);
     if (st.isDirectory()) {
+      if (filter) throw new Error(`a made list names a directory: ${p}`);
       for (const e of readdirSync(p).sort(byteOrder)) visit(join(p, e), true);
       return;
     }
     if (!st.isFile()) throw new Error(`not a regular file: ${p}`);
-    if (fromDir && !RELEASE_EXTENSIONS.some((x) => p.endsWith(x))) {
+    if ((fromDir || filter) && !RELEASE_EXTENSIONS.some((x) => p.endsWith(x))) {
       skipped.push(p);
       return;
     }
@@ -98,6 +134,49 @@ export function collectArtifacts(inputs, skipped = []) {
   };
   for (const i of inputs) visit(i, false);
   return out;
+}
+
+/**
+ * The artifact paths of one `make` (packaging/cli.ts writes the list beside them), resolved
+ * against the list's own directory. Refused: not a list, a list made for another version,
+ * an empty list, and any entry that is absolute, uses backslashes or climbs out with `..`.
+ */
+export function readMadeList(file, version) {
+  const st = statSync(file);
+  if (!st.isFile() || st.size > MAX_MADE_LIST_BYTES)
+    throw new Error(`${file} is not a made list (not a small regular file)`);
+  let list;
+  try {
+    list = JSON.parse(readFileSync(file, 'utf8'));
+  } catch {
+    throw new Error(`${file} is not JSON`);
+  }
+  if (typeof list !== 'object' || list === null || list.schema !== MADE_LIST_SCHEMA)
+    throw new Error(`${file} is not a ${MADE_LIST_SCHEMA} list`);
+  if (list.version !== version)
+    throw new Error(
+      `${file} was made for version ${JSON.stringify(list.version)}, not ${version}: a stale list?`,
+    );
+  if (!Array.isArray(list.artifacts) || list.artifacts.length === 0)
+    throw new Error(`${file} lists no artifacts`);
+  const base = dirname(resolve(file));
+  return list.artifacts.map((rel) => {
+    if (
+      typeof rel !== 'string' ||
+      rel.startsWith('/') ||
+      rel.includes('\\') ||
+      rel.split('/').some((seg) => seg === '' || seg === '.' || seg === '..')
+    )
+      throw new Error(`${file}: bad artifact path ${JSON.stringify(rel)}`);
+    return join(base, ...rel.split('/'));
+  });
+}
+
+/** Whether `name` carries `version` as a whole field (`-0.1.0-`, `_0.1.0_`, `-0.1.0.`). */
+export function nameCarriesVersion(name, version) {
+  if (!VERSION.test(version)) return false;
+  const esc = version.replace(/[.+]/g, (c) => `\\${c}`);
+  return new RegExp(`(?:^|[-_])${esc}(?:[-_.]|$)`).test(name);
 }
 
 export function sumsText(artifacts) {
@@ -135,7 +214,7 @@ export function unsignedEvent({ artifacts, version, commit, createdAt }) {
 
 export async function buildManifest(paths, { version, commit, createdAt }) {
   if (paths.length === 0) throw new Error('no release artifacts given');
-  if (typeof version !== 'string' || !/^[0-9A-Za-z.+-]{1,64}$/.test(version))
+  if (typeof version !== 'string' || !VERSION.test(version))
     throw new Error('--version must be a plain version string');
   if (commit !== undefined && !/^[0-9a-f]{40}$/.test(commit))
     throw new Error('--commit must be a full 40-hex git sha');
@@ -145,6 +224,11 @@ export async function buildManifest(paths, { version, commit, createdAt }) {
   for (const p of paths) {
     const name = basename(p);
     if (!SAFE_NAME.test(name)) throw new Error(`unsafe artifact name: ${JSON.stringify(name)}`);
+    if (!nameCarriesVersion(name, version))
+      throw new Error(
+        `${name} does not carry version ${version}: a stale artifact? Use the make's own list ` +
+          '(--made out/make/<platform>-<arch>.artifacts.json) or empty out/make',
+      );
     if (seen.has(name)) throw new Error(`two artifacts named ${name}`);
     seen.add(name);
     artifacts.push({ name, ...(await sha256File(p)) });
@@ -164,8 +248,8 @@ export async function buildManifest(paths, { version, commit, createdAt }) {
   };
 }
 
-function parseArgs(argv) {
-  const o = { inputs: [], out: '.' };
+export function parseArgs(argv) {
+  const o = { inputs: [], made: [], out: DEFAULT_OUT };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     const next = () => {
@@ -173,6 +257,7 @@ function parseArgs(argv) {
       return argv[++i];
     };
     if (a === '--out') o.out = next();
+    else if (a === '--made') o.made.push(next());
     else if (a === '--version') o.version = next();
     else if (a === '--commit') o.commit = next();
     else if (a === '--created-at') o.createdAt = Number(next());
@@ -200,18 +285,22 @@ function gitHead() {
   }
 }
 
-export async function run(argv, env = process.env) {
+export async function run(argv) {
   const o = parseArgs(argv);
+  const version = o.version ?? desktopVersion();
   const skipped = [];
-  const paths = collectArtifacts(o.inputs, skipped);
+  const paths = [
+    ...o.made.flatMap((list) => collectArtifacts(readMadeList(list, version), skipped, true)),
+    ...collectArtifacts(o.inputs, skipped),
+  ];
   for (const s of skipped)
     process.stderr.write(`release-manifest: skipped (not a release artifact): ${s}\n`);
-  const epoch = Number(env.SOURCE_DATE_EPOCH);
-  const createdAt =
-    o.createdAt ??
-    (Number.isSafeInteger(epoch) && epoch > 0 ? epoch : Math.floor(Date.now() / 1000));
+  // Now, not SOURCE_DATE_EPOCH: the event is addressable (one per key + kind + d on a relay),
+  // so a re-made manifest must be newer than the event it replaces, and the verifier reports
+  // this as the date the release notice was created.
+  const createdAt = o.createdAt ?? Math.floor(Date.now() / 1000);
   const { manifest, sums, event } = await buildManifest(paths, {
-    version: o.version ?? desktopVersion(),
+    version,
     commit: o.commit ?? gitHead(),
     createdAt,
   });

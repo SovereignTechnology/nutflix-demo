@@ -11,17 +11,20 @@
  * out/appimage-runtime; holds the pinned runtime file, placed by hand — maker-appimage.ts).
  *
  * After `package`/`make`: the fuses of every packaged binary were read back and match
- * fuses.ts, and the layout matches layout.ts (a mismatch fails the run). Then run
- * `node ../../scripts/release-manifest.mjs out/make` for the sha256 manifest and the UNSIGNED
- * Nostr event (signed later through Bunker46 — never here).
+ * fuses.ts, and the layout matches layout.ts (a mismatch fails the run). `make` also writes
+ * `out/make/<platform>-<arch>.artifacts.json`, the list of what it produced. Then run
+ * `node ../../scripts/release-manifest.mjs --made out/make/<platform>-<arch>.artifacts.json …`
+ * for the sha256 manifest and the UNSIGNED Nostr event (signed later through Bunker46 — never
+ * here).
  */
-import { readFileSync } from 'node:fs';
-import { join, resolve } from 'node:path';
+import { readFileSync, writeFileSync } from 'node:fs';
+import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 
 import { api, utils } from '@electron-forge/core';
 import type { ForgeArch, ForgePlatform } from '@electron-forge/shared-types';
 
 import { TARGETS, forgeConfig, type Target } from './forge-config.ts';
+import { MADE_LIST_SCHEMA, MADE_LIST_SUFFIX } from './identity.ts';
 import { pinnedRuntime } from './maker-appimage.ts';
 import { PKG_DIR, REPO_ROOT, stageApp } from './stage.ts';
 
@@ -80,6 +83,46 @@ export function parseCli(argv: readonly string[]): CliOptions {
   };
 }
 
+/** `out/make/<platform>-<arch>.artifacts.json` (identity.ts MADE_LIST_*). */
+export interface MadeList {
+  readonly schema: typeof MADE_LIST_SCHEMA;
+  readonly platform: string;
+  readonly arch: string;
+  readonly version: string;
+  /** Relative to the list's directory (`out/make`), `/`-separated, sorted. */
+  readonly artifacts: readonly string[];
+}
+
+/** The list of what one `make` produced; refuses an artifact outside `makeDir`. */
+export function madeList(
+  makeDir: string,
+  platform: string,
+  arch: string,
+  version: string,
+  artifacts: readonly string[],
+): MadeList {
+  const rel = artifacts.map((a) => {
+    const r = relative(makeDir, resolve(a));
+    if (r === '' || isAbsolute(r) || r.split(sep)[0] === '..')
+      throw new Error(`an artifact outside ${makeDir}: ${a}`);
+    return r.split(sep).join('/');
+  });
+  return {
+    schema: MADE_LIST_SCHEMA,
+    platform,
+    arch,
+    version,
+    artifacts: [...rel].sort(),
+  };
+}
+
+/** Writes (replaces) the list for this platform-arch; returns its path. */
+export function writeMadeList(makeDir: string, list: MadeList): string {
+  const file = join(makeDir, `${list.platform}-${list.arch}${MADE_LIST_SUFFIX}`);
+  writeFileSync(file, `${JSON.stringify(list, null, 2)}\n`);
+  return file;
+}
+
 export async function runCli(o: CliOptions): Promise<string[]> {
   // Fail before minutes of packaging when the AppImage maker would refuse anyway.
   if (o.command === 'make' && o.platform === 'linux' && (o.targets ?? TARGETS).includes('appimage'))
@@ -93,9 +136,13 @@ export async function runCli(o: CliOptions): Promise<string[]> {
   const checksums = JSON.parse(
     readFileSync(join(REPO_ROOT, 'node_modules', 'electron', 'checksums.json'), 'utf8'),
   ) as Record<string, string>;
+  const { version } = JSON.parse(readFileSync(join(stageDir, 'package.json'), 'utf8')) as {
+    version: string;
+  };
   utils.registerForgeConfigForDirectory(
     stageDir,
     forgeConfig({
+      version,
       electronChecksums: checksums,
       appImageRuntimeDir: o.appImageRuntimeDir,
       ...(o.targets === undefined ? {} : { targets: o.targets }),
@@ -119,7 +166,10 @@ export async function runCli(o: CliOptions): Promise<string[]> {
       arch: o.arch,
       outDir: o.out,
     });
-    return made.flatMap((m) => m.artifacts);
+    const artifacts = made.flatMap((m) => m.artifacts);
+    const makeDir = join(o.out, 'make');
+    const list = writeMadeList(makeDir, madeList(makeDir, o.platform, o.arch, version, artifacts));
+    return [...artifacts, list];
   } finally {
     utils.unregisterForgeConfigForDirectory(stageDir);
   }

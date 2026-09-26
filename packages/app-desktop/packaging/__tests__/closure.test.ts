@@ -131,6 +131,34 @@ describe('runtimeClosure', () => {
     expect(() => runtimeClosure({ lockfileVersion: 1, packages: {} }, base)).toThrow(/v2\+/);
   });
 
+  it('fails closed on a copy nested under the app workspace itself (independent review)', () => {
+    // npm nests `b@2` under the app because `a` needs `b@1` at the root. The staged app IS the
+    // workspace, so `b@2` would have to replace the root `b@1` — refused, not mis-mapped.
+    const l = lock({
+      'packages/app': { dependencies: { a: '1', b: '2' } },
+      'node_modules/@s/app': { link: true, resolved: 'packages/app' },
+      'packages/app/node_modules/b': { version: '2.0.0' },
+      'node_modules/a': { version: '1.0.0', dependencies: { b: '1' } },
+      'node_modules/b': { version: '1.0.0' },
+    });
+    expect(() => runtimeClosure(l, base)).toThrow(ClosureError);
+    expect(() => runtimeClosure(l, base)).toThrow(
+      /packages\/app\/node_modules\/b is nested under packages\/app/,
+    );
+    // A nested copy nothing in the closure resolves is not shipped, so it is not refused.
+    const viaDep = lock({
+      'packages/app': { dependencies: { a: '1' } },
+      'packages/app/node_modules/c': { version: '1.0.0' },
+      'node_modules/a': { version: '1.0.0', dependencies: { c: '1' } },
+      'node_modules/c': { version: '2.0.0' },
+    });
+    // `a` resolves `c` from the root: the nested copy is never reached.
+    expect(runtimeClosure(viaDep, base).map((e) => e.source)).toEqual([
+      'node_modules/a',
+      'node_modules/c',
+    ]);
+  });
+
   it('on the real lockfile: ships the runtime, never dev tooling or pear-runtime', () => {
     const real = JSON.parse(readFileSync(join(REPO_ROOT, 'package-lock.json'), 'utf8')) as Lockfile;
     const c = runtimeClosure(real, {

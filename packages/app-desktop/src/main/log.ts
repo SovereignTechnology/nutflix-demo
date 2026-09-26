@@ -18,6 +18,11 @@ export type LogEvent =
   | 'app.already-running'
   | 'app.sandbox-bypass-refused'
   | 'app.dev-flag-refused'
+  // Issue #6 (ADR 0017): a packaged build refuses Chromium's remote-debugging switches, and
+  // handles Squirrel.Windows' lifecycle launches (squirrel.ts) before anything else.
+  | 'app.debug-switch-refused'
+  | 'app.squirrel-event'
+  | 'app.squirrel-update-failed'
   | 'window.created'
   | 'window.load-failed'
   | 'renderer.gone'

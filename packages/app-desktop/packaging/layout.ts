@@ -15,7 +15,13 @@ import { join } from 'node:path';
 
 import { statFile } from '@electron/asar';
 
-import { PACKAGED_WORKER_BUNDLE, PACKAGED_WORKER_ENTRY } from './identity.ts';
+import {
+  PACKAGED_WORKER_BUNDLE,
+  PACKAGED_WORKER_ENTRY,
+  PRELOAD_FILES,
+  PROMPT_FILES,
+  RENDERER_FILES,
+} from './identity.ts';
 
 export function resourcesDir(outputDir: string, platform: string, productName: string): string {
   return platform === 'darwin' || platform === 'mas'
@@ -23,14 +29,20 @@ export function resourcesDir(outputDir: string, platform: string, productName: s
     : join(outputDir, 'resources');
 }
 
-/** Files that must be packed (read from app.asar, covered by its header hash). */
-export const PACKED = [
+/**
+ * Files that must be packed (read from app.asar, covered by its header hash): everything main
+ * loads or serves — its own bundle, the host, both preloads, and every file of the app window
+ * and the prompt window (ADR 0013), derived from the same lists the staging step copies, so a
+ * file added there is checked here too (independent review of the packaging lane).
+ */
+export const PACKED: readonly string[] = [
   'package.json',
   'main/main.js',
   'host/main.js',
-  'preload.cjs',
-  'renderer/app.js',
-] as const;
+  ...PRELOAD_FILES,
+  ...RENDERER_FILES.map((f) => `renderer/${f}`),
+  ...PROMPT_FILES.map((f) => `prompt/${f}`),
+];
 
 export function layoutProblems(
   outputDir: string,

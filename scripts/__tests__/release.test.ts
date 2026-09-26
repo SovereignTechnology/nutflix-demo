@@ -10,7 +10,7 @@
  * library entry point is called with that throwaway key only to reach the file checks.
  */
 import { createHash } from 'node:crypto';
-import { mkdirSync, readFileSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { finalizeEvent, generateSecretKey, getPublicKey } from 'nostr-tools/pure';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
@@ -35,12 +35,18 @@ interface VerifyLib {
   verifyRelease(
     ev: unknown,
     o: { files?: string[]; allDir?: string; trustedPubkey?: string },
-  ): Promise<{ version: string; createdAt: number; files: Artifact[] }>;
+  ): Promise<{ version: string; commit?: string; createdAt: number; files: Artifact[] }>;
+  MAX_EVENT_BYTES: number;
 }
 interface ManifestLib {
   sovtechPubkeyHex(): string;
   SOVTECH_NPUB: string;
   RELEASE_NOTICE_KIND: number;
+  MADE_LIST_SCHEMA: string;
+  MADE_LIST_SUFFIX: string;
+  DEFAULT_OUT: string;
+  parseArgs(argv: string[]): { out: string };
+  nameCarriesVersion(name: string, version: string): boolean;
 }
 
 const SOVTECH_HEX = '83d8bce2f7d6966f306e6f1a712497cf0a2c77d073923136a0e2bb54963b3434';
@@ -63,10 +69,12 @@ let dir = '';
 let cleanup: () => void = () => undefined;
 let make = '';
 let out = '';
+// Every artifact name carries the release version (independent review of the packaging lane:
+// the manifest refuses a name without it, so the Setup.exe is now versioned too).
 const files: Record<string, Buffer> = {
   'Nutflix-0.1.0-x64.AppImage': Buffer.from('appimage '.repeat(1000)),
   'nutflix_0.1.0_amd64.deb': Buffer.from('deb '.repeat(777)),
-  'Nutflix-Setup.exe': Buffer.from('exe'),
+  'Nutflix-0.1.0-Setup.exe': Buffer.from('exe'),
 };
 
 beforeEach(() => {
@@ -85,8 +93,8 @@ beforeEach(() => {
     files['nutflix_0.1.0_amd64.deb']!,
   );
   writeFileSync(
-    join(make, 'squirrel.windows', 'x64', 'Nutflix-Setup.exe'),
-    files['Nutflix-Setup.exe']!,
+    join(make, 'squirrel.windows', 'x64', 'Nutflix-0.1.0-Setup.exe'),
+    files['Nutflix-0.1.0-Setup.exe']!,
   );
   // Not a release artifact: skipped, and listed on stderr.
   writeFileSync(join(make, 'squirrel.windows', 'x64', 'RELEASES'), 'x');
@@ -131,7 +139,7 @@ function artifactPaths(): string[] {
   return [
     join(make, 'appimage', 'x64', 'Nutflix-0.1.0-x64.AppImage'),
     join(make, 'deb', 'x64', 'nutflix_0.1.0_amd64.deb'),
-    join(make, 'squirrel.windows', 'x64', 'Nutflix-Setup.exe'),
+    join(make, 'squirrel.windows', 'x64', 'Nutflix-0.1.0-Setup.exe'),
   ];
 }
 
@@ -189,7 +197,15 @@ describe('scripts/release-manifest.mjs', () => {
     ).toMatch(/unsafe artifact name/);
     mkdirSync(join(dir, 'other'));
     writeFileSync(join(dir, 'other', 'nutflix_0.1.0_amd64.deb'), 'dup');
-    const dup = runNode('release-manifest.mjs', [make, join(dir, 'other'), '--out', out]);
+    // --version: the names must now carry it (the default is app-desktop's own version).
+    const dup = runNode('release-manifest.mjs', [
+      make,
+      join(dir, 'other'),
+      '--out',
+      out,
+      '--version',
+      '0.1.0',
+    ]);
     expect(dup.status).toBe(1);
     expect(dup.stderr).toMatch(/two artifacts named nutflix_0\.1\.0_amd64\.deb/);
     symlinkSync(join(make, 'deb', 'x64', 'nutflix_0.1.0_amd64.deb'), join(dir, 'link.deb'));
@@ -225,6 +241,174 @@ describe('scripts/release-manifest.mjs', () => {
   });
 });
 
+/** A made list as packaging/cli.ts writes it (relative to its own directory). */
+function madeList(file: string, version: string, artifacts: string[]): string {
+  writeFileSync(
+    file,
+    JSON.stringify({
+      schema: 'nutflix-made/1',
+      platform: 'linux',
+      arch: 'x64',
+      version,
+      artifacts,
+    }),
+  );
+  return file;
+}
+
+describe('scripts/release-manifest.mjs — one release, only this make (independent review)', () => {
+  it('created_at is NOW by default, never SOURCE_DATE_EPOCH (a re-made manifest must be newer on the relays)', () => {
+    const before = Math.floor(Date.now() / 1000);
+    const r = runNode(
+      'release-manifest.mjs',
+      [make, '--out', out, '--version', '0.1.0', '--commit', 'a'.repeat(40)],
+      { env: { SOURCE_DATE_EPOCH: '1700000000' } },
+    );
+    expect(r.status, r.stderr).toBe(0);
+    const ev = unsigned();
+    expect(ev.created_at).toBeGreaterThanOrEqual(before);
+    expect(ev.created_at).toBeLessThanOrEqual(Math.floor(Date.now() / 1000));
+    const src = readFileSync(join(scriptsDir, 'release-manifest.mjs'), 'utf8');
+    expect(src).not.toMatch(/env\.SOURCE_DATE_EPOCH/);
+  });
+
+  it('refuses an artifact whose name does not carry the version (a stale one in out/make)', () => {
+    writeFileSync(join(make, 'appimage', 'x64', 'Nutflix-0.0.9-x64.AppImage'), 'old build');
+    const r = manifest();
+    expect(r.status).toBe(1);
+    expect(r.stderr).toMatch(/Nutflix-0\.0\.9-x64\.AppImage does not carry version 0\.1\.0/);
+    expect(existsSync(join(out, 'release-event.unsigned.json'))).toBe(false);
+  });
+
+  it('nameCarriesVersion matches the version as a whole field only', async () => {
+    const m = await lib<ManifestLib>('release-manifest.mjs');
+    for (const n of [
+      'Nutflix-0.1.0-x64.AppImage',
+      'nutflix_0.1.0_amd64.deb',
+      'Nutflix-0.1.0-Setup.exe',
+      'Nutflix-0.1.0-arm64.dmg',
+    ])
+      expect(m.nameCarriesVersion(n, '0.1.0'), n).toBe(true);
+    for (const n of [
+      'Nutflix-Setup.exe',
+      'Nutflix-0.1.01-x64.AppImage',
+      'Nutflix-10.1.0-x64.AppImage',
+      'Nutflix-0x1x0-x64.AppImage',
+    ])
+      expect(m.nameCarriesVersion(n, '0.1.0'), n).toBe(false);
+    expect(m.nameCarriesVersion('a-0.1.0-x.deb', '0.1.0 ')).toBe(false);
+  });
+
+  it('--made takes exactly the artifacts that make produced; a stale file beside them is ignored', () => {
+    writeFileSync(join(make, 'appimage', 'x64', 'Nutflix-0.0.9-x64.AppImage'), 'old build');
+    const list = madeList(join(make, 'linux-x64.artifacts.json'), '0.1.0', [
+      'deb/x64/nutflix_0.1.0_amd64.deb',
+      'appimage/x64/Nutflix-0.1.0-x64.AppImage',
+      'squirrel.windows/x64/RELEASES',
+    ]);
+    const r = runNode('release-manifest.mjs', [
+      '--made',
+      list,
+      '--out',
+      out,
+      '--version',
+      '0.1.0',
+      '--commit',
+      'a'.repeat(40),
+    ]);
+    expect(r.status, r.stderr).toBe(0);
+    expect(r.stderr).toMatch(/skipped \(not a release artifact\): .*RELEASES/);
+    expect(
+      unsigned()
+        .tags.filter((t) => t[0] === 'artifact')
+        .map((t) => t[1]),
+    ).toEqual(['Nutflix-0.1.0-x64.AppImage', 'nutflix_0.1.0_amd64.deb']);
+  });
+
+  it('--made refuses a list for another version, an empty or foreign list, and paths that escape it', () => {
+    const run = (content: string): ReturnType<typeof runNode> => {
+      const f = join(make, 'x.artifacts.json');
+      writeFileSync(f, content);
+      return runNode('release-manifest.mjs', ['--made', f, '--out', out, '--version', '0.1.0']);
+    };
+    const base = { schema: 'nutflix-made/1', platform: 'linux', arch: 'x64', version: '0.1.0' };
+    expect(
+      run(
+        JSON.stringify({
+          ...base,
+          version: '0.0.9',
+          artifacts: ['deb/x64/nutflix_0.1.0_amd64.deb'],
+        }),
+      ).stderr,
+    ).toMatch(/made for version "0\.0\.9", not 0\.1\.0/);
+    expect(run(JSON.stringify({ ...base, artifacts: [] })).stderr).toMatch(/lists no artifacts/);
+    expect(run(JSON.stringify({ ...base, schema: 'x', artifacts: ['a'] })).stderr).toMatch(
+      /is not a nutflix-made\/1 list/,
+    );
+    expect(run('{').stderr).toMatch(/is not JSON/);
+    for (const bad of [
+      '../make/deb/x64/nutflix_0.1.0_amd64.deb',
+      '/etc/passwd',
+      'deb\\x64\\a.deb',
+      'deb//a.deb',
+      './deb/a.deb',
+    ])
+      expect(run(JSON.stringify({ ...base, artifacts: [bad] })).stderr, bad).toMatch(
+        /bad artifact path/,
+      );
+    // A list naming a symlink is refused like any other input.
+    symlinkSync(
+      join(make, 'deb', 'x64', 'nutflix_0.1.0_amd64.deb'),
+      join(make, 'nutflix_0.1.0_link.deb'),
+    );
+    expect(run(JSON.stringify({ ...base, artifacts: ['nutflix_0.1.0_link.deb'] })).stderr).toMatch(
+      /symlinks/,
+    );
+  });
+
+  it('--out defaults to packages/app-desktop/out/release (gitignored), never the working directory', async () => {
+    const m = await lib<ManifestLib>('release-manifest.mjs');
+    expect(m.DEFAULT_OUT).toBe(join(repoRoot, 'packages', 'app-desktop', 'out', 'release'));
+    expect(m.parseArgs([make]).out).toBe(m.DEFAULT_OUT);
+    expect(readFileSync(join(repoRoot, '.gitignore'), 'utf8')).toMatch(
+      /^packages\/app-desktop\/out\/$/m,
+    );
+  });
+
+  it('the made-list schema and suffix are the ones packaging/cli.ts writes', async () => {
+    const m = await lib<ManifestLib>('release-manifest.mjs');
+    const identity = (await import(
+      /* @vite-ignore */ join(repoRoot, 'packages', 'app-desktop', 'packaging', 'identity.ts')
+    )) as { MADE_LIST_SCHEMA: string; MADE_LIST_SUFFIX: string; RELEASE_D_TAG: string };
+    expect(m.MADE_LIST_SCHEMA).toBe(identity.MADE_LIST_SCHEMA);
+    expect(m.MADE_LIST_SUFFIX).toBe(identity.MADE_LIST_SUFFIX);
+    expect(identity.RELEASE_D_TAG).toBe('nutflix-desktop');
+  });
+
+  it('the CI makes ONE release event, after every platform job (kind 30071 is addressable)', () => {
+    const ci = readFileSync(
+      join(repoRoot, 'packages', 'app-desktop', 'packaging', 'ci', 'release.gitlab-ci.yml'),
+      'utf8',
+    );
+    const code = ci
+      .split('\n')
+      .filter((l) => !/^\s*#/.test(l))
+      .join('\n');
+    const runs = code.match(/release-manifest\.mjs[^\n]*(?:\n\s+--[^\n]*)*/g) ?? [];
+    expect(runs).toHaveLength(1);
+    for (const list of ['linux-x64', 'darwin-arm64', 'darwin-x64', 'win32-x64'])
+      expect(runs[0], list).toContain(
+        `--made packages/app-desktop/out/make/${list}.artifacts.json`,
+      );
+    expect(code).toMatch(
+      /^desktop-release-manifest:\n(?: {2}.*\n)*? {2}needs: \[desktop-linux, desktop-macos, desktop-windows\]\n/m,
+    );
+    // …and it is the job that runs it: the only script line naming release-manifest.mjs.
+    const job = /^desktop-release-manifest:\n((?: {2}.*\n|\s*\n)*)/m.exec(code)?.[1] ?? '';
+    expect(job).toContain('release-manifest.mjs');
+  });
+});
+
 describe('scripts/release-verify.mjs', () => {
   it('the CLI REFUSES an event signed by any key but the SovTech one', () => {
     expect(manifest().status).toBe(0);
@@ -243,6 +427,24 @@ describe('scripts/release-verify.mjs', () => {
     const r = runNode('release-verify.mjs', [join(dir, 'forged.json'), '--all', make]);
     expect(r.status).toBe(1);
     expect(r.stderr).toMatch(/id or signature does not verify/);
+  });
+
+  it('the CLI refuses an oversized event file (bytes read, symlink measured by its target) and a device', async () => {
+    expect(manifest().status).toBe(0);
+    const v = await lib<VerifyLib>('release-verify.mjs');
+    const big = join(dir, 'big.json');
+    writeFileSync(big, `{"pad":"${'x'.repeat(v.MAX_EVENT_BYTES)}"}`);
+    const r = runNode('release-verify.mjs', [big, ...artifactPaths()]);
+    expect(r.status).toBe(1);
+    expect(r.stderr).toMatch(/event file is too large/);
+    symlinkSync(big, join(dir, 'small-looking.json'));
+    expect(
+      runNode('release-verify.mjs', [join(dir, 'small-looking.json'), ...artifactPaths()]).stderr,
+    ).toMatch(/event file is too large/);
+    if (existsSync('/dev/zero'))
+      expect(runNode('release-verify.mjs', ['/dev/zero', ...artifactPaths()]).stderr).toMatch(
+        /not a regular file/,
+      );
   });
 
   it('the CLI refuses the unsigned template and junk', () => {
@@ -289,6 +491,25 @@ describe('scripts/release-verify.mjs', () => {
       expect(all.files).toHaveLength(3);
       // What was verified is reported: an old genuine release verifies too (no "latest").
       expect(all).toMatchObject({ version: '0.1.0', createdAt: 1790000000 });
+    });
+
+    it('reports the commit; refuses a symlinked download (never follows it to other bytes)', async () => {
+      expect(manifest().status).toBe(0);
+      const { ev, pubkey } = signThrowaway(unsigned());
+      const v = await lib<VerifyLib>('release-verify.mjs');
+      const deb = join(make, 'deb', 'x64', 'nutflix_0.1.0_amd64.deb');
+      expect(await v.verifyRelease(ev, { files: [deb], trustedPubkey: pubkey })).toMatchObject({
+        commit: 'a'.repeat(40),
+      });
+      const dl = join(dir, 'dl');
+      mkdirSync(dl);
+      symlinkSync(deb, join(dl, 'nutflix_0.1.0_amd64.deb'));
+      await expect(
+        v.verifyRelease(ev, {
+          files: [join(dl, 'nutflix_0.1.0_amd64.deb')],
+          trustedPubkey: pubkey,
+        }),
+      ).rejects.toThrow(/is not a regular file/);
     });
 
     it('refuses a changed byte, a truncated file, a file not in the release, a missing artifact', async () => {
@@ -350,7 +571,7 @@ describe('scripts/release-verify.mjs', () => {
         /x tag/,
       );
       const evil = t.tags.map((x) =>
-        x[0] === 'artifact' && x[1] === 'Nutflix-Setup.exe'
+        x[0] === 'artifact' && x[1] === 'Nutflix-0.1.0-Setup.exe'
           ? ['artifact', '../../etc/passwd', x[2]!, x[3]!]
           : x,
       );
@@ -359,6 +580,20 @@ describe('scripts/release-verify.mjs', () => {
         { ...t, tags: [...t.tags, t.tags.find((x) => x[0] === 'artifact')!] },
         /listed twice/,
       );
+      await check(
+        { ...t, tags: t.tags.map((x) => (x[0] === 'files' ? ['files', '2'] : x)) },
+        /files tag does not match the artifact count/,
+      );
+      await check(
+        { ...t, tags: t.tags.map((x) => (x[0] === 'size' ? ['size', '1'] : x)) },
+        /size tag does not match/,
+      );
+      await check({ ...t, tags: t.tags.filter((x) => x[0] !== 'size') }, /exactly one "size" tag/);
+      await check(
+        { ...t, tags: t.tags.map((x) => (x[0] === 'commit' ? ['commit', 'HEAD'] : x)) },
+        /malformed commit tag/,
+      );
+      await check({ ...t, tags: [...t.tags, ['commit', 'b'.repeat(40)]] }, /more than one commit/);
       // Tampering after signing breaks the signature — even on an in-process copy that still
       // carries nostr-tools' cached "verified" flag (`{ ...ev }` copies that symbol property).
       // (Found by this test: checkEvent now re-verifies plain JSON data, see there.)

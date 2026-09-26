@@ -79,12 +79,13 @@ export const PACKAGED_WORKER_ENTRY = 'worker/boot.mjs';
 
 /**
  * The worker entry main hands the host, from main's own `dist/` directory. In a dev build that
- * is the `tsc` output next to main. In a packaged build `distDir` IS the asar archive
+ * is the `tsc` output next to main. In a packaged build `distDir` IS the app's archive
  * (`resources/app.asar`), which Bare cannot read, so the entry is the boot module in the
- * unpacked tree beside it.
+ * unpacked tree beside it. `archive` is the app's own archive (`appArchive(process.resourcesPath)`),
+ * `undefined` outside Electron.
  */
-export function workerEntryFor(distDir: string): string {
-  const unpacked = asarUnpacked(distDir);
+export function workerEntryFor(distDir: string, archive: string | undefined): string {
+  const unpacked = asarUnpacked(distDir, archive);
   return unpacked === undefined
     ? join(distDir, WORKER_ENTRY)
     : join(unpacked, PACKAGED_WORKER_ENTRY);

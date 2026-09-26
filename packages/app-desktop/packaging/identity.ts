@@ -21,6 +21,16 @@ export const APP = {
 export const RELEASE_D_TAG = 'nutflix-desktop';
 
 /**
+ * After `make`, cli.ts writes `out/make/<platform>-<arch>.artifacts.json`: the artifacts THAT
+ * make produced (Forge's own list), relative to `out/make`, with the version. The release
+ * manifest is built from these lists (`scripts/release-manifest.mjs --made`), never from
+ * whatever else is lying in `out/make` (independent review of the packaging lane). The schema
+ * string and suffix are pinned against the script by a test.
+ */
+export const MADE_LIST_SUFFIX = '.artifacts.json';
+export const MADE_LIST_SCHEMA = 'nutflix-made/1';
+
+/**
  * Relative to `app.asar.unpacked/`: the packaged worker's unbundled boot module. Must equal
  * `PACKAGED_WORKER_ENTRY` in src/main/args.ts (main hands this path to the host); a test pins
  * the two together, since this build-time code cannot import the app's sources at runtime.
