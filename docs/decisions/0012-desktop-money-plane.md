@@ -143,6 +143,65 @@ above the manifest, so no block is ever paid at the wrong price.
   Main's settings gate (F4/F8) now also asks when `amountSats` changes, and its question states
   the amount, the daily cap and the first-time confirm.
 
+- Addendum 2026-09-25 (lane I2-paygate; a fund-loss path the residuals lane's round-3 verifier
+  found): **PAY builds and melts at one mint never overlap.** Core runs a wallet's operations at
+  one mint one at a time (`Spender.exclusive`), and a melt holds that turn until the mint has paid
+  the invoice — up to 300 s since issue #8 fix round 3. The worker gives `pay.build` 300 s, and
+  the host cannot cancel a request once it started. A PAY queued behind a long melt was built
+  after the worker had given up: the viewer's proofs were swapped into P2PK sets locked to the
+  seeder and the creator, never delivered, with no refund path. The verifier reproduced the core
+  half: a send finishing after a 300 s caller deadline, balance 96 → 61. The money plane now has
+  a per-mint gate (`host/pay-melt-gate.ts`):
+  - **a melt** marks its mint. PAY builds waiting their turn there are refused, the one in flight
+    is waited for, then it melts, and the mark clears however the melt settles (paid, unpaid,
+    thrown, timed out). It waits at most the worker's deadline, then is refused without melting;
+  - **a PAY** is refused at once while its mint is marked, before any wallet call (`rate-limited:`,
+    nothing spent, its blocks returned to the session budget, no `onPayment`);
+  - **PAY builds at one mint take turns** in arrival order. Core would run their wallet calls one
+    at a time anyway, and the wait for a turn becomes visible in the host. At its turn a PAY
+    re-checks the plane (not closed) and its session (still open);
+  - **the belt**: a PAY that has not reached the wallet `PAY_BUILD_START_BY_MS` after its request
+    arrived is refused (`rate-limited:`), measured on a monotonic clock whose readings have their
+    own type (`Arrival`), so a wall-clock time cannot be passed in by mistake.
+
+  Every desktop melt goes through the gate, because the plane's wallet is `GatedCashuWallet`
+  (core's `CashuWallet` with `melt` overridden). That covers the renderer's `wallet.melt`
+  (dispatch → the adapter's wallet, the plane's own or through `SwitchingWallet`) and an auto
+  top-up's funding melt (`liveWallet`). A top-up melt the gate refused moved nothing: its ledger
+  entry is `failed`, not `unknown`. The worker's `seeder.melt` stays refused
+  (`payments-unavailable`), so the host runs no seeder-earnings melt. A test fails if core's
+  `CashuWallet` grows another melt-like method.
+
+  **The numbers** live in `ipc/deadlines.ts`, shared by the host and the worker:
+  - the worker's deadline for any host request, `WORKER_HOST_REQUEST_TIMEOUT_MS` = 300 s (the
+    `WorkerRpc` default; the worker entry sets none of its own);
+  - `MELT_REQUEST_TIMEOUT_MS` = 300 s and `MINT_REQUEST_TIMEOUT_MS` = 30 s, now passed to the host
+    transport explicitly (the same values as core's defaults);
+  - `PAY_BUILD_WORST_MS` = 5 mint round trips × 30 s + 6 relay publishes × 7.4 s = 194.4 s: the
+    host's worst for one PAY build outside a melt, alone at its mint, with no journal entries
+    left there. The round trips are one mint load, then two sends, each a swap and one follow-up.
+    The publishes are each send's token, deletion and history events; 7.4 s is nostr-tools' 3 s
+    to connect plus 4.4 s for the relay's answer, pinned against the library;
+  - `PAY_BUILD_START_BY_MS` = 300 s − 194.4 s = 105.6 s.
+
+  A test pins that the deadline exceeds the worst time and that the belt leaves a PAY that starts
+  in time its whole worst time.
+
+  **The worker** treats every failed PAY as retryable, as before: the blocks stay owed, the
+  session stays up, and nothing reaches the seeder, so its window is never exceeded and there is
+  no ban. After a `rate-limited:` answer the viewer payer also pays what is owed again by itself,
+  on a backoff (2 s, doubling up to 30 s, reset by a PAY that goes through). With every credit
+  unit held by owed blocks, no download, ACK or pressure event may come to trigger that retry.
+  Streaming at that mint pauses during a melt and resumes after it.
+
+  Left as it was: the model leaves out a NIP-46 bunker's own latency when the wallet's events are
+  signed, and wallet operations that are not PAYs or melts at the same mint (a redeem, a NUT-07
+  check, a top-up's mint at the target, the settle loop). Each of those is a few 30 s round
+  trips, and core's queue does not show them to the host. Closing that fully needs core to check
+  a deadline when it grants the turn (a locked path); see `docs/reviews/2026-09-25-pre-push-pay-melt-gate.md`.
+  A withdrawal made while a PAY is in flight waits for that PAY, up to 300 s at the worst, with
+  nothing on screen to say why.
+
 ## Consequences
 
 - With a signer, the desktop pays and is paid for real: tested end to end — the worker (real
