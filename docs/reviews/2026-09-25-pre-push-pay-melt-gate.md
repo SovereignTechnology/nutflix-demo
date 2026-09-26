@@ -385,3 +385,109 @@ the melt installed it); fixed in `aecddbc`, the file passed three runs in a row.
 - `npm run check:locked`: OK;
 - `npm run lint:electron`: OK (229 files, 0 violations);
 - the Electron e2e was not run (lane rule).
+
+## Round 5
+
+Four items from the verifier of the round-4 fixes (money plane), handled as the orchestrator
+decided. Commits: `f9b7e1f` (TestMint: `quoteExpiry`), `5f7a9ad` (the fixes and their tests),
+`959fbbf` (one more explicit test timeout, R5-4), then this record, ADR 0012's round-5 addendum
+and the lane report. Contracts and locked paths are untouched; no contract request.
+
+| # | Severity | Finding | Outcome |
+|---|---|---|---|
+| R5-1 | LOW | `auto-topup.ts:427`: the 15 s bound on a zero-balance play started only once the run was past the first-funding question. The run's wait for the startup settle (`v.recovery()`) and its own `resolveOpen` came before that point and were not bounded. The verifier measured 3 205 ms instead of ~30 ms with a 3 s settle; with the settle spending 30 s per request at a blackholed mint, a play waited all of that and then 15 s more | **fixed** (`5f7a9ad`). `checkForPlay` now has one bound, `PLAY_TOP_UP_WAIT_MS` in all, starting when the play asks. It covers open top-ups finishing, the settle, the run's own finishing, the quotes, the melt and the polls. The only time set aside is while the run's first-funding question is open (`QuestionClock`, on the monotonic clock: `open`/`close` around `ask`, and closed again when the flight ends). `within` pauses while the question is open and gives the rest of the budget after it. A bound that is not a number is spent at once. Verified before the fix: the two new tests, run against the round-4 `auto-topup.ts`, fail. The play is still waiting after the tests' 2 s cap, with a settle that never ends and with a slow poll in the run's own `resolveOpen` |
+| R5-2 | INFO | `auto-topup.ts:673`: an open top-up whose source is gone for good (or forgets the quote) blocks auto top-ups into its target forever. `meltPending` stays true (core can never ask the source), or `meltState` throws, so every run reads `unresolved`. The record's `quote.expiry` was never used | **fixed** (`5f7a9ad`) as decided. When the target still says UNPAID `TOP_UP_EXPIRED_RELEASE_AFTER_MS` = 24 h after the later of the quote's expiry and the reservation, the kept quote is released unless the source says PAID. That includes a source whose melt is still journaled or PENDING, or that cannot be asked at all. An expired invoice can no longer be paid. The margin covers clocks that disagree, and a target mint that reads its stored UNPAID while its own Lightning backend cannot be asked (a mint may answer that way when its backend check fails). The release settles `unknown`, never `failed`: counted like any melt that may have run, for its 24-hour window. By the time this release happens that window has passed, since it comes at least 24 h after the reservation. It logs `auto top-up invoice expired unpaid: its quote is released`. A quote without an expiry (0) is kept, and so is one whose source says PAID (the target owes it). TestMint gained `quoteExpiry` so a test can use a near expiry. The remaining manual-clear gap is R5-R1 |
+| R5-3 | INFO | R4-R2's justification ("at least seconds after the melt returned") was not guaranteed. `run()` never updated `lastResolve`, so the first trigger after a failed run could resolve within milliseconds of the melt throwing. For a melt that is not journaled, a request that reaches the source late could pay a quote already released | **fixed in code, by a different mechanism than the one suggested.** Updating `lastResolve` at the end of a run would pace every finishing of open top-ups, including minting a quote the target already says PAID. With it, the whole-host test "a funding melt answered PENDING while the target already has the payment … the next play mints it once and goes ahead" fails: the next play's finishing is paced, its check reads `backoff`, and the play fails `no-balance`. Only a release is unsafe early, so the release itself is guarded. An open top-up is released no sooner than `TOP_UP_RELEASE_AFTER_MS` = 600 s after its melt returned (`meltReturned`, kept in memory per entry and dropped when the top-up is closed). That is core's own `PENDING_SETTLE_AFTER_S`, the age at which core settles a journaled melt it cannot find. After a restart, when that time is not known, it counts from the latest the melt can have returned: the reservation plus `MELT_REQUEST_TIMEOUT_MS` (300 s), so 900 s after the reservation. Minting a PAID quote never waits. R4-R2 is reworded below |
+| R5-4 | INFO | `auto-topup.test.ts`: tests that do several real top-ups time out under load at the default 5 s | **fixed**: an explicit 30 s timeout (the file's precedent for heavy tests), with a comment giving the measured times. It is on the two named tests ("rolling 24 h…", "smaller top-ups…") and on three tests of the same shape that also timed out in this round's runs (load average 18-24 on 8 cores): "the ledger survives a restart" (four real top-ups and a restart, 5 089 ms at HEAD), F3's "end to end: a melt that never answered…" (three real top-ups, a reserved fourth and a restart, 5 146 ms at HEAD), and "an explicit yes is remembered…" (four real top-ups, two P2PK sends and a restart; it timed out in the whole-suite run, took 5.8-6.5 s alone on the round-4 code, and was given 30 s in `959fbbf`). No code path is timed by them |
+
+**One existing test changed, with a comment** (R5-3): F3's "end to end: a melt that never
+answered, then a restart". Its restart used to release the quote of a melt that never answered
+at once, then read `cap`. That immediate release is exactly the R4-R2 hazard. The test now first
+asserts `unresolved` right after the restart (nothing moves, the balance is unchanged). It then
+moves the clock past the reservation + melt timeout + `TOP_UP_RELEASE_AFTER_MS` and asserts the
+same `cap` and balance as before. Nothing was deleted or weakened; the harness gained `second`
+(the third TestMint) and `targetQuoteExpiry`.
+
+**Tests** (new, 8):
+
+- `auto-topup.test.ts`, +7:
+  - R5-1: a startup settle that never ends until the test releases it, so the play fails
+    `in-flight` within the bound and the top-up finishes `done` once the settle is over; a slow
+    target poll inside the run's own `resolveOpen` (the trigger's finishing paced by a `resume()`
+    just before), so the play fails in the bound and the run then reads `unresolved`;
+  - R5-3: the next trigger right after the melt returned, and one 1 ms before 600 s, keep the
+    quote; at 600 s it is released (settled `unknown`, still counted 2 002) and the next top-up
+    runs. After a restart it is kept until reservation + 300 s + 600 s − 1 ms and released at
+    that moment;
+  - R5-2: the source goes offline for good and the user switches to a second source. Kept while
+    the source cannot be asked, still kept 1 ms before the lapse. At the lapse it is released,
+    `settle(…, { state: 'unknown', open: null })`, with the log line and no mint URL or invoice
+    in the logs, and the next top-up from the new source runs (one Lightning payment, 2 000 at
+    the target). Two more cases are kept a day past the lapse: a source that says PAID (then
+    minted once when the target sees the payment), and a quote without an expiry.
+- core `test-mint.test.ts`, +1: a mint quote carries the expiry the test set, 2100-01-01 by
+  default, and stays payable.
+
+**Mutation checks (round 5)**: each mutation applied alone to the fix, the round-5 tests and the
+round-4 release and play tests run (`-t` filter), and the file restored from a copy afterwards.
+The tree was checked clean at the end.
+
+| # | Mutation | Killed by |
+|---|---|---|
+| M19a | the play's bound starts past the question (round 4's behaviour: the question held "open" from the run's start) | 2 (slow settle, slow own finishing) |
+| M19b | no release guard (round 4's behaviour) | 3 (next trigger, restart, F3 end to end) |
+| M19c | after a restart, the guard counts from the reservation (no melt timeout) | 1 (restart) |
+| M19d | no release on a lapsed invoice (round 4's behaviour) | 1 (source gone) |
+| M19e | a lapsed invoice is released even when the source says PAID | 1 |
+| M19f | an expiry of 0 counts as lapsed | 1 |
+| M19g | a lapsed invoice is released without the 24 h margin | 1 (1 ms before the lapse) |
+| M19h | the lapse release settles `failed` (uncounted) | 1 |
+| M19i | the question's time counts toward the play's bound | 1 (the round-4 play-bound test) |
+
+The round-4 behaviour of each finding is one of these (M19a, M19b, M19d). The new tests were
+also run against the round-4 `auto-topup.ts` itself (restored afterwards). Five fail: both R5-1
+tests (the play is still waiting at the 2 s cap), the R5-3 in-session test at its first assertion
+(released at the very next trigger), the R5-3 restart test, and the R5-2 release (`unresolved`
+at the lapse). The restart test needs the new constant, so its failure there says little; M19b
+and M19c cover it. The two "kept past the lapse" cases pass there, as they should: round 4 kept
+everything.
+
+**Residuals (round 5)**:
+
+- **R5-R1: kept with no in-app clear.** Each of these holds back auto top-ups into its target for
+  that identity: a target that forgets the quote (answers not found, so no UNPAID is ever read),
+  a target that says UNPAID while the source says PAID (the target owes the sats), a quote without
+  an expiry, and a record that does not unseal (R4-R1). They are fail-safe (nothing moves) and
+  visible only in a throttled `unresolved` log line and in plays that fail `no-balance` at that
+  target. Manual top-ups are unaffected. Clearing one needs a user action the app does not have
+  yet.
+- **R5-R2: the lapse margin trades delay for safety.** A source that is gone for good holds its
+  target back for about 24 h past the invoice's expiry. A shorter margin would unblock sooner but
+  would release a quote a target had been paid for if its Lightning backend link stayed down for
+  longer than the margin.
+- **R4-R2, reworded: a melt request arriving late.** A quote is released when the source mint
+  reads UNPAID with nothing journaled, but never sooner than 600 s after the melt returned (900 s
+  after the reservation, after a restart). Only a melt request that the transport gave up on and
+  that reaches the mint later than that could still pay a quote no longer kept.
+- **R5-R3: the play's bound is 15 s in all.** A play whose open top-ups take most of it leaves the
+  run little time, so the play fails `no-balance` sooner than under round 4's two 15 s phases. The
+  top-up still finishes in the background and the next play goes ahead.
+
+**Checks (round 5)**, at `5f7a9ad` plus these docs:
+
+- the touched packages, `npx vitest run packages/app-desktop packages/core --maxWorkers=2` (at
+  `5f7a9ad`'s code): 136 files passed, 2 failed, 2 skipped; 2232 tests passed, 3 failed, 17
+  skipped. All three failures were timeouts at load average ~24 on 8 cores, and each passed when
+  rerun alone: `money.test.ts` "only for a registered session…" and "onPayment names the mint…",
+  and `auto-topup.test.ts` "an explicit yes is remembered…";
+- the whole suite, `npx vitest run --maxWorkers=2`, at `5f7a9ad`: 205 files passed, 1 failed, 3
+  skipped; 3159 tests passed, 1 failed, 21 skipped. The failure was "an explicit yes is
+  remembered…" again, a timeout (5 540 ms). Rerun alone it also timed out (5 110 ms). Timed back
+  to back against the round-4 code it took 5.8-6.5 s there and 5.7-7.3 s on round 5's, so it is
+  load, not the change. It got the same explicit 30 s as the caps tests, with those times in its
+  comment (`959fbbf`), and then passed alone (6 078 ms). No other timeout was raised;
+- `npx tsc -b --force`: clean;
+- `eslint` and `prettier --check` on the 7 changed `.ts` files and these docs: clean;
+- `npm run check:locked`: OK;
+- `npm run lint:electron`: OK (229 files, 0 violations);
+- the Electron e2e was not run (lane rule).

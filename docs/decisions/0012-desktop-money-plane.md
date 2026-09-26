@@ -264,6 +264,35 @@ above the manifest, so no block is ever paid at the wrong price.
     the prompt's 5 minutes). A slower top-up (a melt may take 300 s) finishes in the background
     and the play fails `no-balance` ("a top-up is on its way …"), to be retried.
 
+- Addendum 2026-09-26 (fix round 5, the verifier of round 4): **a play has one bound, a quote is
+  never released right after its melt, and an invoice long expired releases its quote.**
+  - **One bound for a play** (replaces round 4's "15 s, then 15 s once past the question"):
+    `PLAY_TOP_UP_WAIT_MS` = 15 s in all, from the moment the play asks. It covers open top-ups
+    finishing, the startup settle the run waits for, the run's own finishing of open top-ups,
+    the quotes, the melt and the polls. Only the time the first-funding question is open is set
+    aside (the user's own, bounded by the prompt's 5 minutes). Before, the run's wait for the
+    settle and its own finishing were not bounded: with the startup settle spending 30 s per
+    request at a blackholed mint, a play waited all of that and then 15 s more.
+  - **No release right after a melt** (R4-R2's gap): an open top-up is released no sooner than
+    `TOP_UP_RELEASE_AFTER_MS` = 600 s (core's `PENDING_SETTLE_AFTER_S`) after its melt returned,
+    a time kept in memory. After a restart it counts from the latest the melt can have returned:
+    the reservation plus `MELT_REQUEST_TIMEOUT_MS`. A melt request the transport gave up on but
+    that reaches the mint within that time is marked PENDING there before the release reads the
+    source. Minting a quote the target says PAID never waits. This is not done by pacing the
+    trigger (`lastResolve`), because that would also hold back minting a paid quote at the next
+    play.
+  - **An invoice long expired releases its quote**: an open top-up whose target still says
+    UNPAID `TOP_UP_EXPIRED_RELEASE_AFTER_MS` = 24 h after the later of the quote's expiry and the
+    reservation is released even when the source cannot say the melt did not pay (still
+    journaled, PENDING, or the mint gone for good). An expired invoice can no longer be paid. The
+    margin covers clocks that disagree, and a target that reads its stored UNPAID while its own
+    Lightning backend cannot be asked. It settles `unknown`, never `failed`. A source that says
+    PAID keeps it (the target owes it), and so does a quote without an expiry (0).
+  - **Still kept, with no in-app way to clear it**: a target that forgets the quote (not found),
+    a target that says UNPAID while the source says PAID, a quote without an expiry, and a record
+    that does not unseal (R4-R1). Each holds back auto top-ups into its target for that identity;
+    manual top-ups are unaffected.
+
 ## Consequences
 
 - With a signer, the desktop pays and is paid for real: tested end to end — the worker (real

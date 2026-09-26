@@ -205,8 +205,62 @@ Residuals R4-R1 … R4-R8 in the review record. The ones to know:
   loop clears them (fail-safe);
 - `resume()` on a `DesktopSigner` lock/unlock is not driven end to end in a host test.
 
+## Fix round 5
+
+Four items from the verifier of the round-4 fixes, handled as the orchestrator decided. Commits
+`f9b7e1f` (TestMint `quoteExpiry`), `5f7a9ad` (fixes and tests) and `959fbbf` (one more explicit
+test timeout). ADR 0012 has a round-5 addendum, and the review record has a "Round 5" section with
+the table, the mutation checks and the residuals. Contracts and locked paths are still untouched;
+no contract request.
+
+- **LOW — the play's 15 s bound missed the run's own waits.** The run's wait for the startup
+  settle and its own finishing of open top-ups came before the point where the bound started.
+  Now there is one bound, `PLAY_TOP_UP_WAIT_MS` in all, from the moment the play asks. The only
+  time set aside is while the first-funding question is open (`QuestionClock`). Tested with a
+  settle that never ends and with a slow poll in the run's own finishing; both tests fail against
+  the round-4 code.
+- **INFO — an open top-up whose source is gone for good blocked its target forever.** Its quote
+  is now released when the target still says UNPAID 24 h after the later of the invoice's expiry
+  and the reservation, unless the source says PAID. An expired invoice can no longer be paid. It
+  settles `unknown`, never `failed`. A quote without an expiry, one whose source says PAID, one
+  the target forgot, and a record that does not unseal are still kept, with no in-app clear
+  (residual R5-R1).
+- **INFO — R4-R2's "seconds after the melt" was not guaranteed.** This is fixed in code, but not
+  by updating `lastResolve` as suggested: pacing the trigger would also hold back minting a quote
+  the target already says PAID, and the whole-host test "the next play mints it once and goes
+  ahead" fails with it. Instead the release itself waits `TOP_UP_RELEASE_AFTER_MS` = 600 s (core's
+  `PENDING_SETTLE_AFTER_S`) after the melt returned. After a restart it waits until the
+  reservation plus the 300 s melt timeout plus 600 s. One existing test (F3's end to end) now
+  asserts `unresolved` right after its restart, then the same `cap` once past the guard, with a
+  comment.
+- **INFO — load-sensitive tests**: an explicit 30 s timeout, with the measured times in a comment,
+  on the two named multi-top-up tests and on the three of the same shape that also timed out in
+  this round's runs (load average 18-24 on 8 cores).
+
+Files: changed `host/topup/auto-topup.ts` (the bound, `QuestionClock`, `meltReturned`, the release
+guard, the lapse release), `host/adapter.ts`, `host/topup/ledger.ts` and `host/topup/open-topup.ts`
+(comments), `core/src/mocks/test-mint.ts` (`quoteExpiry`), and the tests.
+
+Tests: 8 new (`auto-topup.test.ts` +7, core `test-mint.test.ts` +1). One existing test changed,
+with a comment (F3 end to end, above); none deleted or weakened. Mutation checks M19a–M19i: 9
+applied, 9 killed.
+
+Checks (at `5f7a9ad` plus these docs):
+
+- `npx vitest run packages/app-desktop packages/core --maxWorkers=2`: 2232 passed, 3 failed,
+  17 skipped. The 3 were timeouts at load average ~24, and each passed alone.
+- Whole suite, `npx vitest run --maxWorkers=2`: 3159 passed, 1 failed, 21 skipped. The failure
+  was a timeout in "an explicit yes is remembered…", which also timed out alone. It is not caused
+  by this change: timed back to back, it took 5.8-6.5 s on the round-4 code and 5.7-7.3 s on
+  round 5's. It got an explicit 30 s with that reason (`959fbbf`) and then passed.
+- `npx tsc -b --force`: clean.
+- `eslint` and `prettier --check` on the changed files: clean.
+- `npm run check:locked`: OK.
+- `npm run lint:electron`: OK (229 files, 0 violations).
+- Electron e2e not run (lane rule).
+
 ## Proposed `docs/status.md` row
 
 | Lane | Branch | Status |
 |---|---|---|
-| PAY/melt gate (fund loss from the residuals round-3 verifier, ADR 0012 amendment) + cross-lane review round 4 | `stage-3/int-pay-melt-gate` (on `9a20d30`, with lanes #2 and #8 merged) | **done** — a PAY queued behind a melt at its mint (melts may take 300 s since issue #8 fix round 3) was built after the worker's 300 s `pay.build` deadline, its P2PK proofs lost. The money plane's per-mint gate (`host/pay-melt-gate.ts`): a melt marks its mint, refuses waiting PAYs, waits for the one in flight, and clears however it settles; a PAY is refused at once (`rate-limited:`, nothing spent) while its mint is marked; PAY builds take turns and each must start within its own belt. Every desktop melt goes through it (`GatedCashuWallet`). Shared deadlines in `ipc/deadlines.ts`; round 4 made the belt per PAY (`payBuildStartByMs`: journal entries at the mint cost each send a restore and a check — 105.6 s with none, 15.6 s with one at a loaded mint, none otherwise). The worker's payer retries a `rate-limited` PAY on a 2 → 30 s backoff. Round 4 also fixed a HIGH in the auto top-up: a funding melt whose outcome was unclear dropped the target's quote, and a later paid settle left it unminted while a second top-up ran (reproduced: Lightning paid twice). The quote is now kept before the melt, sealed to the identity (NIP-44 via the signer) on the ledger entry, minted exactly once when PAID or released once the melt is settled unpaid, finished by any trigger, a restart, an unlock or a signer swap; no second top-up into a target with one open; the settled melt reads "top-up". Also: provable nothing-sent melt refusals settle `failed`, a run waits for the startup settle, a play at zero balance waits at most 15 s past the question. 58 new tests over both rounds, 37 mutations killed. Open: other operations at the same mint are not gated (R1); a coded refusal after the melt request still counts against the cap (core has no "not executed", R4-R3) |
+| PAY/melt gate (fund loss from the residuals round-3 verifier, ADR 0012 amendment) + cross-lane review round 4 | `stage-3/int-pay-melt-gate` (on `9a20d30`, with lanes #2 and #8 merged) | **done** — a PAY queued behind a melt at its mint (melts may take 300 s since issue #8 fix round 3) was built after the worker's 300 s `pay.build` deadline, its P2PK proofs lost. The money plane's per-mint gate (`host/pay-melt-gate.ts`): a melt marks its mint, refuses waiting PAYs, waits for the one in flight, and clears however it settles; a PAY is refused at once (`rate-limited:`, nothing spent) while its mint is marked; PAY builds take turns and each must start within its own belt. Every desktop melt goes through it (`GatedCashuWallet`). Shared deadlines in `ipc/deadlines.ts`; round 4 made the belt per PAY (`payBuildStartByMs`: journal entries at the mint cost each send a restore and a check — 105.6 s with none, 15.6 s with one at a loaded mint, none otherwise). The worker's payer retries a `rate-limited` PAY on a 2 → 30 s backoff. Round 4 also fixed a HIGH in the auto top-up: a funding melt whose outcome was unclear dropped the target's quote, and a later paid settle left it unminted while a second top-up ran (reproduced: Lightning paid twice). The quote is now kept before the melt, sealed to the identity (NIP-44 via the signer) on the ledger entry, minted exactly once when PAID or released once the melt is settled unpaid, finished by any trigger, a restart, an unlock or a signer swap; no second top-up into a target with one open; the settled melt reads "top-up". Also: provable nothing-sent melt refusals settle `failed`, a run waits for the startup settle. Round 5: a play at zero balance waits at most 15 s in all (the first-funding question aside); a kept quote is never released within 600 s of its melt returning; a quote whose target still says UNPAID a day after the invoice expired is released unless the source says PAID (a source gone for good no longer blocks its target forever). 66 new tests over three rounds, 46 mutations killed. Open: other operations at the same mint are not gated (R1); a coded refusal after the melt request still counts against the cap (core has no "not executed", R4-R3); a target that forgets a kept quote, or says UNPAID while the source says PAID, holds auto top-ups into it with no in-app clear (R5-R1) |
