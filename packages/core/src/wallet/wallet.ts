@@ -46,6 +46,13 @@ import { heldSecrets, proofTotal, type ProofStore } from './store.js';
  * One loaded cashu-ts `Wallet` per mint, created on first use. `request` overrides the HTTP
  * transport per mint (the in-process `TestMint`, or a host transport with its own policy).
  * `requireSigDleq`: a mint that advertises NUT-12 must return DLEQ proofs on every signature.
+ *
+ * Without `request` (or where it answers `undefined`), cashu-ts's OWN fetch transport is used,
+ * which RETRIES swaps, melts and mints at a mint advertising NUT-19. `spend.ts` reads a coded
+ * answer as the mint's answer to its one request (`isDefinitive`), so every production wallet
+ * passes a single-attempt transport for every mint: the desktop's `host/mint-transport.ts`, the
+ * daemons' `@sovit/seeder` `runtime/mint-http.ts` (issue #8 fix round 2). Only the opt-in
+ * real-mint tests use the default.
  */
 export class CashuMintConnections implements MintConnections {
   private readonly wallets = new Map<MintUrl, Promise<CashuTsWallet>>();
