@@ -6,17 +6,32 @@
  * Opt-in: runs only when `NUTFLIX_REAL_MINT_URL` names a mint (`scripts/real-mint/nutshell.sh`
  * starts a local Nutshell with FakeWallet). Plain `npm test` skips it and stays offline.
  *
- * The viewer is a Seeder node used as a client, paying through the SAME `UpstreamPayer` the
- * gateway and the desktop worker use (manifest price, per-channel carry, one PAY in flight).
+ * The viewer is a Seeder node used as a client, paying through the SAME stack the gateway and the
+ * desktop worker use (`viewerStack`, routed): `UpstreamPayer` (manifest price, per-channel carry,
+ * one PAY in flight) with `CreditSettler`, and `SeederCredit` routing every core through
+ * `OnePeerRouter` — one seeder per block (security review F33) and each seeder asked only within
+ * its own window (issue #8). The first test also runs a clearly labelled BASELINE on the pre-F33
+ * rig (a bare `UpstreamPayer`, nothing routed) to measure what the routing changes.
  */
-import { payment, payProtocol, signer as signerMod, wallet as walletMod } from '@sovit/core';
+import {
+  DEFAULT_WINDOW_BLOCKS,
+  payment,
+  payProtocol,
+  signer as signerMod,
+  wallet as walletMod,
+} from '@sovit/core';
 import type {
+  BlockRange,
   CashuP2pkPubkey,
   CashuProof,
   LockedProofSet,
   MintUrl,
   MuxLike,
+  NostrPubkey,
   PayMessage,
+  PayProtocol,
+  PaymentEngineViewer,
+  PeerWindow,
   PricePolicy,
   Sats,
 } from '@sovit/core';
@@ -25,7 +40,7 @@ import { Seeder, nodeCrypto, nodeFs, toHex } from '@sovit/seeder';
 import type { PeerSession } from '@sovit/seeder';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { UpstreamPayer } from '../upstream/payer.js';
+import { CreditPool, CreditSettler, SeederCredit, UpstreamPayer } from '../upstream/payer.js';
 import { capturedLogger, settle, tmpDir, until } from './helpers.js';
 
 const MINT = process.env['NUTFLIX_REAL_MINT_URL'] as MintUrl | undefined;
@@ -80,6 +95,8 @@ interface SeederNode {
   readonly signer: signerMod.LocalSigner;
   readonly zaps: LockedProofSet[];
   readonly log: string[];
+  /** The most it ever counted outstanding for one peer, read where it decides to cut. */
+  readonly peak: { outstanding: number };
 }
 
 async function seederNode(mint: MintUrl, fill: number, windowBlocks: number): Promise<SeederNode> {
@@ -124,7 +141,104 @@ async function seederNode(mint: MintUrl, fill: number, windowBlocks: number): Pr
     await seeder.close();
     await t.rm();
   });
-  return { seeder, engine, wallet: w, key, signer, zaps, log: log.lines };
+  const peak = { outstanding: 0 };
+  const record = engine.recordUpload.bind(engine);
+  engine.recordUpload = (peer: NostrPubkey, blocks: BlockRange, pricing): PeerWindow => {
+    const win = record(peer, blocks, pricing);
+    peak.outstanding = Math.max(peak.outstanding, win.outstanding);
+    return win;
+  };
+  return { seeder, engine, wallet: w, key, signer, zaps, log: log.lines, peak };
+}
+
+type ViewerCore = Parameters<UpstreamPayer['attachCore']>[0];
+
+/** What the viewer pays with (see the module comment). */
+interface ViewerStack {
+  readonly payer: UpstreamPayer;
+  /** `null` on the BASELINE rig (nothing routed). */
+  readonly seeders: SeederCredit | null;
+  attachPeer(noiseHex: string, chan: PayProtocol): () => void;
+  attachCore(core: ViewerCore): () => void;
+}
+
+/**
+ * `routed`: the production wiring, as `gateway.ts` and the desktop's `viewer-payer.ts` build it.
+ * Otherwise the BASELINE: the pre-F33 rig, a bare `UpstreamPayer` and hypercore's own scheduler.
+ */
+function viewerStack(
+  engine: PaymentEngineViewer,
+  mint: MintUrl,
+  core: string,
+  policy: PricePolicy,
+  routed: boolean,
+): ViewerStack {
+  const logger = capturedLogger('error').logger;
+  if (!routed) {
+    const payer = new UpstreamPayer({
+      engine,
+      logger,
+      payEveryBlocks: 1,
+      ownMints: [mint],
+      policyFor: () => policy,
+    });
+    cleanups.push(() => {
+      payer.dispose();
+      return Promise.resolve();
+    });
+    return {
+      payer,
+      seeders: null,
+      attachPeer: (noiseHex, chan) => payer.attachPeer(noiseHex, chan),
+      attachCore: (c) => payer.attachCore(c),
+    };
+  }
+  const credit = new CreditPool(DEFAULT_WINDOW_BLOCKS);
+  const settler = new CreditSettler({ credit, logger, payable: (c) => c === core });
+  const seeders = new SeederCredit({
+    settler,
+    pool: credit,
+    policyFor: (c) => (c === core ? policy : null),
+    logger,
+  });
+  const payer = new UpstreamPayer({
+    engine,
+    logger,
+    payEveryBlocks: 1,
+    credit,
+    seederBatch: (noiseHex) => seeders.seederBatch(noiseHex),
+    ownMints: [mint],
+    policyFor: () => policy,
+  });
+  cleanups.push(() => {
+    payer.dispose();
+    seeders.dispose();
+    return Promise.resolve();
+  });
+  return {
+    payer,
+    seeders,
+    attachPeer: (noiseHex, chan) => {
+      const settled = settler.attachPeer(noiseHex, chan);
+      const detachCredit = seeders.attachPeer(noiseHex, chan);
+      const detachPayer = payer.attachPeer(noiseHex, settled.protocol);
+      return () => {
+        detachPayer();
+        detachCredit();
+        settled.detach();
+      };
+    },
+    attachCore: (c) => {
+      const offRoute = seeders.attachCore(c);
+      const offSettler = settler.attachCore(c);
+      const offPayer = payer.attachCore(c);
+      return () => {
+        offRoute();
+        offSettler();
+        offPayer();
+      };
+    },
+  };
 }
 
 /** A viewer node: a Seeder used as a client, its own engine irrelevant (it only downloads). */
@@ -141,13 +255,13 @@ interface Link {
 
 /**
  * Pipe `from` (seeder) ⇄ `viewer`, attach `pay/1` on both ends of the same protomux, exchange
- * connection-bound HELLOs, and register the viewer side with the payer.
+ * connection-bound HELLOs, and register the viewer side with its paying stack.
  */
 async function connect(
   from: SeederNode,
   viewer: Seeder,
   viewerSigner: signerMod.LocalSigner,
-  payer: UpstreamPayer,
+  stack: ViewerStack,
   policy: PricePolicy,
   windowBlocks: number,
 ): Promise<Link> {
@@ -167,7 +281,7 @@ async function connect(
   seederChan.attach(seederMux);
   viewerChan.attach(viewerMux);
   from.seeder.attachPayProtocol(session, seederChan);
-  payer.attachPeer(toHex(sb.noiseStream.remotePublicKey!), viewerChan);
+  stack.attachPeer(toHex(sb.noiseStream.remotePublicKey!), viewerChan);
   seederChan.sendHello(
     await payProtocol.buildHello(from.signer, payProtocol.bindingFromMux(seederMux)!, {
       acceptedMints: [...policy.mints],
@@ -211,7 +325,7 @@ describe.skipIf(MINT === undefined)(
     const mint = MINT!;
     const creatorKey = keyOf(77);
 
-    async function world(blocks: number, windowBlocks: number) {
+    async function world(blocks: number, windowBlocks: number, routed = true) {
       const origin = await seederNode(mint, 71, windowBlocks);
       const data = new Uint8Array(BLOCK * blocks).map((_, i) => (i * 31 + 7) % 256);
       const put = await origin.seeder.putBytes(data, { mime: 'video/mp4' });
@@ -240,24 +354,36 @@ describe.skipIf(MINT === undefined)(
         },
         wallet: viewerWallet,
       });
-      const payer = new UpstreamPayer({
-        engine: viewerEngine,
-        logger: capturedLogger('error').logger,
-        payEveryBlocks: 1,
-        ownMints: [mint],
-        policyFor: () => policy,
-      });
-      return { origin, data, put, core, policy, viewerWallet, viewerSigner, viewerEngine, payer };
+      const stack = viewerStack(viewerEngine, mint, core, policy, routed);
+      const payer = stack.payer;
+      return {
+        origin,
+        data,
+        put,
+        core,
+        policy,
+        viewerWallet,
+        viewerSigner,
+        viewerEngine,
+        payer,
+        stack,
+      };
     }
 
-    it('the viewer downloads one video from three seeders and pays each for what it served; every seeder redeems at the mint and the creator redeems its share', async () => {
+    /**
+     * One video (24 blocks) from three seeders with the given windows; the viewer reads it at
+     * full speed (no gate: the per-seeder caps alone must hold the windows when routed) and pays
+     * with the real mint. Every seeder then redeems, and the creator redeems its share.
+     */
+    async function threeSeeders(routed: boolean, windows: readonly [number, number, number]) {
       const BLOCKS = 24;
-      const WINDOW = 64; // no flow control here (the desktop credit pool does that): the window only has to hold the burst
-      const w = await world(BLOCKS, WINDOW);
-      // Two more seeders mirror the core from the origin before the viewer arrives (unpaid warm-up:
-      // they are seeders, not viewers — the origin's window absorbs it).
-      const s2 = await seederNode(mint, 72, WINDOW);
-      const s3 = await seederNode(mint, 73, WINDOW);
+      const w = await world(BLOCKS, windows[0], routed);
+      const s2 = await seederNode(mint, 72, windows[1]);
+      const s3 = await seederNode(mint, 73, windows[2]);
+      // Two more seeders mirror the core from the origin before the viewer arrives: FREE while
+      // they copy it (ADR 0015), so the origin records nothing for them and its window is the
+      // viewer's alone.
+      w.origin.seeder.setFreeCore(w.core, true);
       for (const s of [s2, s3]) {
         s.seeder.setPolicy(w.policy);
         const a = w.origin.seeder.replicate(true);
@@ -271,22 +397,21 @@ describe.skipIf(MINT === undefined)(
         a.destroy();
         b.destroy();
       }
+      w.origin.seeder.setFreeCore(w.core, false);
 
+      const nodes = [w.origin, s2, s3];
       const viewer = await viewerNode(mint);
       const links: Link[] = [];
-      for (const s of [w.origin, s2, s3])
-        links.push(await connect(s, viewer, w.viewerSigner, w.payer, w.policy, WINDOW));
+      for (const [k, s] of nodes.entries())
+        links.push(await connect(s, viewer, w.viewerSigner, w.stack, w.policy, windows[k]!));
       const vcore = await viewer.blobs.openCoreByKey(Buffer.from(w.core, 'hex'));
-      const detachCore = w.payer.attachCore(vcore.core);
-      const full = await vcore.blobs.get(w.put.entry.blob, { wait: true, timeout: 30_000 });
+      const detachCore = w.stack.attachCore(vcore.core);
+      const full = await vcore.blobs.get(w.put.entry.blob, { wait: true, timeout: 60_000 });
       expect(Buffer.from(full!).equals(Buffer.from(w.data))).toBe(true);
       await w.payer.flush();
-      // Every block paid AND every PAY answered ("acks == pays" alone is briefly true between an
-      // ACK and the next PAY, which takes a real-mint round trip to build).
-      // Done when every block ANY seeder sent is paid and every PAY answered. Hypercore can fetch
-      // one block from two seeders (racing requests); each is paid for what it sent (see below).
+      // Done when every block ANY seeder sent is paid and every PAY answered ("acks == pays" alone
+      // is briefly true between an ACK and the next PAY, which takes a real-mint round trip).
       const viewerPk = await w.viewerSigner.getPublicKey();
-      const nodes = [w.origin, s2, s3];
       await until(() => {
         const st = w.payer.stats();
         const wins = nodes.map((n) => n.engine.window(viewerPk));
@@ -298,22 +423,26 @@ describe.skipIf(MINT === undefined)(
 
       const stats = w.payer.stats();
       expect(stats).toMatchObject({ acksRejected: 0, skippedOverpriced: 0 });
-      // Real-mint finding: blocks a seeder sent twice (a raced request) are paid twice — each
-      // seeder counts what it SENT. So the viewer pays blocksPaid × price, which can exceed the
-      // video's price; docs/security-review.md F33.
-      expect(stats.blocksPaid).toBeGreaterThanOrEqual(BLOCKS);
       expect(w.viewerEngine.spent().total).toBe(stats.blocksPaid * 2);
 
       let swapped = 0;
       let nutzapped = 0;
       let served = 0;
       let dust = 0;
+      const perSeeder: { uploaded: number; paid: number; peak: number }[] = [];
       for (const s of nodes) {
         const win = s.engine.window(viewerPk);
-        if (win !== undefined) {
-          expect(win).toMatchObject({ outstanding: 0, banned: false });
-          served += win.uploaded;
-        }
+        // Each seeder is paid exactly for what it sent, and holds nothing unpaid.
+        expect(win ?? { outstanding: 0, banned: false }).toMatchObject({
+          outstanding: 0,
+          banned: false,
+        });
+        served += win?.uploaded ?? 0;
+        perSeeder.push({
+          uploaded: win?.uploaded ?? 0,
+          paid: win?.paid ?? 0,
+          peak: s.peak.outstanding,
+        });
         const r = await s.engine.flush();
         expect(r.failed).toBe(0);
         swapped += r.swapped;
@@ -335,6 +464,41 @@ describe.skipIf(MINT === undefined)(
         expect(creatorGot).toBeLessThanOrEqual(nutzapped);
       }
       for (const l of links) l.destroy();
+      // The measurement the F33 lane reports (paid deliveries per 24 blocks; counts only), as a
+      // test annotation: no console in this package (SECURITY.md invariant 7).
+      const report =
+        `[real-mint F33] ${routed ? 'routed' : 'BASELINE unrouted'}: ${String(stats.blocksPaid)} ` +
+        `paid deliveries for ${String(BLOCKS)} blocks; per seeder ${JSON.stringify(perSeeder)}`;
+      return { blocks: BLOCKS, stats, perSeeder, seeders: w.stack.seeders, report };
+    }
+
+    it('BASELINE (unrouted: the pre-F33 rig, a bare UpstreamPayer and hypercore’s own scheduler) — three racing seeders, each paid for what it SENT, duplicates included', async ({
+      annotate,
+    }) => {
+      // Kept to measure what the routing changes (security review F33: 29 paid for 24 measured
+      // here before it). Windows of 64: nothing but the window holds the unpaced burst.
+      const r = await threeSeeders(false, [64, 64, 64]);
+      await annotate(r.report);
+      expect(r.stats.blocksPaid).toBeGreaterThanOrEqual(r.blocks);
+    });
+
+    it('routed (production): the viewer downloads one video from three seeders — each block paid ONCE, each seeder paid exactly for what it served and never above its own window; every seeder redeems at the mint and the creator redeems its share', async ({
+      annotate,
+    }) => {
+      const windows = [6, 3, 2] as const;
+      const r = await threeSeeders(true, windows);
+      await annotate(r.report);
+      // F33: one seeder per block — paid deliveries == blocks.
+      expect(r.stats.blocksPaid).toBe(r.blocks);
+      expect(r.perSeeder.reduce((a, x) => a + x.uploaded, 0)).toBe(r.blocks);
+      for (const [k, x] of r.perSeeder.entries()) {
+        expect(x.paid, `seeder ${String(k)} paid for what it sent`).toBe(x.uploaded);
+        // Issue #8: never above its own window, read where the seeder decides to cut.
+        expect(x.peak, `seeder ${String(k)} (window ${String(windows[k])})`).toBeLessThanOrEqual(
+          windows[k]!,
+        );
+      }
+      expect(r.seeders?.router.stats().raced).toBe(0);
     });
 
     it('a live double-spend: a creator set bound to one seeder is refused by another, and a replayed PAY is refused and banned', async () => {
@@ -403,9 +567,9 @@ describe.skipIf(MINT === undefined)(
       const WINDOW = 32;
       const w = await world(BLOCKS, WINDOW);
       const viewer = await viewerNode(mint);
-      let link = await connect(w.origin, viewer, w.viewerSigner, w.payer, w.policy, WINDOW);
+      let link = await connect(w.origin, viewer, w.viewerSigner, w.stack, w.policy, WINDOW);
       const vcore = await viewer.blobs.openCoreByKey(Buffer.from(w.core, 'hex'));
-      const detachCore = w.payer.attachCore(vcore.core);
+      const detachCore = w.stack.attachCore(vcore.core);
       for (let i = 0; i < 6; i++)
         expect(await vcore.core.get(i, { wait: true, timeout: 5000 })).not.toBeNull();
       await until(() => w.payer.stats().acksOk > 0, 10_000);
@@ -424,7 +588,7 @@ describe.skipIf(MINT === undefined)(
       await settle(300);
       // Reconnect: a new channel (carry 0 on both sides — the seeder rebinds, the payer keeps
       // carry per channel), and the rest of the video.
-      link = await connect(w.origin, viewer, w.viewerSigner, w.payer, w.policy, WINDOW);
+      link = await connect(w.origin, viewer, w.viewerSigner, w.stack, w.policy, WINDOW);
       const full = await vcore.blobs.get(w.put.entry.blob, { wait: true, timeout: 30_000 });
       expect(Buffer.from(full!).equals(Buffer.from(w.data))).toBe(true);
       await w.payer.flush();
