@@ -233,6 +233,11 @@ describe('PayMeltGate: a melt and a PAY build at one mint never overlap', () => 
     expect(late.done).toBe(true);
     expect(refusal(late.error)).toBe(`rate-limited: ${PAY_TOO_LATE}`);
     expect(built).toBe(0);
+    // An arrival comes from the gate's clock only: a wall-clock number does not type-check (against
+    // the monotonic default it would read as a request from the future and switch the belt off).
+    // @ts-expect-error — `Date.now()` is not an `Arrival`
+    const wrongClock = (): Promise<void> => g.pay(A, Date.now(), () => Promise.resolve());
+    expect(typeof wrongClock).toBe('function');
     // Exactly at the limit is still in time.
     const t0 = g.now();
     advance(PAY_BUILD_START_BY_MS);
@@ -266,6 +271,14 @@ describe('PayMeltGate: a melt and a PAY build at one mint never overlap', () => 
     expect(await quick).toBe('q');
     expect(await waited).toBe('paid');
     expect(timers.armed).toEqual([]);
+  });
+
+  it('refuses durations that would switch a rule off (NaN, infinite, negative)', () => {
+    for (const bad of [Number.NaN, Number.POSITIVE_INFINITY, -1]) {
+      expect(() => new PayMeltGate({ startByMs: bad }), String(bad)).toThrow(RangeError);
+      expect(() => new PayMeltGate({ meltWaitMs: bad }), String(bad)).toThrow(RangeError);
+    }
+    expect(() => new PayMeltGate({ startByMs: 0, meltWaitMs: 0 })).not.toThrow();
   });
 
   it('every refusal is a GateRefusal: code rate-limited, and it crosses the wire as such', () => {

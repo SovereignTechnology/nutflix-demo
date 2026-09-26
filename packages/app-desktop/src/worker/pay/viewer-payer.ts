@@ -56,7 +56,10 @@ import type { CreditPool } from '../playback/credit.js';
 
 export type PayFn = PaymentEngineViewer['pay'];
 
-/** After a PAY the host refused "for now" (`rate-limited:`), the pending blocks are paid again after this long … */
+/**
+ * After a PAY the host refused "for now" (`rate-limited:`), what is owed is paid again after this
+ * long …
+ */
 export const PAY_RETRY_LATER_MS = 2_000;
 /** … doubling per refusal in a row, up to this. */
 export const PAY_RETRY_LATER_MAX_MS = 30_000;

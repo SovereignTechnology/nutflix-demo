@@ -47,6 +47,13 @@ export class GateRefusal extends IpcError {
   }
 }
 
+/**
+ * When a PAY request arrived, on the gate's own clock: only `PayMeltGate.now()` makes one, so a
+ * wall-clock time (`Date.now()`, another base) cannot be passed by mistake — against the
+ * monotonic default it would read as a request from the future and switch the belt off.
+ */
+export type Arrival = number & { readonly __arrival: unique symbol };
+
 export interface GateTimers {
   setTimeout(fn: () => void, ms: number): unknown;
   clearTimeout(handle: unknown): void;
@@ -67,10 +74,21 @@ export interface PayMeltGateOptions {
   /** A monotonic clock in ms (default `performance.now`). */
   readonly clock?: () => number;
   readonly timers?: GateTimers;
-  /** The belt (default `PAY_BUILD_START_BY_MS`). */
+  /** The belt (default `PAY_BUILD_START_BY_MS`); a finite number ≥ 0, else the constructor throws. */
   readonly startByMs?: number;
-  /** How long a melt waits for the PAY build in flight (default the worker's deadline). */
+  /**
+   * How long a melt waits for the PAY build in flight (default the worker's deadline); a finite
+   * number ≥ 0, else the constructor throws.
+   */
   readonly meltWaitMs?: number;
+}
+
+/** A duration option: `NaN` would switch the belt off (`x > NaN` is false), so none is taken. */
+function durationMs(name: string, v: number | undefined, fallback: number): number {
+  if (v === undefined) return fallback;
+  if (!Number.isFinite(v) || v < 0)
+    throw new RangeError(`PayMeltGate: ${name} must be a finite number of ms ≥ 0`);
+  return v;
 }
 
 interface Turn {
@@ -99,13 +117,13 @@ export class PayMeltGate {
   constructor(o: PayMeltGateOptions = {}) {
     this.clock = o.clock ?? ((): number => performance.now());
     this.timers = o.timers ?? realTimers;
-    this.startByMs = o.startByMs ?? PAY_BUILD_START_BY_MS;
-    this.meltWaitMs = o.meltWaitMs ?? WORKER_HOST_REQUEST_TIMEOUT_MS;
+    this.startByMs = durationMs('startByMs', o.startByMs, PAY_BUILD_START_BY_MS);
+    this.meltWaitMs = durationMs('meltWaitMs', o.meltWaitMs, WORKER_HOST_REQUEST_TIMEOUT_MS);
   }
 
   /** The gate's clock: when a PAY request arrived, for `pay`'s belt. */
-  now(): number {
-    return this.clock();
+  now(): Arrival {
+    return this.clock() as Arrival;
   }
 
   /** A melt is pending or in flight at `mint` (PAY builds there are refused). */
@@ -118,7 +136,7 @@ export class PayMeltGate {
    * flight there, and — at its turn — once `startByMs` has passed since `arrived` (`now()` when
    * the request came in). `build` is never called for a refused PAY.
    */
-  async pay<T>(mint: MintUrl, arrived: number, build: () => Promise<T>): Promise<T> {
+  async pay<T>(mint: MintUrl, arrived: Arrival, build: () => Promise<T>): Promise<T> {
     const m = this.mint(mint);
     if (m.melts > 0) throw new GateRefusal(MELT_AT_MINT);
     if (m.busy)

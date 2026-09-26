@@ -6,6 +6,10 @@
  * (Why a PAY is never queued behind a melt at all: a melt may run `MELT_REQUEST_TIMEOUT_MS`, far
  * past the belt — `host/__tests__/pay-melt-gate.test.ts` and `money.test.ts` test the gate.)
  */
+import { readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
 import { SimplePool } from 'nostr-tools/pool';
 import { Relay } from 'nostr-tools/relay';
 import { describe, expect, it } from 'vitest';
@@ -52,5 +56,14 @@ describe('money plane deadlines', () => {
     } finally {
       pool.destroy();
     }
+  });
+
+  it('the worker runs on the shared deadline: its entry sets no request timeout of its own', () => {
+    // `WorkerRpc`'s `requestTimeoutMs` is for tests; a production value here would move the
+    // deadline the host's PAY builds are kept inside.
+    const src = join(dirname(fileURLToPath(import.meta.url)), '..', '..');
+    const entry = readFileSync(join(src, 'worker', 'entry.ts'), 'utf8');
+    expect(entry).toMatch(/new WorkerRpc\(/);
+    expect(entry).not.toMatch(/requestTimeoutMs/);
   });
 });
