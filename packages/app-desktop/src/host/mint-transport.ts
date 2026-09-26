@@ -36,13 +36,22 @@ import { request as httpsRequest } from 'node:https';
 
 import { wallet as walletMod } from '@sovit/core';
 
+import { MELT_REQUEST_TIMEOUT_MS, MINT_REQUEST_TIMEOUT_MS } from '../ipc/deadlines.js';
+
 /** Raw HTTP to a mint: `node:http` for `http:` (a loopback dev mint), `node:https` otherwise. */
 export const hostRawHttp: walletMod.RawHttp = walletMod.httpModuleRawHttp({
   http: { request: httpRequest },
   https: { request: httpsRequest },
 });
 
-/** The cashu-ts request function every mint of the money plane uses (one attempt per request). */
+/**
+ * The cashu-ts request function every mint of the money plane uses (one attempt per request). Its
+ * timeouts are the shared `ipc/deadlines.ts` numbers (core's defaults, named where the worker's
+ * `pay.build` deadline is weighed against them): 30 s, and 300 s for a melt.
+ */
 export function hostMintRequest(): ReturnType<typeof walletMod.cashuRequestFn> {
-  return walletMod.cashuRequestFn(hostRawHttp);
+  return walletMod.cashuRequestFn(hostRawHttp, {
+    timeoutMs: MINT_REQUEST_TIMEOUT_MS,
+    meltTimeoutMs: MELT_REQUEST_TIMEOUT_MS,
+  });
 }

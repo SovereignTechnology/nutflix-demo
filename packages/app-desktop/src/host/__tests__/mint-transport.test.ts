@@ -30,6 +30,7 @@ import type { CashuP2pkPubkey, MintUrl, RelayUrl, Sats } from '@sovit/core';
 import { mocks, nostr, signer as signerMod } from '@sovit/core';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+import { MELT_REQUEST_TIMEOUT_MS, MINT_REQUEST_TIMEOUT_MS } from '../../ipc/deadlines.js';
 import { memoryLogger } from '../log.js';
 import { MoneyPlane } from '../money.js';
 import { hostMintRequest } from '../mint-transport.js';
@@ -406,6 +407,31 @@ describe('fix round 3: a melt waits for its Lightning payment; every other mint 
         await vi.advanceTimersByTimeAsync(1);
         expect(await r.result, path).toMatchObject({
           err: { name: 'NetworkError', message: 'timed out after 30000 ms' },
+        });
+      }
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('hostMintRequest: its timeouts are the shared deadlines the worker’s pay.build is weighed against (ipc/deadlines.ts)', async () => {
+    const m = await slowMint();
+    const request = hostMintRequest();
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      for (const [path, ms] of [
+        ['/v1/melt/bolt11', MELT_REQUEST_TIMEOUT_MS],
+        ['/v1/swap', MINT_REQUEST_TIMEOUT_MS],
+      ] as const) {
+        const r = observe(
+          request({ endpoint: `${m.url}${path}`, method: 'POST', requestBody: { quote: 'q' } }),
+        );
+        await m.next();
+        await vi.advanceTimersByTimeAsync(ms - 1);
+        expect(r.done, path).toBe(false);
+        await vi.advanceTimersByTimeAsync(1);
+        expect(await r.result, path).toMatchObject({
+          err: { name: 'NetworkError', message: `timed out after ${String(ms)} ms` },
         });
       }
     } finally {

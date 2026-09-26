@@ -32,7 +32,9 @@
  *      settings (still on and due, the same source and amount, the target still on the list);
  *   8. the reservation is persisted BEFORE the melt; a melt that throws or is not paid stays
  *      counted (its sats may have left) — except core's `insufficient-funds`, refused before the
- *      mint is asked. What a paid melt moved is read from its own history line; without one, the
+ *      mint is asked, and the money plane's PAY/melt gate refusing it (`GateRefusal`: a PAY at the
+ *      source mint was still being built; the melt never started — ADR 0012 amendment
+ *      2026-09-25). What a paid melt moved is read from its own history line; without one, the
  *      whole reservation counts, or the source's balance drop when that is larger (input fees past
  *      the allowance — core does not say up front how many inputs it will spend).
  *
@@ -56,6 +58,7 @@ import type {
 import { AUTO_TOP_UP_MAX_SATS, wallet as walletMod } from '@sovit/core';
 
 import type { Logger } from '../log.js';
+import { GateRefusal } from '../pay-melt-gate.js';
 import { autoTopUpDue } from '../settings/settings.js';
 import type { TopUpLedger } from './ledger.js';
 import { isHistoryId } from './ledger.js';
@@ -334,9 +337,11 @@ export class AutoTopUp {
     } catch (err) {
       this.meltInFlight = null;
       // Core refuses `insufficient-funds` while choosing proofs, before the mint is asked (input
-      // fees on top of amount + reserve): nothing moved. Any other failure may have moved sats.
+      // fees on top of amount + reserve): nothing moved. Neither did a melt the money plane's
+      // PAY/melt gate refused before it started. Any other failure may have moved sats.
       const short = err instanceof walletMod.WalletError && err.code === 'insufficient-funds';
-      await this.o.ledger.settle(entry, { state: short ? 'failed' : 'unknown' });
+      const unmoved = short || err instanceof GateRefusal;
+      await this.o.ledger.settle(entry, { state: unmoved ? 'failed' : 'unknown' });
       return short ? 'source-short' : 'failed';
     }
     if (!paid.paid) {

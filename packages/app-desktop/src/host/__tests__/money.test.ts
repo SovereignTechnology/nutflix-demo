@@ -5,7 +5,8 @@
  * and budget; a HELLO signature only over a pay/1 challenge; seller hooks only at the wallet's own
  * mints; nutzaps only to creators seen in a manifest (the user's own share redeemed instead).
  */
-import { getPubKeyFromPrivKey } from '@cashu/cashu-ts';
+import { NetworkError, getPubKeyFromPrivKey } from '@cashu/cashu-ts';
+import type { RequestFn } from '@cashu/cashu-ts';
 import type {
   CashuP2pkPubkey,
   CoreKeyHex,
@@ -22,9 +23,15 @@ import type {
 import { NostrKind, mocks, nostr, payProtocol, payment, signer as signerMod } from '@sovit/core';
 import { describe, expect, it } from 'vitest';
 
+import {
+  MELT_REQUEST_TIMEOUT_MS,
+  PAY_BUILD_START_BY_MS,
+  WORKER_HOST_REQUEST_TIMEOUT_MS,
+} from '../../ipc/deadlines.js';
 import type { SessionId } from '../../ipc/protocol.js';
 import { memoryLogger } from '../log.js';
 import { MoneyPlane, sessionBudgetBlocks } from '../money.js';
+import { MELT_AT_MINT, PAY_TOO_LATE } from '../pay-melt-gate.js';
 
 const MINT = 'https://mint.money.test' as MintUrl;
 const OTHER_MINT = 'https://mint-other.money.test' as MintUrl;
@@ -54,9 +61,14 @@ async function rig(
     fund?: number;
     pool?: nostr.FakeRelayPool;
     onPayment?: (mint: MintUrl) => unknown;
+    /** Wraps the test mint's transport (holding requests, recording when they reach it). */
+    wrap?: (request: RequestFn) => RequestFn;
+    /** The PAY/melt gate's clock (ms). */
+    clock?: () => number;
   } = {},
 ) {
   const mint = new mocks.TestMint({ url: MINT, seed: new Uint8Array(32).fill(0x61) });
+  const request = o.wrap?.(mint.request) ?? mint.request;
   const pool = o.pool ?? new nostr.FakeRelayPool();
   const { signer } = await signerMod.LocalSigner.create({
     passphrase: Buffer.from('money plane test passphrase'),
@@ -70,10 +82,11 @@ async function rig(
     relays: () => [{ url: RELAY, read: true, write: true }],
     defaultMints: () => [MINT],
     log: memoryLogger('warn'),
-    mintRequest: () => mint.request,
+    mintRequest: () => request,
     createWallet: true,
     now: () => t++ as UnixSeconds,
     ...(o.onPayment === undefined ? {} : { onPayment: o.onPayment }),
+    ...(o.clock === undefined ? {} : { clock: o.clock }),
   });
   if ((o.fund ?? 0) > 0) {
     const q = await plane.wallet.mintQuote(MINT, o.fund as Sats);
@@ -380,5 +393,243 @@ describe('MoneyPlane: seller hooks', () => {
       claimedAmount: 4,
       mint: MINT,
     });
+  });
+});
+
+/** A request the holding transport keeps from the mint until the test lets it go. */
+interface Held {
+  readonly path: string;
+  /** Send it on to the mint now. */
+  release(): void;
+  /** Answer it with `e` without the mint ever seeing it (a request cut off at its timeout). */
+  fail(e: Error): void;
+}
+
+/**
+ * A transport over the test mint that holds the requests `hold` picks (`METHOD /path`) and
+ * records when each request reaches the mint, on `clock`.
+ */
+function holding(clock: () => number = () => 0) {
+  let pick: ((path: string) => boolean) | null = null;
+  const arrived: Held[] = [];
+  const waiting: ((h: Held) => void)[] = [];
+  const reached: { readonly path: string; readonly at: number }[] = [];
+  const wrap =
+    (inner: RequestFn): RequestFn =>
+    <T>(args: Parameters<RequestFn>[0]): Promise<T> => {
+      const path = `${(args.method ?? 'GET').toUpperCase()} ${new URL(args.endpoint).pathname}`;
+      const send = (): Promise<T> => {
+        reached.push({ path, at: clock() });
+        return inner<T>(args);
+      };
+      if (pick?.(path) !== true) return send();
+      return new Promise<T>((resolve, reject) => {
+        const h: Held = {
+          path,
+          release: () => {
+            send().then(resolve, reject);
+          },
+          fail: (e) => {
+            reject(e);
+          },
+        };
+        const w = waiting.shift();
+        if (w === undefined) arrived.push(h);
+        else w(h);
+      });
+    };
+  return {
+    wrap,
+    reached,
+    /** Hold what `p` picks from now on (`null`: nothing). */
+    hold(p: ((path: string) => boolean) | null): void {
+      pick = p;
+    },
+    /** The next held request. */
+    next(): Promise<Held> {
+      const h = arrived.shift();
+      return h !== undefined ? Promise.resolve(h) : new Promise((r) => waiting.push(r));
+    },
+  };
+}
+
+/** A promise's outcome, readable without awaiting it. */
+function observe<T>(p: Promise<T>): { done: boolean; value?: T; error?: unknown } {
+  const o: { done: boolean; value?: T; error?: unknown } = { done: false };
+  p.then(
+    (v) => {
+      o.done = true;
+      o.value = v;
+    },
+    (e: unknown) => {
+      o.done = true;
+      o.error = e;
+    },
+  );
+  return o;
+}
+
+const settleIo = (): Promise<void> => new Promise((r) => setTimeout(r, 30));
+const isSwap = (p: string): boolean => p === 'POST /v1/swap';
+const tokenEvents = (pool: nostr.FakeRelayPool): number =>
+  pool.published.filter((x) => x.event.kind === NostrKind.WalletToken).length;
+
+describe('MoneyPlane: PAY builds and melts never overlap at a mint (ADR 0012 amendment, I2-paygate)', () => {
+  it('a melt in flight: a PAY at that mint is refused at once — nothing spent, no proofs made — and one after it settles is built', async () => {
+    const t = holding();
+    const { mint, pool, plane, h } = await rig({ fund: 200, wrap: t.wrap });
+    plane.authorizeSession(SID, { core: CORE, blob: BLOB, policy: POLICY }, CREATOR);
+    const q = await plane.wallet.meltQuote(MINT, 'lnbc200n1paygate');
+    t.hold((p) => p === 'POST /v1/melt/bolt11');
+    const melt = observe(plane.wallet.melt(q));
+    const held = await t.next(); // the mint is paying the invoice
+    const calls = mint.calls.length;
+    const tokens = tokenEvents(pool);
+    const history = (await plane.wallet.history()).length;
+    // The melt's inputs are held out of the balance while it runs (ADR 0014 amendment).
+    const during = await plane.wallet.balance(MINT);
+    expect(during).toBeLessThan(200);
+
+    const pay = observe(h['pay.build']!(build()));
+    await settleIo();
+    expect(pay.done).toBe(true); // at once: not queued behind the melt
+    expect(pay.error).toMatchObject({
+      code: 'rate-limited',
+      message: `rate-limited: ${MELT_AT_MINT}`,
+    });
+    // Nothing reached the wallet: no swap at the mint, no proofs made or dropped, no history.
+    expect(mint.calls.slice(calls)).toEqual([]);
+    expect(tokenEvents(pool)).toBe(tokens);
+    expect((await plane.wallet.history()).length).toBe(history);
+    expect(await plane.wallet.balance(MINT)).toBe(during);
+
+    held.release();
+    await settleIo();
+    expect(melt).toMatchObject({ done: true, value: { paid: true } });
+    expect(await plane.wallet.balance(MINT)).toBe(180);
+    // The mark cleared, and the refused PAY's blocks were not charged to the session's budget.
+    const msg = await h['pay.build']!(build());
+    expect(msg.seederProofs.proofs.reduce((n, p) => n + p.amount, 0)).toBe(2);
+    expect(await plane.wallet.balance(MINT)).toBe(176);
+  });
+
+  it('a PAY in flight: the melt waits for both of its sends, then runs; a PAY asked for meanwhile is refused at once', async () => {
+    const t = holding();
+    const { mint, plane, h } = await rig({ fund: 200, wrap: t.wrap });
+    plane.authorizeSession(SID, { core: CORE, blob: BLOB, policy: POLICY }, CREATOR);
+    const q = await plane.wallet.meltQuote(MINT, 'lnbc200n1paygate');
+    const start = mint.calls.length;
+    t.hold(isSwap);
+    const pay = observe(h['pay.build']!(build()));
+    const seederShare = await t.next(); // the PAY's first send is at the mint
+    t.hold(null);
+    const melt = observe(plane.wallet.melt(q));
+    await settleIo();
+    // Pending, not melting: the melt has not asked the mint anything yet.
+    expect(melt.done).toBe(false);
+    expect(mint.calls.slice(start).filter((c) => c.includes('/melt/'))).toEqual([]);
+    expect(
+      await code(h['pay.build']!(build({ range: { core: CORE, fromBlock: 12, toBlock: 13 } }))),
+    ).toBe('rate-limited');
+
+    seederShare.release();
+    await settleIo();
+    await settleIo();
+    expect(pay.done).toBe(true);
+    expect(pay.error).toBeUndefined();
+    expect(melt).toMatchObject({ done: true, value: { paid: true } });
+    // Both of the PAY's sends (seeder share, creator share), and only then the melt — never the
+    // melt between them, where the creator's send would wait out the Lightning payment.
+    expect(
+      mint.calls.slice(start).filter((c) => c === 'POST /v1/swap' || c.includes('/melt/')),
+    ).toEqual([
+      'POST /v1/swap',
+      'POST /v1/swap',
+      expect.stringMatching(/^GET \/v1\/melt\/quote\/bolt11\/m\d+$/),
+      'POST /v1/melt/bolt11',
+    ]);
+    expect(await plane.wallet.balance(MINT)).toBe(200 - 4 - 20);
+  });
+
+  it("the verifier's scenario: a melt held until its 300 s timeout and a PAY requested meanwhile — no P2PK proofs are made after the worker's deadline", async () => {
+    let now = 0;
+    const clock = (): number => now;
+    const t = holding(clock);
+    const { plane, h } = await rig({ fund: 96, wrap: t.wrap, clock });
+    plane.authorizeSession(SID, { core: CORE, blob: BLOB, policy: POLICY }, CREATOR);
+    const q = await plane.wallet.meltQuote(MINT, 'lnbc350n1paygate'); // 35 sat, as reproduced
+    t.hold((p) => p === 'POST /v1/melt/bolt11');
+    const melt = observe(plane.wallet.melt(q));
+    const held = await t.next();
+    t.hold(null);
+    const during = await plane.wallet.balance(MINT); // the melt's inputs held out of it
+
+    // The worker asks for a PAY at the same mint while the Lightning payment hangs.
+    const asked = now;
+    const pay = observe(h['pay.build']!(build()));
+    await settleIo();
+    // The melt runs to its timeout; the worker gives up on the PAY at the same moment.
+    now += MELT_REQUEST_TIMEOUT_MS;
+    held.fail(new NetworkError(`timed out after ${String(MELT_REQUEST_TIMEOUT_MS)} ms`));
+    await settleIo();
+    await settleIo();
+    expect(melt.done).toBe(true);
+    expect(melt.error).toMatchObject({ code: 'mint-error' });
+    expect(pay.done).toBe(true);
+    expect(pay.error).toMatchObject({ code: 'rate-limited' });
+
+    // Every swap (a P2PK set made) reached the mint before the worker's deadline for that PAY.
+    const late = t.reached.filter(
+      (r) => isSwap(r.path) && r.at >= asked + WORKER_HOST_REQUEST_TIMEOUT_MS,
+    );
+    expect(late).toEqual([]);
+    // The PAY spent nothing; the melt's outcome is unknown to the wallet, so its inputs stay held
+    // until the mint can say (core's journal, ADR 0014 amendment) — the balance is unchanged.
+    expect(await plane.wallet.balance(MINT)).toBe(during);
+    // The gate cleared with the failed melt: the next PAY is built at once.
+    const msg = await h['pay.build']!(build());
+    expect(msg.creatorProofs.proofs.reduce((n, p) => n + p.amount, 0)).toBe(2);
+    expect(await plane.wallet.balance(MINT)).toBe(during - 4);
+  });
+
+  it('the belt: a PAY that waited behind another at its mint past PAY_BUILD_START_BY_MS is refused before the wallet; its blocks go back to the budget', async () => {
+    let now = 0;
+    const t = holding();
+    const { plane, h } = await rig({ fund: 200, wrap: t.wrap, clock: () => now });
+    plane.authorizeSession(SID, { core: CORE, blob: BLOB, policy: POLICY }, CREATOR);
+    t.hold(isSwap);
+    const first = observe(h['pay.build']!(build()));
+    const held = await t.next();
+    t.hold(null);
+    const second = observe(
+      h['pay.build']!(build({ range: { core: CORE, fromBlock: 12, toBlock: 13 } })),
+    );
+    await settleIo();
+    expect(second.done).toBe(false); // waiting for its turn at the mint
+    now += PAY_BUILD_START_BY_MS + 1;
+    held.release();
+    await settleIo();
+    await settleIo();
+    expect(first.done && first.error === undefined).toBe(true);
+    expect(second.error).toMatchObject({
+      code: 'rate-limited',
+      message: `rate-limited: ${PAY_TOO_LATE}`,
+    });
+    expect(t.reached.filter((r) => isSwap(r.path))).toHaveLength(2); // the first PAY's two sends
+    expect(await plane.wallet.balance(MINT)).toBe(196);
+    // Budget 12 blocks: 2 paid, the refused 2 returned — five more PAYs of 2 fit.
+    for (let i = 0; i < 5; i++) await h['pay.build']!(build());
+    expect(await code(h['pay.build']!(build()))).toBe('forbidden');
+  });
+
+  it('the mark clears after a melt that throws (the mint changed the amount since the quote was shown)', async () => {
+    const { plane, h } = await rig({ fund: 200 });
+    plane.authorizeSession(SID, { core: CORE, blob: BLOB, policy: POLICY }, CREATOR);
+    const q = await plane.wallet.meltQuote(MINT, 'lnbc200n1paygate');
+    await expect(plane.wallet.melt({ ...q, amount: q.amount + 1 })).rejects.toMatchObject({
+      code: 'bad-mint-response',
+    });
+    expect(await code(h['pay.build']!(build()))).toBe('resolved');
+    expect(await plane.wallet.balance(MINT)).toBe(196);
   });
 });

@@ -7,8 +7,9 @@
  */
 import * as fc from 'fast-check';
 import { mocks } from '@sovit/core';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
+import { WORKER_HOST_REQUEST_TIMEOUT_MS } from '../../ipc/deadlines.js';
 import { IpcError } from '../../ipc/errors.js';
 import { FrameDecoder, encodeFrame } from '../../ipc/framing.js';
 import type { Guard } from '../../ipc/protocol.js';
@@ -225,6 +226,36 @@ describe('WorkerRpc', () => {
     const p5 = r.rpc.request('studio.publish', draft);
     r.rpc.end();
     await expect(p5).rejects.toMatchObject({ code: 'backend-down' });
+  });
+
+  it('the default worker → host deadline is WORKER_HOST_REQUEST_TIMEOUT_MS, pay.build included (ADR 0012 amendment)', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      const r = rig();
+      const pay = r.rpc.request('pay.build', {
+        sid: SID as never,
+        range: { core: 'c0'.repeat(32) as never, fromBlock: 0, toBlock: 1 },
+        seeder: {
+          pubkey: 'd1'.repeat(32) as never,
+          p2pk: `02${'11'.repeat(32)}` as never,
+          mint: 'https://mint.rpc.test' as never,
+        },
+        policy: mocks.VIDEOS[0]!.price,
+        carryIn: 0,
+      });
+      const out: { done: boolean; err?: unknown } = { done: false };
+      pay.catch((e: unknown) => {
+        out.done = true;
+        out.err = e;
+      });
+      expect(r.out.filter((m) => m.op === 'req')).toHaveLength(1);
+      await vi.advanceTimersByTimeAsync(WORKER_HOST_REQUEST_TIMEOUT_MS - 1);
+      expect(out.done).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(out.err).toMatchObject({ code: 'backend-down' });
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('a corrupt stream is terminal: onFatal once, no resync, push never throws', async () => {

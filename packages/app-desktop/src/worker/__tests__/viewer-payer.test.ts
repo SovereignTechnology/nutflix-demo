@@ -15,10 +15,11 @@ import type {
 import { mocks } from '@sovit/core';
 import type Hypercore from 'hypercore';
 import { silentLogger, toHex } from '@sovit/seeder';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
+import { fromWireError, wireError } from '../../ipc/errors.js';
 import type { PaidEvent } from '../pay/viewer-payer.js';
-import { ViewerPayer } from '../pay/viewer-payer.js';
+import { PAY_RETRY_LATER_MAX_MS, PAY_RETRY_LATER_MS, ViewerPayer } from '../pay/viewer-payer.js';
 import { CreditPool } from '../playback/credit.js';
 
 type Listeners = { [K in keyof PayProtocolEvents]: Set<PayProtocolEvents[K]> };
@@ -347,5 +348,129 @@ describe('ViewerPayer', () => {
       [false, 0, 1],
       [true, 0, 1],
     ]);
+  });
+});
+
+describe('ViewerPayer: a PAY the host refuses for now (ADR 0012 amendment, lane I2-paygate)', () => {
+  it('a melt at the mint (rate-limited): the blocks stay owed, nothing reaches the seeder, the session stays up; the payer asks again on a backoff — never in a loop — and pays once the host accepts', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      const engine = new mocks.MockPaymentEngine();
+      let melting = true;
+      let asked = 0;
+      const credit = new CreditPool(2);
+      const payer = new ViewerPayer({
+        pay: (range, seeder, p) => {
+          asked++;
+          // What the worker's `pay.build` rejects with while the host's gate is closed.
+          if (melting)
+            return Promise.reject(
+              fromWireError(wireError('rate-limited', 'a melt is in progress at this mint')),
+            );
+          return engine.pay(range, seeder, p);
+        },
+        ownMints: [mocks.MINTS.a],
+        credit,
+        logger: silentLogger,
+        policyFor: () => policy,
+      });
+      const core = fakeCore(1);
+      const key = toHex(core.key);
+      payer.attachCore(core);
+      const proto = new FakeProto();
+      payer.attachPeer(NOISE, proto);
+      proto.hello();
+      // Both credit units are held by blocks nobody has paid for: no download can come.
+      for (const i of [0, 1]) {
+        credit.tryAcquire(key, i);
+        core.emit('download', i, 65_536, { remotePublicKey: peerKey });
+      }
+      await settle();
+      const first = asked; // each download asked (the second after the first was refused)
+      expect(first).toBeGreaterThanOrEqual(1);
+      // A 5-minute melt: a handful of asks, spaced by the backoff (the 2 s tail timer too) —
+      // 2, 4, 8, 16 s, then every 30 s: about 14, never one per event-loop turn.
+      for (let s = 0; s < 300; s++) {
+        await vi.advanceTimersByTimeAsync(1_000);
+        await settle();
+      }
+      expect(asked - first).toBeGreaterThanOrEqual(5);
+      expect(asked - first).toBeLessThanOrEqual(Math.ceil(300_000 / PAY_RETRY_LATER_MAX_MS) + 8);
+      expect(proto.sent).toEqual([]); // the seeder never saw a PAY: no window, no ban
+      expect(credit.holds(key, 0) && credit.holds(key, 1)).toBe(true); // still owed
+      expect(payer.stats().owed).toBe(2);
+
+      // The melt settles: the next ask goes through by itself, with no download to trigger it.
+      melting = false;
+      await vi.advanceTimersByTimeAsync(PAY_RETRY_LATER_MAX_MS);
+      await settle();
+      // One PAY for the whole owed run (the retry pays what is owed however short).
+      expect(proto.sent.map((m) => [m.range.fromBlock, m.range.toBlock])).toEqual([[0, 1]]);
+      proto.ack(0, 1);
+      expect(credit.size).toBe(0);
+      // Nothing owed any more: no further asks.
+      const after = asked;
+      await vi.advanceTimersByTimeAsync(10 * PAY_RETRY_LATER_MAX_MS);
+      await settle();
+      expect(asked).toBe(after);
+      payer.close();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('only rate-limited brings the payer back by itself; the first ask waits PAY_RETRY_LATER_MS, and close() cancels it', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      const make = (code: 'rate-limited' | 'no-balance') => {
+        let asked = 0;
+        const credit = new CreditPool(2);
+        const payer = new ViewerPayer({
+          pay: () => {
+            asked++;
+            return Promise.reject(fromWireError(wireError(code, 'refused')));
+          },
+          ownMints: [mocks.MINTS.a],
+          credit,
+          logger: silentLogger,
+          policyFor: () => policy,
+        });
+        const core = fakeCore(1);
+        payer.attachCore(core);
+        const proto = new FakeProto();
+        payer.attachPeer(NOISE, proto);
+        proto.hello();
+        credit.tryAcquire(toHex(core.key), 0);
+        core.emit('download', 0, 65_536, { remotePublicKey: peerKey });
+        return { payer, asked: () => asked };
+      };
+      const limited = make('rate-limited');
+      const broke = make('no-balance');
+      await settle();
+      const [l0, b0] = [limited.asked(), broke.asked()];
+      expect(l0).toBe(b0); // the same triggers so far
+      // The tail timer (2 s after the download) asks each once more; the rate-limited one's
+      // backoff (PAY_RETRY_LATER_MS) comes due at the same moment.
+      await vi.advanceTimersByTimeAsync(PAY_RETRY_LATER_MS - 1);
+      await settle();
+      expect([limited.asked(), broke.asked()]).toEqual([l0, b0]);
+      await vi.advanceTimersByTimeAsync(1);
+      await settle();
+      const [l1, b1] = [limited.asked(), broke.asked()];
+      expect(b1).toBe(b0 + 1);
+      expect(l1).toBe(l0 + 2);
+      await vi.advanceTimersByTimeAsync(60_000);
+      await settle();
+      expect(broke.asked()).toBe(b1); // no-balance: the next trigger decides, as before
+      expect(limited.asked()).toBeGreaterThan(l1);
+      limited.payer.close();
+      const closed = limited.asked();
+      await vi.advanceTimersByTimeAsync(10 * PAY_RETRY_LATER_MAX_MS);
+      await settle();
+      expect(limited.asked()).toBe(closed);
+      broke.payer.close();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
