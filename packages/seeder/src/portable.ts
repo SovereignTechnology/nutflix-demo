@@ -34,6 +34,25 @@ export type { SessionEvent } from './net/session-registry.js';
 export { RateLimiter, DEFAULT_RATE_LIMITS } from './net/rate-limit.js';
 export type { AdmitResult, RateLimitConfig } from './net/rate-limit.js';
 export { SwarmManager } from './net/swarm.js';
+export {
+  DEFAULT_STALL_MS,
+  MAX_REMEMBERED_REMOTES,
+  MIN_STALL_MS,
+  OnePeerRouter,
+  ROUTED_HYPERCORE_VERSION,
+  RoutingUnsupported,
+  STALL_HARD_FACTOR,
+  UNCAPPED,
+  isRoutablePeer,
+  routableReplicator,
+} from './net/one-peer.js';
+export type {
+  DownloadPeer,
+  OnePeerRouterOptions,
+  OnePeerRouterStats,
+  PeerBudget,
+  RoutableCore,
+} from './net/one-peer.js';
 export type { SwarmConfig } from './net/swarm.js';
 export { BanList, BAN_FILE } from './store/ban-list.js';
 export type { PersistedBan } from './store/ban-list.js';

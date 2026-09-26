@@ -72,12 +72,16 @@ export function devHello(
 /** The dev engine: the plain v5 `MockPaymentEngine`. */
 export type DevEngine = mocks.MockPaymentEngine;
 
-/** A fresh `MockPaymentEngine('honest')` under a dev identity. */
-export function devEngine(label: string): DevEngine {
+/** A fresh `MockPaymentEngine('honest')` under a dev identity (window: the mock's, 4). */
+export function devEngine(label: string, opts: { readonly windowBlocks?: number } = {}): DevEngine {
   const id = devIdentity(label);
   return new mocks.MockPaymentEngine({
     mode: 'honest',
-    config: { ownPubkey: id.pubkey, ownP2pk: id.p2pk },
+    config: {
+      ownPubkey: id.pubkey,
+      ownP2pk: id.p2pk,
+      ...(opts.windowBlocks !== undefined ? { windowBlocks: opts.windowBlocks } : {}),
+    },
   });
 }
 

@@ -13,10 +13,15 @@
  * So every block the worker asks the network for first takes one unit of credit here, and
  * the unit comes back only when the block is SETTLED: its `PAY` was acknowledged by the
  * seeder that sent it (`ACK`, ok or not), or it came from a peer we have no `pay/1` with
- * (nothing is owed), or the request died without the block arriving. With `limit` equal to
- * the seeders' window, the blocks any one seeder has sent us and not yet been paid for can
- * never exceed its window — whatever mix of peers hypercore picks — because the pool is
- * global across peers, cores and sessions.
+ * (nothing is owed), or the request died without the block arriving.
+ *
+ * Issue #8 split the job in two. The pool is now the DOWNLOADER's budget: how many blocks it may
+ * have requested or unpaid in all, which `SeederCredit` keeps at the sum of the connected
+ * seeders' windows (never below the size it was created with). Each SEEDER's window is enforced
+ * per peer where requests are routed (`OnePeerRouter` in `@sovit/seeder`, capped by
+ * `SeederCredit.budget`) — a single global pool could only protect every seeder by being as
+ * small as the smallest window, starving the large ones, and was overrun by any seeder smaller
+ * than it.
  *
  * Blocking `acquire()`s (a player waiting for its next block) are served FIFO and before any
  * opportunistic `tryAcquire()` (lookahead), so prefetch never starves playback.
@@ -43,16 +48,35 @@ export class CreditCancelled extends Error {
 }
 
 export class CreditPool {
-  readonly limit: number;
+  private lim: number;
   private readonly held = new Set<string>();
   private readonly waiters: Waiter[] = [];
   private readonly listeners = new Set<() => void>();
   private readonly pressureListeners = new Set<() => void>();
 
   constructor(limit: number) {
-    if (!Number.isSafeInteger(limit) || limit < 1)
-      throw new RangeError('credit limit must be >= 1');
-    this.limit = limit;
+    this.lim = checkLimit(limit);
+  }
+
+  /** Units the pool hands out at most (issue #8: follows the seeders' windows, `setLimit`). */
+  get limit(): number {
+    return this.lim;
+  }
+
+  /**
+   * Resize the pool (issue #8: `SeederCredit` keeps it at the sum of the connected seeders'
+   * windows). Growing serves queued acquirers and wakes lookahead; shrinking takes effect as
+   * units settle — held units are never revoked. The per-seeder limit is enforced where requests
+   * are routed (`OnePeerRouter`), not here.
+   */
+  setLimit(limit: number): void {
+    const next = checkLimit(limit);
+    if (next === this.lim) return;
+    const grew = next > this.lim;
+    this.lim = next;
+    if (!grew) return;
+    this.grant();
+    for (const cb of [...this.listeners]) cb();
   }
 
   /** Units in use (blocks requested or downloaded and not yet settled). */
@@ -67,7 +91,7 @@ export class CreditPool {
 
   /** Every unit is held, or a blocking acquirer is queued: a batching payer must pay now. */
   get pressured(): boolean {
-    return this.waiters.length > 0 || this.held.size >= this.limit;
+    return this.waiters.length > 0 || this.held.size >= this.lim;
   }
 
   /** Called when an acquire has to queue, or a `tryAcquire` is refused for lack of units. */
@@ -84,7 +108,7 @@ export class CreditPool {
   tryAcquire(core: string, index: number): boolean {
     const id = unit(core, index);
     if (this.held.has(id)) return true;
-    if (this.waiters.length > 0 || this.held.size >= this.limit) {
+    if (this.waiters.length > 0 || this.held.size >= this.lim) {
       this.pressure();
       return false;
     }
@@ -95,7 +119,7 @@ export class CreditPool {
   /** Wait (FIFO) for a unit for this block. Resolves at once when it already holds one. */
   acquire(core: string, index: number): CreditWaiter {
     const id = unit(core, index);
-    if (this.held.has(id) || (this.waiters.length === 0 && this.held.size < this.limit)) {
+    if (this.held.has(id) || (this.waiters.length === 0 && this.held.size < this.lim)) {
       this.held.add(id);
       return { promise: Promise.resolve(), cancel: () => undefined };
     }
@@ -147,13 +171,18 @@ export class CreditPool {
       const w = this.waiters[0];
       if (w === undefined) return;
       if (!this.held.has(w.id)) {
-        if (this.held.size >= this.limit) return;
+        if (this.held.size >= this.lim) return;
         this.held.add(w.id);
       }
       this.waiters.shift();
       w.resolve?.();
     }
   }
+}
+
+function checkLimit(limit: number): number {
+  if (!Number.isSafeInteger(limit) || limit < 1) throw new RangeError('credit limit must be >= 1');
+  return limit;
 }
 
 function unit(core: string, index: number): string {

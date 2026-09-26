@@ -70,7 +70,10 @@ class FakeProto implements PayProtocol {
       satsPerBlock: mocks.sats(2),
       split: { seeder: 50, creator: 50 },
       p2pk: mocks.asP2pk('seeder'),
-      windowBlocks: 4,
+      // Issue #8: PAYs batch to half the SEEDER's window now (was: half the pool). A window of 2
+      // (with the policy's 2-sat minimum PAY at 2 sats/block) keeps these tests at one block per
+      // PAY; the F5 batching tests below announce 8.
+      windowBlocks: 2,
       ...h,
     };
     this.peer = m;
@@ -92,9 +95,50 @@ const NOISE = 'aa'.repeat(32);
 const CORE_1 = '01'.repeat(32) as CoreKeyHex;
 const peerKey = Uint8Array.from(Buffer.from(NOISE, 'hex'));
 
+/**
+ * Just enough of hypercore's replicator for `OnePeerRouter` (F33 / issue #8: `attachCore` routes
+ * the core and refuses one without these internals). No replication peers: these tests drive
+ * `download` events by hand.
+ */
+class FakeReplicator {
+  static Peer = class {
+    getMaxInflight(): number {
+      return 16;
+    }
+    getMaxHotswapInflight(): number {
+      return 16;
+    }
+    _cancelRequest(): void {
+      // no wire
+    }
+    _requestBlock(): boolean {
+      return false;
+    }
+  };
+  hotswaps = {
+    add: (): void => undefined,
+    remove: (): void => undefined,
+    pick: (): unknown[] => [],
+  };
+  peers: unknown[] = [];
+  updateAll(): void {
+    // nothing to schedule
+  }
+  updatePeer(): void {
+    // nothing to schedule
+  }
+  _updateHotswap(): void {
+    // nothing to race
+  }
+}
+
 function fakeCore(fill: number): Hypercore & EventEmitter {
   const e = new EventEmitter() as Hypercore & EventEmitter;
-  Object.assign(e, { key: new Uint8Array(32).fill(fill) });
+  Object.assign(e, {
+    key: new Uint8Array(32).fill(fill),
+    opened: true,
+    replicator: new FakeReplicator(),
+  });
   return e;
 }
 
@@ -104,6 +148,9 @@ const policy: PricePolicy = {
   mints: [mocks.MINTS.a],
   split: { seeder: 50, creator: 50 },
   creatorP2pk: mocks.asP2pk('creator'),
+  // Issue #8: the window a viewer stays under widens to fit one minimum PAY (ADR 0007); 2 sats
+  // at 2 sats/block keeps each seeder's window at its HELLO's `windowBlocks`.
+  minPaySats: mocks.sats(2),
 };
 
 const settle = async (): Promise<void> => {
@@ -112,8 +159,9 @@ const settle = async (): Promise<void> => {
 
 function rig(policyFor?: (c: CoreKeyHex) => PricePolicy | null, creditBlocks = 2) {
   const engine = new mocks.MockPaymentEngine();
-  // A pool of 2 batches ONE block per PAY (half the pool): these tests are about settlement,
-  // matching and policy, one PAY at a time. Batching has its own tests below (F5).
+  // A seeder window of 2 (the HELLO below) batches ONE block per PAY (half the seeder's window,
+  // issue #8; it was half this pool of 2): these tests are about settlement, matching and policy,
+  // one PAY at a time. Batching has its own tests below (F5).
   const credit = new CreditPool(creditBlocks);
   const paid: PaidEvent[] = [];
   const payer = new ViewerPayer({
@@ -249,7 +297,8 @@ describe('ViewerPayer', () => {
 
   it('F5 batching: PAYs cover half the credit pool, not one block each', async () => {
     const r = rig(undefined, 8);
-    r.proto.hello();
+    // Issue #8: the batch is half the SEEDER's window (8 here), no longer half the pool.
+    r.proto.hello({ windowBlocks: 8 });
     for (const i of [0, 1, 2]) r.download(i);
     await settle();
     expect(r.proto.sent).toHaveLength(0); // 3 < ⌊8 / 2⌋: waiting for a batch
@@ -262,7 +311,7 @@ describe('ViewerPayer', () => {
 
   it('F5 batching never stalls a download: under pressure every held block is paid', async () => {
     const r = rig(undefined, 8);
-    r.proto.hello();
+    r.proto.hello({ windowBlocks: 8 }); // issue #8: a seeder batch of 4, as the pool's was
     r.download(0);
     await settle();
     expect(r.proto.sent).toHaveLength(0);
@@ -281,7 +330,7 @@ describe('ViewerPayer', () => {
     const other = fakeCore(2);
     r.payer.attachCore(other);
     const otherKey = toHex(other.key);
-    r.proto.hello();
+    r.proto.hello({ windowBlocks: 8 }); // issue #8: a seeder batch of 4, as the pool's was
     r.download(0);
     r.download(1);
     r.credit.tryAcquire(otherKey, 0);

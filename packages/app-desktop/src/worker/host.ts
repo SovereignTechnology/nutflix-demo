@@ -534,8 +534,11 @@ export class WorkerHost {
     const sc = await net.seeder.blobs.openCoreByKey(fromHex(core));
     if (this.sessions.has(a.sid)) fail('invalid-argument', 'duplicate session id');
     if (!this.coresAttached.has(core)) {
-      this.coresAttached.add(core);
+      // F33 / issue #8: routes the core (one seeder per block, per-seeder credit). It throws when
+      // hypercore is not the release the router is pinned to — and then the core is NOT marked
+      // attached, so a retry cannot download it unrouted (fail closed).
       net.payer.attachCore(sc.core);
+      this.coresAttached.add(core);
     }
     net.node.join(sc.core.discoveryKey, { server: this.seeding.enabled, client: true });
     const gate = new PlaybackGate({
@@ -756,6 +759,10 @@ export class WorkerHost {
     this.imageCores.delete(core);
     if (!e.opened) return; // a core we write to, or one a playback opened: not ours to close
     net.seeder.setFreeCore(core, false);
+    // A playback attached it after the image path opened it: it is routed and paid for now, and
+    // closing its session would leave the router, settler and payer on a dead one (a reopened
+    // core would then download unrouted). Not ours to close either (F33 independent review).
+    if (this.coresAttached.has(core)) return;
     const sc = net.seeder.blobs.coreByKey(core);
     if (sc !== undefined) net.node.leave(sc.core.discoveryKey);
     try {
@@ -853,7 +860,14 @@ export class WorkerHost {
       for (const sid of [...this.sessions.keys()]) this.closeSession(sid);
       await this.net?.payer.flush().catch(() => undefined);
       await this.live?.server.close();
-      await this.net?.node.destroy();
+      try {
+        await this.net?.node.destroy();
+      } finally {
+        // F33 independent review: only once the connections are gone. Released while a core still
+        // replicates, a routed core must not go back to hypercore's own scheduler (the router
+        // parks it: nothing more is asked of any peer), and after `destroy` nothing replicates.
+        this.net?.payer.close();
+      }
       await this.fixtures?.close().catch(() => undefined);
       await this.net?.seeder.close();
       this.net?.providers.close?.();

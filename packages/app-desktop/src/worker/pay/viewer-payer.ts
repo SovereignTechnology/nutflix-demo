@@ -22,6 +22,12 @@
  *     manifest is not paid (never pay more than the price shown); the HELLO's own split is
  *     ignored (a seeder cannot re-route the creator's share); the mint paid at must be one
  *     the video lists (the host's wallet is debited there).
+ *   - **one seeder per block, credit per seeder** (security review F33, issue #8): every core it
+ *     watches is routed by the shared `SeederCredit` — a block is asked of one seeder at a time
+ *     (hypercore's racing "hotswap" is off; a stalled request moves to another seeder, never to
+ *     two), and a seeder is asked only while its own window (HELLO `windowBlocks`, widened for
+ *     the manifest's minimum PAY) has room. The `CreditPool` follows the sum of those windows and
+ *     PAYs batch to half each seeder's window.
  */
 import type {
   CoreKeyHex,
@@ -35,7 +41,7 @@ import type {
   Sats,
 } from '@sovit/core';
 import type Hypercore from 'hypercore';
-import { CreditSettler, UpstreamPayer } from '@sovit/gateway/upstream';
+import { CreditSettler, SeederCredit, UpstreamPayer } from '@sovit/gateway/upstream';
 import type { Logger } from '@sovit/seeder';
 
 import type { CreditPool } from '../playback/credit.js';
@@ -60,6 +66,8 @@ export interface ViewerPayerOptions {
   /** The manifest policy of a core being watched; `null` = not ours to pay. */
   readonly policyFor: (core: CoreKeyHex) => PricePolicy | null;
   readonly onPaid?: (e: PaidEvent) => void;
+  /** A request unanswered this long moves to another seeder (`OnePeerRouter`; tests shorten it). */
+  readonly stallMs?: number;
 }
 
 function proofSum(msg: PayMessage): number {
@@ -74,6 +82,8 @@ export class ViewerPayer {
   private readonly log: Logger;
   private readonly upstream: UpstreamPayer;
   private readonly settler: CreditSettler;
+  /** Per-seeder credit and one-seeder-per-block routing (F33, issue #8). */
+  readonly seeders: SeederCredit;
 
   constructor(o: ViewerPayerOptions) {
     this.o = o;
@@ -99,13 +109,22 @@ export class ViewerPayer {
       logger: o.logger,
       payable: (core) => o.policyFor(core) !== null,
     });
+    this.seeders = new SeederCredit({
+      settler: this.settler,
+      pool: o.credit,
+      policyFor: o.policyFor,
+      logger: o.logger,
+      ...(o.stallMs !== undefined ? { stallMs: o.stallMs } : {}),
+    });
     this.upstream = new UpstreamPayer({
       engine,
       logger: o.logger,
-      // Batch to half the credit window, and pay everything the moment the pool is under
-      // pressure — so a tail never waits on blocks that credit keeps from coming (F5 batching).
+      // Batch to half each seeder's window (issue #8), pay at once when a seeder is at its cap,
+      // and pay everything the moment the pool is under pressure — so a tail never waits on
+      // blocks that credit keeps from coming (F5 batching).
       payEveryBlocks: 1,
       credit: o.credit,
+      seederBatch: (noiseHex) => this.seeders.seederBatch(noiseHex),
       ownMints: o.ownMints,
       policyFor: (core, hello) => this.resolvePolicy(core, hello),
     });
@@ -122,18 +141,26 @@ export class ViewerPayer {
   /** A peer's `pay/1` instance (one per connection). Returns a detach function. */
   attachPeer(noiseHex: string, protocol: PayProtocol): () => void {
     const settled = this.settler.attachPeer(noiseHex, protocol);
+    const detachCredit = this.seeders.attachPeer(noiseHex, protocol);
     const detachUpstream = this.upstream.attachPeer(noiseHex, settled.protocol);
     return () => {
       detachUpstream();
+      detachCredit();
       settled.detach();
     };
   }
 
-  /** Watch a core's verified downloads. Returns a detach function. */
+  /**
+   * Watch a core's verified downloads and route its requests (one seeder per block, per-seeder
+   * credit). The core must be open. Throws `RoutingUnsupported` (fail closed) when hypercore's
+   * internals are not the ones the router is pinned to. Returns a detach function.
+   */
   attachCore(core: Hypercore): () => void {
+    const detachRoute = this.seeders.attachCore(core);
     const detachSettler = this.settler.attachCore(core);
     const detachUpstream = this.upstream.attachCore(core);
     return () => {
+      detachRoute();
       detachSettler();
       detachUpstream();
     };
@@ -142,6 +169,12 @@ export class ViewerPayer {
   /** Pay every pending tail now (session close, shutdown, tests). */
   flush(): Promise<void> {
     return this.upstream.flush();
+  }
+
+  /** Stop routing and paying (shutdown, after `flush()`): timers and hooks go. */
+  close(): void {
+    this.seeders.dispose();
+    this.upstream.dispose();
   }
 
   private resolvePolicy(core: CoreKeyHex, hello: HelloMessage): PricePolicy | null {

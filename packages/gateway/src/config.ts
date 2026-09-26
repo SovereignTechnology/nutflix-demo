@@ -103,8 +103,10 @@ export interface UpstreamConfig {
   readonly payEveryBlocks: number;
   /**
    * Upstream blocks requested or downloaded and not yet paid-and-acknowledged, across every
-   * upstream seeder (security review F37): at most the smallest unpaid window the gateway's
-   * upstream seeders allow. Default `DEFAULT_WINDOW_BLOCKS`, every seeder's minimum.
+   * upstream seeder (security review F37): the FLOOR of the gateway's credit pool, which grows to
+   * the sum of the connected upstream seeders' windows (issue #8). Each seeder's own window is
+   * enforced per seeder where requests are routed (`SeederCredit`), so this no longer has to stay
+   * below the smallest window. Default `DEFAULT_WINDOW_BLOCKS`.
    */
   readonly creditBlocks: number;
   /**
