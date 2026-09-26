@@ -15,10 +15,12 @@ import {
   chmodSync,
   existsSync,
   mkdirSync,
+  readdirSync,
   readFileSync,
   symlinkSync,
   writeFileSync,
 } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
 import { finalizeEvent, generateSecretKey, getPublicKey } from 'nostr-tools/pure';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
@@ -452,14 +454,34 @@ type MakerCtor = new (config: Record<string, unknown>) => MakerLike;
 
 const byteOrder = (a: string, b: string): number => Buffer.compare(Buffer.from(a), Buffer.from(b));
 
+/** electron-installer-common's .deb staging dirs in `root` (tmp: `<prefix>-<pid>-<random>`). */
+const installerStaging = (root: string): string[] =>
+  readdirSync(root).filter((n) => n.startsWith('electron-installer-'));
+
 /**
  * The file names the four configured makers write for `version` on every build arch: Squirrel's
  * `setupExe` from the Forge config, the dmg maker with hdiutil stubbed, and — when `real` — the
  * real deb maker (electron-installer-debian, dpkg + fakeroot) and the real AppImage maker
  * (mksquashfs, a fixture runtime) run over a minimal packaged tree with the staged package.json's
- * fields (stage.ts: no Debian `revision`).
+ * fields (stage.ts: no Debian `revision`). The makers' temp files go to `<work>/tmp`.
  */
 async function makerNames(version: string, work: string, real: boolean): Promise<string[]> {
+  // electron-installer-common stages each .deb in tmp.dir() and removes it only in tmp's
+  // graceful-cleanup exit hook, which never runs in a vitest worker (verifier, round 3). tmp
+  // reads os.tmpdir(), and so TMPDIR, on every call: point it into `work` while the makers run,
+  // so the caller's cleanup of `work` removes the staging, then restore it (or its absence).
+  const savedTmpdir = process.env['TMPDIR'];
+  mkdirSync(join(work, 'tmp'), { recursive: true });
+  process.env['TMPDIR'] = join(work, 'tmp');
+  try {
+    return await makeNames(version, work, real);
+  } finally {
+    if (savedTmpdir === undefined) delete process.env['TMPDIR'];
+    else process.env['TMPDIR'] = savedTmpdir;
+  }
+}
+
+async function makeNames(version: string, work: string, real: boolean): Promise<string[]> {
   const { APP, BUILD_ARCHES } = await packaging<IdentityLib>('identity.ts');
   const { makers } = await packaging<ForgeConfigLib>('forge-config.ts');
   const { MakerDmg } = await packaging<{ MakerDmg: MakerCtor }>('maker-dmg.ts');
@@ -662,6 +684,12 @@ describe('scripts/release-manifest.mjs — exact maker names (verifier, round 2)
     'accepts exactly what the four makers write, no more (real deb and AppImage makers)',
     async () => {
       const m = await lib<ManifestLib>('release-manifest.mjs');
+      // Verifier, round 3: electron-installer-common stages each .deb in tmp.dir() and removes
+      // it only in tmp's graceful-cleanup exit hook, which never runs in a vitest worker, so
+      // every run left ~0.5 MB per .deb in the real os.tmpdir(). Nothing may be left there.
+      const realTmp = tmpdir();
+      const tmpdirEnv = process.env['TMPDIR'];
+      const before = new Set(installerStaging(realTmp));
       const written = await makerNames('0.1.0', dir, true);
       expect(written).toEqual([...m.releaseArtifactNames('0.1.0')].sort(byteOrder));
       expect(written).toHaveLength(7);
@@ -676,6 +704,18 @@ describe('scripts/release-manifest.mjs — exact maker names (verifier, round 2)
         expect(m.nameCarriesVersion(n, '0.1.0-rc.1'), n).toBe(true);
       for (const n of rc) expect(m.nameCarriesVersion(n, '0.1.0'), n).toBe(false);
       for (const n of written) expect(m.nameCarriesVersion(n, '0.1.0-rc.1'), n).toBe(false);
+      // Round 3, continued. Only this process's staging counts (the pid is in tmp's name):
+      // another test process or session may be staging in os.tmpdir() at the same time.
+      const ours = `-${process.pid}-`;
+      const left = installerStaging(realTmp).filter((n) => !before.has(n));
+      expect(left.filter((n) => n.includes(ours))).toEqual([]);
+      // Not vacuous: the four .debs (two arches, two versions) were staged in the test's own
+      // dir, under this pid, which afterEach's cleanup removes; and TMPDIR is restored.
+      const staged = installerStaging(join(dir, 'tmp'));
+      expect(staged).toHaveLength(4);
+      for (const n of staged) expect(n).toContain(ours);
+      expect(process.env['TMPDIR']).toBe(tmpdirEnv);
+      expect(Object.hasOwn(process.env, 'TMPDIR')).toBe(tmpdirEnv !== undefined);
     },
     60_000,
   );
