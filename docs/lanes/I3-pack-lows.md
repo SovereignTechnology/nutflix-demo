@@ -1,4 +1,4 @@
-# Lane I3-pack-lows — packaging lows from the cross-lane review (round 4)
+# Lane I3-pack-lows — packaging lows from the cross-lane review (rounds 4 and 5)
 
 Branch `stage-3/int-packaging-lows`, off `e55adf0` (lane I1's head: the packaged DLEQ thread
 fix, on the Stage 3 integration head with packaging #6 merged). Date: 2026-09-25. Commits:
@@ -41,8 +41,9 @@ any of these holds:
   package must also have its `main` and `exports` files, because the dry run does not notice
   outputs deleted by hand.
 - `@sovit/ui`'s `dist/*.css` is older than its `src/` stylesheets.
-- A bundle output the stage copies is older than the newest file under `src/renderer`,
-  `src/preload`, `src/ipc`, `static/` or `@sovit/ui`'s `src/`. Tests and stories do not count.
+- A bundle output the stage copies is older than the newest file the bundle reads: under
+  `src/renderer`, `src/preload`, `src/ipc`, `static/`, or `@sovit/ui`'s `dist/` (round 5) or
+  `src/`. Tests and stories do not count.
 
 With the reviewer's mutation, the stage now exits 1 and names `packages/core/tsconfig.json`; the
 previous stage is left as it was. Refusing was chosen over rebuilding:
@@ -55,7 +56,8 @@ previous stage is left as it was. Refusing was chosen over rebuilding:
 **For whoever runs the suite next:** `stage.test.ts` and `packaged-worker.integration.test.ts`
 now need a current build. After a merge that touches core, gateway, seeder, ui, or the app's
 renderer, preload, ipc or static sources, run `npm run build` before `npx vitest run`.
-Otherwise those two files fail with a StageError naming what is stale.
+Otherwise those two files fail with a StageError naming what is stale. Since round 5 this also
+applies after `npx tsc -b --force`: it rewrites ui's `dist/`, so the bundle has to be rebuilt.
 
 ### 2. The other switches a wrapper could add
 
@@ -91,6 +93,43 @@ gets in.
 - It carries no build-machine path, and it shrank by about 72 KB.
 - The dev host and the worker's copy of core are unchanged.
 
+## Round 5 (the round-4 verifier's findings)
+
+Commits: `26f4e98` (the rule and its tests), then this report, the review record and ADR 0017.
+Review record: the "Round 5" section of `docs/reviews/2026-09-25-pre-push-int-packaging-lows.md`.
+
+| Finding | Outcome |
+|---|---|
+| LOW: the renderer freshness rule watched `@sovit/ui`'s `src/`, but the bundle reads its `dist/`, so a bundle made from an old ui `dist/` staged | **fixed**: rule (3) also watches each bundled workspace's `dist/` (`bundleInputDirs`) |
+| INFO: ADR 0017 §4 listed `SANDBOX_BYPASS_SWITCHES` after the remote-debugging check | **fixed**, doc only: §4 gives main.ts's order with each list named where it runs |
+
+- **The renderer rule.** The verifier's probe: edit a ui source, bundle (as `npm start` does),
+  `tsc -b packages/ui`, then stage. On the round-4 code it exited 0 and shipped the old
+  renderer. `scripts/bundle.ts` reads the UI through its package exports: 74 renderer inputs
+  lie under `packages/ui/dist`, none under `src/`, and it copies `dist/ui.css`. The watched
+  set is now `BUNDLE_SOURCES` plus each bundled workspace's `dist/` and `src/`. On the real
+  worktree the probe and its CSS form now exit 1 and name a ui `dist/` file. After the file is
+  restored and rebuilt in order, the stage exits 0.
+- **New tests.** Two synthetic cases in `stage-guards.test.ts`: the probe, and its CSS form.
+  Each is refused, then re-bundled, staged, and the new value ships. One real-app pin in
+  `stage.test.ts`: the renderer bundle's metafile inputs and the copied stylesheet must all
+  lie under `bundleInputDirs`.
+- **One changed assertion.** In the round-4 ui case, the refusal now names ui's
+  `dist/ui.css`, the file the bundle copies, instead of `src/ui.css`. It is commented in
+  place, and it is still exact.
+- **Mutations.** M5a: the round-4 rule put back fails 4 tests. M5b: `src/ipc` dropped from
+  `BUNDLE_SOURCES` is caught by the new pin; the round-4 pin missed it. M5c and M5d: the real
+  probes.
+- **Gates.** Packaging tests: 44 passed. Whole suite (`--maxWorkers=2`, after
+  `npm run build`): 3166 passed, 21 skipped, 6 failed. All 6 are 5 s timeouts in
+  `host/__tests__/{auto-topup,money}.test.ts`, under a load average of 23–26 on 8 cores; this
+  round neither touches nor imports those files. Rerun alone, both pass (55/55 and 8/8), and
+  the packaged-worker integration test passes (2/2). `tsc -b --force`, eslint, prettier,
+  `check:locked` and `lint:electron`: clean. No timeout was raised. No Electron e2e.
+- **New residual R-8.** ui's whole `dist/` is watched, so files the renderer never imports can
+  refuse a stage: extra refusals, never missed ones. `tsc -b --force` needs `npm run build`
+  after it.
+
 ## Files
 
 - New:
@@ -102,6 +141,8 @@ gets in.
   - tests: `packaging/__tests__/{stage,stage-guards}.test.ts`,
     `src/main/__tests__/{security,main-wiring}.test.ts`;
   - docs: `docs/decisions/0017-packaging.md`.
+- Round 5 changed: `packaging/stage.ts`, `packaging/__tests__/{stage,stage-guards}.test.ts`,
+  `docs/decisions/0017-packaging.md` (§1 rule 3, §4 order), the review record and this file.
 - No test was deleted or weakened. The stage-guards fixture now writes its bundle outputs
   after its sources, as a real build leaves them; this is commented in place.
 
@@ -145,7 +186,10 @@ Detail in the review record.
 - **R-6** `e2e/support.ts` still says "main refuses the first three". That file is outside this
   lane.
 - **R-7** For Cameron: ADR 0017 open questions 8 (fuses) and 11 (feature switches).
+- **R-8** (round 5) ui's whole `dist/` is a freshness input, including files the renderer
+  never imports: extra refusals (after `npx tsc -b --force`, until `npm run build`), never
+  missed ones.
 
 ## Proposed `docs/status.md` row (Stage 3 table)
 
-| Packaging lows, cross-lane review round 4 (issue #6, lane I3-pack-lows) | `stage-3/int-packaging-lows` | **done**. The stage now refuses a build older than its sources, before touching `out`: TypeScript's own dry build over core, gateway, seeder and ui (a touched-only source counts as current; a shipped package's entry points must exist), ui's stylesheets, and the renderer/prompt/preload bundles against their sources. So a local `make` can no longer ship a stale core, as the reviewer's melt-timeout mutation showed it could. `stage.test.ts` and the packaged-worker integration test therefore need `npm run build` after source changes. Main refuses 10 more sandbox switches in every build (seccomp, namespaces, setuid, zygote sandbox, Landlock, sandbox debugging, single-process, in-process GPU…) and, when packaged, the process wrappers (`renderer/utility-cmd-prefix`, `gpu-launcher`, `zygote-cmd-prefix`, `browser-subprocess-path`), `js-flags` and the isolation overrides, in the existing order. The packaged host bundle carries stubs instead of core's test doubles, and a guard fails the stage if any gets in. Deferred to Cameron: `GrantFileProtocolExtraPrivileges` (open question 8) and `--enable/disable-features` (open question 11) |
+| Packaging lows, cross-lane review round 4 (issue #6, lane I3-pack-lows) | `stage-3/int-packaging-lows` | **done**. The stage now refuses a build older than its sources, before touching `out`: TypeScript's own dry build over core, gateway, seeder and ui (a touched-only source counts as current; a shipped package's entry points must exist), ui's stylesheets, and the renderer/prompt/preload bundles against everything they read, ui's built `dist/` included (round 5). So a local `make` can no longer ship a stale core, as the reviewer's melt-timeout mutation showed it could. `stage.test.ts` and the packaged-worker integration test therefore need `npm run build` after source changes. Main refuses 10 more sandbox switches in every build (seccomp, namespaces, setuid, zygote sandbox, Landlock, sandbox debugging, single-process, in-process GPU…) and, when packaged, the process wrappers (`renderer/utility-cmd-prefix`, `gpu-launcher`, `zygote-cmd-prefix`, `browser-subprocess-path`), `js-flags` and the isolation overrides, in the existing order. The packaged host bundle carries stubs instead of core's test doubles, and a guard fails the stage if any gets in. Deferred to Cameron: `GrantFileProtocolExtraPrivileges` (open question 8) and `--enable/disable-features` (open question 11) |

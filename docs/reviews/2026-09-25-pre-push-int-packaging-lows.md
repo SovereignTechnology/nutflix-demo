@@ -253,3 +253,122 @@ write order: bundle outputs after sources, as a real build leaves them, commente
 - **R-6** `e2e/support.ts`'s comment "main refuses the first three" is now stale (main refuses
   all six in its list). That file is outside this lane's allowlist.
 - **R-7** Open questions for Cameron: ADR 0017 8 (fuses) and 11 (feature switches).
+
+## Round 5 (the round-4 verifier's findings)
+
+### [low] the renderer freshness rule watched `@sovit/ui`'s `src/`, but the bundle reads its `dist/` → **fixed**
+
+Verified first, on the real worktree, with the verifier's probe:
+
+1. `'nf-sats'` → `'nf-sats-R5PROBE'` in `packages/ui/src/components/SatsBadge/SatsBadge.tsx`;
+2. `npm run -w packages/app-desktop bundle` (what `npm start` runs, before any tsc);
+3. `npx tsc -b packages/ui` (what `npm run typecheck` runs);
+4. `node packaging/stage.ts --out <scratch>`.
+
+On the round-4 code the verifier's run exited 0: the staged `renderer/app.js` lacked the probe,
+while `ui/dist/…/SatsBadge.js` held it. With the round-4 rule put back, the synthetic version
+of the probe also stages and ships the old renderer (mutation M5a below). The cause: rule (3) compared the bundle outputs against
+`BUNDLE_SOURCES` and ui's `src/`. But `scripts/bundle.ts` resolves `@sovit/ui` through its
+package exports to `dist/*.js`: the real renderer bundle has 74 inputs under `packages/ui/dist`
+and none under `src/`. It also copies `dist/ui.css`. Rules (1) and (2) only hold ui's `dist/`
+to its `src/`, never the bundle to ui's `dist/`. My own "What the bundles read" note above
+already said `dist/`; the rule did not follow it.
+
+Fix (`packaging/stage.ts`): rule (3)'s watched set is now `bundleInputDirs(pkg, root,
+bundled)`, which is `BUNDLE_SOURCES` plus each bundled workspace's `dist/` and `src/`. `src/`
+stays in the set: it reaches the bundle only through `dist/`, so it is a second, stricter
+check, and keeping it removes nothing round 4 refused. `dist/` is watched whole (tests and
+stories excluded, as before), not only the files one bundle happens to import. `npm run build`
+runs tsc, then build:css, then the bundle, so the bundle outputs are newer than all of ui's
+`dist/` after every build. A refusal still clears with `npm run build`.
+
+After the fix, the same real probe exits 1 with `dist/renderer/index.html is older than
+packages/ui/dist/components/SatsBadge/SatsBadge.d.ts.map: run \`npm run build\``. The name is
+the newest file tsc wrote. The CSS form was also run on the real worktree: a comment appended
+to `ui/src/tokens/tokens.css`, then bundle, then `build:css`, then stage. It exits 1 naming
+`packages/ui/dist/ui.css`. Both were restored with `git checkout` of the file, the rebuild in
+the right order (`tsc -b packages/ui` or `build:css`, then bundle), and a stage that exits 0.
+`git status` was clean apart from this lane's edits.
+
+Only the renderer bundle can read outside `BUNDLE_SOURCES`. `scripts/bundle.ts` itself fails
+the preload bundles if they read anything but `src/preload` and `src/ipc`, and fails the prompt
+bundle if it reads anything outside `src/renderer/prompt`.
+
+A consequence for the gates: `npx tsc -b --force` rewrites every file in ui's `dist/`, so after
+it the stage refuses until `npm run build` has re-bundled. Measured: `dist/renderer/index.html
+is older than packages/ui/dist/components/testing/render.d.ts`. That is a content-identical
+refusal. It is the known over-inclusion of mtime rules, now one step wider. Run `npm run build`
+after `tsc -b --force` and before the stage tests.
+
+### [info] ADR 0017 §4 listed `SANDBOX_BYPASS_SWITCHES` after the remote-debugging check → **fixed** (doc only)
+
+Verified: `main.ts` refuses in this order: Squirrel's lifecycle launch, `sandboxBypassSwitch`,
+the dev flags, `remoteDebuggingSwitch`, then `packagedRefusedSwitch`. main-wiring's "refusal
+order" test pins that order. The code is right. The ADR said "…the remote-debugging switches,
+then:" and then listed `SANDBOX_BYPASS_SWITCHES` first. §4 now gives the full order, with each
+list named where it runs ("the sandbox switches (`SANDBOX_BYPASS_SWITCHES`, the first list
+below)", and last `PACKAGED_REFUSED_SWITCHES`). The first list's entry now says "second after
+Squirrel". The lane report already had the right order and is unchanged there. Nothing changed
+in code.
+
+### Mutation checks (round 5)
+
+| # | Mutation | Caught by |
+|---|---|---|
+| M5a | `bundleInputDirs` without the bundled workspaces' `dist/` (the round-4 rule) | 4 tests: both new probe cases (the stage **resolved**, i.e. staged the old renderer), the round-4 ui case (named `src/ui.css`), and the real pin (74 uncovered `packages/ui/dist` inputs) |
+| M5b | `src/ipc` dropped from `BUNDLE_SOURCES` | the new real pin, which reads the renderer's metafile. The round-4 pin checks only entry points and copies, so it missed this |
+| M5c | the verifier's probe on the real worktree (edit ui/src, bundle, tsc ui, stage) | this lane: exit 1, naming a ui `dist/` file. Restored: exit 0 |
+| M5d | the CSS probe on the real worktree (edit ui/src css, bundle, build:css, stage) | this lane: exit 1, naming `packages/ui/dist/ui.css`. Restored: exit 0 |
+
+### Tests added and changed (round 5)
+
+- `stage-guards.test.ts`:
+  - "a bundle made from an old @sovit/ui dist/ (ui rebuilt after the bundle) is refused". The
+    verifier's probe on the synthetic repo: the fixture's bundle step inlines ui's
+    `dist/index.js` into `renderer/app.js`. The test asserts the refusal, then re-bundles and
+    stages, and checks that the new value ships.
+  - "the same with ui's stylesheet": bundled (copying the old `dist/ui.css`), then build:css,
+    then refused. Re-bundled, the new stylesheet ships.
+- `stage.test.ts` (the real app): "bundleInputDirs covers every workspace file the renderer
+  bundle reads and the ui stylesheet it copies". The test runs esbuild with the renderer
+  build's entry, platform and tsconfig. These are checked against `scripts/bundle.ts`'s text,
+  along with the absence of resolution overrides. It then asserts that every non-npm input
+  lies under a watched directory, that at least one lies under `packages/ui/dist`, and that
+  `@sovit/ui/ui.css` resolves into it.
+- One existing assertion changed, with a comment citing round 5: in the round-4 ui case, the
+  step "UI css rebuilt, bundle not rerun" expected the refusal to name `packages/ui/src/ui.css`.
+  It now names `packages/ui/dist/ui.css`, the file the bundle actually copies (mtime 61 against
+  the src file's 60). The test is still exact, and it still refuses at the same step.
+
+No test was deleted or weakened.
+
+### Gates (round 5)
+
+- Packaging tests (`stage.test.ts`, `stage-guards.test.ts`): 44 passed.
+- `npx vitest run --project app-desktop --maxWorkers=2`, run twice: 1606 passed and 3 failed,
+  then 5 failed. Every failure was a 5 s timeout in a file this round does not touch or import:
+  `ipc/__tests__/guards.test.ts`, and `host/__tests__/auto-topup.test.ts` (in-process
+  TestMints, CPU-bound). The load average was 23–26 on 8 cores, from other sessions. Rerun
+  alone, `guards.test.ts` passed (356). `auto-topup.test.ts` failed 4 twice alone, still at
+  5.0–5.7 s, and then passed 55/55 alone.
+- `npx vitest run --maxWorkers=2`, whole suite, final code, after `npm run build`: 3166 passed,
+  21 skipped, 6 failed. All 6 are 5 s timeouts: 4 in `auto-topup.test.ts` and 2 in
+  `host/__tests__/money.test.ts`. The one `ENOTEMPTY` rmdir is the cleanup of a timed-out
+  auto-topup test. Rerun alone: `money.test.ts` 8/8, `auto-topup.test.ts` 55/55.
+  `packaged-worker.integration.test.ts`, which spawns the real stage under the new rule,
+  passed in the whole run and again alone (2/2). No timeout was raised: neither file is in
+  this lane, and neither failed without load.
+- `npx tsc -b --force`: clean. It is followed by `npm run build` (see the consequence above).
+- eslint and `prettier --check` on the changed files: clean. Prettier reformatted
+  `bundleInputDirs`'s signature onto one line.
+- `npm run check:locked` and `npm run lint:electron`: OK.
+- The Electron e2e was not run.
+
+### Residuals (round 5)
+
+- **R-8** Rule (3) watches ui's `dist/` whole, including files the renderer never imports
+  (`dist/components/testing/`, `.d.ts`, maps). The effect is extra refusals, never missed
+  ones: after `npx tsc -b --force` the stage refuses until `npm run build`. Narrowing the set
+  to the metafile's own inputs would mean running the renderer bundle inside the stage.
+- **R-1** (mtimes) and **R-3** (npm packages inlined into the renderer are not inputs) are
+  unchanged. `newestInput` still does not follow symlinks, and ui's `dist/` has none.

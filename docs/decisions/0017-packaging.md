@@ -124,13 +124,18 @@ refuses when:
    project whose sources were only touched ("would update timestamps") counts as current;
 2. a stylesheet a workspace builds beside tsc (`@sovit/ui`'s `dist/*.css`) is older than the
    package's newest `src/` stylesheet;
-3. a bundle output the stage copies is older than the newest file under `src/renderer`,
-   `src/preload`, `src/ipc`, `static/` or `@sovit/ui`'s `src/` (tests and stories excluded).
+3. a bundle output the stage copies is older than the newest file the bundle reads: under
+   `src/renderer`, `src/preload`, `src/ipc`, `static/`, `@sovit/ui`'s `dist/` or its `src/`
+   (tests and stories excluded). The bundle reads the UI through its package exports, so from
+   its `dist/` (`dist/*.js` and the copied `dist/ui.css`), never its `src/`: round 5 added
+   `dist/` after a bundle made before `tsc` rebuilt the UI staged the old renderer. A test pins
+   the watched set (`bundleInputDirs`) against the real renderer bundle's inputs.
 
 (2) and (3) compare mtimes; `npm run build` rewrites each of those files on every run, so the
 remedy is always `npm run build`. The stage never runs the build itself, so it still writes
 nothing outside its output directory. The Stage tests (`stage.test.ts`, the packaged-worker
-integration test) now need a current build too.
+integration test) now need a current build too, including after `npx tsc -b --force`, which
+rewrites the UI's `dist/` (round 5).
 
 Asar settings: `asar: { unpackDir: '{worker,node_modules}' }`, `prune: false`. The staged tree
 is the whole app.
@@ -196,13 +201,16 @@ path) is still dropped.
   the DevTools server starts. A dev build keeps them, because the e2e harness attaches through
   them (independent review).
 - **The other switches a wrapper could add** (cross-lane review, round 4). Main's refusals run
-  in this order: Squirrel's lifecycle launch, the sandbox switches, the dev flags, the
-  remote-debugging switches, then:
-  - `SANDBOX_BYPASS_SWITCHES`, refused in **every** build (D4), now thirteen: D4's `no-sandbox`,
-    `disable-gpu-sandbox` and `no-zygote`, plus `no-zygote-sandbox`,
-    `disable-seccomp-filter-sandbox`, `disable-namespace-sandbox`, `disable-setuid-sandbox`,
-    `disable-landlock-sandbox`, `allow-sandbox-debugging`, `gpu-sandbox-allow-sysv-shm`,
-    `disable-webnn-compiler-sandbox`, `single-process` and `in-process-gpu`;
+  in this order (main.ts; pinned by main-wiring's refusal-order test): Squirrel's lifecycle
+  launch, the sandbox switches (`SANDBOX_BYPASS_SWITCHES`, the first list below), the dev
+  flags, the remote-debugging switches, and last `PACKAGED_REFUSED_SWITCHES` (the second list).
+  Round 4 extended the first list and added the second:
+  - `SANDBOX_BYPASS_SWITCHES`, refused in **every** build (D4), second after Squirrel, now
+    thirteen: D4's `no-sandbox`, `disable-gpu-sandbox` and `no-zygote`, plus
+    `no-zygote-sandbox`, `disable-seccomp-filter-sandbox`, `disable-namespace-sandbox`,
+    `disable-setuid-sandbox`, `disable-landlock-sandbox`, `allow-sandbox-debugging`,
+    `gpu-sandbox-allow-sysv-shm`, `disable-webnn-compiler-sandbox`, `single-process` and
+    `in-process-gpu`;
   - `PACKAGED_REFUSED_SWITCHES`, refused in **packaged** builds, last: the process wrappers
     `renderer-cmd-prefix`, `utility-cmd-prefix` (the host is a utility process),
     `gpu-launcher`, `zygote-cmd-prefix` and `browser-subprocess-path`, V8's `js-flags`, and
