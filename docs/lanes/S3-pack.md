@@ -5,6 +5,33 @@ ADR 0017 (`docs/decisions/0017-packaging.md`). Review: `docs/reviews/2026-09-25-
 There is no contract request, and no file under `packages/core/src/contracts/`, the locked
 paths, `docs/status.md` or `docs/security-review.md` changed.
 
+## Fix round 3 (verifier, 2026-09-25)
+
+The round-2 verifier found one Low (test hygiene). A failing test reproduced it first, then
+commit `e159210` fixed it in the test file only. Details, mutations R41–R44 and evidence: the
+review record, "Fix round 3".
+
+- **Staging left in /tmp (Low).** In the real-maker test in `release.test.ts`, maker-deb's
+  electron-installer-common stages each `.deb` in `tmp.dir()`. tmp removes that dir only in
+  an exit hook, which never runs in a vitest worker, so every run left four
+  `electron-installer-*` dirs in `/tmp`. `makerNames` now points `TMPDIR` into the test's own
+  temp dir while the makers run, so `afterEach` removes the staging. It then restores
+  `TMPDIR`, or its absence. The test compares the real `os.tmpdir()` listing before and after
+  (this process's entries, by pid), checks that the four staging dirs landed in the test's
+  dir, and checks the restore.
+- **/tmp cleanup.** 84 leftover dirs were removed: this lane's runs from round 2 and its
+  verifier, plus this round's pre-fix run. A script proved each one was the fixture's own
+  staging before removing it (owner, name, a dead pid, the one staged tree and the fixture's
+  bytes). Nothing else in `/tmp` was touched. Four dirs made at 21:02 by a run in the
+  `stage-3/integration` worktree were left alone; that branch keeps leaving four per run until
+  it takes `e159210`.
+- Files: `scripts/__tests__/release.test.ts`, the review record and this file. No contract,
+  locked path, `docs/status.md`, `docs/security-review.md` or dependency changed.
+- Gates: `npx vitest run scripts/__tests__` gave 51 passing tests, and `/tmp` was unchanged
+  across the run. `tsc -b --force`, eslint and prettier on the changed file, and
+  `check:locked` are clean. `lint:electron` was not needed (app-desktop unchanged), and the
+  Electron e2e was not run.
+
 ## Fix round 2 (verifier, 2026-09-25)
 
 An independent verifier checked the fix pass and found one Low and one Info finding. Both
