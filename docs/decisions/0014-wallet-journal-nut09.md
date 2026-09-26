@@ -218,11 +218,42 @@ which sends "the whole balance", no longer tries to spend held inputs.
   place in the outbox, ahead of every deletion it covers, so a drain that fails part-way never
   leaves the relays with an old token deleted and no token holding its proofs.
 - **Refusals cashu-ts wraps are refusals.** A keyset refusal (12xxx, thrown as a
-  `StaleKeysetError` with the code in its `cause`) and a 429 (`RateLimitError`) drop the entry at
-  once, like any coded answer. A coded `cause` under any other error does not: cashu-ts's
-  `MeltChangeError` means the melt went through, and its change is restored by NUT-09.
+  `StaleKeysetError` with the code in its `cause`) drops the entry at once, like any coded answer.
+  A coded `cause` under any other error does not: cashu-ts's `MeltChangeError` means the melt went
+  through, and its change is restored by NUT-09. (This bullet first named a 429 too; fix round 2
+  below reverses that.)
 - **A paid quote answers paid.** A melt of a quote the mint reports PAID (a retry after the
   startup settle restored its change) returns `paid: true` without a request. Recovered entries
   are matched by kind as well as key.
 - Deferred [Info]: the journal grows by about 3 KB an operation during a relay outage, and at
   32 MiB commits fail closed until the relays take the events.
+
+### Fix round 2 (same day): one attempt per request, and a 429 is ambiguous
+
+An independent verifier found that the 429 rule above could lose money on the desktop, and
+reproduced it on cdk-mintd 0.18.1. The money plane gave `CashuMintConnections` no request
+function, so cashu-ts used its own fetch transport. That transport retries `/v1/swap`,
+`/v1/melt/bolt11` and `/v1/mint/bolt11` after a network error or a 5xx, up to 9 times within the
+ttl, whenever the mint advertises NUT-19 (cdk-mintd does, ttl 60). If the first attempt executed
+and its answer was lost, a rate limiter could answer the retry with 429. The wallet then dropped
+the entry and reconciled the inputs away, and the outputs the mint had signed were lost.
+
+- **Every production transport sends each request once.** The desktop money plane now uses
+  core's `cashuRequestFn` over `node:http(s)` (`host/mint-transport.ts`), the same
+  implementation as the daemons and the gateway. `httpModuleRawHttp` moved from the seeder into
+  core for this. The host and the seeder runtime fall back to it for any mint an injected (test)
+  transport leaves out. So cashu-ts's retrying transport is reachable only from opt-in real-mint
+  tests. Over a custom transport, cashu-ts sends a swap, melt or mint once: its keyset repair does
+  not resend, and the NUT-20 legacy fallback resends only after a coded 20008 refusal.
+- **A coded answer stays a refusal because of that.** A coded answer, or a `StaleKeysetError`
+  with a coded `cause`, is the mint's answer to our one request.
+- **A 429 is not a refusal.** A transport may retry, and the wallet cannot tell a limiter's 429
+  before the request from one on a retry of a request that executed. So a 429 is resolved like a
+  lost answer: the inputs are held, NUT-09 restores what the mint signed, and after the wait NUT-07
+  decides. A 429 on a request that never ran therefore holds its inputs, and locks a melt's quote
+  locally, for `PENDING_SETTLE_AFTER_S`. That is the cost finding 4 had removed, taken back
+  deliberately.
+- **The settle loop backs off from a mint it cannot decide.** `recoverPending`'s `left` now
+  counts every entry still journaled, a skipped mint's included. Before, a mint whose wallet did
+  not load (or that stopped offering NUT-09) read as progress, and the loop retried every 30 s
+  for ever.

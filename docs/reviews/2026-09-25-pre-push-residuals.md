@@ -433,3 +433,266 @@ rebuilt where the test reads it (runner in the lane's scratch directory).
 - [Info] A second melt of a quote whose first is still unresolved locally is refused ("still
   unresolved at the mint") even when the mint already reports it PAID; the loop settles it within
   the wait and the retry then answers paid.
+
+## Fix round 2 (2026-09-25)
+
+An independent verifier checked the fix pass (`7e6f6c4` to `c8ce8c2`). It found one high
+regression, caused by the finding-4 fix, and two low findings. All three were checked against the
+code and hold. All three are fixed on `stage-3/residuals`, `68440fe` to `15c3ea2`, then the docs.
+
+| # | Finding | Outcome |
+|---|---|---|
+| HIGH | A 429 read as a refusal loses the outputs when a retrying transport meets it after the first attempt executed. The desktop used cashu-ts's retrying fetch transport. | **fixed**: `68440fe` (429 ambiguous), `88a6476` and `7609e1f` (single-attempt transport), `15c3ea2` (doc) |
+| LOW 1 | Jobs queued through `verify()` start DLEQ threads beside one that is still leaving | **fixed**: `694046a` |
+| LOW 2 | The settle loop's backoff never grows for a mint the wallet cannot load | **fixed**: `8af6d3a` |
+
+### HIGH: a 429 after a retry is not a refusal — fixed
+
+What was checked, in cashu-ts 4.10.0:
+
+- `Mint` uses `customRequest ?? <default>`. The default wraps every request in a retry loop.
+  The loop runs when the endpoint is one of the mint's NUT-19 `cached_endpoints` and a ttl is set.
+  It retries a `NetworkError` or a 5xx up to 9 times within the ttl. The delay is jittered, capped
+  at min(2^n × 100 ms, 1 s).
+- `requestWithAuth` spreads the mint's NUT-19 parameters into every request.
+- cdk-mintd 0.18.1 (3397) advertises ttl 60, with swap, mint and melt cached. Nutshell 0.21.0
+  (3399) advertises no NUT-19.
+- `MoneyPlane` passed no request function, and `createHost` never passes one in production, so
+  the desktop used that transport.
+
+The verifier's run was reproduced two ways. In process, with a TestMint advertising NUT-19 behind
+a stubbed `fetch`. On cdk-mintd, with the 429 rule put back (M2): `mint-error: P2PK swap failed
+(RateLimitError)`, the entry dropped, the balance 0.
+
+The same retry also breaks the rule for coded answers, not only the 429. Take a mint whose NUT-19
+cache misses (for example, more than one instance). The retry of a swap that executed is then
+answered 11001 ("already spent"), which also reads as a refusal. So the transport sending each
+request once is what makes the coded rule true at all.
+
+Fix, part 1: the desktop money plane sends each request once.
+
+- `host/mint-transport.ts` (new): `hostMintRequest()` is core's `cashuRequestFn` over
+  `node:http(s)`. `MoneyPlane` uses it for every mint. It also uses it for any mint that an
+  injected (test) `mintRequest` answers `undefined` for. `createNodeRuntime` does the same for the
+  daemons.
+- The raw HTTP is reused, not copied. `httpModuleRawHttp` moved from the seeder's `mint-http.ts`
+  into `core/src/wallet/http-module.ts`. The caller hands in the modules, so core still has no
+  `node:` import. The seeder binds it with its `createRequire`-loaded modules (F16), and the host
+  binds it with its own.
+- Why not import `nodeMintRequest` from `@sovit/seeder`? The seeder's Node entry would load into
+  the process that spends. Measured: +175 ms, and five native addons (rocksdb-native,
+  fs-native-extensions, simdle-native, quickbit-native, udx-native).
+
+What the default transport gave, and what the new one keeps (checked in the cashu-ts source):
+
+| | cashu-ts fetch transport (before) | host transport (now) |
+|---|---|---|
+| Attempts | up to 10 per request at a NUT-19 mint | 1 |
+| Timeout | none of its own (undici's 300 s header and body timeouts) | 30 s for the whole exchange, or cashu-ts's `requestTimeout` |
+| Redirects | followed (refused only with auth headers) | never followed: a 3xx is an `HttpResponseError` |
+| Response size | unbounded | 4 MiB |
+| Schemes | whatever `fetch` takes (http, https, data, blob) | http and https only |
+| Errors | `MintOperationError` / `RateLimitError` / `HttpResponseError` / `NetworkError` | the same classes (`cashuRequestFn`'s contract) |
+| Headers | `Accept: application/json, text/plain, */*`, `User-Agent: Mozilla/5.0` | `Accept: application/json`, no User-Agent |
+| Cookies, cache, referrer | none (`credentials: omit`, `no-store`, `no-referrer`) | none |
+
+https-only is not enforced by either transport. The desktop's own mint settings are https only
+(`isMintUrl`). A manifest's mint list accepts `http(s)` (`manifest/parse.ts`). That is unchanged
+and listed in the residuals.
+
+Fix, part 2: `isDefinitive` (`spend.ts`, locked; `check:locked` OK; one cashu-ts import removed)
+no longer treats `RateLimitError` as a refusal. A 429 is resolved like a lost answer: the inputs
+are held, NUT-09 restores what the mint signed, and after the wait NUT-07 decides.
+
+A `StaleKeysetError` with a coded `cause` stays a refusal, because every production transport
+now sends each request once:
+
+- the desktop: the money plane's connections, with no other path (below);
+- the seeder daemon and the gateway: `createNodeRuntime` gives every mint `nodeMintRequest`;
+  neither CLI passes `mintRequest`;
+- cashu-ts over a custom transport sends a swap, melt or mint once. `withStaleKeysetRepair`
+  converts, it does not resend. `withLegacyQuoteSigFallback` resends a mint only after a coded
+  20008 refusal of the first, which is definitive by itself;
+- cashu-ts's retrying default remains only in the opt-in real-mint tests, which construct
+  `CashuMintConnections()` bare. It is documented on `CashuMintConnections`.
+
+Nothing else in the desktop reaches a mint:
+
+- `inputFeePpk`, `keyset` (behind `seller.keyset`), mint info (`loadMint`), quotes, every spend,
+  `checkSpent`, `spentByUs` and `recover` all go through `this.o.mints.wallet(mint)`, which is the
+  money plane's connections;
+- the worker imports no cashu-ts, and reaches a mint only through the host's `seller.*` handlers;
+- main's only `fetch` is the loopback media proxy (`LOOPBACK_LINK`).
+
+A source test pins this: `host/money.ts` is the only desktop file with a cashu-ts import,
+`new Mint(` or `CashuMintConnections(`, and it passes the fallback request.
+
+Cost, accepted by the orchestrator's decision: a 429 on a request that never ran now holds its
+inputs, and locks a melt's quote locally, for `PENDING_SETTLE_AFTER_S`. That is the cost finding 4
+had removed. The daemon has no settle loop, so it holds a payout's inputs until the next receive
+after the wait.
+
+Tests:
+
+- `core/src/wallet/__tests__/journal-retry.test.ts` (new, 5):
+  - with a retrying stand-in transport (the first request executes and its answer is lost, the
+    retry is answered 429): the send completes from NUT-09; with the restore down too, the entry
+    is kept and a later settle recovers it (61 sat, the history line 3 sat); a melt is held, then
+    its change is restored (44 sat) and a retry answers paid;
+  - a 429 on a request that never ran is held until the wait, then comes back;
+  - the verifier's scenario in process, with cashu-ts's own fetch transport against a NUT-19
+    TestMint: the swap is POSTed twice, and nothing is lost.
+- `journal-review.test.ts`: the finding-4 test that expected a 429 to drop the entry at once
+  asserted the defect. It now asserts the entry is held (no second melt request), settled after
+  the wait, and the quote payable, with a comment citing this round.
+- `core/src/wallet/__tests__/http-module.test.ts` (new, 3):
+  - exact bytes and `Content-Length`, lower-case and joined headers, a BOM kept;
+  - no redirect, the size cap, the timer, other schemes refused;
+  - under `cashuRequestFn`, a dropped connection is one request even with NUT-19 hints.
+- `app-desktop/src/host/__tests__/mint-transport.test.ts` (new, 4):
+  - the money plane with no `mintRequest`, over real HTTP to a NUT-19 TestMint that loses the
+    first swap answer and answers any retry 429: one swap reaches the mint, no 429 is served, the
+    send completes (28 sat), and the headers are the host transport's;
+  - a mint an injected transport leaves out gets the host transport;
+  - `hostMintRequest` ignores NUT-19 hints;
+  - the source pin above.
+- `seeder/src/runtime/__tests__/mint-transport.test.ts` (new, 1): a mint the injected transport
+  leaves out gets `node:http`, not cashu-ts's fetch.
+- Real mints (opt-in, +3 in `journal-real-mint.integration.test.ts`):
+  - a retrying transport meeting a 429 after the swap ran loses nothing (cdk-mintd and Nutshell);
+  - cashu-ts's own fetch transport, the verifier's run: two swap POSTs on cdk-mintd, one on
+    Nutshell (no NUT-19), nothing lost;
+  - the production Node transport sends a lost swap once, and the send completes.
+  - With the 429 rule put back (M2), the first two fail on cdk-mintd and the first on Nutshell.
+
+### LOW 1: a DLEQ thread beside a leaving one, via queued jobs — fixed
+
+Verified: the "no new thread while a retired one is leaving" guard was only in `tryVerify`. Jobs
+already queued through `verify()` reached `run()` → `ensureStarted()` after the thread was retired
+for a timeout, and each spawned a thread. With a stand-in that boots but never answers, three
+queued PAYs made three threads.
+
+Fix (`worker/pay/dleq-thread.ts`): `run()` rejects at once when no thread is up and a retired one
+is still reaping. The caller checks the job on the chunked path.
+
+Tests (`dleq-thread.test.ts`):
+
+- +1: three PAYs queued on the HANG stand-in. The first times out, the other two fail at once
+  ("still leaving"), and one thread is spawned. Through `dleqVerifier`, the verdicts come from the
+  chunked path and no thread is added.
+- The start-retry test tried its second start at once, beside the first thread. It now shows the
+  immediate refusal, and makes the second start once that thread is let go, with a comment citing
+  this round.
+- The real Bare run (`bare-dleq-thread.test.ts`, on the rebuilt `dist/`) still passes.
+
+### LOW 2: the settle loop never backed off from a mint it could not load — fixed
+
+Verified: `recoverPending` skipped a mint whose `spender.recover` threw (for example, `loadMint`
+refused), and returned `{0, 0}` for a mint that no longer offers NUT-09. Neither counted its
+entries in `left`. So `left < before` read as progress, and the delay stayed at 30 s.
+
+Fix (`core/src/wallet/wallet.ts`): `left` counts every entry still in the journal after the
+settle, a skipped mint's included. The balance event fires only when that count moved. The
+startup log and the daemon's "still unresolved" warning now report the true count.
+
+Tests (`settle-loop.test.ts`, +2), both over the real wallet:
+
+- a mint whose `wallet()` rejects: `left` is 1, and the delays go 30, 30, 60, 120, 240, 480, 600,
+  600. The entry is kept, and decided once the mint is back (the input returns, 16 sat);
+- a mint that stopped advertising NUT-09: `left` is 1, and the delay grows.
+
+Before the fix, both stayed at 30 s.
+
+### Self-review of this round (`differential-review`, `sharp-edges` method)
+
+Risk:
+
+- HIGH: `spend.ts` (which failures drop an entry, for send, receive, mint and melt, desktop and
+  daemons).
+- HIGH: the transport swap (every desktop mint request, and the daemons' raw HTTP moved).
+- LOW: `dleq-thread.ts` and the `recoverPending` counts.
+
+Blast radius:
+
+- `isDefinitive`: four operations, two hosts;
+- `httpModuleRawHttp`: all Node mint traffic (seeder, gateway, desktop);
+- `recoverPending`: the startup settles (desktop and daemon) and `SettleLoop`.
+
+Adversarial questions:
+
+- **A mint that answers 429 to everything?** Every operation holds its inputs for the wait. Then
+  NUT-07 gives them back, and the loop backs off to 10 min. Liveness, not loss.
+- **A mint that executes and then answers a coded error?** Unchanged: that operation's outputs are
+  lost, as with any coded answer (residual).
+- **An injected transport that retries?** Test seams only (`mintRequest` on `MoneyPlaneOptions`,
+  `HostOptions`, `NodeRuntimeOptions`). Each documents that it must not retry.
+- **Did the moved raw HTTP change a byte?**
+  - The body is written as the encoded `Uint8Array`, and `Content-Length` is its length (was
+    `Buffer.byteLength` of the string: same value).
+  - The answer is decoded with `TextDecoder` and `ignoreBOM: true`, which keeps a BOM as
+    `Buffer#toString` did.
+  - Limits and timer unchanged.
+  - The seeder's own `nodeRawHttp` tests pass unchanged against it.
+- **Does dropping the User-Agent break a mint?** No: both real mints pass every real-mint test
+  without one. The daemons never sent one.
+
+Found and fixed during the round:
+
+- S4 [Low]: the first version of the host default used the single-attempt transport only when
+  `mintRequest` was absent. The seeder runtime's did the same. A mint that an injected transport
+  answered `undefined` for fell through to cashu-ts's fetch. Fixed in `88a6476`, with tests in
+  `7609e1f` (M4, M5).
+
+### Mutation checks (fix round 2)
+
+Each guard was broken, the named tests run, and the guard restored with `git checkout`. Core's
+`dist/` was rebuilt where a desktop test reads `@sovit/core` (M3b).
+
+| # | Guard broken | Result |
+|---|---|---|
+| pre | the new tests against the unfixed code | `journal-retry` 5/5 fail; host default test fails (2 swap POSTs); LOW 1 test fails (second job starts a thread, times out); LOW 2 delays stay 30 s |
+| M1 | `RateLimitError` definitive again | 6 core tests fail (5 new, the rewritten finding-4 test) |
+| M2 | the same, on real mints | cdk-mintd: 2 real-mint tests fail (`RateLimitError`, entry dropped). Nutshell: 1 fails; cashu-ts does not retry there (no NUT-19) |
+| M3 | the money plane's default back to cashu-ts's fetch | 3 host tests fail (2 swap POSTs; its headers; the source pin) |
+| M3b | M3 and M1 together (the defect as shipped) | the host send fails: `P2PK swap failed (RateLimitError)` |
+| M4 | seeder runtime: fallback only without `mintRequest` | the seeder transport test fails |
+| M5 | host: fallback only without `mintRequest` | the host fallback test fails |
+| M6 | no guard in `run()` | 2 tests fail (queued jobs; start retry) |
+| M7 | a skipped mint's entries not counted | the ECONNREFUSED backoff test fails |
+| M8 | `left` from `spender.recover` again | the NUT-09 backoff test fails |
+
+### Checks run (fix round 2)
+
+- `npx vitest run --maxWorkers=2` (at `8af6d3a`, plus the `15c3ea2` comment): 183 files passed, 3
+  skipped (opt-in); 2806 tests passed, 18 skipped; 176 s.
+- Real mints, with `NUTFLIX_REAL_MINT_URL` set and `NUTFLIX_REAL_MINT_URL_2` = Nutshell 3398. The
+  files are core's `real-mint.integration.test.ts` and `journal-real-mint.integration.test.ts`,
+  and the gateway's `real-mint-swarm.integration.test.ts`. The gateway's daemon wallet now runs on
+  the moved raw HTTP.
+  - Nutshell 0.21.0 (3399): 3 files, 18/18 (core 7, journal 8, gateway swarm 3).
+  - cdk-mintd 0.18.1 (3397): 3 files, 18/18.
+- `npx tsc -b --force`: clean.
+- `npx eslint` and `npx prettier --check` on every changed file: clean.
+- `npm run check:locked`: OK. `npm run lint:electron`: OK.
+- The Electron e2e was not run (not asked). No dependency changed.
+
+### Residuals after fix round 2
+
+- [Low] A 429 on a request that never ran holds its inputs for `PENDING_SETTLE_AFTER_S`, and locks
+  a melt's quote locally for as long. This is finding 4's cost, taken back deliberately. The
+  daemon has no settle loop, so it holds them until the next receive after the wait.
+- [Low] A mint (or a proxy in front of it) that executes a request and then answers with a NUT
+  error code, or a keyset code, loses that operation's outputs. The same holds for any coded answer
+  after executing. An honest mint does not do this, and with one attempt per request no retry can
+  produce it. This replaces round 1's residual, which also named the 429.
+- [Low] Core's `CashuMintConnections` with no `request` is still cashu-ts's retrying fetch
+  transport. No production wallet uses it: it is documented on the class, and pinned by the host
+  source test and the seeder runtime test. Only opt-in real-mint tests construct it bare.
+- [Info] A manifest's mint list accepts `http://` and any host, LAN included. The money plane
+  contacts such a mint when a PAY names it, as the fetch transport did before. Not changed by
+  this round.
+- Still open from round 1:
+  - the daemon has no settle loop;
+  - a retired DLEQ thread that never says it is leaving is let go after 60 s;
+  - finding 6: the journal's growth during a relay outage;
+  - a second melt of a quote that is still unresolved locally is refused.
