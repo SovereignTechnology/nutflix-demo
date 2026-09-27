@@ -290,8 +290,10 @@ describe('replication over a direct stream pair (offline)', () => {
     );
     protocol.remotePay(pay);
     await settle(20);
+    // Contracts v6 amendment (2026-09-26): every ACK carries what the viewer still owes on the
+    // core — 0 once blocks 0..3 are paid. (Written before `outstanding` existed.)
     expect(protocol.acks).toEqual([
-      { type: 'ACK', core: entry.coreKey, fromBlock: 0, toBlock: 3, ok: true },
+      { type: 'ACK', core: entry.coreKey, fromBlock: 0, toBlock: 3, ok: true, outstanding: 0 },
     ]);
     expect(seeder.engine.window(viewerPubkey)).toMatchObject({
       uploaded: 4,

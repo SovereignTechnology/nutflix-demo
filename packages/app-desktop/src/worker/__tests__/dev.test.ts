@@ -94,12 +94,66 @@ describe('LoopbackPayHub (D1)', () => {
     a.sendAck({ core, fromBlock: 1, toBlock: 1, ok: true });
     a.sendAck({ core, fromBlock: 2, toBlock: 2, ok: true });
     await tick();
-    expect(got).toEqual([`hello:${hello.pubkey.slice(0, 4)}`, 'ack:1', 'ack:2']);
+    // This used to expect `open` on B as soon as A's HELLO arrived, before B sent its own. The
+    // real channel (`core/src/pay-protocol/channel.ts`) fires `open` only once BOTH HELLOs are
+    // done, and the seeder's OWED report (contracts v6 amendment) is sent from `open` and must
+    // follow the seeder's own HELLO — so the loopback now keeps the channel's rule. The HELLO is
+    // still delivered (and kept as `peer`) in order, before the ACKs.
+    expect(got).toEqual(['ack:1', 'ack:2']);
+    expect(b.peer?.pubkey).toBe(hello.pubkey);
     expect(b.peer).not.toBe(hello); // structured clone, not a shared object
+    expect(b.state).toBe('idle');
     b.sendHello(hello);
+    expect(got).toEqual(['ack:1', 'ack:2', `hello:${hello.pubkey.slice(0, 4)}`]);
+    expect(b.state).toBe('open');
     await tick();
     expect(a.state).toBe('open');
     expect(hub.size).toBe(2);
+  });
+
+  it("keeps the real channel's order rules: `open` once, after both HELLOs; OWED only on an open end, and one that arrives early is a protocol error", async () => {
+    const hub = new LoopbackPayHub();
+    const a = hub.endpoint({ connectionId: 'c3', localNoise: A, remoteNoise: B, stream: stream() });
+    const b = hub.endpoint({ connectionId: 'c3', localNoise: B, remoteNoise: A, stream: stream() });
+    const hello = devHello(devEngine('a'), {
+      satsPerBlock: DEV_PRICE,
+      split: { seeder: 50, creator: 50 },
+    });
+    const core = mocks.asCoreKey('owed');
+    // Before both HELLOs, sending an OWED is a local bug: it throws, and nothing goes out.
+    expect(() => {
+      a.sendOwed({ core, ranges: [[0, 1]] });
+    }).toThrow(/both HELLOs/);
+    const opens: string[] = [];
+    const owed: unknown[] = [];
+    a.on('open', (h) => opens.push(`a:${h.pubkey.slice(0, 4)}`));
+    b.on('open', (h) => opens.push(`b:${h.pubkey.slice(0, 4)}`));
+    b.on('owed', (m) => owed.push(m));
+    a.sendHello(hello);
+    b.sendHello(hello);
+    await tick();
+    expect(opens.sort()).toEqual([
+      `a:${hello.pubkey.slice(0, 4)}`,
+      `b:${hello.pubkey.slice(0, 4)}`,
+    ]);
+    a.sendOwed({ core, ranges: [[0, 1]] });
+    a.sendHello(hello); // a second HELLO: no second `open`
+    await tick();
+    expect(owed).toEqual([{ type: 'OWED', core, ranges: [[0, 1]] }]);
+    expect(opens).toHaveLength(2);
+    // An end that is not open yet: an arriving OWED closes it as a protocol error.
+    const c = hub.endpoint({ connectionId: 'c4', localNoise: A, remoteNoise: B, stream: stream() });
+    const d = hub.endpoint({ connectionId: 'c4', localNoise: B, remoteNoise: A, stream: stream() });
+    const closed: string[] = [];
+    d.on('close', (r) => closed.push(r));
+    d.receive({ t: 'owed', m: { type: 'OWED', core, ranges: [[0, 0]] } });
+    expect(closed).toEqual(['protocol-error']);
+    expect(d.state).toBe('closed');
+    // A closed end drops an OWED like any message (no throw).
+    c.cut('local');
+    expect(() => {
+      c.sendOwed({ core, ranges: [[0, 0]] });
+    }).not.toThrow();
   });
 
   it('never pairs ends of different connections, and a closed connection closes its partner', async () => {

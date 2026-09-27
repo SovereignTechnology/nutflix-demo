@@ -46,6 +46,7 @@ import type {
   MintKeyset,
   MintUrl,
   NostrPubkey,
+  OwedRange,
   PayMessage,
   PaymentEngine,
   PaymentEngineConfig,
@@ -58,6 +59,13 @@ import type {
   Wallet,
 } from '../contracts/index.js';
 import { checkPayLock, PAY1_TAG } from './lock.js';
+import {
+  OWED_LIMITS,
+  boundOwed,
+  type OwedCore,
+  type OwedLimits,
+  type UnpaidLedger,
+} from './owed.js';
 import { RangeSet } from './range-set.js';
 import { SeenSecrets } from './seen.js';
 import {
@@ -313,7 +321,7 @@ function dleqKey(mint: MintUrl, p: CashuProof): string {
   return `${mint}|${p.id}|${String(p.amount)}|${p.C}|${p.secret}`;
 }
 
-export class RealPaymentEngine implements PaymentEngine {
+export class RealPaymentEngine implements PaymentEngine, UnpaidLedger {
   readonly config: PaymentEngineConfig;
   private readonly now: () => UnixSeconds;
   private readonly seen: SeenSecrets;
@@ -735,6 +743,25 @@ export class RealPaymentEngine implements PaymentEngine {
   window(peer: NostrPubkey): PeerWindow | undefined {
     const st = this.peers.get(peer);
     return st === undefined ? undefined : this.snapshot(st);
+  }
+
+  /** `UnpaidLedger` (pay/1 `ACK.outstanding`): what `peer` still owes on `core`. */
+  outstandingOn(peer: NostrPubkey, core: CoreKeyHex): number {
+    const cs = this.peers.get(peer)?.cores.get(core);
+    // `paid` ⊆ `sent`: a PAY is accepted only for blocks all sent (`range-not-uploaded`).
+    return cs === undefined ? 0 : cs.sent.size - cs.paid.size;
+  }
+
+  /** `UnpaidLedger` (pay/1 `OWED`): per core, oldest first, the blocks `peer` has not paid. */
+  unpaid(peer: NostrPubkey, limits: OwedLimits = OWED_LIMITS): readonly OwedCore[] {
+    const st = this.peers.get(peer);
+    if (st === undefined) return [];
+    // Lazily, core by core: `boundOwed` stops at the caps, so the cores past them are never walked.
+    const byCore = st.cores;
+    function* cores(): Generator<readonly [CoreKeyHex, readonly OwedRange[]]> {
+      for (const [core, cs] of byCore) yield [core, cs.sent.difference(cs.paid)];
+    }
+    return boundOwed(cores(), limits);
   }
 
   windows(): readonly PeerWindow[] {

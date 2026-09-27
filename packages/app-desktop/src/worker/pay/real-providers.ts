@@ -8,7 +8,7 @@
  *            pay their own blocks (fix round 5);
  *   HELLO    signed by the host over this connection's `pay/1` challenge (`pay.hello`); the price
  *            it states is a ceiling (the highest price among the cores we serve) and each core's
- *            own price follows as `PRICE` on its first block (`announceCorePrices`);
+ *            own price follows as `PRICE` on its first block (always, contracts v6 amendment);
  *   seeder   `RealPaymentEngine` runs HERE (its upload accounting is synchronous), with every
  *            money step asked of the host: keysets, redeem (swap into the NIP-60 wallet), NUT-07
  *            checks, nutzaps. Accepted-but-unflushed PAYs are kept in `<storage>/payments/

@@ -5,6 +5,7 @@
  */
 import * as fc from 'fast-check';
 
+import { MAX_OWED_BLOCKS, MAX_OWED_RANGES } from '../../contracts/index.js';
 import type {
   AckMessage,
   CashuP2pkPubkey,
@@ -14,6 +15,8 @@ import type {
   LockedProofSet,
   MintUrl,
   NostrPubkey,
+  OwedMessage,
+  OwedRange,
   PayMessage,
   PayProtocolMessage,
   PayWireMessage,
@@ -224,20 +227,84 @@ export const ackArb: fc.Arbitrary<AckMessage> = fc
     toBlock: blockIndexArb,
     ok: fc.boolean(),
     reason: fc.option(fc.constantFrom(...REJECT_REASONS)),
+    // v6 amendment: the seeder's count after the PAY (any safe count; 0 is common).
+    outstanding: fc.option(fc.oneof(fc.constant(0), fc.nat(64), fc.maxSafeNat())),
   })
-  .map(({ core, fromBlock, toBlock, ok, reason }) => {
-    const base: AckMessage = { type: 'ACK', core, fromBlock, toBlock, ok };
-    return reason === null ? base : { ...base, reason };
+  .map(({ core, fromBlock, toBlock, ok, reason, outstanding }) => {
+    let base: AckMessage = { type: 'ACK', core, fromBlock, toBlock, ok };
+    if (reason !== null) base = { ...base, reason };
+    return outstanding === null ? base : { ...base, outstanding };
   })
   .map(plain);
 
-export const priceArb: fc.Arbitrary<PriceMessage> = fc
+/** A priced PRICE: `free` absent (the v5 shape) or `false`. */
+const pricedArb: fc.Arbitrary<PriceMessage> = fc
   .record({
-    type: fc.constant<'PRICE'>('PRICE'),
     core: coreKeyArb,
     satsPerBlock: satsArb,
     effectiveFromBlock: blockIndexArb,
+    free: fc.option(fc.constant(false)),
   })
+  .map(({ core, satsPerBlock, effectiveFromBlock, free }) => {
+    const base: PriceMessage = { type: 'PRICE', core, satsPerBlock, effectiveFromBlock };
+    return free === null ? base : { ...base, free };
+  });
+
+/** v6 amendment: `{ free: true }` — no price, from block 0. */
+const freePriceArb: fc.Arbitrary<PriceMessage> = coreKeyArb.map((core) => ({
+  type: 'PRICE',
+  core,
+  satsPerBlock: 0 as Sats,
+  effectiveFromBlock: 0,
+  free: true,
+}));
+
+export const priceArb: fc.Arbitrary<PriceMessage> = fc
+  .oneof({ arbitrary: pricedArb, weight: 3 }, { arbitrary: freePriceArb, weight: 1 })
+  .map(plain);
+
+/**
+ * v6 amendment: OWED with canonical ranges (ascending, disjoint, not adjacent), within the caps.
+ * Built from a start and (gap, length) steps: every gap ≥ 1 keeps ranges apart; lengths ≤ 16 over
+ * ≤ 64 steps keep the total ≤ 1024 = MAX_OWED_BLOCKS; a second shape is one long range.
+ */
+export const owedArb: fc.Arbitrary<OwedMessage> = fc
+  .oneof(
+    {
+      weight: 4,
+      arbitrary: fc
+        .tuple(
+          coreKeyArb,
+          blockIndexArb,
+          fc.array(
+            fc.tuple(fc.integer({ min: 1, max: 2 ** 20 }), fc.integer({ min: 1, max: 16 })),
+            {
+              minLength: 1,
+              maxLength: 64,
+            },
+          ),
+        )
+        .map(([core, start, steps]) => {
+          const ranges: OwedRange[] = [];
+          let at = start;
+          for (const [gap, len] of steps) {
+            ranges.push([at, at + len - 1]);
+            at += len + gap;
+          }
+          return { type: 'OWED' as const, core, ranges };
+        }),
+    },
+    {
+      weight: 1,
+      arbitrary: fc
+        .tuple(coreKeyArb, blockIndexArb, fc.integer({ min: 1, max: MAX_OWED_BLOCKS }))
+        .map(([core, from, len]) => ({
+          type: 'OWED' as const,
+          core,
+          ranges: [[from, from + len - 1] as const],
+        })),
+    },
+  )
   .map(plain);
 
 export const messageArb: fc.Arbitrary<PayProtocolMessage> = fc.oneof(
@@ -245,7 +312,27 @@ export const messageArb: fc.Arbitrary<PayProtocolMessage> = fc.oneof(
   payWireArb,
   ackArb,
   priceArb,
+  owedArb,
 );
+
+/** v6 amendment: whether `x` is canonical OWED ranges within the caps (the codec's grammar). */
+export function isOwedRanges(x: unknown): x is readonly OwedRange[] {
+  if (!Array.isArray(x) || x.length < 1 || x.length > MAX_OWED_RANGES) return false;
+  let prev = -2;
+  let total = 0;
+  for (const r of x as unknown[]) {
+    if (!Array.isArray(r) || r.length !== 2) return false;
+    const [from, to] = r as unknown[];
+    if (!Number.isSafeInteger(from) || !Number.isSafeInteger(to)) return false;
+    const f = from as number;
+    const t = to as number;
+    if (f < 0 || t < f || f <= prev + 1) return false;
+    total += t - f + 1;
+    if (total > MAX_OWED_BLOCKS) return false;
+    prev = t;
+  }
+  return true;
+}
 
 // ---------------------------------------------------------------------------------------
 // Structural validator: what a *decoded* value must look like to count as a message at all
@@ -332,10 +419,21 @@ export function isPayProtocolMessage(x: unknown): x is PayProtocolMessage {
         typeof x['ok'] === 'boolean' &&
         (x['reason'] === undefined
           ? !('reason' in x)
-          : (REJECT_REASONS as readonly string[]).includes(x['reason'] as string))
+          : (REJECT_REASONS as readonly string[]).includes(x['reason'] as string)) &&
+        (x['outstanding'] === undefined ? !('outstanding' in x) : isUint(x['outstanding']))
       );
     case 'PRICE':
-      return isCoreKey(x['core']) && isUint(x['satsPerBlock']) && isUint(x['effectiveFromBlock']);
+      return (
+        isCoreKey(x['core']) &&
+        isUint(x['satsPerBlock']) &&
+        isUint(x['effectiveFromBlock']) &&
+        (x['free'] === undefined
+          ? !('free' in x)
+          : x['free'] === false ||
+            (x['free'] === true && x['satsPerBlock'] === 0 && x['effectiveFromBlock'] === 0))
+      );
+    case 'OWED':
+      return isCoreKey(x['core']) && isOwedRanges(x['ranges']);
     default:
       return false;
   }

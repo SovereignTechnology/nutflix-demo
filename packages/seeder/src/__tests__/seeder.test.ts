@@ -25,7 +25,6 @@ async function make(
     diskCapBytes?: number;
     dataDir?: string;
     mode?: mocks.MockPaymentMode;
-    announceCorePrices?: boolean;
   } = {},
 ) {
   const t = opts.dataDir ? null : await tmpDir();
@@ -49,7 +48,6 @@ async function make(
       },
       flushEveryBlocks: 1000,
       flushEveryMs: 60_000,
-      ...(opts.announceCorePrices === true ? { announceCorePrices: true } : {}),
     },
     { engine, logger: log.logger, ...adapters },
   );
@@ -216,8 +214,8 @@ describe('Seeder façade', () => {
     expect(s.seeder.policy().satsPerBlock).toBe(2);
   });
 
-  it("announceCorePrices (ADR 0012): the first block of each core sent to a pay/1 peer is preceded by PRICE from block 0 at that core's price, and PAYs are verified at it", async () => {
-    const s = await make({ announceCorePrices: true, windowBlocks: 16 });
+  it("core prices (ADR 0012; always on since the v6 amendment): the first block of each core sent to a pay/1 peer is preceded by PRICE from block 0 at that core's price, and PAYs are verified at it", async () => {
+    const s = await make({ windowBlocks: 16 });
     const policy = (sats: number, who: string): PricePolicy => ({
       satsPerBlock: sats as never,
       blockSize: BLOCK,
@@ -246,16 +244,20 @@ describe('Seeder façade', () => {
         toBlock: 7,
       }).satsPerBlock,
     ).toBe(5);
-    // Off by default: a one-price seeder sends none.
+    // This used to assert "off by default: a one-price seeder sends none". Cameron, 2026-09-26
+    // (contracts v6 amendment, ADR 0015 amendment): every seeder sends a core's PRICE before its
+    // first block, with no switch — so a one-price seeder (its price is the default policy) sends
+    // it too, and the option is gone.
     const plain = await make({ windowBlocks: 16 });
-    plain.seeder.setCorePolicy('a'.repeat(64) as never, policy(3, 'creator-A'), {
-      announce: false,
-    });
+    plain.seeder.setPolicy(policy(3, 'creator-A'));
     const ps = plain.seeder.sessions.admit(new FakeStream(noiseKey(10)))!;
     const pp = new FakePayProtocol();
     plain.seeder.attachPayProtocol(ps, pp);
     ps.onUpload('a'.repeat(64), 0, BLOCK);
-    expect(pp.prices).toEqual([]);
+    expect(pp.prices).toEqual([
+      { type: 'PRICE', core: 'a'.repeat(64), satsPerBlock: 3, effectiveFromBlock: 0 },
+    ]);
+    expect('announceCorePrices' in plain.seeder.config).toBe(false);
   });
 
   // Security review F9: the seeder used to verify every PAY at its CURRENT price, so after a
@@ -280,7 +282,10 @@ describe('Seeder façade', () => {
     protocol.remoteHello(hello(pubkey('f9')));
     for (let i = 0; i < 3; i++) session.onUpload(core, i, BLOCK);
     s.seeder.setPolicy(newP);
+    // v6 amendment: the core's price from block 0 now precedes its first block (always on), then
+    // the change. (Written when only the change was announced.)
     expect(protocol.prices).toEqual([
+      { type: 'PRICE', core, satsPerBlock: 2, effectiveFromBlock: 0 },
       { type: 'PRICE', core, satsPerBlock: 4, effectiveFromBlock: 3 },
     ]);
     for (let i = 3; i < 6; i++) session.onUpload(core, i, BLOCK);
@@ -311,6 +316,10 @@ describe('Seeder façade', () => {
     // A per-core policy change announces a PRICE for that core only.
     const other = mocks.asCoreKey('F9-other');
     session.onUpload(other, 0, BLOCK);
+    // v6 amendment: `other`'s own first block was announced (at the default price, from 0)…
+    expect(protocol.prices.filter((p) => p.core === other)).toEqual([
+      { type: 'PRICE', core: other, satsPerBlock: 4, effectiveFromBlock: 0 },
+    ]);
     s.seeder.setCorePolicy(core, { ...newP, satsPerBlock: 6 as never });
     expect(protocol.prices.at(-1)).toEqual({
       type: 'PRICE',
@@ -318,7 +327,8 @@ describe('Seeder façade', () => {
       satsPerBlock: 6,
       effectiveFromBlock: 6,
     });
-    expect(protocol.prices.filter((p) => p.core === other)).toEqual([]);
+    // …and the per-core change of `core` adds nothing for `other`.
+    expect(protocol.prices.filter((p) => p.core === other)).toHaveLength(1);
   });
 
   it('v3 (c): setCorePolicy adds a per-core policy the pay bridge resolves by range.core; setPolicy stays the default', async () => {

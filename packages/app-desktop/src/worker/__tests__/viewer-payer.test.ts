@@ -5,6 +5,7 @@ import type {
   CoreKeyHex,
   HelloMessage,
   MuxLike,
+  OwedMessage,
   PayMessage,
   PayProtocol,
   PayProtocolEvents,
@@ -34,6 +35,7 @@ class FakeProto implements PayProtocol {
     pay: new Set(),
     ack: new Set(),
     price: new Set(),
+    owed: new Set(),
     close: new Set(),
   };
   attach(_m: MuxLike): void {
@@ -50,6 +52,9 @@ class FakeProto implements PayProtocol {
   }
   sendPrice(_p: Omit<PriceMessage, 'type'>): void {
     // viewer never prices
+  }
+  sendOwed(_o: Omit<OwedMessage, 'type'>): void {
+    // viewer never reports what it is owed (contracts v6 amendment: seeder → viewer only)
   }
   cut(): void {
     // not exercised

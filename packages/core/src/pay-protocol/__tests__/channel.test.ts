@@ -13,6 +13,7 @@ import type {
   HelloMessage,
   MintUrl,
   MuxLike,
+  OwedMessage,
   PayMessage,
   PriceMessage,
   Sats,
@@ -326,6 +327,111 @@ describe('PayChannel', () => {
     expect(k.a.stream.destroyed).toBe(false);
     expect(a.state).toBe('open');
     expect(p.a.stream.destroyed).toBe(false);
+  });
+
+  // v6 amendment (ADR 0018): the seeder's OWED report, and the v6 PRICE / ACK fields end to end.
+  it('OWED is delivered once the channel is open; PRICE.free and ACK.outstanding cross intact', async () => {
+    const { a, b } = await opened();
+    const owed: OwedMessage[] = [];
+    const prices: PriceMessage[] = [];
+    const acks: AckMessage[] = [];
+    b.on('owed', (m) => owed.push(m));
+    b.on('price', (m) => prices.push(m));
+    b.on('ack', (m) => acks.push(m));
+    a.sendPrice({ core: CORE, satsPerBlock: 0 as Sats, effectiveFromBlock: 0, free: true });
+    a.sendOwed({
+      core: CORE,
+      ranges: [
+        [0, 3],
+        [7, 7],
+      ],
+    });
+    a.sendAck({ core: CORE, fromBlock: 0, toBlock: 3, ok: true, outstanding: 1 });
+    await tick();
+    expect(prices).toEqual([
+      { type: 'PRICE', core: CORE, satsPerBlock: 0, effectiveFromBlock: 0, free: true },
+    ]);
+    expect(owed).toEqual([
+      {
+        type: 'OWED',
+        core: CORE,
+        ranges: [
+          [0, 3],
+          [7, 7],
+        ],
+      },
+    ]);
+    expect(acks).toEqual([
+      { type: 'ACK', core: CORE, fromBlock: 0, toBlock: 3, ok: true, outstanding: 1 },
+    ]);
+    expect(b.state).toBe('open');
+  });
+
+  it('an OWED before both HELLOs is a protocol error (no pubkey is bound for it yet)', async () => {
+    const whys: string[] = [];
+    const p = muxPair();
+    const a = new PayChannel({ onProtocolError: (why) => whys.push(why) });
+    a.attach(p.a);
+    const owed: OwedMessage[] = [];
+    let closed = '';
+    a.on('owed', (m) => owed.push(m));
+    a.on('close', (r) => (closed = r));
+    const frame = payCodec.encode({ type: 'OWED', core: CORE, ranges: [[0, 0]] });
+    p.inject('a', frame); // idle: no HELLO either way
+    expect(owed).toEqual([]);
+    expect(closed).toBe('protocol-error');
+    expect(whys).toEqual(['OWED before both HELLOs']);
+    // Half-open (the remote's HELLO verified, ours not sent): still refused.
+    const s = await signer();
+    const q = muxPair();
+    const half = new PayChannel();
+    half.attach(q.a);
+    let halfClosed = '';
+    half.on('close', (r) => (halfClosed = r));
+    q.inject('a', payCodec.encode({ type: 'HELLO', ...(await buildHello(s, q.bindB, TERMS)) }));
+    expect(half.peer).not.toBeNull();
+    expect(half.state).toBe('idle');
+    q.inject('a', frame);
+    expect(halfClosed).toBe('protocol-error');
+  });
+
+  it('sendOwed refuses to put an OWED on the wire before both HELLOs (a local bug), and drops it once closed', async () => {
+    const s = await signer();
+    const p = muxPair();
+    const a = new PayChannel();
+    const b = new PayChannel();
+    a.attach(p.a);
+    b.attach(p.b);
+    const got: OwedMessage[] = [];
+    let bClosed = '';
+    b.on('owed', (m) => got.push(m));
+    b.on('close', (r) => (bClosed = r));
+    const owed = { core: CORE, ranges: [[0, 0]] as const };
+    // idle, then hello-sent: throws, and nothing reaches the remote (which would close on it).
+    expect(() => {
+      a.sendOwed(owed);
+    }).toThrow(/both HELLOs/);
+    a.sendHello(await buildHello(s, p.bindA, TERMS));
+    expect(a.state).toBe('hello-sent');
+    expect(() => {
+      a.sendOwed(owed);
+    }).toThrow(/both HELLOs/);
+    await tick();
+    expect(got).toEqual([]);
+    expect(bClosed).toBe('');
+    // open: sent and delivered.
+    b.sendHello(await buildHello(s, p.bindB, TERMS));
+    await tick();
+    expect(a.state).toBe('open');
+    expect(b.state).toBe('open');
+    a.sendOwed(owed);
+    await tick();
+    expect(got).toEqual([{ type: 'OWED', ...owed }]);
+    // closed: dropped silently, like every other message.
+    a.cut('local');
+    expect(() => {
+      a.sendOwed(owed);
+    }).not.toThrow();
   });
 
   it('sendHello refuses a HELLO signed for another connection; a remote channel close is `remote`', async () => {

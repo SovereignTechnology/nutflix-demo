@@ -18,11 +18,17 @@
  * NOT a protocol implementation: HELLO "signatures" are not checked (they are the literal
  * `dev-unsigned`), there is no codec. The `--dev-mocks` fence (loopback-only DHT, loopback
  * bootstrap) keeps it off any real network.
+ *
+ * It does keep the real channel's ORDER rules (`core/src/pay-protocol/channel.ts`), which the
+ * seeder relies on: `open` fires once, when this end has sent its HELLO and received the remote's;
+ * an `OWED` (contracts v6 amendment) is sent only on an open end and one received before this end
+ * is open closes it as a protocol error.
  */
 import type {
   AckMessage,
   HelloMessage,
   MuxLike,
+  OwedMessage,
   PayMessage,
   PayProtocol,
   PayProtocolEvents,
@@ -40,6 +46,7 @@ type Wire =
   | { readonly t: 'pay'; readonly m: PayMessage }
   | { readonly t: 'ack'; readonly m: AckMessage }
   | { readonly t: 'price'; readonly m: PriceMessage }
+  | { readonly t: 'owed'; readonly m: OwedMessage }
   | { readonly t: 'close' };
 
 /** Messages held for a counterpart that has not registered yet. */
@@ -53,12 +60,14 @@ export class LoopbackEnd implements PayProtocol {
     pay: new Set(),
     ack: new Set(),
     price: new Set(),
+    owed: new Set(),
     close: new Set(),
   };
   /** Set by the hub once the counterpart exists. */
   other: LoopbackEnd | null = null;
   readonly queue: Wire[] = [];
   private helloSent = false;
+  private openFired = false;
   dropped = 0;
 
   constructor(
@@ -76,6 +85,7 @@ export class LoopbackEnd implements PayProtocol {
     this.helloSent = true;
     if (this.state === 'idle') this.state = 'hello-sent';
     this.send({ t: 'hello', m: { type: 'HELLO', ...hello } });
+    this.maybeOpen();
   }
 
   sendPay(msg: PayMessage): void {
@@ -88,6 +98,14 @@ export class LoopbackEnd implements PayProtocol {
 
   sendPrice(price: Omit<PriceMessage, 'type'>): void {
     this.send({ t: 'price', m: { type: 'PRICE', ...price } });
+  }
+
+  /** Like the real channel: only on an open end (a local bug otherwise), dropped once closed. */
+  sendOwed(owed: Omit<OwedMessage, 'type'>): void {
+    if (this.state === 'closed') return;
+    if (this.state !== 'open')
+      throw new Error('pay/1: OWED is sent only once both HELLOs are done');
+    this.send({ t: 'owed', m: { type: 'OWED', ...owed } });
   }
 
   cut(reason: CloseReason): void {
@@ -142,9 +160,9 @@ export class LoopbackEnd implements PayProtocol {
     if (this.state === 'closed') return;
     switch (w.t) {
       case 'hello':
-        this.peer = w.m;
-        if (this.helloSent) this.state = 'open';
-        for (const cb of [...this.listeners.open]) cb(w.m);
+        // The first HELLO is the peer's (the real channel refuses a different second one).
+        this.peer ??= w.m;
+        this.maybeOpen();
         return;
       case 'pay':
         for (const cb of [...this.listeners.pay]) cb(w.m);
@@ -155,10 +173,26 @@ export class LoopbackEnd implements PayProtocol {
       case 'price':
         for (const cb of [...this.listeners.price]) cb(w.m);
         return;
+      case 'owed':
+        if (this.state !== 'open') {
+          this.closeLocal('protocol-error');
+          return;
+        }
+        for (const cb of [...this.listeners.owed]) cb(w.m);
+        return;
       case 'close':
         this.closeLocal('remote');
         return;
     }
+  }
+
+  /** `open` once, when this end sent its HELLO and received the remote's (the channel's rule). */
+  private maybeOpen(): void {
+    if (this.openFired || !this.helloSent || this.peer === null || this.state === 'closed') return;
+    this.openFired = true;
+    this.state = 'open';
+    const peer = this.peer;
+    for (const cb of [...this.listeners.open]) cb(peer);
   }
 
   private closeLocal(reason: CloseReason): void {
