@@ -7,8 +7,9 @@
  *
  *   publish  when a phrase is created or rotated (never at startup);
  *   read     ONLY by an explicit restore: every `nutflix/nut13/*` copy of the signed-in identity
- *            on its read relays, signature-checked, newest per `d`, decrypted through the signer;
- *            a copy that does not decrypt or parse is counted and skipped;
+ *            on its read relays, signature-checked, newest per `d`, blanks dropped, at most
+ *            `MAX_RELAY_COPIES` decrypted through the signer (the rest counted); a copy that does
+ *            not decrypt or parse is counted and skipped;
  *   retire   after a rotation whose reissue completed: a blank replacement (so relays that
  *            ignore deletions drop the ciphertext too) and a NIP-09 deletion — both best effort
  *            (ADR 0016: the old copy may survive on some relay; the reissue already moved the
@@ -92,6 +93,8 @@ export interface RelayCopies {
   readonly copies: readonly { readonly device: string; readonly entropy: string }[];
   /** Copies of this identity that did not decrypt or parse (another app, a damaged event). */
   readonly unreadable: number;
+  /** Live copies left undecrypted by the `MAX_RELAY_COPIES` cap (counted, never silent). */
+  readonly omitted: number;
 }
 
 /** Every copy of `pubkey` it can decrypt (only for an explicit restore). */
@@ -101,7 +104,7 @@ export async function readRelayCopies(o: {
   readonly relays: RecoveryRelays;
 }): Promise<RelayCopies> {
   const read = o.relays.read();
-  if (read.length === 0) return { copies: [], unreadable: 0 };
+  if (read.length === 0) return { copies: [], unreadable: 0, omitted: 0 };
   const raw = await o.relays.pool.query(
     read,
     { kinds: [walletMod.RECOVERY_RELAY_KIND], authors: [o.pubkey], limit: 500 },
@@ -119,10 +122,12 @@ export async function readRelayCopies(o: {
     const seen = newest.get(device);
     if (seen === undefined || nostr.byNewest(ev, seen) < 0) newest.set(device, ev);
   }
+  // A retired copy's blank replacement is skipped BEFORE the cap, so blanks never crowd out a
+  // live copy; what the cap leaves out is counted (independent review IR10).
+  const live = [...newest].filter(([, ev]) => ev.content !== '');
   const copies: { device: string; entropy: string }[] = [];
   let unreadable = 0;
-  for (const [device, ev] of [...newest].slice(0, MAX_RELAY_COPIES)) {
-    if (ev.content === '') continue; // a retired copy's blank replacement
+  for (const [device, ev] of live.slice(0, MAX_RELAY_COPIES)) {
     let copy: walletTypes.RecoveryRelayCopy | null;
     try {
       copy = parseRelayCopy(await o.signer.nip44Decrypt(o.pubkey, ev.content));
@@ -132,7 +137,7 @@ export async function readRelayCopies(o: {
     if (copy === null) unreadable++;
     else copies.push({ device, entropy: copy.entropy });
   }
-  return { copies, unreadable };
+  return { copies, unreadable, omitted: Math.max(0, live.length - MAX_RELAY_COPIES) };
 }
 
 /** Best effort: blank a retired copy and ask relays to delete it (NIP-09). Never throws. */

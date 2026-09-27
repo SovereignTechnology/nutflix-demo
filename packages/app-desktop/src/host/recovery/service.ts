@@ -17,16 +17,17 @@
  *            A phrase whose reissue did not finish: only the reissue runs again.
  *            A finished phrase: rotation — re-authenticate first, then as above; the old phrase
  *            is kept on this device as `.retired` (restore reads it) and its relay copy retired
- *            once the reissue under the new one completed (`replaces`, kept until then).
+ *            once the reissue under the new one completed (`replaces`, kept until a relay took
+ *            the retirement; the next setup retries it first).
  *   show     re-authenticate (the local key's passphrase in the prompt window; a native confirm
  *            for a remote signer), then show the words again; an unconfirmed backup may be
  *            confirmed then.
  *   restore  requires this device's own phrase in use (the seam's restore lives on the seeded
  *            wallet, docs/contract-requests/N2-nut13-desktop.md item 2); an optional typed phrase
- *            (`recovery-restore`, checksum re-checked here by core), this device's phrases
- *            (current and retired) and every relay copy the identity decrypts — read ONLY here —
- *            each scanned from counter 0 at the wallet's mints, with progress, and one report
- *            row per mint.
+ *            and mint addresses (`recovery-restore`, checksum re-checked here by core), this
+ *            device's phrases (current and retired) and every relay copy the identity decrypts —
+ *            read ONLY here — each scanned from counter 0 at the wallet's mints and the typed
+ *            ones, with progress, and one report row per mint.
  *
  * Secrets: the entropy exists as bytes (zeroed after use), inside the NIP-44 plaintext (a JS
  * string, which cannot be wiped: ADR 0016 §2 residual) and as word indices in the prompt form
@@ -39,10 +40,10 @@ import { randomBytes, randomInt } from 'node:crypto';
 
 import type { MintUrl, NostrPubkey, Sats, Signer, UnixSeconds } from '@sovit/core';
 import type { wallet as walletMod } from '@sovit/core';
-import { signer as signerMod } from '@sovit/core';
+import { nostr, signer as signerMod } from '@sovit/core';
 
 import { IpcError } from '../../ipc/errors.js';
-import { isConfirmForm } from '../../ipc/guards.js';
+import { isConfirmForm, isMintUrl, isReissuePlanWire } from '../../ipc/guards.js';
 import type {
   ConfirmForm,
   RecoveryProgressWire,
@@ -318,7 +319,7 @@ export class RecoveryService {
   private async setupNow(): Promise<RecoverySetupWire> {
     const { core, signer, pubkey } = this.ready();
     const path = recoveryPath(this.o.dir, pubkey);
-    const old = await this.envelope(pubkey);
+    let old = await this.envelope(pubkey);
     if (old !== null && this.unreadable.has(pubkey))
       fail(
         'forbidden',
@@ -326,8 +327,11 @@ export class RecoveryService {
       );
     // A phrase whose reissue did not finish: finish it (nothing is revealed or replaced).
     if (old !== null && !old.reissued) return await this.finishReissue(pubkey, old);
+    // A replaced phrase's relay copy whose retirement did not land yet: try again first (best
+    // effort, idempotent; the funds it could restore were already moved).
+    if (old !== null && old.replaces !== null) old = await this.retireReplaced(pubkey, old);
     // Rotation replaces a working phrase: the user proves it is them first.
-    if (old !== null) await this.reauth(signer, pubkey);
+    if (old !== null) await this.reauth(signer, pubkey, 'rotate');
 
     const entropy = core.phrases.generate();
     let words: number[] = [];
@@ -355,8 +359,9 @@ export class RecoveryService {
         confirmed: false,
         reissued: false,
         relayCopy: false,
-        // A replaced phrase's relay copy is retired once the reissue under this one completed
-        // (`old` is a finished phrase here, so its own `replaces` is already null).
+        // A replaced phrase's relay copy is retired once the reissue under this one completed.
+        // (`old` is a finished phrase here; should ITS replaced copy still be pending — the retry
+        // above did not land either — that older retirement is not retried again: a residual.)
         replaces: old === null ? null : old.device,
         sealed,
       };
@@ -440,22 +445,13 @@ export class RecoveryService {
     if (r.complete) {
       // The replaced phrase restores nothing held any more: its relay copy goes (best effort,
       // idempotent — a crash before the write below only repeats it), then ONE write records
-      // both, so a recorded reissue never leaves a copy to retire behind.
-      const signer = this.o.signer();
-      if (env.replaces !== null && signer !== undefined) {
-        const retired = await retireRelayCopy({
-          signer,
-          pubkey,
-          relays: this.o.relays,
-          device: env.replaces,
-          now: this.now,
-        });
-        if (!retired) this.log.warn('the replaced phrase’s relay copy may still be on a relay');
-      }
+      // both. A retirement that did not land keeps `replaces`, so the next setup tries again
+      // (independent review IR7).
+      const retired = env.replaces === null || (await this.retireCopy(pubkey, env.replaces));
       await writeEnvelope(this.o.dir, recoveryPath(this.o.dir, pubkey), {
         ...env,
         reissued: true,
-        replaces: null,
+        replaces: retired ? null : env.replaces,
       });
     }
     return {
@@ -464,6 +460,28 @@ export class RecoveryService {
       feeSats: r.fee as Sats,
       reissueFailed: r.failed,
     };
+  }
+
+  /** Blank and NIP-09-delete a replaced phrase's relay copy; `true` once a relay took both. */
+  private async retireCopy(pubkey: NostrPubkey, device: string): Promise<boolean> {
+    const signer = this.o.signer();
+    const retired =
+      signer !== undefined &&
+      (await retireRelayCopy({ signer, pubkey, relays: this.o.relays, device, now: this.now }));
+    if (!retired) this.log.warn('the replaced phrase’s relay copy may still be on a relay');
+    return retired;
+  }
+
+  /** A finished phrase whose replaced copy is still to be retired: retry, record the outcome. */
+  private async retireReplaced(
+    pubkey: NostrPubkey,
+    env: RecoveryEnvelope,
+  ): Promise<RecoveryEnvelope> {
+    if (env.replaces === null || !(await this.retireCopy(pubkey, env.replaces))) return env;
+    const done: RecoveryEnvelope = { ...env, replaces: null };
+    await writeEnvelope(this.o.dir, recoveryPath(this.o.dir, pubkey), done);
+    this.log.info('the replaced phrase’s relay copy was retired on a retry');
+    return done;
   }
 
   private async reissueAll(pubkey: NostrPubkey): Promise<{
@@ -494,7 +512,18 @@ export class RecoveryService {
       try {
         const p = await seeded.reissuePlan(mint);
         // Dust whose fee would eat it all stays as it is (nothing sensible to move).
-        if (p.mint === mint && p.amount > 0 && p.feeSats < p.amount) plans.push(p);
+        if (p.mint !== mint || p.amount <= 0 || p.feeSats >= p.amount) continue;
+        // Each plan must be one main's dialog can show (an https mint, bounded inputs): one
+        // that is not — an http dev mint, say — is left out and counted, and never sinks the
+        // question for every other mint (independent review IR1).
+        const wire = { mint: p.mint, amount: p.amount, inputs: p.inputs, feeSats: p.feeSats };
+        if (isReissuePlanWire(wire)) plans.push(p);
+        else {
+          failed++;
+          this.log.warn(
+            'a reissue plan main’s dialog cannot show (not an https mint, or too many inputs): that balance stays uncovered',
+          );
+        }
       } catch (e) {
         failed++;
         this.log.warn('no reissue plan at a mint', { reason: reasonOf(e) });
@@ -514,6 +543,9 @@ export class RecoveryService {
     });
     if (!ok) {
       this.log.info('reissue not confirmed by the user: the balance stays uncovered for now');
+      // A declined fee dialog is a dismissed prompt: a renderer that keeps reopening it is
+      // paused like any other (independent review IR2). The result still reports the state.
+      this.dismissed();
       return { sats: 0, fee: 0, failed: failed + asked.length, complete: false };
     }
     let sats = 0;
@@ -538,7 +570,7 @@ export class RecoveryService {
     const { core, signer, pubkey } = this.ready();
     const env = await this.envelope(pubkey);
     if (env === null) fail('not-found', 'there is no recovery phrase on this device');
-    await this.reauth(signer, pubkey);
+    await this.reauth(signer, pubkey, 'reveal');
     let words: number[] = [];
     let posted: number[] = [];
     let entropy: walletMod.RecoveryEntropy | undefined;
@@ -622,21 +654,33 @@ export class RecoveryService {
       }
       // ADR 0016 D2: the relay copies are read HERE only — an explicit restore — never at startup.
       let relayUnreadable = 0;
+      let relayOmitted = 0;
       try {
         const r = await readRelayCopies({ signer, pubkey, relays: this.o.relays });
         relayUnreadable = r.unreadable;
+        relayOmitted = r.omitted;
         for (const c of r.copies) add(entropyFromHex(c.entropy));
       } catch (e) {
         this.log.warn('the relay copies could not be read', { reason: reasonOf(e) });
       }
       const listed = await plane.wallet.mints().catch((): readonly MintUrl[] => []);
-      const mints = uniqueMints([...plane.mints, ...listed]);
+      // ADR 0016 §5.1: mints typed in the restore window (main checked them with the same
+      // guard; checked again here, https only, normalised like the wallet's own).
+      const typed = uniqueMints(
+        (a.mints ?? []).flatMap((m) => {
+          const n = isMintUrl(m) ? nostr.normalizeMintUrl(m) : null;
+          return n?.startsWith('https://') === true ? [n] : [];
+        }),
+      );
+      const mints = uniqueMints([...plane.mints, ...listed, ...typed]);
       const phrases = found.length;
       this.log.info('restoring from recovery phrases', {
         phrases,
         mints: mints.length,
+        typedMints: typed.length,
         localUnreadable,
         relayUnreadable,
+        relayOmitted,
       });
       const rows = new Map<MintUrl, { outcome: RestoreOutcomeWire; restoredSats: number }>();
       for (const m of mints) rows.set(m, { outcome: 'nothing', restoredSats: 0 });
@@ -710,9 +754,14 @@ export class RecoveryService {
 
   /**
    * Before the phrase is revealed or replaced: the local key's passphrase (`UNLOCK_ATTEMPTS`
-   * tries, checked against the key file), or main's native confirm for a remote signer.
+   * tries, checked against the key file), or main's native confirm for a remote signer, worded
+   * for what follows (`recovery-reveal` / `recovery-rotate`).
    */
-  private async reauth(signer: Signer, pubkey: NostrPubkey): Promise<void> {
+  private async reauth(
+    signer: Signer,
+    pubkey: NostrPubkey,
+    purpose: 'reveal' | 'rotate',
+  ): Promise<void> {
     if (signer.kind === 'local') {
       for (let attempt = 1; attempt <= UNLOCK_ATTEMPTS; attempt++) {
         const a = await this.o.bridge.ask({ kind: 'recovery-reauth', retry: attempt > 1 });
@@ -732,6 +781,11 @@ export class RecoveryService {
       }
       this.log.warn('re-authentication for the recovery phrase failed (wrong passphrase)');
       fail('forbidden', 'wrong passphrase');
+    }
+    if (purpose === 'rotate') {
+      if (!(await this.confirm({ kind: 'recovery-rotate' })))
+        fail('cancelled', 'replacing the recovery phrase was not confirmed');
+      return;
     }
     if (!(await this.confirm({ kind: 'recovery-reveal' })))
       fail('cancelled', 'showing the recovery phrase was not confirmed');
@@ -798,23 +852,29 @@ export class RecoveryService {
     }
   }
 
-  /** A renderer-started flow: refused while cooling down; a dismissed prompt counts. */
+  /**
+   * A renderer-started flow: refused while cooling down; a dismissed prompt counts (a closed
+   * window — a `cancelled` refusal — or a declined native dialog, `dismissed()`).
+   */
   private async throttled<T>(f: () => Promise<T>): Promise<T> {
     if (this.clock() < this.coolUntil)
       fail('rate-limited', 'too many dismissed prompts: try again in a minute');
     try {
       return await f();
     } catch (e) {
-      if (e instanceof IpcError && e.code === 'cancelled') {
-        const t = this.clock();
-        this.cancels = [...this.cancels.filter((c) => t - c < CANCEL_WINDOW_MS), t];
-        if (this.cancels.length >= CANCEL_LIMIT) {
-          this.coolUntil = t + CANCEL_COOLDOWN_MS;
-          this.cancels = [];
-          this.log.warn('recovery prompts dismissed repeatedly: paused for a minute');
-        }
-      }
+      if (e instanceof IpcError && e.code === 'cancelled') this.dismissed();
       throw e;
+    }
+  }
+
+  /** One dismissed prompt: `CANCEL_LIMIT` in `CANCEL_WINDOW_MS` pause every flow a while. */
+  private dismissed(): void {
+    const t = this.clock();
+    this.cancels = [...this.cancels.filter((c) => t - c < CANCEL_WINDOW_MS), t];
+    if (this.cancels.length >= CANCEL_LIMIT) {
+      this.coolUntil = t + CANCEL_COOLDOWN_MS;
+      this.cancels = [];
+      this.log.warn('recovery prompts dismissed repeatedly: paused for a minute');
     }
   }
 

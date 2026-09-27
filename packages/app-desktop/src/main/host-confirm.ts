@@ -2,7 +2,7 @@
  * ADR 0016: questions the HOST asks main to put in a native dialog (`HostOut` `confirm`,
  * answered by `HostIn` `confirm-result`) — the reissue of the balance under the recovery phrase
  * with its fee, and the re-authentication of a signer that has no local passphrase before the
- * phrase is shown again.
+ * phrase is shown again or replaced (each worded for what it does).
  *
  * Like the confirm gate (`money-gate.ts`): the form is data only (`isConfirmForm`, checked by
  * `isHostOut` before it gets here), every word of the dialog is built here, Cancel is the
@@ -56,6 +56,14 @@ export function describeHostConfirm(form: ConfirmForm): ConfirmPrompt {
         detail:
           'Anyone who sees these 12 words can take your ecash. Make sure no one is watching and nothing is recording or sharing your screen.',
         confirmLabel: 'Show phrase',
+      };
+    case 'recovery-rotate':
+      return {
+        title: 'Replace recovery phrase',
+        message: 'Replace your recovery phrase with a new one?',
+        detail:
+          'Nutflix makes a new 12-word phrase for this device and shows it next: write it down. Your balance is then moved under the new phrase (the mints’ fee is shown first), and the old phrase stops covering new ecash.',
+        confirmLabel: 'Replace phrase',
       };
   }
 }

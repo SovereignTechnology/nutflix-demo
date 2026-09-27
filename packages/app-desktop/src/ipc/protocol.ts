@@ -351,8 +351,16 @@ export type PromptAnswer =
   | { readonly kind: 'recovery-show'; readonly done: boolean }
   /** ADR 0016: the indices typed at the asked positions, in the same order. */
   | { readonly kind: 'recovery-confirm'; readonly words: readonly number[] }
-  /** ADR 0016: a typed phrase as `RECOVERY_WORDS` indices, or none (`[]`). */
-  | { readonly kind: 'recovery-restore'; readonly words: readonly number[] };
+  /**
+   * ADR 0016: a typed phrase as `RECOVERY_WORDS` indices, or none (`[]`); `mints`: https mint
+   * addresses typed there too (§5.1: the words alone do not say which mints were used), 1 to
+   * `MAX_RESTORE_MINTS`, absent when none.
+   */
+  | {
+      readonly kind: 'recovery-restore';
+      readonly words: readonly number[];
+      readonly mints?: readonly MintUrl[];
+    };
 
 // ---- the recovery phrase (Stage 3, ADR 0016) ----------------------------------------------
 
@@ -364,6 +372,8 @@ export const BIP39_LIST_SIZE = 2048;
 export const RECOVERY_CONFIRM_WORDS = 3;
 /** Mints one reissue confirm may list (at most the wallet's keyset bound, ADR 0016 §5). */
 export const MAX_REISSUE_PLANS = 32;
+/** Mint addresses the restore window takes (ADR 0016 §5.1), besides the wallet's own mints. */
+export const MAX_RESTORE_MINTS = 8;
 
 /**
  * `desktop.wallet.recovery.status`:
@@ -444,11 +454,14 @@ export interface ReissuePlanWire {
  * every word (`host-confirm.ts`), Cancel is the default.
  *   `recovery-reissue`  move the balance at these mints under the recovery phrase, for this fee;
  *   `recovery-reveal`   show the phrase again (the re-authentication of a signer without a local
- *                       passphrase: NIP-46).
+ *                       passphrase: NIP-46);
+ *   `recovery-rotate`   replace the phrase with a new one (the same re-authentication, worded for
+ *                       what it does: independent review IR8).
  */
 export type ConfirmForm =
   | { readonly kind: 'recovery-reissue'; readonly plans: readonly ReissuePlanWire[] }
-  | { readonly kind: 'recovery-reveal' };
+  | { readonly kind: 'recovery-reveal' }
+  | { readonly kind: 'recovery-rotate' };
 
 /** What main's keychain holds, one sealed file each. */
 export type KeychainSlot = 'passphrase' | 'nip46';

@@ -14,6 +14,7 @@ import { describe, expect, it } from 'vitest';
 import {
   isConfirmForm,
   isConfirmPositions,
+  isReissuePlanWire,
   isHostIn,
   isHostOut,
   isPhraseIndices,
@@ -28,6 +29,7 @@ import type { PromptAnswer, PromptForm } from '../protocol.js';
 import {
   BIP39_LIST_SIZE,
   MAX_REISSUE_PLANS,
+  MAX_RESTORE_MINTS,
   RECOVERY_CONFIRM_WORDS,
   RECOVERY_WORDS,
   SHELL_TOPIC_METHODS,
@@ -136,6 +138,34 @@ describe('prompt answers (page → main → host)', () => {
     for (const a of bad) expect(isPromptAnswer(a), JSON.stringify(a)).toBe(false);
   });
 
+  // Independent review IR4 (ADR 0016 §5.1): the restore window takes mint addresses too.
+  it('recovery-restore may carry 1..8 normalised https mint addresses, and nothing else', () => {
+    const many = Array.from(
+      { length: MAX_RESTORE_MINTS + 1 },
+      (_, i) => `https://m${String(i)}.example`,
+    );
+    const good: unknown[] = [
+      { kind: 'recovery-restore', words: [], mints: [MINT] },
+      { kind: 'recovery-restore', words: PHRASE, mints: [MINT, 'https://mint.example:3338/cashu'] },
+      { kind: 'recovery-restore', words: [], mints: many.slice(0, MAX_RESTORE_MINTS) },
+    ];
+    for (const a of good) expect(isPromptAnswer(a), JSON.stringify(a)).toBe(true);
+    const bad: unknown[] = [
+      { kind: 'recovery-restore', words: [], mints: [] },
+      { kind: 'recovery-restore', words: [], mints: many },
+      { kind: 'recovery-restore', words: [], mints: ['http://mint.example'] },
+      { kind: 'recovery-restore', words: [], mints: ['https://mint.example/?x=1'] },
+      { kind: 'recovery-restore', words: [], mints: ['https://user@mint.example'] },
+      { kind: 'recovery-restore', words: [], mints: ['https://mint.example/'] },
+      { kind: 'recovery-restore', words: [], mints: ['legal winner thank'] },
+      { kind: 'recovery-restore', words: [], mints: MINT },
+      { kind: 'recovery-restore', words: [], mints: undefined },
+      { kind: 'recovery-restore', mints: [MINT] },
+      { kind: 'recovery-restore', words: [], mints: [MINT], note: 'x' },
+    ];
+    for (const a of bad) expect(isPromptAnswer(a), JSON.stringify(a)).toBe(false);
+  });
+
   it('an answer must fit its question: confirm counts, reauth is a secret', () => {
     const confirm: PromptForm = { kind: 'recovery-confirm', positions: [1, 2, 3], retry: false };
     expect(promptAnswerFits(confirm, { kind: 'recovery-confirm', words: [4, 5, 6] })).toBe(true);
@@ -179,6 +209,28 @@ describe('the host’s native-dialog questions (ConfirmForm) and their answer', 
     expect(
       isConfirmForm({ kind: 'recovery-reissue', plans: many.slice(0, MAX_REISSUE_PLANS) }),
     ).toBe(true);
+  });
+
+  // Independent review IR8: a rotation's re-authentication has its own question.
+  it('recovery-rotate: exact, data free', () => {
+    expect(isConfirmForm({ kind: 'recovery-rotate' })).toBe(true);
+    expect(isConfirmForm({ kind: 'recovery-rotate', words: PHRASE })).toBe(false);
+    expect(isConfirmForm({ kind: 'recovery-rotate', message: 'hello' })).toBe(false);
+    expect(isHostOut({ kind: 'confirm', req: 3, form: { kind: 'recovery-rotate' } })).toBe(true);
+  });
+
+  // Independent review IR1: the host checks each plan with the same guard before asking.
+  it('isReissuePlanWire is exactly one plan of a valid question', () => {
+    expect(isReissuePlanWire(plan)).toBe(true);
+    for (const p of [
+      { ...plan, mint: 'http://127.0.0.1:3399' },
+      { ...plan, mint: 'https://mint.example/?q=1' },
+      { ...plan, inputs: 100_001 },
+      { ...plan, feeSats: plan.amount },
+      { ...plan, extra: 1 },
+      null,
+    ])
+      expect(isReissuePlanWire(p), JSON.stringify(p)).toBe(false);
   });
 
   it('HostOut confirm / HostIn confirm-result are exact', () => {

@@ -120,6 +120,20 @@ describe('redact — word phrases (ADR 0016)', () => {
     ['pipes and tabs', (w) => w.join(' |\t')],
     ['in quotes inside a sentence', (w) => `error: "${w.join(' ')}" was refused`],
     ['as a path segment', (w) => `open /tmp/${w.join('/')}/x failed`],
+    // Independent review IR3: the forms a library error or a forwarded line would carry.
+    ['a JSON array', (w) => JSON.stringify(w)],
+    ['a JSON array inside an error', (w) => `invalid mnemonic: ${JSON.stringify({ words: w })}`],
+    ['single quotes per word', (w) => w.map((x) => `'${x}'`).join(' ')],
+    ['double quotes per word, commas', (w) => w.map((x) => `"${x}"`).join(', ')],
+    ['backticks per word', (w) => w.map((x) => `\`${x}\``).join(' ')],
+    ['ampersands', (w) => w.join('&')],
+    ['plus signs (form encoding)', (w) => w.join('+')],
+    ['URL-encoded spaces', (w) => w.join('%20')],
+    ['bracket-numbered', (w) => w.map((x, i) => `[${String(i + 1)}] ${x}`).join(' ')],
+    ['short keys, numbered', (w) => w.map((x, i) => `w${String(i)}=${x}`).join(' ')],
+    ['word keys, a query string', (w) => w.map((x, i) => `word${String(i + 1)}=${x}`).join('&')],
+    ['one-letter keys', (w) => w.map((x) => `k=${x}`).join('&')],
+    ['a JS array literal', (w) => `[ '${w.join("', '")}' ]`],
   ])('%s', (_what, fmt) => {
     const out = redact(`seed ${fmt(VECTOR)} end`);
     expect(out).toContain('<redacted>');
@@ -144,6 +158,45 @@ describe('redact — word phrases (ADR 0016)', () => {
       ),
       { numRuns: 300 },
     );
+  });
+
+  it('any 12-word phrase as a JSON array or quoted word by word is redacted whole (property)', () => {
+    fc.assert(
+      fc.property(
+        fc.uint8Array({ minLength: 16, maxLength: 16 }),
+        fc.constantFrom<(w: string[]) => string>(
+          (w) => JSON.stringify(w),
+          (w) => w.map((x) => `'${x}'`).join(', '),
+          (w) => w.join('%20'),
+          (w) => w.map((x, i) => `w${String(i)}=${x}`).join('&'),
+        ),
+        (entropy, fmt) => {
+          const words = phraseOf(entropy);
+          const out = redact(`before ${fmt(words)} after`);
+          expect(out).toContain('<redacted>');
+          // At most a stray word survives (a phrase's words can repeat, so count positions).
+          expect(
+            words.filter((x) => new RegExp(`(?<![a-z])${x}(?![a-z])`).test(out)).length,
+          ).toBeLessThanOrEqual(1);
+        },
+      ),
+      { numRuns: 300 },
+    );
+  });
+
+  it('the rule stays linear on hostile input (no catastrophic backtracking)', () => {
+    const hostile = [
+      'abcdefgh1='.repeat(400),
+      `${'abc '.repeat(7)}abcdefghijklmnop `.repeat(150),
+      `${'ab1=abc '.repeat(7)}x`.repeat(80),
+      `${'abc'.padEnd(3)}${' '.repeat(13)}`.repeat(250),
+      'a1'.repeat(2000),
+    ];
+    for (const h of hostile) {
+      const t0 = performance.now();
+      redact(h);
+      expect(performance.now() - t0).toBeLessThan(250);
+    }
   });
 
   it('eight words are a phrase; seven, capitalised prose, or short words are not', () => {

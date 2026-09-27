@@ -78,6 +78,43 @@ export function phraseValid(indices: readonly number[]): boolean {
   }
 }
 
+// ---- ADR 0016 §5.1: mint addresses typed in the restore window ------------------------------
+
+/** Mint addresses the restore window takes (`MAX_RESTORE_MINTS`, pinned by a test). */
+export const RESTORE_MINTS = 8;
+/** Longest mint address (`LIMITS.maxServerUrl`, pinned by a test). */
+const MAX_MINT_URL = 512;
+// The IPC guards' `isMintUrl` grammar (src/ipc/guards.ts `HTTPS_SERVER_RE`), copied because the
+// page bundle imports no ipc code; a test checks the two agree. Main and the host check again.
+const LABEL = '[A-Za-z0-9_](?:[A-Za-z0-9_-]{0,61}[A-Za-z0-9_])?';
+const HOST = `(?:${LABEL}(?:\\.${LABEL})*|\\[[0-9A-Fa-f:.]{2,45}\\])`;
+const PCHAR = "[A-Za-z0-9\\-._~!$&'()*+,;=:@%]";
+const PATH = `(?:/[A-Za-z0-9\\-._~!$&'()*+,;=:@%/]*${PCHAR})?`;
+const MINT_URL_RE = new RegExp(`^https://${HOST}(?::[0-9]{1,5})?${PATH}$`);
+
+/**
+ * A typed mint address → its normalised https URL (typed with `https://`; no user-info, no
+ * query, no fragment, no trailing slash, an ASCII host), or `undefined`. Never `http:` — a
+ * restore sends the phrase's blinded outputs to that mint (ADR 0016 §6: https only) — and never
+ * a bare word, so a phrase typed into the wrong box is not taken for a list of hosts.
+ */
+export function mintAddress(typed: string): string | undefined {
+  const t = typed.trim();
+  if (t.length > MAX_MINT_URL || !/^https:\/\//i.test(t)) return undefined;
+  let u: URL;
+  try {
+    u = new URL(t);
+  } catch {
+    return undefined;
+  }
+  if (u.protocol !== 'https:' || u.username !== '' || u.password !== '' || u.search !== '')
+    return undefined;
+  u.hash = '';
+  let out = u.toString();
+  while (out.endsWith('/')) out = out.slice(0, -1);
+  return out.length <= MAX_MINT_URL && MINT_URL_RE.test(out) ? out : undefined;
+}
+
 function isIndexList(x: unknown, n: number, max: number): x is readonly number[] {
   return (
     Array.isArray(x) &&
@@ -142,7 +179,7 @@ type Answer =
   | { kind: 'top-up-first'; confirm: boolean }
   | { kind: 'recovery-show'; done: boolean }
   | { kind: 'recovery-confirm'; words: number[] }
-  | { kind: 'recovery-restore'; words: number[] }
+  | { kind: 'recovery-restore'; words: number[]; mints?: string[] }
   | null;
 
 // ---- tiny DOM helpers --------------------------------------------------------------------
@@ -705,6 +742,32 @@ function recoveryRestore(): View {
       });
     });
   });
+  // ADR 0016 §5.1: the words alone do not say which mints a phrase was used at.
+  const mintBox = el('textarea', {
+    id: 'r-mints',
+    rows: '2',
+    autocomplete: 'off',
+    spellcheck: 'false',
+    autocapitalize: 'off',
+    maxlength: String(RESTORE_MINTS * (MAX_MINT_URL + 1)),
+    placeholder: 'https://mint.example',
+  });
+  const collectMints = (): string[] | { error: string } => {
+    const mints: string[] = [];
+    const parts = mintBox.value.split(/[\s,]+/).filter((x) => x !== '');
+    for (let n = 0; n < parts.length; n++) {
+      const m = mintAddress(parts[n] ?? '');
+      // The typed text is not repeated back (it could be anything the user pasted).
+      if (m === undefined)
+        return {
+          error: `Mint address ${String(n + 1)} is not an https address like https://mint.example (no http, no ? part).`,
+        };
+      if (!mints.includes(m)) mints.push(m);
+    }
+    if (mints.length > RESTORE_MINTS)
+      return { error: `Type at most ${String(RESTORE_MINTS)} mint addresses.` };
+    return mints;
+  };
   return {
     title: 'Restore from recovery phrases',
     body: [
@@ -727,13 +790,30 @@ function recoveryRestore(): View {
         ),
       ),
       wordDatalist('nf-words'),
+      el(
+        'div',
+        { class: 'field' },
+        el('label', { for: mintBox.id }, 'Other mints (optional)'),
+        mintBox,
+      ),
+      el(
+        'p',
+        { class: 'hint' },
+        `The words do not say which mints they were used at. If the phrase was used at a mint that is not in your list, type its address here (https only, up to ${String(RESTORE_MINTS)}).`,
+      ),
     ],
     submitLabel: 'Restore',
     ...(fields[0] === undefined ? {} : { focus: fields[0] }),
     secrets: fields,
     collect: () => {
+      const mints = collectMints();
+      if (!Array.isArray(mints)) return mints;
+      const answer = (words: number[]): Answer =>
+        mints.length > 0
+          ? { kind: 'recovery-restore', words, mints }
+          : { kind: 'recovery-restore', words };
       const typed = fields.map((f) => f.value.trim());
-      if (typed.every((t) => t === '')) return { kind: 'recovery-restore', words: [] };
+      if (typed.every((t) => t === '')) return answer([]);
       if (typed.some((t) => t === ''))
         return { error: 'Type all 12 words, or leave every field empty.' };
       const words: number[] = [];
@@ -747,7 +827,7 @@ function recoveryRestore(): View {
         return {
           error: 'These words are not a valid recovery phrase: check their spelling and order.',
         };
-      return { kind: 'recovery-restore', words };
+      return answer(words);
     },
   };
 }

@@ -771,3 +771,199 @@ describe('guard rails', () => {
     expect(r.status.reissuePending).toBe(false);
   });
 });
+
+/**
+ * The independent review of this lane (2026-09-27, docs/reviews/2026-09-26-pre-push-nut13-desktop.md
+ * § Independent review): each test failed before its fix.
+ */
+describe('independent review fixes', () => {
+  it('IR1: a plan main’s dialog cannot show (an http dev mint, too many inputs) is left out and counted; the other mints are still asked and reissued', async () => {
+    const w = await world();
+    const HTTP = 'http://127.0.0.1:3399' as MintUrl;
+    w.core.phrases.queue.push(ENTROPY_1);
+    for (const [mint, amount] of [
+      [MINT_A, 1_000],
+      [HTTP, 500],
+      [MINT_B, 700],
+    ] as const) {
+      w.balances.set(mint, amount);
+      w.core.wallet.balances.set(mint, amount);
+    }
+    w.core.wallet.plans.set(MINT_A, { inputs: 4, feeSats: 2 });
+    w.core.wallet.plans.set(HTTP, { inputs: 2, feeSats: 1 });
+    w.core.wallet.plans.set(MINT_B, { inputs: 100_001, feeSats: 3 });
+    userWhoWritesItDown(w);
+    w.confirm = () => true;
+    const r = await w.svc.setup();
+    expect(w.confirms).toEqual([
+      { kind: 'recovery-reissue', plans: [{ mint: MINT_A, amount: 1_000, inputs: 4, feeSats: 2 }] },
+    ]);
+    expect(w.core.wallet.reissued.map((p) => p.mint)).toEqual([MINT_A]);
+    expect(r).toMatchObject({ reissuedSats: 998, feeSats: 2, reissueFailed: 2 });
+    // The two left out are still uncovered: the reissue is not recorded as complete.
+    expect(r.status.reissuePending).toBe(true);
+    expect(
+      w.log.lines.filter((l) => l.msg.startsWith('a reissue plan main’s dialog')),
+    ).toHaveLength(2);
+    expect(w.log.lines.some((l) => l.msg.includes('did not pass the IPC guard'))).toBe(false);
+    expect(w.log.lines.some((l) => l.msg.includes('not confirmed by the user'))).toBe(false);
+    expectNoPhrase(w, [r]);
+  });
+
+  it('IR2: a declined fee dialog counts as a dismissal — the renderer cannot reopen it again and again', async () => {
+    const w = await world();
+    w.balances.set(MINT_A, 500);
+    w.core.wallet.balances.set(MINT_A, 500);
+    w.core.wallet.plans.set(MINT_A, { inputs: 2, feeSats: 1 });
+    userWhoWritesItDown(w, { later: true });
+    w.confirm = () => false;
+    for (let i = 0; i < CANCEL_LIMIT; i++) {
+      const r = await w.svc.setup();
+      expect(r.status.reissuePending).toBe(true);
+    }
+    expect(w.confirms).toHaveLength(CANCEL_LIMIT);
+    await expect(w.svc.setup()).rejects.toMatchObject({ code: 'rate-limited' });
+    await expect(w.svc.show()).rejects.toMatchObject({ code: 'rate-limited' });
+    expect(w.confirms).toHaveLength(CANCEL_LIMIT);
+    w.clock += 61_000;
+    w.confirm = () => true;
+    const r = await w.svc.setup();
+    expect(r.status.reissuePending).toBe(false);
+    expect(w.core.wallet.reissued.map((p) => p.mint)).toEqual([MINT_A]);
+  });
+
+  it('IR5: a finished phrase that did not open (sealed to another key) is never rotated away — forbidden, nothing asked, the file untouched', async () => {
+    const w = await world();
+    userWhoWritesItDown(w);
+    w.confirm = () => true;
+    await w.svc.setup();
+    const path = recoveryPath(w.dir, w.pubkey);
+    const env = await readEnvelope(path);
+    expect(env?.reissued).toBe(true);
+    const { signer: other } = await signerMod.LocalSigner.create({
+      passphrase: enc('another passphrase!'),
+      cost: signerMod.minimumCost(),
+    });
+    const foreign = JSON.stringify({
+      ...env,
+      sealed: await other.nip44Encrypt(
+        await other.getPublicKey(),
+        JSON.stringify({ v: 1, entropy: entropyHex(ENTROPY_3), created: 1 }),
+      ),
+    });
+    await writeFile(path, foreign, { mode: 0o600 });
+    await w.openPlane(); // the envelope parses, the seal does not open: `unreadable`
+    expect((await w.svc.status()).state).toBe('unreadable');
+    w.asked.length = 0;
+    await expect(w.svc.setup()).rejects.toMatchObject({ code: 'forbidden' });
+    expect(w.asked).toEqual([]);
+    expect(await readFile(path, 'utf8')).toBe(foreign);
+    expect((await readdir(w.dir)).some((n) => n.endsWith('.retired'))).toBe(false);
+  });
+
+  it('IR7: a relay copy whose retirement did not land stays recorded, and the next setup retries it before asking anything', async () => {
+    const w = await world();
+    userWhoWritesItDown(w);
+    w.confirm = () => true;
+    await w.svc.setup();
+    const path = recoveryPath(w.dir, w.pubkey);
+    const first = await readEnvelope(path);
+    // The relays take the new copy but refuse the old one's blank and its deletion.
+    let refuseRetire = true;
+    const publish = w.pool.publish.bind(w.pool);
+    (w.pool as unknown as { publish: nostr.PoolLike['publish'] }).publish = (relays, ev) =>
+      refuseRetire && (ev.kind === 5 || ev.content === '')
+        ? Promise.resolve(relays.map((url) => ({ url, ok: false, reason: 'blocked' })))
+        : publish(relays, ev);
+    await w.svc.setup(); // rotation
+    const second = await readEnvelope(path);
+    expect(second).toMatchObject({ reissued: true, replaces: first?.device });
+    expect(w.log.lines.some((l) => l.msg.includes('may still be on a relay'))).toBe(true);
+
+    refuseRetire = false;
+    const before = w.pool.published.length;
+    w.asked.length = 0;
+    w.answer = () => null; // the user then closes the passphrase window
+    await expect(w.svc.setup()).rejects.toMatchObject({ code: 'cancelled' });
+    expect(w.asked.map((f) => f.kind)).toEqual(['recovery-reauth']);
+    const d = `${walletMod.RECOVERY_D_PREFIX}${first?.device ?? ''}`;
+    const retired = w.pool.published.slice(before);
+    expect(
+      retired.some(
+        (p) =>
+          p.event.kind === walletMod.RECOVERY_RELAY_KIND &&
+          p.event.content === '' &&
+          p.event.tags[0]?.[1] === d,
+      ),
+    ).toBe(true);
+    expect(retired.some((p) => p.event.kind === 5)).toBe(true);
+    expect(await readEnvelope(path)).toMatchObject({
+      device: second?.device,
+      reissued: true,
+      replaces: null,
+    });
+  });
+
+  it('IR8: a remote signer’s rotation is confirmed with its own native question, not “show your phrase”', async () => {
+    const w = await world({ kind: 'nip46' });
+    userWhoWritesItDown(w);
+    w.confirm = () => true;
+    await w.svc.setup();
+    const before = await readFile(recoveryPath(w.dir, w.pubkey), 'utf8');
+    w.confirms.length = 0;
+    w.asked.length = 0;
+    w.confirm = (f) => f.kind !== 'recovery-rotate';
+    await expect(w.svc.setup()).rejects.toMatchObject({ code: 'cancelled' });
+    expect(w.confirms).toEqual([{ kind: 'recovery-rotate' }]);
+    expect(w.asked).toEqual([]);
+    expect(await readFile(recoveryPath(w.dir, w.pubkey), 'utf8')).toBe(before);
+    w.confirm = () => true;
+    w.confirms.length = 0;
+    await w.svc.setup();
+    expect(w.confirms[0]).toEqual({ kind: 'recovery-rotate' });
+    expect(w.asked[0]?.kind).toBe('recovery-show');
+    // Show again keeps the reveal question.
+    w.confirms.length = 0;
+    await w.svc.show();
+    expect(w.confirms).toEqual([{ kind: 'recovery-reveal' }]);
+  });
+
+  it('IR4: mint addresses typed in the restore window are scanned too (ADR 0016 §5.1) — normalised, https only, once each', async () => {
+    const w = await world();
+    w.core.phrases.queue.push(ENTROPY_1);
+    userWhoWritesItDown(w);
+    w.confirm = () => true;
+    await w.svc.setup();
+    const TYPED = 'https://other-wallet-mint.recovery.test' as MintUrl;
+    w.answer = (f) =>
+      f.kind === 'recovery-restore'
+        ? {
+            kind: 'recovery-restore',
+            words: [],
+            mints: [
+              TYPED,
+              MINT_A,
+              'HTTPS://Other-Wallet-Mint.recovery.test' as MintUrl,
+              // Not an https mint URL: main's guard refuses it; the host drops it too.
+              'http://plain.recovery.test' as MintUrl,
+            ],
+          }
+        : null;
+    w.core.wallet.restores.set(entropyHex(ENTROPY_1), {
+      [TYPED]: { outcome: 'restored', restoredSats: 5 },
+    });
+    const r = await w.svc.restore();
+    expect(w.core.wallet.restoreCalls[0]?.mints).toEqual([MINT_A, MINT_B, TYPED]);
+    expect(r.reports).toEqual([
+      { mint: MINT_A, outcome: 'nothing', restoredSats: 0 },
+      { mint: MINT_B, outcome: 'nothing', restoredSats: 0 },
+      { mint: TYPED, outcome: 'restored', restoredSats: 5 },
+    ]);
+    expect(w.log.lines.find((l) => l.msg === 'restoring from recovery phrases')).toMatchObject({
+      mints: 3,
+      // Distinct https mints typed: TYPED and MINT_A (the http one dropped, the case twin merged).
+      typedMints: 2,
+    });
+    expectNoPhrase(w, [r]);
+  });
+});

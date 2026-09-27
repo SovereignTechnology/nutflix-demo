@@ -46,11 +46,18 @@ const IPV6_RE =
 const CONTROL_RE = /[\u0000-\u001f\u007f]/g;
 /**
  * ADR 0016 (related finding 3): a word phrase — 8 or more consecutive lower-case words of 3 to 8
- * letters (every BIP-39 English word is one), separated by spaces or punctuation, optionally
- * numbered ("1. abandon 2. ability …"). Over-matches ordinary prose on purpose: a recovery
- * phrase must never reach a log whole, and part of one is still a guessing head start.
+ * letters (every BIP-39 English word is one), each separated from the next by a short run (1 to
+ * 12 characters) of white space, digits and ASCII punctuation — quotes, brackets, `,` `&` `+`
+ * `=` `%`, so a JSON array, quoted words, a numbered list, `%20` or a query string all count —
+ * where a one- or two-letter key directly before a digit or `=` (`w1=`, `k=`) counts as
+ * separator too (independent review IR3); short English words ("is", "to"), an opening
+ * parenthesis and non-ASCII punctuation (an em dash) do not, so our own prose messages keep
+ * reading. Over-matches ordinary prose on purpose: a recovery phrase must never reach a log
+ * whole, and part of one is still a guessing head start. Linear: letters and separators never
+ * overlap (a key needs a non-letter before it), so a failed attempt has one way to parse.
  */
-const PHRASE_SEP = String.raw`(?:[\s,;:.|/_-]+(?:\d{1,2}[.):]?[\s,;:.|/_-]*)?)`;
+const PHRASE_SEP_CHAR = String.raw`[\s!-')-@\[-\x60{-~]`;
+const PHRASE_SEP = String.raw`(?:${PHRASE_SEP_CHAR}|(?<![A-Za-z])[A-Za-z]{1,2}(?=[0-9=])){1,12}`;
 const PHRASE_WORD = '[a-z]{3,8}';
 const PHRASE_RE = new RegExp(
   String.raw`(?<![A-Za-z])${PHRASE_WORD}(?:${PHRASE_SEP}${PHRASE_WORD}){7,}(?![A-Za-z])`,

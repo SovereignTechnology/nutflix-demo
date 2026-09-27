@@ -22,9 +22,20 @@
  *
  * Electron-free: `main.ts` passes a window factory; the tests pass fakes.
  */
-import { isAuthUrl, isExternalLink, isWordIndex, promptAnswerFits } from '../ipc/guards.js';
+import {
+  isAuthUrl,
+  isExternalLink,
+  isMintUrl,
+  isWordIndex,
+  promptAnswerFits,
+} from '../ipc/guards.js';
 import type { OpenLinkForm, PromptAnswer, PromptForm, WindowForm } from '../ipc/protocol.js';
-import { MAX_SECRET_BYTES, RECOVERY_CONFIRM_WORDS, RECOVERY_WORDS } from '../ipc/protocol.js';
+import {
+  MAX_RESTORE_MINTS,
+  MAX_SECRET_BYTES,
+  RECOVERY_CONFIRM_WORDS,
+  RECOVERY_WORDS,
+} from '../ipc/protocol.js';
 import type { LogEvent } from './log.js';
 import { APP_SCHEME, PROMPT_HOST } from './schemes.js';
 
@@ -126,6 +137,25 @@ function indices(x: unknown, lengths: readonly number[]): number[] | undefined {
   return out;
 }
 
+type RestoreMint = NonNullable<
+  Extract<PromptAnswer, { kind: 'recovery-restore' }>['mints']
+>[number];
+
+/**
+ * ADR 0016 §5.1: the mint addresses typed in the restore window — 1 to `MAX_RESTORE_MINTS`
+ * normalised https URLs (`isMintUrl`, the host's own guard), copied into main's own array; `null`
+ * when anything else.
+ */
+function mintList(x: unknown): RestoreMint[] | null {
+  if (!Array.isArray(x) || x.length < 1 || x.length > MAX_RESTORE_MINTS) return null;
+  const out: RestoreMint[] = [];
+  for (const m of x as unknown[]) {
+    if (!isMintUrl(m)) return null;
+    out.push(m);
+  }
+  return out;
+}
+
 function isOwnText(x: unknown, max: number): x is string {
   return typeof x === 'string' && x.length > 0 && x.length <= max && !x.includes('\u0000');
 }
@@ -183,14 +213,18 @@ export function toPromptAnswer(
         return words === undefined ? undefined : { kind: 'recovery-confirm', words };
       }
       case 'recovery-restore': {
-        if (keys !== 'kind,words') return undefined;
+        if (keys !== 'kind,words' && keys !== 'kind,mints,words') return undefined;
+        const mints = keys === 'kind,words' ? undefined : mintList(o['mints']);
+        if (mints === null) return undefined;
         const words = indices(o['words'], [0, RECOVERY_WORDS]);
         if (words === undefined) return undefined;
         if (words.length > 0 && opts.checksumOk?.(words) !== true) {
           words.fill(0);
           return undefined;
         }
-        return { kind: 'recovery-restore', words };
+        return mints === undefined
+          ? { kind: 'recovery-restore', words }
+          : { kind: 'recovery-restore', words, mints };
       }
       case 'secret': {
         if (keys !== 'kind,value' || !isOwnText(o['value'], MAX_SECRET_BYTES)) return undefined;

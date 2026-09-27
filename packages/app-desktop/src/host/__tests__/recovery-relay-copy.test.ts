@@ -5,7 +5,7 @@
  */
 import { describe, expect, it } from 'vitest';
 
-import type { NostrPubkey, RelayUrl, UnixSeconds } from '@sovit/core';
+import type { NostrEvent, NostrPubkey, RelayUrl, UnixSeconds } from '@sovit/core';
 import { nostr, signer as signerMod, wallet as walletMod } from '@sovit/core';
 
 import {
@@ -202,7 +202,7 @@ describe('reading the copies (restore only)', () => {
       pubkey: s.pk,
       relays: { pool, write: () => [W], read: () => [] },
     });
-    expect(r).toEqual({ copies: [], unreadable: 0 });
+    expect(r).toEqual({ copies: [], unreadable: 0, omitted: 0 });
     expect(pool.queries).toEqual([]);
   });
 
@@ -231,6 +231,99 @@ describe('reading the copies (restore only)', () => {
       relays: { pool, write: () => [], read: () => [R] },
     });
     expect(decrypts).toBe(MAX_RELAY_COPIES);
+  });
+
+  // Independent review IR6: the fake pool replaces parameterised-replaceable events itself, so
+  // the reader never saw two versions of one `d`; real relays can return both.
+  it('newest per d, whatever order the relays answer in: a newer blank retires the copy, a newer copy wins', async () => {
+    const s = await me();
+    const d = `nutflix/nut13/${'03'.repeat(16)}`;
+    const ev = async (at: number, content: string): Promise<NostrEvent> =>
+      s.signEvent({
+        kind: walletMod.RECOVERY_RELAY_KIND,
+        created_at: at,
+        tags: [['d', d]],
+        content,
+      });
+    const seal = (entropy: string): Promise<string> =>
+      s.nip44Encrypt(s.pk, JSON.stringify({ v: 1, entropy, created: 1 }));
+    const E1 = '11'.repeat(16);
+    const E2 = '22'.repeat(16);
+    const old = await ev(10, await seal(E1));
+    const blank = await ev(11, '');
+    const newer = await ev(12, await seal(E2));
+    const answering = (events: readonly unknown[]): nostr.PoolLike => {
+      const base = new nostr.FakeRelayPool();
+      return {
+        query: () => Promise.resolve(events),
+        subscribe: (r, f, h) => base.subscribe(r, f, h),
+        publish: (r, e) => base.publish(r, e),
+        close: () => {
+          base.close();
+        },
+      };
+    };
+    const read = (events: readonly unknown[]) =>
+      readRelayCopies({
+        signer: s,
+        pubkey: s.pk,
+        relays: { pool: answering(events), write: () => [], read: () => [R] },
+      });
+    for (const order of [
+      [old, blank],
+      [blank, old],
+    ])
+      expect(await read(order)).toEqual({ copies: [], unreadable: 0, omitted: 0 });
+    for (const order of [
+      [old, blank, newer],
+      [newer, old, blank],
+      [blank, newer, old],
+    ])
+      expect((await read(order)).copies).toEqual([{ device: '03'.repeat(16), entropy: E2 }]);
+  });
+
+  // Independent review IR10: blanks are dropped before the cap, and the cap is never silent.
+  it(`blanks never crowd out a live copy, and copies beyond ${String(MAX_RELAY_COPIES)} are counted`, async () => {
+    const s = await me();
+    const pool = new nostr.FakeRelayPool();
+    const E1 = '11'.repeat(16);
+    const at = (i: number): string => `nutflix/nut13/${i.toString(16).padStart(32, '0')}`;
+    // The relay answers newest first: MAX_RELAY_COPIES retired blanks, then the one live copy.
+    for (let i = 0; i < MAX_RELAY_COPIES; i++)
+      pool.store(
+        await s.signEvent({
+          kind: walletMod.RECOVERY_RELAY_KIND,
+          created_at: 100,
+          tags: [['d', at(i)]],
+          content: '',
+        }),
+      );
+    pool.store(
+      await s.signEvent({
+        kind: walletMod.RECOVERY_RELAY_KIND,
+        created_at: 50,
+        tags: [['d', at(999)]],
+        content: await s.nip44Encrypt(s.pk, JSON.stringify({ v: 1, entropy: E1, created: 1 })),
+      }),
+    );
+    const relays = { pool, write: () => [], read: () => [R] };
+    expect(await readRelayCopies({ signer: s, pubkey: s.pk, relays })).toEqual({
+      copies: [{ device: at(999).slice('nutflix/nut13/'.length), entropy: E1 }],
+      unreadable: 0,
+      omitted: 0,
+    });
+    for (let i = 0; i < MAX_RELAY_COPIES + 2; i++)
+      pool.store(
+        await s.signEvent({
+          kind: walletMod.RECOVERY_RELAY_KIND,
+          created_at: 200,
+          tags: [['d', at(2000 + i)]],
+          content: 'x',
+        }),
+      );
+    const r = await readRelayCopies({ signer: s, pubkey: s.pk, relays });
+    expect(r.unreadable).toBe(MAX_RELAY_COPIES);
+    expect(r.omitted).toBe(3);
   });
 
   it('retire: a blank replacement and a NIP-09 deletion naming the address; never throws', async () => {

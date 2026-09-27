@@ -10,13 +10,16 @@ import { entropyToMnemonic } from '@scure/bip39';
 import { wordlist } from '@scure/bip39/wordlists/english.js';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
+import { isMintUrl } from '../../ipc/guards.js';
 import type { PromptForm } from '../../ipc/protocol.js';
-import { BIP39_LIST_SIZE, RECOVERY_WORDS } from '../../ipc/protocol.js';
+import { BIP39_LIST_SIZE, MAX_RESTORE_MINTS, RECOVERY_WORDS } from '../../ipc/protocol.js';
 import {
   PHRASE_WORDS,
+  RESTORE_MINTS,
   WORDS,
   WORDS_VISIBLE_MS,
   isForm,
+  mintAddress,
   mount,
   phraseValid,
   wordIndex,
@@ -216,6 +219,82 @@ describe('recovery-restore', () => {
     submit();
     expect(sent).toEqual([{ kind: 'recovery-restore', words: PHRASE }]);
     expect(f.every((x) => x.value === '')).toBe(true);
+  });
+
+  // Independent review IR4 (ADR 0016 §5.1): the words do not say which mints were used.
+  describe('typed mint addresses', () => {
+    // By tag, not id: a test that mounts twice leaves the first page in the document, and a
+    // duplicate id defeats jsdom's scoped `#id` lookup.
+    const box = (): HTMLTextAreaElement => find('textarea') as HTMLTextAreaElement;
+
+    it('the page’s normaliser agrees with the IPC guard (https only, no query or user-info, no trailing slash)', () => {
+      expect(RESTORE_MINTS).toBe(MAX_RESTORE_MINTS);
+      const cases: [string, string | undefined][] = [
+        ['https://mint.example', 'https://mint.example'],
+        ['  https://Mint.Example/  ', 'https://mint.example'],
+        ['HTTPS://mint.example:3338/cashu/', 'https://mint.example:3338/cashu'],
+        ['mint.example', undefined],
+        ['mint.example:3338/cashu/', undefined],
+        ['https://mint.example/#frag', 'https://mint.example'],
+        // A look-alike (Cyrillic "і") host leaves as punycode (checked below).
+        ['https://mіnt.example', 'https://xn--mnt-jhd.example'],
+        ['http://mint.example', undefined],
+        ['ws://mint.example', undefined],
+        ['https://mint.example/?token=1', undefined],
+        ['https://user:pw@mint.example', undefined],
+        ['javascript:alert(1)', undefined],
+        ['https://', undefined],
+        ['legal winner thank', undefined],
+        [`https://${'a'.repeat(600)}.example`, undefined],
+        ['', undefined],
+      ];
+      for (const [typed, want] of cases) {
+        const got = mintAddress(typed);
+        expect(got, typed).toBe(want);
+        if (got !== undefined) expect(isMintUrl(got), got).toBe(true);
+      }
+    });
+
+    it('sent normalised and once each, with or without a typed phrase (an empty box sends no `mints`: see “twelve empty fields”)', () => {
+      const first = show({ kind: 'recovery-restore' });
+      box().value = 'https://a.example\n https://mint.b.example:3338/ , https://A.example';
+      submit();
+      expect(first.sent).toEqual([
+        {
+          kind: 'recovery-restore',
+          words: [],
+          mints: ['https://a.example', 'https://mint.b.example:3338'],
+        },
+      ]);
+      const second = show({ kind: 'recovery-restore' });
+      fields().forEach((x, i) => {
+        x.value = TEXT[i] ?? '';
+      });
+      box().value = 'https://a.example';
+      submit();
+      expect(second.sent).toEqual([
+        { kind: 'recovery-restore', words: PHRASE, mints: ['https://a.example'] },
+      ]);
+    });
+
+    it('an http, query-carrying or junk address, or too many, is refused on the page without repeating it', () => {
+      const { sent } = show({ kind: 'recovery-restore' });
+      box().value = 'https://ok.example\nhttp://plain.example';
+      submit();
+      const err = find('.error[role="alert"]').textContent;
+      expect(err).toMatch(/Mint address 2 is not an https address/);
+      expect(err).not.toContain('plain.example');
+      box().value = 'legal winner thank year';
+      submit();
+      expect(find('.error[role="alert"]').textContent).not.toMatch(/legal|winner/);
+      box().value = Array.from(
+        { length: RESTORE_MINTS + 1 },
+        (_, i) => `https://m${String(i)}.example`,
+      ).join(' ');
+      submit();
+      expect(find('.error[role="alert"]').textContent).toMatch(/at most 8 mint addresses/);
+      expect(sent).toEqual([]);
+    });
   });
 
   it('pasting a whole phrase into one field spreads it over the fields', () => {

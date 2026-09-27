@@ -204,6 +204,54 @@ describe('the prompt window with words on screen', () => {
     ]);
   });
 
+  // Independent review IR4 (ADR 0016 §5.1): the mint addresses typed in the restore window.
+  it('restore: typed mint addresses pass through main’s own guard (https, normalised, 1..8), never loosely', () => {
+    const MINT = 'https://mint.typed.example';
+    expect(toPromptAnswer({ kind: 'recovery-restore', words: [], mints: [MINT] })).toEqual({
+      kind: 'recovery-restore',
+      words: [],
+      mints: [MINT],
+    });
+    expect(
+      toPromptAnswer(
+        { kind: 'recovery-restore', words: [...PHRASE], mints: [MINT, 'https://b.example:3338'] },
+        { checksumOk },
+      ),
+    ).toEqual({
+      kind: 'recovery-restore',
+      words: PHRASE,
+      mints: [MINT, 'https://b.example:3338'],
+    });
+    const nine = Array.from({ length: 9 }, (_, i) => `https://m${String(i)}.example`);
+    for (const mints of [
+      [],
+      nine,
+      ['http://mint.typed.example'],
+      ['https://mint.typed.example/?q=1'],
+      ['https://mint.typed.example/'],
+      ['legal winner thank'],
+      [42],
+      MINT,
+      null,
+    ])
+      expect(
+        toPromptAnswer({ kind: 'recovery-restore', words: [], mints }),
+        JSON.stringify(mints),
+      ).toBeUndefined();
+    // A bad mint list refuses the whole answer, typed phrase included.
+    expect(
+      toPromptAnswer(
+        { kind: 'recovery-restore', words: [...PHRASE], mints: ['http://x.example'] },
+        { checksumOk },
+      ),
+    ).toBeUndefined();
+    // Main's copy is its own array (the page's cannot change it afterwards).
+    const pageMints = [MINT];
+    const a = toPromptAnswer({ kind: 'recovery-restore', words: [], mints: pageMints });
+    pageMints[0] = 'https://evil.example';
+    expect(a).toEqual({ kind: 'recovery-restore', words: [], mints: [MINT] });
+  });
+
   it('toPromptAnswer: exact keys, indices only, no checksum function = every typed phrase refused', () => {
     expect(toPromptAnswer({ kind: 'recovery-show', done: true })).toEqual({
       kind: 'recovery-show',
@@ -264,6 +312,16 @@ describe('the host’s native confirms (host-confirm.ts)', () => {
     const p = describeHostConfirm({ kind: 'recovery-reveal' });
     expect(p.detail).toMatch(/recording or sharing your screen/);
     expect(p.confirmLabel).toBe('Show phrase');
+  });
+
+  // Independent review IR8: a rotation is worded as the destructive step it is.
+  it('the rotate dialog says the phrase is replaced (not shown), with the fee to come', () => {
+    const p = describeHostConfirm({ kind: 'recovery-rotate' });
+    expect(p.title).toBe('Replace recovery phrase');
+    expect(p.message).toMatch(/^Replace your recovery phrase/);
+    expect(p.detail).toMatch(/fee is shown first/);
+    expect(p.confirmLabel).toBe('Replace phrase');
+    expect(`${p.title}${p.message}${p.confirmLabel}`).not.toMatch(/Show/);
   });
 
   it('true only for the confirm button; one dialog at a time; a failed dialog is no', async () => {

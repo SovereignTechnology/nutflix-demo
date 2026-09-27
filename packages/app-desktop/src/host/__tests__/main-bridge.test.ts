@@ -5,7 +5,7 @@
 import { describe, expect, it } from 'vitest';
 
 import type { HostOut } from '../../ipc/protocol.js';
-import { MainBridge } from '../signer/main-bridge.js';
+import { MainBridge, PROMPT_TIMEOUT_MS, RECOVERY_SHOW_TIMEOUT_MS } from '../signer/main-bridge.js';
 import type { Timers } from '../worker/supervisor.js';
 
 class Clock implements Timers {
@@ -75,6 +75,47 @@ describe('MainBridge', () => {
     clock.fireAll();
     expect(await p).toBeNull();
     expect(out.at(-1)).toEqual({ kind: 'prompt-cancel', req: reqOf(out[0]) });
+  });
+
+  // Independent review IR9: a new phrase is discarded when its window times out; writing 12
+  // words down can take longer than any other question.
+  it('ADR 0016: a shown phrase gets its own, longer deadline; every other question the usual one', async () => {
+    const ms: number[] = [];
+    const fire: (() => void)[] = [];
+    const out: HostOut[] = [];
+    const b = new MainBridge({
+      post: (o) => out.push(o),
+      timers: {
+        setTimeout: (fn, t) => {
+          ms.push(t);
+          fire.push(fn);
+          return fire.length;
+        },
+        clearTimeout: () => undefined,
+      },
+    });
+    const shown = b.ask({ kind: 'recovery-show', words: Array<number>(12).fill(1), again: false });
+    void b.ask({ kind: 'recovery-confirm', positions: [0, 5, 11], retry: false });
+    void b.ask({ kind: 'import-nsec' });
+    expect(ms).toEqual([RECOVERY_SHOW_TIMEOUT_MS, PROMPT_TIMEOUT_MS, PROMPT_TIMEOUT_MS]);
+    expect(RECOVERY_SHOW_TIMEOUT_MS).toBeGreaterThanOrEqual(6 * PROMPT_TIMEOUT_MS);
+    // It is still a deadline: past it the window is closed in main and the phrase discarded.
+    fire[0]?.();
+    expect(await shown).toBeNull();
+    expect(out.at(-1)).toEqual({ kind: 'prompt-cancel', req: reqOf(out[0]) });
+  });
+
+  // Independent review IR11: like main's own `wipe()`.
+  it('ADR 0016: a stray or misfitting answer carrying word indices is zeroed', async () => {
+    const { b, out } = bridge();
+    const stray = [5, 6, 7];
+    b.onPromptAnswer(77, { kind: 'recovery-confirm', words: stray });
+    expect(stray).toEqual([0, 0, 0]);
+    const p = b.ask({ kind: 'create-wallet' });
+    const typed = Array.from({ length: 12 }, (_, i) => i + 1);
+    b.onPromptAnswer(reqOf(out[0]), { kind: 'recovery-restore', words: typed });
+    expect(await p).toBeNull();
+    expect(typed).toEqual(Array<number>(12).fill(0));
   });
 
   it('keychain: get returns the value, put/forget never do (a stray value is wiped)', async () => {

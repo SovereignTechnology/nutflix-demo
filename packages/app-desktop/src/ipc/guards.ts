@@ -67,6 +67,7 @@ import {
   LIMITS,
   MAX_AUTH_URL,
   MAX_REISSUE_PLANS,
+  MAX_RESTORE_MINTS,
   MAX_SECRET_BYTES,
   RECOVERY_CONFIRM_WORDS,
   RECOVERY_WORDS,
@@ -643,14 +644,20 @@ export const isConfirmPositions: Guard<readonly number[]> = safe(
 const isTypedPhrase = (x: unknown): x is readonly number[] =>
   arrayOf(isWordIndex, RECOVERY_WORDS)(x) && (x.length === 0 || x.length === RECOVERY_WORDS);
 
-/** One mint's reissue for main's dialog: a fee below the amount, inputs bounded. */
-const isReissuePlanWire = (x: unknown): x is ReissuePlanWire =>
-  obj({
-    mint: isMintUrl,
-    amount: isPositiveSats,
-    inputs: int(1, 100_000),
-    feeSats: isSats,
-  })(x) && x.feeSats < x.amount;
+/**
+ * One mint's reissue for main's dialog: an https mint, a fee below the amount, inputs bounded.
+ * The host checks each plan with it before asking (a plan that fails is left out and counted,
+ * never allowed to sink the whole question: independent review IR1).
+ */
+export const isReissuePlanWire: Guard<ReissuePlanWire> = safe(
+  (x): x is ReissuePlanWire =>
+    obj({
+      mint: isMintUrl,
+      amount: isPositiveSats,
+      inputs: int(1, 100_000),
+      feeSats: isSats,
+    })(x) && x.feeSats < x.amount,
+);
 
 /** ADR 0016: a native-dialog question from the host (data only; main holds the words). */
 export const isConfirmForm: Guard<ConfirmForm> = safe(
@@ -661,6 +668,7 @@ export const isConfirmForm: Guard<ConfirmForm> = safe(
         plans: arrayOf(isReissuePlanWire, MAX_REISSUE_PLANS, 1),
       })(x) && new Set(x.plans.map((p) => p.mint)).size === x.plans.length,
     obj({ kind: literal('recovery-reveal') }),
+    obj({ kind: literal('recovery-rotate') }),
   ),
 );
 
@@ -706,7 +714,10 @@ export const isPromptAnswer: Guard<PromptAnswer> = safe(
       kind: literal('recovery-confirm'),
       words: arrayOf(isWordIndex, RECOVERY_CONFIRM_WORDS, RECOVERY_CONFIRM_WORDS),
     }),
-    obj({ kind: literal('recovery-restore'), words: isTypedPhrase }),
+    obj(
+      { kind: literal('recovery-restore'), words: isTypedPhrase },
+      { mints: arrayOf(isMintUrl, MAX_RESTORE_MINTS, 1) },
+    ),
   ),
 );
 
