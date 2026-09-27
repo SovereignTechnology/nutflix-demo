@@ -12,8 +12,9 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { isMintUrl } from '../../ipc/guards.js';
 import type { PromptForm } from '../../ipc/protocol.js';
-import { BIP39_LIST_SIZE, MAX_RESTORE_MINTS, RECOVERY_WORDS } from '../../ipc/protocol.js';
+import { BIP39_LIST_SIZE, LIMITS, MAX_RESTORE_MINTS, RECOVERY_WORDS } from '../../ipc/protocol.js';
 import {
+  MAX_MINT_URL,
   PHRASE_WORDS,
   RESTORE_MINTS,
   WORDS,
@@ -229,6 +230,7 @@ describe('recovery-restore', () => {
 
     it('the page’s normaliser agrees with the IPC guard (https only, no query or user-info, no trailing slash)', () => {
       expect(RESTORE_MINTS).toBe(MAX_RESTORE_MINTS);
+      expect(MAX_MINT_URL).toBe(LIMITS.maxServerUrl);
       const cases: [string, string | undefined][] = [
         ['https://mint.example', 'https://mint.example'],
         ['  https://Mint.Example/  ', 'https://mint.example'],

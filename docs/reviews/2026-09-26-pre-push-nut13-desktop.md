@@ -242,3 +242,120 @@ All 32 killed. M19 and M20 survived the first run: no test covered the status of
    (e.g. `payout skipped: the balance does not cover the swap fee`).
 10. `app-desktop/package.json` does not declare `@scure/bip39` (hoisted from core; contract
     request item 6, a lockfile change outside the lane).
+
+## Independent review (2026-09-27)
+
+An independent reviewer read the lane at `134cdea`. It found no critical or high defects: 1
+medium, 3 low, 7 info. It re-ran 14 mutations (12 killed, 2 survived) and 3 probes. Each finding
+was verified first. The six reproducible ones got a test that failed on `134cdea` (IR1, IR2,
+IR3, IR4, IR7, IR8: the failing run is quoted below). The two test gaps (IR5, IR6) got the test
+that kills the reviewer's surviving mutation. The three that are code-reading findings (IR9,
+IR10, IR11) got a test written with the fix, and reverting the fix makes it fail (the mutation
+table). Fixes are in `dd7addd`; the page's length pin and these docs are in the next commit.
+
+| # | Sev | Finding (reviewer's anchor) | Verified | Fix (file:line at `dd7addd`) | Test |
+| --- | --- | --- | --- | --- | --- |
+| IR1 | Medium | One reissue plan that fails the dialog's wire guard (an `http://` dev mint, inputs > 100 000) made the whole `recovery-reissue` form fail, so no mint was asked; the log blamed the user (`service.ts:503`) | Reproduced: https 1 000 + http 500 + an https plan with 100 001 inputs gave `confirms = []`, nothing reissued | Each plan is checked with `isReissuePlanWire` (now exported, `guards.ts:652`). A failing plan is left out, counted in `reissueFailed` and logged with its own reason. The rest are asked (`service.ts:520`). The dialog's guard is not loosened: `recovery-guards.test.ts` pins http refused there. | `recovery-service` “IR1” |
+| IR2 | Low | A declined native fee dialog was not counted by the throttle, so a renderer could reopen it on every close (`service.ts:515`) | Reproduced: 3 declines, then a 4th `setup()` resolved instead of `rate-limited` | A declined `recovery-reissue` confirm calls `dismissed()`, the same counter a closed window feeds (`service.ts:548`, `:865`). The result is still returned. | `recovery-service` “IR2” (3 declines, then `setup` and `show` rate-limited, then fine after the cooldown) |
+| IR3 | Low | The phrase log rule missed JSON arrays, per-word quotes, `&`, `%20`, `[n]` and `k=` (`log.ts:53`) | Reproduced: 13 new canary forms and a property all failed on the old rule | The separator is 1–12 characters of white space, digits or ASCII punctuation, or a one- or two-letter key before a digit or `=` (`log.ts:59-60`). `(` and non-ASCII punctuation are not separators. With them, four constant host/worker messages were swallowed; the constant-message test caught that, and the set was narrowed rather than the messages reworded in other lanes' files. The rule stays linear: letters and separators never overlap. | `log` 13 forms, a property (JSON / quotes / `%20` / `w0=`), a hostile-input timing test, the constant-message test |
+| IR4 | Low | The restore could not take mint URLs typed in the window (ADR 0016 §5.1), yet the page invites another wallet's phrase (`service.ts:632`) | Reproduced: an answer's mints were never scanned | `recovery-restore` answers may carry 1–8 `mints` (optional key; `protocol.ts` `MAX_RESTORE_MINTS`). The page normalises them (`prompt.ts:101`, explicit `https://` only, no bare words, the typed text never echoed). Main re-checks with `isMintUrl` into its own array (`main/prompt.ts:149`, `:216`). The IPC guard is exact-key (`guards.ts:719`). The host checks again, normalises, dedupes and scans them beside the wallet's mints (`service.ts:669`). | `recovery-service` “IR4”, `recovery-main` “typed mint addresses”, `recovery-guards` “1..8 … mint addresses”, `prompt-recovery-page` “typed mint addresses” (3) |
+| IR5 | Info | Test gap: the refusal to replace a phrase that did not open survived `if (false)` (`service.ts:322`) | Confirmed a gap: the guard is right, and the new test passed on `134cdea` | none needed | `recovery-service` “IR5”: a finished envelope sealed to another key → `forbidden`, nothing asked, the file byte-identical, no `.retired` |
+| IR6 | Info | Test gap: newest-per-`d` survived a reversed comparator (`relay-copy.ts:120`); the fake pool replaces events itself | Confirmed a gap | none needed | `recovery-relay-copy` “newest per d, whatever order”: a pool answering both versions in every order; a newer blank retires the copy, a newer copy wins |
+| IR7 | Info | `replaces` was cleared even when retiring the old relay copy failed, so it was never retried (`service.ts:455`) | Reproduced: relays refusing the blank and deletion left `replaces: null` | `replaces` is kept until a relay took both (`service.ts:454`). The next setup retries before anything else (`service.ts:332`, `retireReplaced`). | `recovery-service` “IR7” (the retry lands even though the user then closes the passphrase window) |
+| IR8 | Info | A NIP-46 rotation re-authenticated with the “Show your recovery phrase?” dialog (`service.ts:736`) | Reproduced: the rotation asked `recovery-reveal` | A new data-free `ConfirmForm` `recovery-rotate` (`protocol.ts`, `guards.ts:671`), worded by main as a replacement with the fee to come (`host-confirm.ts:60`). `reauth(…, purpose)`. | `recovery-service` “IR8”, `recovery-main` “the rotate dialog”, `recovery-guards` “recovery-rotate” |
+| IR9 | Info | The 5-minute prompt deadline discarded a phrase the user was still writing down (`main-bridge.ts`, `service.ts:341`) | By reading: `recovery-show` used `PROMPT_TIMEOUT_MS` | `recovery-show` waits `RECOVERY_SHOW_TIMEOUT_MS` = 30 min (`main-bridge.ts:30`). The page still hides the words after 2 min or on blur. Every other question keeps 5 min. The Settings note (“the phrase was not saved”) was not added: see residual 13. | `main-bridge` “a shown phrase gets its own, longer deadline” |
+| IR10 | Info | Restore reach was capped silently: the 64-copy cap was applied before blanks were skipped (`relay-copy.ts:124`) | By reading, then a test | Blanks are dropped before the cap (`relay-copy.ts:127`). Copies left out are counted (`omitted`, `:140`) and logged by the restore (`relayOmitted`, `service.ts:661`). Paging the query with `until` and the 64 local retired files are deferred (residual 12). | `recovery-relay-copy` “blanks never crowd out a live copy…” |
+| IR11 | Info | `wipeAnswer` did not zero the index arrays of a stray or misfitting `recovery-confirm` / `recovery-restore` answer (`main-bridge.ts:67`) | By reading | Both kinds are zeroed (`main-bridge.ts:80`), like main's own `wipe()` | `main-bridge` “a stray or misfitting answer carrying word indices is zeroed” |
+
+Failing runs on `134cdea` (before the fixes): the service tests IR1, IR2, IR4, IR7, IR8 (5
+failed, IR5 passed). `log.test.ts`: 14 failed (13 forms and the property).
+
+### Mutation checks for the fixes (applied to `dd7addd`, named suite run, file restored with `git checkout`)
+
+| # | Mutation (file) | Result |
+| --- | --- | --- |
+| MIR1 | every plan asked, no per-plan wire check (`host/recovery/service.ts`) | KILLED: recovery-service “IR1” |
+| MIR2 | declined fee dialog not counted (`service.ts`) | KILLED: recovery-service “IR2” |
+| MIR3a | phrase separator back to the old set (`host/log.ts`) | KILLED: log, 13 forms and the property |
+| MIR3b | no short-key separator (`w1=`, `k=`) (`log.ts`) | KILLED: log “short keys, numbered”, “one-letter keys”, the property |
+| MIR3c | quotes and backticks not separators (`log.ts`) | KILLED: log, 6 forms and the property |
+| MIR4a | main takes any string as a typed mint (`main/prompt.ts`) | KILLED: recovery-main “typed mint addresses” |
+| MIR4b | the host takes typed mints unchecked (`service.ts`) | KILLED: recovery-service “IR4” |
+| MIR4c | the page's `https://` prefix check loosened to `https?` (`renderer/prompt/prompt.ts`) | SURVIVED, as designed: the `u.protocol` check and the copied grammar each refuse http again. Removing all three layers together is KILLED (prompt-recovery-page, 2 tests). The page is a convenience layer; main (MIR4a) and the host (MIR4b) enforce. |
+| MIR4d | the answer guard takes any array as `mints` (`ipc/guards.ts`) | KILLED: recovery-guards “1..8 … mint addresses” |
+| MIR5 | `if (false)` for the unreadable-phrase replace guard (`service.ts`) | KILLED: recovery-service “IR5” (the reviewer's survivor) |
+| MIR6 | newest per `d` reversed (`host/recovery/relay-copy.ts`) | KILLED: recovery-relay-copy “newest per d” (the reviewer's survivor) |
+| MIR7a | `replaces` cleared although the retirement failed (`service.ts`) | KILLED: recovery-service “IR7” |
+| MIR7b | no retry of a pending retirement (`service.ts`) | KILLED: recovery-service “IR7” |
+| MIR8 | rotation asks the reveal question (`service.ts`) | KILLED: recovery-service “IR8” |
+| MIR8b | main words the rotate dialog as a reveal (`main/host-confirm.ts`) | KILLED: recovery-main “the rotate dialog” |
+| MIR9 | `recovery-show` on the usual deadline (`host/signer/main-bridge.ts`) | KILLED: main-bridge “a shown phrase gets its own, longer deadline” |
+| MIR10a | cap applied before blanks are dropped (`relay-copy.ts`) | KILLED: recovery-relay-copy “blanks never crowd out…” |
+| MIR10b | the cap silent (`omitted: 0`) (`relay-copy.ts`) | KILLED: recovery-relay-copy “blanks never crowd out…” |
+| MIR11 | `wipeAnswer` leaves the indices (`main-bridge.ts`) | KILLED: main-bridge “… word indices is zeroed” |
+
+19 mutations: 18 killed. The one survivor is a redundant layer, and removing all its layers is
+killed.
+
+### Differential review and sharp edges of the fix commit (`134cdea..dd7addd`, 17 files)
+
+Risk: HIGH `service.ts` (value: which mints are asked and reissued; which mints a restore
+contacts), `main/prompt.ts` and `ipc/guards.ts` (a new optional key at the page → main → host
+boundary), `log.ts` (the redaction every log line passes). MEDIUM `relay-copy.ts`,
+`main-bridge.ts`, `host-confirm.ts`, the page. LOW tests and css. No validation was removed:
+the dialog's guard is unchanged apart from the new `recovery-rotate` shape, and the answer guard
+gained an optional, exact-key, capped field.
+
+Blast radius: `redact()` covers every host log line, forwarded worker lines and upload error
+text. It is broader, so it over-redacts more prose; the constant-message test holds.
+`wipeAnswer` has 5 callers: 4 in `desktop-signer.ts`, which never receive a recovery answer, and
+1 in the service. `MainBridge.ask`: only `recovery-show` changes deadline. `toPromptAnswer` has 1
+caller (`PromptService.submit`). A refused answer there becomes a cancel ('prompt.bad-answer'),
+so it fails closed. `readRelayCopies` has 1 caller.
+
+Adversarial notes and sharp edges (none needed a code change):
+
+- **D1 (info): the retirement retry runs before re-authentication** (`service.ts:332`). A
+  renderer calling `setup` while a retirement is pending makes the signer sign a blank and a
+  NIP-09 deletion of an already-replaced copy, and publishes them to the user's write relays
+  (with NIP-46, two bunker requests). The step is idempotent, reveals nothing a first attempt did
+  not, and ends once one lands. It is throttled, because the re-auth window that follows counts
+  when dismissed. `finishReissue` already retired without a prompt when no plan was left to ask.
+  Accepted.
+- **D2 (info): the 30-minute show deadline.** Main shows one window at a time, and the host's
+  deadline for a queued question starts when it is asked. A bunker-auth, top-up-first or unlock
+  question queued behind an open phrase window can therefore time out to its safe answer.
+  Residual 14.
+- **D3 (info): typed mints are scanned for every phrase.** ADR §5.1 defines one mint set, so a
+  typed mint receives restore requests (blinded outputs, nothing derivable) for each phrase the
+  identity reaches, as the wallet's own mints do. This is the linkage ADR 0016 accepts. Residual
+  15.
+- **D4 (sharp edge, low): the page's copy of the mint grammar** could drift from `isMintUrl`
+  (the page bundle imports no ipc code). A drift fails closed: main turns the answer into a
+  cancel. It is pinned by a cross-check on 17 inputs and by the `RESTORE_MINTS` /
+  `MAX_MINT_URL` pins (`prompt-recovery-page.test.ts`).
+- **D5 (sharp edge): `mints: []` is refused** (guard minimum 1; main too). The page omits the
+  key when the box is empty (tested: “twelve empty fields” sends exactly `{kind, words: []}`).
+- **D6 (sharp edge): `recoveryShowTimeoutMs` 0, NaN or Infinity** fires at once (Node clamps an
+  overflow to 1 ms). That fails closed: the phrase is discarded.
+- `isReissuePlanWire` is exported inside `safe`. The whole form is still checked by
+  `isConfirmForm` before it is posted (distinct mints, 1–32 plans), so an individual check can
+  never bypass the form check. `RelayCopies.omitted` is a required field, so a caller cannot
+  miss it silently. `reauth(purpose)` is a required union.
+
+### Residuals added by this round
+
+11. **An older relay-copy retirement is not retried after a further rotation.** If a phrase
+    whose replaced copy X is still pending is itself rotated and the retry fails, `replaces`
+    now names the newer phrase. X's retirement is kept only in the retired envelope. Deletion
+    is best effort (ADR 0016).
+12. **Restore reach:** the relay query is one page (`limit: 500` of the identity's kind-30078
+    events, other apps' NIP-78 data included). Copies beyond the 64 cap are counted in the log,
+    not paged in; paging across merged multi-relay answers with `until` is imprecise, so it is
+    deferred. `listRetired` still reads at most 64 retired phrases per identity (64 rotations
+    on one device, each re-authenticated).
+13. **A phrase window closed or timed out** (now after 30 min) discards a new phrase. Settings
+    stays silent on `cancelled`, and its status line reads “Not on this device”.
+14. D2: prompts queued behind an open phrase window can time out to their safe answer.
+15. D3: a typed mint sees restore requests of every scanned phrase. The phrase log rule still
+    passes Title Case / UPPER CASE words and words separated by `(` or non-ASCII punctuation.

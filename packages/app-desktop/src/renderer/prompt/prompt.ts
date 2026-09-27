@@ -83,7 +83,7 @@ export function phraseValid(indices: readonly number[]): boolean {
 /** Mint addresses the restore window takes (`MAX_RESTORE_MINTS`, pinned by a test). */
 export const RESTORE_MINTS = 8;
 /** Longest mint address (`LIMITS.maxServerUrl`, pinned by a test). */
-const MAX_MINT_URL = 512;
+export const MAX_MINT_URL = 512;
 // The IPC guards' `isMintUrl` grammar (src/ipc/guards.ts `HTTPS_SERVER_RE`), copied because the
 // page bundle imports no ipc code; a test checks the two agree. Main and the host check again.
 const LABEL = '[A-Za-z0-9_](?:[A-Za-z0-9_-]{0,61}[A-Za-z0-9_])?';
