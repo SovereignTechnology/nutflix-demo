@@ -588,6 +588,86 @@ describe('OnePeerRouter', () => {
     await Promise.allSettled(reads);
   });
 
+  // Lane W8b-p2p (round-8 review, info): free requests were left out of what a seeder may count,
+  // so with its window full of counted requests it could still be asked up to its free cap on a
+  // free core — and a seeder that turns that core SOLD while they are out counts them on top of
+  // its window, and cuts and bans an honest viewer. With `room`, both kinds share the window while
+  // in flight (never as debt).
+  it('the room option: free requests fit under what the seeder may still count, and hold room there while out', async () => {
+    const origin = await store();
+    const video = coreOf(origin, { name: 'video' });
+    const image = coreOf(origin, { name: 'image' });
+    for (const c of [video, image]) {
+      await c.ready();
+      await c.append(Array.from({ length: 8 }, (_, i) => new Uint8Array(BLOCK).fill(i + 1)));
+    }
+    const vs = await store();
+    const v = coreOf(vs, { key: video.key });
+    const im = coreOf(vs, { key: image.key });
+    await v.ready();
+    await im.ready();
+    let sent = 0;
+    for (const c of [video, image]) c.on('upload', () => sent++);
+    const link = connect(origin, vs);
+    await link.remote();
+    await until(() => v.peers.length === 1 && im.peers.length === 1, 10_000, 'both cores to pair');
+    await v.update({ wait: true });
+    await im.update({ wait: true });
+    const imageHex = toHex(im.key);
+    let room = 4;
+    const r = new OnePeerRouter({
+      budget: () => 4,
+      free: (_remote, core) => core === imageHex,
+      room: () => room,
+      logger: silentLogger,
+    });
+    cleanups.push(() => {
+      r.close();
+      link.destroy();
+      return Promise.resolve();
+    });
+    r.attachCore(v);
+    r.attachCore(im);
+    const vp = v.peers[0]!;
+    const ip = im.peers[0]!;
+    await until(
+      () => vp.inflight + vp.dataProcessing + ip.inflight + ip.dataProcessing === 0,
+      5000,
+      'the syncs to settle',
+    );
+    link.hold();
+    // Two counted video requests out: the free core may take only what is left of the window.
+    const videoReads = [0, 1].map((i) => v.get(i, { timeout: 20_000 }));
+    for (const p of videoReads) p.catch(() => undefined);
+    await until(() => sent >= 2, 5000, 'two video requests at the seeder');
+    const remote = toHex(vp.remotePublicKey);
+    expect(r.used(remote)).toBe(2);
+    expect(ip.getMaxInflight()).toBe(2); // not its free cap of 4: 4 − 2 counted
+    // Two image requests out: they hold room in the window — the video may ask nothing more.
+    const imageReads = [0, 1].map((i) => im.get(i, { timeout: 20_000 }));
+    for (const p of imageReads) p.catch(() => undefined);
+    await until(() => sent >= 4, 5000, 'two image requests at the seeder');
+    expect(ip.inflight).toBe(2);
+    expect(r.used(remote)).toBe(2); // still never counted as used…
+    expect(r.debt(remote)).toBe(0); // …nor debt
+    expect(vp.getMaxInflight()).toBe(vp.inflight); // 4 − 2 counted − 2 free out: nothing new
+    expect(ip.getMaxInflight()).toBe(ip.inflight); // the window is spoken for
+    // Junk room fails closed: no free request, and counted ones still leave room for those out.
+    room = Number.NaN;
+    expect(ip.getMaxInflight()).toBe(ip.inflight);
+    room = 4;
+    link.release();
+    await Promise.allSettled([...videoReads, ...imageReads]);
+    await until(
+      () => vp.inflight + vp.dataProcessing + ip.inflight + ip.dataProcessing === 0,
+      5000,
+      'the reads to land',
+    );
+    // Landed: nothing held any more, and the free core's blocks left no debt.
+    expect(ip.getMaxInflight()).toBe(4);
+    expect(r.debt(remote)).toBe(0);
+  });
+
   it('forgive(remote, n): drops at most n of the requests remembered as lost to it, nothing for junk', async () => {
     const w = await world(4, 1);
     const r = routed(w.viewer, { budget: () => 4 });

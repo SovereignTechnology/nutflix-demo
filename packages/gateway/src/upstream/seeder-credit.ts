@@ -67,6 +67,10 @@
  * counted — no probe. A core it later turns sold is never asked again there; a block of it that
  * still lands afterwards is counted as unpaid (browsing never pays). The core a thumbnail URL
  * names may be a paid video: its honest seeders say its price, so it is simply never asked.
+ * Lane W8b-p2p (round-8 review): while they are in flight, free image requests share the seeder's
+ * window with what it may count (`roomOf`, the router's `room`): a core it turns sold while they
+ * are out then counts them within its window, never past it (a ban). Landed or not, they still
+ * leave no debt.
  */
 import { DEFAULT_WINDOW_BLOCKS, MAX_OWED_BLOCKS, MAX_OWED_RANGES, payment } from '@sovit/core';
 import type {
@@ -264,6 +268,9 @@ export class SeederCredit {
       budget: (remote, core) => this.budget(remote, core),
       single: (remote) => this.awaitingReport(remote),
       free: (remote, core) => this.servesFreeImage(remote, core),
+      // Lane W8b-p2p: free image requests fit under what the seeder may still count, so one it
+      // turns sold while they are out cannot take it past its window.
+      room: (remote) => this.roomOf(remote),
       logger: o.logger,
       ...(o.stallMs !== undefined ? { stallMs: o.stallMs } : {}),
     });
@@ -421,6 +428,19 @@ export class SeederCredit {
     const win = this.window(s.hello, this.o.policyFor(core as CoreKeyHex));
     const base = this.o.settler.owedBy(remote) + this.old(remote, s);
     return this.reserve(remote, s, base, Math.max(0, win - base));
+  }
+
+  /**
+   * Lane W8b-p2p (round-8 review): the most `remote` may still count against us over every core —
+   * its bare window (HELLO `windowBlocks`: a core's widened window is never smaller) less what it
+   * already counts (delivered unpaid on the link, and from before). The router fits requests on a
+   * core it serves free under it, with what it may count, while they are in flight (see
+   * `OnePeerRouterOptions.room`). 0 without a live `pay/1` link and a HELLO.
+   */
+  roomOf(remote: string): number {
+    const s = this.seeders.get(remote);
+    if (s === undefined || !s.live || s.hello === null || !this.o.settler.linked(remote)) return 0;
+    return Math.max(0, s.bare - this.o.settler.owedBy(remote) - this.old(remote, s));
   }
 
   /** `remote`'s window for `core` (`null` before its HELLO). */

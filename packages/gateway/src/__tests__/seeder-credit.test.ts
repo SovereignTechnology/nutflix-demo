@@ -408,6 +408,45 @@ describe('SeederCredit — image cores: asked only after PRICE { free: true } (A
     expect(r.credit.budget(A, IMG)).toBe(0);
   });
 
+  // Lane W8b-p2p (round-8 review, info): a free image request was capped by its own budget alone,
+  // so a seeder at its window could still be asked up to NO_PAY_INFLIGHT image blocks — and one
+  // that turned the image core SOLD while they were out counted them past its window (a ban).
+  it('free image requests fit under what the seeder may still count (roomOf, the router’s room)', () => {
+    const r = imageRig();
+    const a = r.link(A);
+    expect(r.credit.roomOf(A)).toBe(0); // no HELLO yet
+    a.proto.remoteHello(helloFrom(pubkey('a'), { windowBlocks: 4 }));
+    a.proto.remotePrice(free());
+    expect(r.credit.roomOf(A)).toBe(4);
+    r.download(0, A); // a paid block owed on CORE
+    expect(r.credit.roomOf(A)).toBe(4 - 1);
+    // Replication peers of seeder A on the video and on the image (hypercore's pinned fields).
+    class Peer {
+      readonly remotePublicKey = hexBytes(A);
+      inflight = 0;
+      dataProcessing = 0;
+      readonly stats = { wireCancel: { tx: 0 } };
+      getMaxInflight(): number {
+        return 16;
+      }
+      _cancelRequest(): void {
+        // no wire
+      }
+    }
+    const vp = new Peer();
+    const ip = new Peer();
+    r.core.emit('peer-add', vp);
+    r.img.emit('peer-add', ip);
+    vp.inflight = 2; // two counted requests out: room left for the image, 3 − 2
+    expect(ip.getMaxInflight()).toBe(1); // not its free cap of NO_PAY_INFLIGHT
+    expect(r.credit.budget(A, IMG)).toBe(NO_PAY_INFLIGHT); // its budget is unchanged
+    ip.inflight = 1; // one image request out: the video may ask nothing more (3 − 2 − 1)
+    expect(vp.getMaxInflight()).toBe(vp.inflight);
+    expect(r.credit.stats().unpaid).toBe(0); // in flight on the free core: never counted
+    a.proto.remoteClose('remote');
+    expect(r.credit.roomOf(A)).toBe(0);
+  });
+
   it('the last detach stops treating it as an image core', () => {
     const r = imageRig();
     const a = r.link(A);
