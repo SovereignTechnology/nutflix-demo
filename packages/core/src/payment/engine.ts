@@ -46,6 +46,7 @@ import type {
   MintKeyset,
   MintUrl,
   NostrPubkey,
+  OwedRange,
   PayMessage,
   PaymentEngine,
   PaymentEngineConfig,
@@ -58,7 +59,13 @@ import type {
   Wallet,
 } from '../contracts/index.js';
 import { checkPayLock, PAY1_TAG } from './lock.js';
-import { OWED_LIMITS, boundOwed, type OwedCore, type OwedLimits, type UnpaidLedger } from './owed.js';
+import {
+  OWED_LIMITS,
+  boundOwed,
+  type OwedCore,
+  type OwedLimits,
+  type UnpaidLedger,
+} from './owed.js';
 import { RangeSet } from './range-set.js';
 import { SeenSecrets } from './seen.js';
 import {
@@ -749,10 +756,12 @@ export class RealPaymentEngine implements PaymentEngine, UnpaidLedger {
   unpaid(peer: NostrPubkey, limits: OwedLimits = OWED_LIMITS): readonly OwedCore[] {
     const st = this.peers.get(peer);
     if (st === undefined) return [];
-    return boundOwed(
-      [...st.cores].map(([core, cs]) => [core, cs.sent.difference(cs.paid)] as const),
-      limits,
-    );
+    // Lazily, core by core: `boundOwed` stops at the caps, so the cores past them are never walked.
+    const byCore = st.cores;
+    function* cores(): Generator<readonly [CoreKeyHex, readonly OwedRange[]]> {
+      for (const [core, cs] of byCore) yield [core, cs.sent.difference(cs.paid)];
+    }
+    return boundOwed(cores(), limits);
   }
 
   windows(): readonly PeerWindow[] {

@@ -12,7 +12,7 @@
  * engine and a real replication stream in `pay1.integration.test.ts`.
  */
 import { MAX_OWED_BLOCKS, MAX_OWED_RANGES, mocks, payProtocol } from '@sovit/core';
-import type { CoreKeyHex, NostrPubkey, PricePolicy } from '@sovit/core';
+import type { NostrPubkey, PricePolicy } from '@sovit/core';
 import { afterEach, describe, expect, it } from 'vitest';
 
 import { Seeder } from '../seeder.js';
@@ -411,7 +411,7 @@ describe('the bridge’s v6 hooks, alone', () => {
       const who = pubkey(`bridge-${String(bad)}`);
       protocol.remoteHello(hello(who));
       expect(opened).toBe(1);
-      session.onUpload(CORE_A as CoreKeyHex, 0, BLOCK);
+      session.onUpload(CORE_A, 0, BLOCK);
       protocol.remotePay(
         await viewer.pay({ core: CORE_A, fromBlock: 0, toBlock: 0 }, ref, policy, { carryIn: 0 }),
       );

@@ -413,10 +413,9 @@ export class WorkerHost {
         dataDir: fs.join(a.storage, 'seeder'),
         diskCapBytes: a.seeding.diskCapBytes,
         swarm: null,
-        // Several videos at their own manifest prices: each core's PRICE precedes its first block.
-        // Always on (fix round 4): a viewer reading an image learns from that PRICE that we sell
-        // the core — and stops before our window would cut it (dev mocks included).
-        announceCorePrices: true,
+        // Several videos at their own manifest prices: each core's PRICE (or `free` for a profile
+        // core) precedes its first block, a returning viewer gets OWED, and every ACK carries
+        // `outstanding` — always on in `Seeder` (contracts v6 amendment), dev mocks included.
       },
       {
         engine: providers.seederEngine,

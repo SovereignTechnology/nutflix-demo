@@ -361,13 +361,14 @@ function owedFrame(ranges: readonly (readonly [number, number])[], count = range
   });
 }
 
-function priceFrame(sats: number, from: number, flags: number): Uint8Array {
+/** A PRICE frame; `flags` null = no flags byte (the v5 layout, and v6 with `free` absent). */
+function priceFrame(sats: number, from: number, flags: number | null): Uint8Array {
   return frame((s, pre) => {
     u8(s, pre, 4);
     core32(s, pre);
     u(s, pre, sats);
     u(s, pre, from);
-    u8(s, pre, flags);
+    if (flags !== null) u8(s, pre, flags);
   });
 }
 
@@ -490,7 +491,7 @@ describe.skipIf(codec === undefined)(
       );
     });
 
-    it('PRICE.free: free:true only with no price from block 0; flags 2 alone and unknown bits are refused', () => {
+    it('PRICE.free: free:true only with no price from block 0; the flags byte is there only with `free`, and 0, 2 or unknown bits are refused', () => {
       const free: PriceMessage = {
         type: 'PRICE',
         core: CORE,
@@ -512,8 +513,15 @@ describe.skipIf(codec === undefined)(
         ...priced,
         free: false,
       });
-      expect(k().decode(priceFrame(3, 9, 0))).toStrictEqual(priced);
+      // Additive on the wire: with `free` absent the frame has no flags byte — exactly the v5
+      // PRICE layout, so an older build reads a priced PRICE of this one, and this one reads the
+      // older build's. An explicit flags byte of 0 would be a second encoding: refused.
+      expect(k().encode(priced)).toEqual(priceFrame(3, 9, null));
+      expect(k().decode(priceFrame(3, 9, null))).toStrictEqual(priced);
+      expect(k().decode(priceFrame(3, 9, 0))).toBeNull();
+      expect(k().encode({ ...priced, free: false })).toEqual(priceFrame(3, 9, 1));
       expect(k().decode(priceFrame(3, 9, 1))).toStrictEqual({ ...priced, free: false });
+      expect(k().encode(free)).toEqual(priceFrame(0, 0, 3));
       // A free core with a price, or from another block: refused both ways.
       for (const [sats, from] of [
         [1, 0],
@@ -526,16 +534,18 @@ describe.skipIf(codec === undefined)(
         expect(k().decode(priceFrame(sats, from, 3))).toBeNull();
       }
       expect(() => k().encode({ ...free, free: 'yes' } as never)).toThrow();
-      for (const flags of [2, 4, 5, 0x80, 0xff])
+      for (const flags of [0, 2, 4, 5, 7, 0x80, 0x81, 0xff])
         expect(k().decode(priceFrame(0, 0, flags))).toBeNull();
-      // The v5 PRICE layout (no flags byte) is a truncated frame now.
-      const v5 = frame((s, pre) => {
+      // Nothing may follow the flags byte.
+      const trailing = frame((s, pre) => {
         u8(s, pre, 4);
         core32(s, pre);
-        u(s, pre, 3);
-        u(s, pre, 9);
+        u(s, pre, 0);
+        u(s, pre, 0);
+        u8(s, pre, 3);
+        u8(s, pre, 0);
       });
-      expect(k().decode(v5)).toBeNull();
+      expect(k().decode(trailing)).toBeNull();
     });
 
     it('ACK.outstanding: present or absent round-trips exactly; a negative or fractional count is refused; unknown ACK flag bits are refused', () => {

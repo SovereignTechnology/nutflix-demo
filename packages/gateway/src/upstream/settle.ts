@@ -162,6 +162,9 @@ export class CreditSettler {
       sendPrice: (p) => {
         protocol.sendPrice(p);
       },
+      sendOwed: (o) => {
+        protocol.sendOwed(o);
+      },
       cut: (reason) => {
         protocol.cut(reason);
       },

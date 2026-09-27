@@ -64,7 +64,9 @@
  *       `PayProtocol.sendOwed`. Normative for every seeder this repository builds: a core's
  *       `PRICE` (priced, or `free`) before its first block to a peer, `OWED` once both HELLOs
  *       verify (with the core's priced `PRICE` first), `outstanding` in every ACK
- *       (`pay-protocol.ts`). `PAY_PROTOCOL_VERSION` stays 1: an older build's codec refuses the
- *       new frames and closes pay/1 (no deployed base yet).
+ *       (`pay-protocol.ts`). `PAY_PROTOCOL_VERSION` stays 1: a priced `PRICE` is byte-for-byte the
+ *       v5 frame (its flags byte is written only with `free`), while an older build's codec
+ *       refuses `OWED`, a `free` PRICE and an ACK carrying `outstanding`, and closes pay/1 (no
+ *       deployed base yet).
  */
 export const CONTRACTS_VERSION = 6 as const;

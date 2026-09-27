@@ -35,6 +35,7 @@ import type {
   UnixSeconds,
 } from '@sovit/core';
 import { DEFAULT_WINDOW_BLOCKS, payProtocol } from '@sovit/core';
+import type { payment } from '@sovit/core';
 import type {
   Logger,
   PeerSession,
@@ -84,14 +85,19 @@ export interface GatewayIdentity {
 export type PayProtocolFactory = (session: PeerSessionInfo) => PayProtocol;
 
 export interface GatewayDeps {
-  readonly seederEngine: PaymentEngineSeeder & {
-    readonly config?: {
-      readonly flushEveryBlocks: number;
-      readonly flushEveryMs: number;
-      /** v5: advertised in HELLO (`DEFAULT_WINDOW_BLOCKS` when absent). */
-      readonly windowBlocks?: number;
+  /**
+   * Also an `UnpaidLedger` (both engines of `@sovit/core` are): the seeder reports a viewer's
+   * unpaid blocks in `OWED` and `ACK.outstanding` (contracts v6 amendment).
+   */
+  readonly seederEngine: PaymentEngineSeeder &
+    payment.UnpaidLedger & {
+      readonly config?: {
+        readonly flushEveryBlocks: number;
+        readonly flushEveryMs: number;
+        /** v5: advertised in HELLO (`DEFAULT_WINDOW_BLOCKS` when absent). */
+        readonly windowBlocks?: number;
+      };
     };
-  };
   readonly viewerEngine: PaymentEngineViewer;
   /** `null` = no provider yet (Stage 1 runtime): authenticated Blossom verbs answer 503. */
   readonly auth: BlossomAuth | null;
@@ -263,10 +269,9 @@ export class Gateway {
         policy: gatewayPolicy(config),
         flushEveryBlocks: config.flushEveryBlocks,
         flushEveryMs: config.flushEveryMs,
-        // Fix round 4: a core's PRICE precedes its first counted block, as on every seeder this
-        // repository builds — a desktop viewer reading an image learns the core is sold before
-        // our window would cut it. Our HELLO price is exact, so it only repeats it per core.
-        announceCorePrices: true,
+        // Every seeder sends a core's PRICE before its first block to a pay/1 peer, reports what
+        // a returning viewer still owes (OWED) and puts `outstanding` in every ACK (contracts v6
+        // amendment, always on in `Seeder`). Our HELLO price is exact, so the PRICE repeats it.
       },
       {
         engine: deps.seederEngine,

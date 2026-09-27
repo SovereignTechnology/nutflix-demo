@@ -395,6 +395,45 @@ describe('PayChannel', () => {
     expect(halfClosed).toBe('protocol-error');
   });
 
+  it('sendOwed refuses to put an OWED on the wire before both HELLOs (a local bug), and drops it once closed', async () => {
+    const s = await signer();
+    const p = muxPair();
+    const a = new PayChannel();
+    const b = new PayChannel();
+    a.attach(p.a);
+    b.attach(p.b);
+    const got: OwedMessage[] = [];
+    let bClosed = '';
+    b.on('owed', (m) => got.push(m));
+    b.on('close', (r) => (bClosed = r));
+    const owed = { core: CORE, ranges: [[0, 0]] as const };
+    // idle, then hello-sent: throws, and nothing reaches the remote (which would close on it).
+    expect(() => {
+      a.sendOwed(owed);
+    }).toThrow(/both HELLOs/);
+    a.sendHello(await buildHello(s, p.bindA, TERMS));
+    expect(a.state).toBe('hello-sent');
+    expect(() => {
+      a.sendOwed(owed);
+    }).toThrow(/both HELLOs/);
+    await tick();
+    expect(got).toEqual([]);
+    expect(bClosed).toBe('');
+    // open: sent and delivered.
+    b.sendHello(await buildHello(s, p.bindB, TERMS));
+    await tick();
+    expect(a.state).toBe('open');
+    expect(b.state).toBe('open');
+    a.sendOwed(owed);
+    await tick();
+    expect(got).toEqual([{ type: 'OWED', ...owed }]);
+    // closed: dropped silently, like every other message.
+    a.cut('local');
+    expect(() => {
+      a.sendOwed(owed);
+    }).not.toThrow();
+  });
+
   it('sendHello refuses a HELLO signed for another connection; a remote channel close is `remote`', async () => {
     const s = await signer();
     const p = muxPair();

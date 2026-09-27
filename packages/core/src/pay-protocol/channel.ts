@@ -161,7 +161,14 @@ export class PayChannel implements PayProtocol {
     this.send({ type: 'PRICE', ...price });
   }
 
+  /**
+   * v6 amendment: only on an `open` channel — the remote closes the channel on an OWED that
+   * arrives before both HELLOs, so sending one earlier is a local bug: it throws rather than cost
+   * the connection. On a closed channel it is dropped, like every other message.
+   */
   sendOwed(owed: Omit<OwedMessage, 'type'>): void {
+    if (this.st === 'closed') return;
+    if (this.st !== 'open') throw new Error('pay/1: OWED is sent only once both HELLOs are done');
     this.send({ type: 'OWED', ...owed });
   }
 

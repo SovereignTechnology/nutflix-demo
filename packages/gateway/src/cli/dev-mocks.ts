@@ -22,6 +22,7 @@ import type {
   HelloMessage,
   MuxLike,
   NostrPubkey,
+  OwedMessage,
   PayMessage,
   PayProtocol,
   PayProtocolEvents,
@@ -88,6 +89,7 @@ class DevPayProtocol implements PayProtocol {
     pay: new Set(),
     ack: new Set(),
     price: new Set(),
+    owed: new Set(),
     close: new Set(),
   };
   attach(_mux: MuxLike): void {
@@ -103,6 +105,9 @@ class DevPayProtocol implements PayProtocol {
     // dev mode
   }
   sendPrice(_price: Omit<PriceMessage, 'type'>): void {
+    // dev mode
+  }
+  sendOwed(_owed: Omit<OwedMessage, 'type'>): void {
     // dev mode
   }
   cut(reason: Parameters<PayProtocolEvents['close']>[0]): void {

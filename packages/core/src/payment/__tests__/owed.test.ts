@@ -13,7 +13,7 @@ import * as fc from 'fast-check';
 import { MAX_OWED_BLOCKS, MAX_OWED_RANGES } from '../../contracts/index.js';
 import type { CoreKeyHex, NostrPubkey, OwedRange, PricePolicy } from '../../contracts/index.js';
 import { MockPaymentEngine } from '../../mocks/mock-payment-engine.js';
-import { RealPaymentEngine } from '../engine.js';
+import type { RealPaymentEngine } from '../engine.js';
 import { OWED_LIMITS, boundOwed } from '../owed.js';
 import { RangeSet } from '../range-set.js';
 import {

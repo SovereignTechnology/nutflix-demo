@@ -1,13 +1,14 @@
 /**
  * Structural stand-in for the contract `PayProtocol` (real one: Stage 2,
  * `core/src/pay-protocol/`, locked) — the same shape L2 used. Records what the gateway
- * sends (HELLO / PAY / ACK / PRICE) and lets a test inject remote events. `attach()`
+ * sends (HELLO / PAY / ACK / PRICE / OWED) and lets a test inject remote events. `attach()`
  * records the mux it was given so a test can assert the gateway attached to a protomux.
  */
 import type {
   AckMessage,
   HelloMessage,
   MuxLike,
+  OwedMessage,
   PayMessage,
   PayProtocol,
   PayProtocolEvents,
@@ -30,6 +31,8 @@ export class FakePayProtocol implements PayProtocol {
   readonly hellos: Omit<HelloMessage, 'type'>[] = [];
   readonly acks: AckMessage[] = [];
   readonly prices: PriceMessage[] = [];
+  /** Contracts v6 amendment: the OWED reports the gateway's seeder sent. */
+  readonly owed: OwedMessage[] = [];
   readonly sentPays: PayMessage[] = [];
   readonly cuts: Parameters<PayProtocolEvents['close']>[0][] = [];
   private readonly listeners: Listeners = {
@@ -37,6 +40,7 @@ export class FakePayProtocol implements PayProtocol {
     pay: new Set(),
     ack: new Set(),
     price: new Set(),
+    owed: new Set(),
     close: new Set(),
   };
 
@@ -59,6 +63,9 @@ export class FakePayProtocol implements PayProtocol {
   }
   sendPrice(price: Omit<PriceMessage, 'type'>): void {
     this.prices.push({ type: 'PRICE', ...price });
+  }
+  sendOwed(owed: Omit<OwedMessage, 'type'>): void {
+    this.owed.push({ type: 'OWED', ...owed });
   }
   cut(reason: Parameters<PayProtocolEvents['close']>[0]): void {
     this.cuts.push(reason);
@@ -84,6 +91,9 @@ export class FakePayProtocol implements PayProtocol {
   }
   remotePrice(price: PriceMessage): void {
     for (const cb of this.listeners.price) cb(price);
+  }
+  remoteOwed(owed: OwedMessage): void {
+    for (const cb of this.listeners.owed) cb(owed);
   }
   remoteClose(reason: Parameters<PayProtocolEvents['close']>[0]): void {
     this.state = 'closed';

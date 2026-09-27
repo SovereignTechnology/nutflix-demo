@@ -19,7 +19,10 @@
  *
  * v6 amendment (2026-09-26):
  *   - ACK's flags byte gains bit2 = `outstanding` present (a uint after the reason);
- *   - PRICE ends with a flags byte: bit0 = `free` present, bit1 = its value (bit1 alone is invalid);
+ *   - PRICE may end with a flags byte, written only when `free` is present: bit0 = present (must be
+ *     set), bit1 = its value, every other bit 0 — so 1 (`free: false`) or 3 (`free: true`). With
+ *     `free` absent there is no flags byte, and the frame is byte-for-byte the v5 PRICE (an older
+ *     build still reads it); a flags byte of 0 or 2 is refused (one encoding per message).
  *     `free: true` requires `satsPerBlock` 0 and `effectiveFromBlock` 0;
  *   - OWED: `core`, a uint count n (1 … MAX_OWED_RANGES), then n × (fromBlock, toBlock) uints —
  *     canonical: each from ≤ to, ascending, disjoint and not adjacent, at most MAX_OWED_BLOCKS
@@ -295,7 +298,7 @@ function messageWriters(m: PayProtocolMessage): Writer[] {
       });
       out.push(w(c.uint, sats));
       out.push(w(c.uint, from));
-      out.push(w(c.uint8, free === undefined ? 0 : free ? 3 : 1));
+      if (free !== undefined) out.push(w(c.uint8, free ? 3 : 1));
       break;
     }
     case 'OWED': {
@@ -426,11 +429,12 @@ function readMessage(state: State): PayProtocolMessage {
       const core = readCore(state);
       const satsPerBlock = readUint(state, 'price.satsPerBlock') as Sats;
       const effectiveFromBlock = readUint(state, 'price.effectiveFromBlock');
-      const flags = c.uint8.decode(state);
-      need((flags & ~3) === 0 && flags !== 2, 'price.flags');
       const price: PriceMessage = { type: 'PRICE', core, satsPerBlock, effectiveFromBlock };
-      if ((flags & 1) === 0) return price;
-      const free = (flags & 2) !== 0;
+      // v6 amendment: the optional trailing flags byte (absent = the v5 PRICE, `free` absent).
+      if (state.start === state.end) return price;
+      const flags = c.uint8.decode(state);
+      need(flags === 1 || flags === 3, 'price.flags');
+      const free = flags === 3;
       need(!free || (satsPerBlock === 0 && effectiveFromBlock === 0), 'price.free: priced');
       return { ...price, free };
     }

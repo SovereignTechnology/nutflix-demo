@@ -22,44 +22,55 @@ export const PAY_PROTOCOL_NAME = 'pay/1' as const;
 export const PAY_PROTOCOL_VERSION = 1 as const;
 
 /**
- * v6 amendment (2026-09-26, ADRs 0015 and 0018 amendments) — NORMATIVE for every seeder this
- * repository builds (the daemon, the gateway, the desktop worker's seeder, the dev fixtures).
+ * v6 amendment (2026-09-26, Cameron; ADRs 0015 and 0018 amendments) — NORMATIVE for every seeder
+ * this repository builds (the daemon, the gateway, the desktop worker's seeder, the dev fixtures).
+ * Additive: `PAY_PROTOCOL_VERSION` stays 1 (see `version.ts`).
  *
- * 1. **A core's PRICE before its first block.** Before a seeder sends a peer the first block of a
- *    core on a `pay/1` connection, it sends that core's `PRICE` on the same connection: priced
- *    (`effectiveFromBlock` = one past the highest block of that core it counted on this connection,
- *    0 when none), or `{ free: true }` for a core it serves outside payment. Protomux keeps one
- *    order per stream, so the `PRICE` precedes the block on the wire (a viewer must attach `pay/1`
- *    before it asks for blocks). It sends a new one whenever that changes: a price change (F9), a
- *    core that turns free, or a free core that turns sold (before the next block). A core with no
- *    terms at all (no price and not free) gets none — no seeder of this repository serves one.
- * 2. **OWED once both HELLOs verified.** When the connection opens (both HELLOs verified), the
- *    seeder sends one `OWED` per core where it still counts unpaid blocks for the viewer's HELLO
- *    pubkey — from this and from earlier connections, under any Noise key. Cores in the order the
- *    seeder first counted them for that pubkey, ranges in ascending block order (oldest first); the
- *    whole report is bounded by `MAX_OWED_RANGES` and `MAX_OWED_BLOCKS`, and what is past the caps
- *    is not reported (`ACK.outstanding` still counts it). Once per connection.
- * 3. **Owed blocks are payable at the core's terms.** Before a core's `OWED` the seeder sends that
- *    core's priced `PRICE` (unless it already did on this connection); an owed range is then an
- *    ordinary `PAY` on this connection, verified at the terms in force for its first block (that
- *    `PRICE`, or a later one), with `carryIn` 0 for that core on a new connection (ADR 0010). An
- *    accepted one clears those blocks. An `OWED` with no priced `PRICE` for its core before it names
- *    blocks the seeder counts but takes no payment for now (a core served free since, or one with
- *    no terms): the viewer counts them against the seeder's window and does not pay them.
- * 4. **`ACK.outstanding` in every ACK.**
+ * 1. **A core's terms before its first block.** Before a seeder sends a peer the first block of a
+ *    core on a connection with `pay/1` attached, it sends that core's `PRICE` on the same
+ *    connection: priced, or `{ free: true }` for a core it serves outside payment. Protomux keeps
+ *    one order per stream, so the `PRICE` precedes the block on the wire (a viewer attaches `pay/1`
+ *    before it asks for blocks). Priced: `effectiveFromBlock` is one past the highest block of that
+ *    core the seeder COUNTED on this connection (0 when none). It sends a new `PRICE` for the core
+ *    whenever what it serves changes — a price change (security review F9), a core that turns free,
+ *    or a free core that turns sold (before its next block) — and never repeats the terms it last
+ *    said on this connection. A core with no terms at all (no price of its own, no default, not
+ *    free) gets no `PRICE`; its blocks are counted and cannot be paid, so no seeder of this
+ *    repository should serve one (see the lane record for the one known window).
+ * 2. **`OWED` once, when both HELLOs are verified.** When the connection opens (both HELLOs
+ *    verified and the viewer's pubkey bound; a banned pubkey is cut instead), the seeder sends one
+ *    `OWED` per core where it counts unpaid blocks for the viewer's HELLO pubkey — blocks sent on
+ *    earlier connections under any Noise key, and on this one before its HELLO. Cores in the order
+ *    the seeder first counted them for that pubkey, each core's ranges ascending: oldest first. The
+ *    whole report (every `OWED` of the connection together) is bounded by `MAX_OWED_RANGES` and
+ *    `MAX_OWED_BLOCKS`; what is past the caps is left out, and a range crossing the block cap is
+ *    cut short. What is left out is still counted: `ACK.outstanding` includes it. Nothing owed:
+ *    no `OWED`. Once per connection; later blocks are reported by `ACK.outstanding` only.
+ * 3. **Owed blocks are payable at the core's terms.** Before a sold core's `OWED` the seeder sends
+ *    that core's priced `PRICE` (unless it already did on this connection). An owed range is then
+ *    an ordinary `PAY` on this connection: verified at the terms this connection was told for its
+ *    first block (that `PRICE`, or a later one), with the carry of a new channel (`carryIn` 0 for
+ *    that core, ADR 0010). An accepted one clears those blocks. An `OWED` whose core got no priced
+ *    `PRICE` on this connection names blocks the seeder counts but takes no payment for here (a
+ *    core it serves free since, or one with no terms): `free` covers the blocks served while it
+ *    holds, not blocks counted before it. The viewer counts them against the seeder's window and
+ *    does not pay them.
+ * 4. **`ACK.outstanding` in every ACK:** after the PAY was applied, the blocks of the ACK's core
+ *    the seeder counts unpaid for this account (see `AckMessage.outstanding`).
  *
  * The viewer's side (ADR 0018 amendment): a viewer starts its credit toward a seeder from what the
  * seeder reports, and pays reported blocks only when its own durable record says it received them
  * from that seeder, at the terms it recorded — a seeder that claims more is respected (never asked
- * beyond its window) and never paid the difference.
+ * beyond its window) and never paid the difference. An `OWED` before the channel is `open` is a
+ * protocol error (`PayProtocolEvents.owed`).
  */
 
 /** Most ranges one `OWED` names (and one connection's whole report). */
 export const MAX_OWED_RANGES = 256 as const;
 /**
- * Most blocks one `OWED` names in total (and one connection's whole report) — the viewer's credit
- * toward one seeder is itself capped at 1024 blocks (`MAX_SEEDER_CREDIT`), so a longer report
- * could only say "ask nothing", which a report at the cap already says.
+ * Most blocks one `OWED` names in total (and one connection's whole report). A viewer's credit
+ * toward one seeder is itself capped at 1024 blocks (the gateway's `MAX_SEEDER_CREDIT`), so a
+ * longer report could only say "ask nothing", which a report at the cap already says.
  */
 export const MAX_OWED_BLOCKS = 1024 as const;
 
@@ -123,10 +134,11 @@ export interface AckMessage {
   readonly ok: boolean;
   readonly reason?: RejectReason;
   /**
-   * v6 amendment (ADR 0018): the blocks of `core` the seeder counts unpaid for this peer's
-   * account when the ACK is sent — after this PAY was applied (accepted or refused), and including
-   * blocks sent since the PAY. Before HELLO that account is the provisional one (ADR 0004 d).
-   * Every seeder this repository builds sends it; absent means the seeder did not say.
+   * v6 amendment (ADR 0018): the blocks of `core` the seeder counts unpaid for this peer's account
+   * when the ACK is sent — after this PAY was applied (accepted or refused), including blocks sent
+   * while it was verified and blocks left out of an `OWED` by its caps. Before HELLO that account
+   * is the provisional one (ADR 0004 d). Every seeder this repository builds sends it; absent means
+   * the seeder did not say (an older seeder).
    */
   readonly outstanding?: number;
 }
@@ -139,11 +151,12 @@ export interface PriceMessage {
   /** Blocks at the old price still honoured; viewer may leave. */
   readonly effectiveFromBlock: number;
   /**
-   * v6 amendment (ADR 0015): `true` = the seeder serves this core OUTSIDE payment: it counts none
-   * of its blocks against the peer's window, never cuts for them, and no PAY for them is due.
-   * `satsPerBlock` and `effectiveFromBlock` are 0 then (the codec refuses anything else). Absent
-   * or `false`: a priced `PRICE`, as before. A viewer reading a core for display asks a peer for
-   * its blocks only after that peer's `{ free: true }` for it.
+   * v6 amendment (ADR 0015): `true` = from now on the seeder serves this core OUTSIDE payment: it
+   * counts none of the blocks it sends of it against the peer's window, never cuts for them, and no
+   * PAY for them is due (blocks it counted before stay counted — rule 3). `satsPerBlock` and
+   * `effectiveFromBlock` are 0 then (the codec refuses anything else). Absent or `false`: a priced
+   * `PRICE`, as before (`false` is never sent by this repository's seeders). A viewer reading a
+   * core for display asks a peer for its blocks only after that peer's `{ free: true }` for it.
    */
   readonly free?: boolean;
 }
@@ -153,10 +166,10 @@ export type OwedRange = readonly [fromBlock: BlockIndex, toBlock: BlockIndex];
 
 /**
  * v6 amendment (ADR 0018), seeder → viewer: the blocks of `core` the seeder still counts unpaid for
- * this viewer's HELLO pubkey (see the normative rules at the top). `ranges` is canonical: 1 …
+ * this viewer's HELLO pubkey (rules 2 and 3 at the top). `ranges` is canonical: 1 …
  * `MAX_OWED_RANGES` ranges, each `fromBlock ≤ toBlock`, ascending, disjoint and not adjacent (one
  * encoding per set of blocks), `MAX_OWED_BLOCKS` blocks at most in total. The codec refuses
- * anything else.
+ * anything else, both ways.
  */
 export interface OwedMessage {
   readonly type: 'OWED';
@@ -165,11 +178,7 @@ export interface OwedMessage {
 }
 
 export type PayProtocolMessage =
-  | HelloMessage
-  | PayWireMessage
-  | AckMessage
-  | PriceMessage
-  | OwedMessage;
+  HelloMessage | PayWireMessage | AckMessage | PriceMessage | OwedMessage;
 
 export type PayProtocolState =
   | 'idle'
@@ -196,7 +205,11 @@ export interface PayProtocolEvents {
   pay: (msg: PayMessage) => void;
   ack: (msg: AckMessage) => void;
   price: (msg: PriceMessage) => void;
-  /** v6 amendment: an `OWED` from the seeder (delivered only once the channel is `open`). */
+  /**
+   * v6 amendment: an `OWED` from the seeder, delivered only once the channel is `open` — one that
+   * arrives earlier closes the channel as a protocol error (it names blocks for a pubkey nobody
+   * has bound yet).
+   */
   owed: (msg: OwedMessage) => void;
   /** Local decision to cut the stream (window exceeded / banned / protocol error). */
   close: (reason: 'window-exceeded' | 'banned' | 'protocol-error' | 'remote' | 'local') => void;
@@ -213,7 +226,7 @@ export interface PayProtocol {
   sendPay(msg: PayMessage): void;
   sendAck(ack: Omit<AckMessage, 'type'>): void;
   sendPrice(price: Omit<PriceMessage, 'type'>): void;
-  /** v6 amendment: the seeder's report of what it still counts on one core (rule 2 above). */
+  /** v6 amendment: the seeder's report of what it still counts on one core (rules 2–3 above). */
   sendOwed(owed: Omit<OwedMessage, 'type'>): void;
 
   /**
