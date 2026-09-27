@@ -262,3 +262,26 @@ The normative text is in `packages/core/src/contracts/pay-protocol.ts`; the choi
   quit, so that tail is respected and not paid. A compromised worker keeps its closed sessions'
   capped budgets as spending authority for 7 days. The gateway has no durable ledger, so it keeps
   the one-block risk after its own crash at a seeder's cap.
+
+### Round-8 fixes (2026-09-27, lane W8b-p2p)
+
+The final cross-lane review found three ways the old-tail rules above paid twice or forgot. The
+orchestrator's decisions, as built:
+
+- **One block, one connection.** An `OWED` on one connection of a seeder never hands over a block
+  that another live connection of the same HELLO pubkey (another node of one operator) holds
+  pending or in its PAY awaiting the ACK (`UpstreamPayer.holds`). That connection pays it; before,
+  both did. A block that connection drops unpaid stays in the record for the seeder's next report.
+  Owed blocks handed over are kept per connection (Noise key) and forgotten with it.
+- **Transient never forgets.** An owed range whose PAY fails for now (no balance, a mint down, a
+  tail file not written) is never given up: it stays owed on its connection and in the record,
+  retried on the transient backoff and, past `PAY_GIVE_UP_MS`, on the deferred cadence (up to
+  30 s). Only a final refusal (`forbidden`, `session-closed`) or terms it can never be paid at
+  take it out of the record; a core no longer priced on this connection drops it from this
+  connection only (scope `connection`). Owed and fresh blocks back off on separate streaks, so a
+  long owed retry never holds this connection's blocks back.
+- **Write-ahead removal.** The record loses a PAY's blocks on disk before the PAY is sent
+  (`UnpaidRecord.removeNow`), when any of them had reached the file (blocks received and paid
+  within one 1 s batch never had: no write). A crash after the send can no longer bring them back
+  for an over-claiming seeder to be paid twice. A failed write is logged and the PAY still goes
+  out: its proofs are built.

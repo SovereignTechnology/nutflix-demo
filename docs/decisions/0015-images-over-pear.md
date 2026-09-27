@@ -134,3 +134,24 @@ Viewer side as built (2026-09-27, lane P2-owed-viewer):
   A peer pairing on it hears `free`, never silence first.
 - **Free for a paid core.** `UpstreamPayer` never reads `{ free: true }` as a 0-sat price. The
   settler and the payer owe nothing for a core a seeder serves free.
+
+Round-8 fixes (2026-09-27, lane W8b-p2p):
+
+- **Sold survives a restart.** `Seeder` keeps its per-core policies in
+  `<dataDir>/core-policies.json` and loads them back at start (at most 16 384, least recently set
+  first out). After a restart, a core this node sold — an upload, a played video still in its
+  store — is still priced, `setFreeCore` still refuses it, and the worker's sold-core check still
+  sees it. Before, an attacker's thumbnail naming such a core marked it free on our own seeder.
+- **One session per core.** Opens of one core at once share one Hypercore session
+  (`BlobStore.openCore` / `openCoreByKey`), so two thumbnails of one profile core read together
+  leave no ungated session replicating once the read is over.
+- **Our own profile core is free before it can be served** (`Seeder.openCore(name, { free: true
+  })`): marked when it is ready, before its upload gate and its unprompted terms.
+- **Free requests share the window while in flight.** With the router's `room` option
+  (`SeederCredit.roomOf`: the seeder's bare window less what it counts), free image requests fit
+  under what the seeder may still count, and counted requests leave room for the free ones out. A
+  seeder that turns an image core sold mid-flight then counts them within its window, never past
+  it (a ban). Landed or not, free requests still leave no debt. The cost: while a seeder's window
+  is full of video, image requests to it wait for room.
+- **One answer for free.** `UpstreamPayer` asks the downloader's bounded `servesFree` (the
+  settler's answer); its own set, and its per-connection price map, are bounded too.
