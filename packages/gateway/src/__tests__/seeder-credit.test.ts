@@ -454,6 +454,24 @@ describe("SeederCredit — the seeder's report (ADR 0018 amendment)", () => {
     expect(peer.getMaxInflight()).toBe(1); // 4 − 2 claimed − 1 owed = 1: pipelining by budget now
   });
 
+  // Review finding (lane P2-owed-viewer): a gateway session may replicate before its pay/1
+  // attaches, so requests can be in flight then; their replies come BEFORE the seeder's report on
+  // the stream and must not complete it.
+  it('replies to requests in flight when its pay/1 attached do not complete its report; the next block does', () => {
+    const r = rig();
+    const peer = peerOn(r, A);
+    peer.inflight = 2; // asked before pay/1 attached (no budget known: a bounded burst)
+    const a = r.link(A);
+    a.proto.remoteHello(helloFrom(pubkey('a'), { windowBlocks: 4 }));
+    peer.inflight = 0;
+    r.download(0, A);
+    r.download(1, A);
+    expect(r.credit.reportOf(A)?.done).toBe(false);
+    a.proto.remoteOwed(owed([[10, 10]]));
+    r.download(2, A); // asked after open: its report came first
+    expect(r.credit.reportOf(A)).toMatchObject({ done: true, claimed: 1 });
+  });
+
   it('never asks beyond window minus what it reports: a report of its whole window asks nothing', () => {
     const r = rig();
     const a = r.link(A);
@@ -547,6 +565,29 @@ describe("SeederCredit — the seeder's report (ADR 0018 amendment)", () => {
     await new Promise((res) => setTimeout(res, 80));
     expect(credit.reportOf(A)).toEqual({ done: true, claimed: 1, truncated: false });
     credit.dispose();
+    // A wait of 0 (or junk) is the default, never "at once": the report is not taken as complete.
+    for (const junk of [0, -5, Number.NaN, Number.POSITIVE_INFINITY]) {
+      const pool2 = new CreditPool(4);
+      const settler2 = new CreditSettler({
+        credit: pool2,
+        logger: silentLogger,
+        payable: () => true,
+      });
+      const credit2 = new SeederCredit({
+        settler: settler2,
+        pool: pool2,
+        policyFor: () => tight,
+        logger: silentLogger,
+        reportWaitMs: junk,
+      });
+      const p2 = new FakePayProtocol();
+      settler2.attachPeer(A, p2);
+      credit2.attachPeer(A, p2);
+      p2.remoteHello(helloFrom(pubkey('a'), { windowBlocks: 4 }));
+      await new Promise((res) => setTimeout(res, 20));
+      expect(credit2.reportOf(A)?.done, String(junk)).toBe(false);
+      credit2.dispose();
+    }
   });
 
   it('a report at the caps (or malformed) may be short: nothing more is asked on that connection', () => {

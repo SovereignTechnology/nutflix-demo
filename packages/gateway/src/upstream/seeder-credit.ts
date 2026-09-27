@@ -36,8 +36,9 @@
  * and every `ACK` carries `outstanding` — what it counts on that core once the PAY was applied.
  * Its report is complete once anything it sent in answer to a frame we sent after our HELLO
  * arrives — a block we asked for, an ACK (the contract's order rule: it writes the whole report
- * before it handles any later frame) — or `REPORT_WAIT_MS` after the channel opened (its report
- * goes out the moment it binds our HELLO; the wait bounds a lost one). So, per connection:
+ * before it handles any later frame; replies to requests already in flight when its `pay/1`
+ * attached come first and do not count) — or `REPORT_WAIT_MS` after the channel opened (its
+ * report goes out the moment it binds our HELLO; the wait bounds a lost one). So, per connection:
  *   - BEFORE the report: `old` is what we know of (blocks left unpaid on earlier connections of
  *     this process, requests lost with them; with a `ledger`, the whole window when the durable
  *     ledger says an earlier run may have left the seeder counting that much), or the report so
@@ -137,7 +138,10 @@ export interface SeederCreditOptions {
   readonly stallMs?: number;
   /** Lane P2-owed-viewer: the durable ledger (desktop only; see `SeederLedger`). */
   readonly ledger?: SeederLedger;
-  /** How long a report may take before it is taken as complete (default `REPORT_WAIT_MS`). */
+  /**
+   * How long a report may take before it is taken as complete (default `REPORT_WAIT_MS`; tests
+   * shorten it). Anything but a positive finite number is the default.
+   */
   readonly reportWaitMs?: number;
 }
 
@@ -162,6 +166,14 @@ interface Report {
   truncated: boolean;
   /** `OnePeerRouter.lostOf` when the connection began: what the report replaces. */
   readonly lostAtStart: number;
+  /**
+   * Requests to it already in flight when its `pay/1` attached (a gateway session may replicate
+   * before `pay/1` attaches): replies to them come before its report on the stream, so the first
+   * this many blocks it delivers do not complete the report.
+   */
+  readonly early: number;
+  /** Blocks it delivered on this connection so far (routed cores). */
+  delivered: number;
   timer: ReturnType<typeof setTimeout> | null;
 }
 
@@ -238,8 +250,10 @@ export class SeederCredit {
     managed.add(o.pool);
     this.o = o;
     this.floor = o.pool.limit;
+    // A wait of 0 (or junk) would take every report as complete at once — before its OWED could
+    // arrive — and undo the wait it bounds: only a positive, finite wait is taken.
     const wait = o.reportWaitMs ?? REPORT_WAIT_MS;
-    this.reportWaitMs = Number.isFinite(wait) && wait >= 0 ? wait : REPORT_WAIT_MS;
+    this.reportWaitMs = Number.isFinite(wait) && wait > 0 ? wait : REPORT_WAIT_MS;
     this.router = new OnePeerRouter({
       budget: (remote, core) => this.budget(remote, core),
       single: (remote) => this.awaitingReport(remote),
@@ -274,7 +288,7 @@ export class SeederCredit {
       conn,
       unpaid: 0,
       free: new Set(),
-      report: newReport(0),
+      report: newReport(0, 0),
     };
     // Most recently seen last: the eviction order.
     this.seeders.delete(noiseHex);
@@ -284,7 +298,7 @@ export class SeederCredit {
     // Terms and report are per connection: the seeder says them again on each.
     seeder.free = new Set();
     if (seeder.report.timer !== null) clearTimeout(seeder.report.timer);
-    seeder.report = newReport(this.router.lostOf(noiseHex));
+    seeder.report = newReport(this.router.lostOf(noiseHex), this.router.inflight(noiseHex));
     // Only an OPEN channel's HELLO: before our own HELLO went out, a request would be counted
     // under the provisional identity, ahead of the seeder's report.
     this.setHello(noiseHex, seeder, protocol.state === 'open' ? protocol.peer : null);
@@ -609,10 +623,16 @@ export class SeederCredit {
     this.changed();
   }
 
-  /** A block `remote` delivered on a routed core: asked after its channel opened, so its report is in. */
+  /**
+   * A block `remote` delivered on a routed core. Once the replies to requests made before its
+   * `pay/1` attached are through (`early`), every block comes from a request made after its
+   * channel opened — after its report on the stream: the report is in.
+   */
   private delivered(remote: string): void {
     const s = this.seeders.get(remote);
-    if (s === undefined || !s.live || s.hello === null || s.report.done) return;
+    if (s === undefined || !s.live || s.report.done) return;
+    s.report.delivered++;
+    if (s.hello === null || s.report.delivered <= s.report.early) return;
     this.complete(remote, s);
     this.changed();
   }
@@ -771,7 +791,7 @@ export class SeederCredit {
 /** Pools a live `SeederCredit` resizes. */
 const managed = new WeakSet<CreditPool>();
 
-function newReport(lostAtStart: number): Report {
+function newReport(lostAtStart: number, early: number): Report {
   return {
     done: false,
     claimed: new Map(),
@@ -779,6 +799,8 @@ function newReport(lostAtStart: number): Report {
     blocks: 0,
     truncated: false,
     lostAtStart,
+    early,
+    delivered: 0,
     timer: null,
   };
 }

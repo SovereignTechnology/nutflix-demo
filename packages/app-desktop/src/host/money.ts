@@ -114,9 +114,10 @@ export interface MoneyPlaneOptions {
   readonly journalDir: string | null;
   /**
    * Lane P2-owed-viewer: where closed sessions' tail authorisations live (`<userData>/tails`,
-   * created 0700). Absent or `null` (tests): in memory, lost with the process.
+   * created 0700). Required, like `journalDir`, so no caller loses them at a restart by leaving
+   * it out: `null` (tests only) keeps them in memory, lost with the process.
    */
-  readonly tailDir?: string | null;
+  readonly tailDir: string | null;
   /** Tests: the tail authorisations' wall clock in ms (default: `now`, else `Date.now`). */
   readonly tailClock?: () => number;
   /**
@@ -287,7 +288,7 @@ export class MoneyPlane {
       const now = o.now;
       const tailClock = o.tailClock ?? (now === undefined ? undefined : () => now() * 1000);
       const tails = await TailBook.open({
-        dir: o.tailDir ?? null,
+        dir: o.tailDir,
         pubkey,
         log: o.log,
         ...(tailClock === undefined ? {} : { now: tailClock }),

@@ -728,7 +728,9 @@ describe('ViewerPayer: the record of what is unpaid, and paying what a seeder re
   afterEach(async () => {
     for (const d of dirs.splice(0)) await rm(d, { recursive: true, force: true });
   });
-  async function tailRig(o: { refuseOwed?: () => string | null } = {}) {
+  async function tailRig(
+    o: { refuseOwed?: () => string | null; refusePay?: () => string | null } = {},
+  ) {
     const dir = await mkdtemp(join(tmpdir(), 'nf-vp-tail-'));
     dirs.push(dir);
     const record = new UnpaidRecord({
@@ -750,7 +752,12 @@ describe('ViewerPayer: the record of what is unpaid, and paying what a seeder re
       policy,
     });
     const payer = new ViewerPayer({
-      pay: (r, sd, p) => engine.pay(r, sd, p),
+      pay: (r, sd, p) => {
+        const refusal = o.refusePay?.() ?? null;
+        if (refusal !== null)
+          return Promise.reject(fromWireError(wireError('session-closed', refusal)));
+        return engine.pay(r, sd, p);
+      },
       ownMints: [mocks.MINTS.a],
       credit,
       logger: silentLogger,
@@ -778,8 +785,9 @@ describe('ViewerPayer: the record of what is unpaid, and paying what a seeder re
   }
   const priced = { core: CORE_1, satsPerBlock: mocks.sats(2), effectiveFromBlock: 0 };
 
-  it('records each block received from a seeder with a verified HELLO, with its session; any ACK forgets it (accepted or refused); a block given up stays (the tail)', async () => {
-    const r = await tailRig();
+  it('records each block received from a seeder with a verified HELLO, with its session; a built PAY takes it out; a block given up stays (the tail)', async () => {
+    let refuse: string | null = null;
+    const r = await tailRig({ refusePay: () => refuse });
     r.download(0); // no HELLO yet: nothing could pay it, nothing asked it — not recorded
     expect(r.held()).toEqual([]);
     r.proto.hello();
@@ -788,12 +796,18 @@ describe('ViewerPayer: the record of what is unpaid, and paying what a seeder re
     expect(r.held()).toEqual([1, 2]);
     expect(r.record.termsOf(SEEDER_PK, CORE_1, 1)?.sid).toBe(SID_A);
     await settle();
-    r.proto.ack(0, 1); // accepted
-    expect(r.held()).toEqual([2]);
-    await settle();
-    r.proto.ack(2, 2, false); // refused: never re-sent, so nothing more to pay from the record
+    // Built (and sent): out of the record, whatever becomes of its ACK.
+    expect(r.proto.sent).toHaveLength(1);
     expect(r.held()).toEqual([]);
-    expect(r.record.unpaidFor(SID_A)).toBe(0);
+    r.proto.ack(r.proto.sent[0]!.range.fromBlock, r.proto.sent[0]!.range.toBlock);
+    // Its session gone for good (the host refuses): given up — the tail, kept for a later OWED.
+    refuse = 'no play session covers these blocks';
+    r.download(3);
+    await r.payer.flush();
+    await settle();
+    expect(r.payer.stats().unpayableBlocks).toBe(1);
+    expect(r.held()).toEqual([3]);
+    expect(r.record.unpaidFor(SID_A)).toBe(1);
   });
 
   it('an OWED: only reported blocks the record holds are paid, under the recorded session and terms; the rest of the claim never', async () => {
@@ -860,6 +874,40 @@ describe('ViewerPayer: the record of what is unpaid, and paying what a seeder re
       [7, 7],
     ]);
     expect(r.owedCalls.map((c) => c.sid)).toEqual([SID_B, 'c3'.repeat(16)]);
+  });
+
+  // Review finding (lane P2-owed-viewer, MEDIUM): blocks left the record only on an ACK, so a
+  // seeder that took a PAY and dropped before its ACK could report the same blocks on the next
+  // connection and be paid again. A built PAY now takes its blocks out at once.
+  it('a PAY built for recorded blocks takes them out at once: a seeder that takes it, drops before its ACK and reports them again is not paid twice', async () => {
+    const r = await tailRig();
+    r.record.add(SEEDER_PK, CORE_1, 5, r.termsOf(SID_B));
+    r.proto.hello();
+    r.proto.price(priced);
+    r.proto.owed(CORE_1, [[5, 5]]);
+    await r.payer.flush();
+    expect(r.owedCalls.map((c) => c.range)).toEqual([[5, 5]]);
+    expect(r.proto.sent.map((p) => [p.range.fromBlock, p.range.toBlock])).toEqual([[5, 5]]);
+    // This connection's block 1 waits behind [5,5]'s PAY (one per core): no ACK comes, it drops.
+    r.download(1);
+    await r.payer.flush();
+    expect(r.held()).toEqual([1]);
+    r.proto.close();
+    const again = new FakeProto();
+    r.payer.attachPeer(NOISE, again);
+    again.hello();
+    again.price(priced);
+    again.owed(CORE_1, [
+      [1, 1],
+      [5, 5],
+    ]);
+    await r.payer.flush();
+    // 5's PAY was built and sent: never again. 1 was never built: paid now, under its session.
+    expect(r.owedCalls.map((c) => [c.sid, c.range])).toEqual([
+      [SID_B, [5, 5]],
+      [SID_A, [1, 1]],
+    ]);
+    expect(r.held()).toEqual([]);
   });
 
   it('a core the seeder serves free: its blocks are owed nothing — settled on arrival, not recorded, never paid', async () => {

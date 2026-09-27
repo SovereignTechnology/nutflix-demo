@@ -34,7 +34,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import type { SessionId } from '../../ipc/protocol.js';
 import { memoryLogger } from '../log.js';
 import { MoneyPlane, sessionBudgetBlocks } from '../money.js';
-import { MAX_TAILS, TAIL_TTL_MS, TailBook } from '../tails.js';
+import { MAX_TAILS, MAX_TAIL_BLOCKS, TAIL_TTL_MS, TailBook } from '../tails.js';
 
 const MINT = 'https://mint.tails.test' as MintUrl;
 const RELAY = 'wss://relay.tails.test' as RelayUrl;
@@ -328,6 +328,35 @@ describe('MoneyPlane: tail authorisations (ADR 0018 amendment)', () => {
       await code(h['pay.build']!(build({ range: { core: CORE, fromBlock: 11, toBlock: 11 } }))),
     ).toBe('forbidden');
     again.close();
+  });
+
+  // Review finding (lane P2-owed-viewer, LOW): a closed session kept its whole remaining budget
+  // (up to twice its blob) as a tail for 7 days, on the worker's word or its silence.
+  it('a tail is never more than MAX_TAIL_BLOCKS, whatever the worker claims or when it cannot say', async () => {
+    const dir = await tmp();
+    const { plane } = await planeRig({ dir });
+    const big: HyperblobId = { blockOffset: 0, blockLength: 5000, byteOffset: 0, byteLength: 1 };
+    plane.authorizeSession(SID, { core: CORE, blob: big, policy: POLICY }, CREATOR);
+    await plane.revokeSession(SID, 1_000_000);
+    plane.authorizeSession(SID2, { core: CORE, blob: big, policy: POLICY }, CREATOR);
+    await plane.revokeSession(SID2, null);
+    const onDisk = JSON.parse(await readFile(join(dir, `${plane.pubkey}.json`), 'utf8')) as {
+      tails: { sid: string; budgetBlocks: number }[];
+    };
+    expect(onDisk.tails.map((t) => t.budgetBlocks)).toEqual([MAX_TAIL_BLOCKS, MAX_TAIL_BLOCKS]);
+    expect(sessionBudgetBlocks(big)).toBeGreaterThan(MAX_TAIL_BLOCKS);
+    // A file claiming more is refused entry by entry.
+    await writeFile(
+      join(dir, `${plane.pubkey}.json`),
+      JSON.stringify({
+        v: 1,
+        tails: [{ ...onDisk.tails[0], budgetBlocks: MAX_TAIL_BLOCKS + 1 }],
+      }),
+      { mode: 0o600 },
+    );
+    const b = await TailBook.open({ dir, pubkey: plane.pubkey, log: memoryLogger('warn') });
+    expect(b.size()).toBe(0);
+    plane.close();
   });
 
   it('a plane closed with sessions open (signed out, locked) keeps their tails; a closed plane makes none', async () => {

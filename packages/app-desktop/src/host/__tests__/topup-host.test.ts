@@ -150,6 +150,7 @@ async function world(
     mintRequest,
     createWallet: true,
     journalDir: null, // in memory: this only creates the NIP-60 wallet (merge of issues #2 and #8)
+    tailDir: null, // in memory: not about tail authorisations
   });
   first.close();
 

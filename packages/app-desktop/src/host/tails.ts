@@ -9,9 +9,9 @@
  * session they were received for. A closed session's `pay.build` is then checked against this
  * book exactly like an open session's (`MoneyPlane.payBuild`): the same core, a range inside the
  * same blob, the same manifest terms (creator key, split, block size, mints, a price at most the
- * manifest's), and a block budget — never more than the session had left, and never more than the
- * worker said was unpaid at its close (`play.close`), or the session's whole remaining budget when
- * the worker could not say (it was gone). Each authorisation expires `TAIL_TTL_MS` after its
+ * manifest's), and a block budget — never more than the session had left, never more than the
+ * worker said was unpaid at its close (`play.close`; the session's remaining budget when the
+ * worker could not say, it was gone), and never more than `MAX_TAIL_BLOCKS`. Each authorisation expires `TAIL_TTL_MS` after its
  * session closed; an expired one pays nothing (the seeder's count of those blocks is then only
  * respected, never paid).
  *
@@ -36,6 +36,14 @@ import { ensurePrivateDir, readPrivateFile, writePrivateFile } from './signer/pr
 export const TAIL_DIR = 'tails';
 /** How long a closed session's tail may still be paid (the worker's record keeps as long). */
 export const TAIL_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+/**
+ * The most blocks one tail authorises (review finding, lane P2-owed-viewer). The worker's
+ * downloader never has more than 1 024 blocks outstanding across all its seeders at once (its
+ * credit pool's cap, `MAX_POOL_CREDIT`), so an honest close leaves no larger tail; a larger count
+ * (a compromised worker's claim) or an unknown one (the worker gone) is cut to it. Without the
+ * cap a closed session kept its whole remaining budget — up to twice its blob — for 7 days.
+ */
+export const MAX_TAIL_BLOCKS = 1024;
 /** Tail authorisations kept per identity (the oldest expiring go first beyond it). */
 export const MAX_TAILS = 1024;
 /** The largest tail file read (1 024 entries are far below it). */
@@ -66,7 +74,7 @@ const isEntry = obj({
   first: int(0, Number.MAX_SAFE_INTEGER),
   last: int(0, Number.MAX_SAFE_INTEGER),
   policy: isPricePolicy,
-  budgetBlocks: int(1, Number.MAX_SAFE_INTEGER),
+  budgetBlocks: int(1, MAX_TAIL_BLOCKS),
   paidBlocks: int(0, Number.MAX_SAFE_INTEGER),
   expiresAt: int(0, Number.MAX_SAFE_INTEGER),
 });
@@ -128,7 +136,13 @@ export class TailBook {
   /** Keep a closed session's tail (persisted; replaces any earlier one of the same session). */
   add(t: Omit<TailAuth, 'paidBlocks' | 'expiresAt'>): Promise<void> {
     if (!(t.budgetBlocks >= 1) || !isSessionId(t.sid)) return Promise.resolve();
-    this.tails.set(t.sid, { ...t, paidBlocks: 0, expiresAt: this.now() + TAIL_TTL_MS });
+    const budgetBlocks = Math.min(MAX_TAIL_BLOCKS, Math.floor(t.budgetBlocks));
+    this.tails.set(t.sid, {
+      ...t,
+      budgetBlocks,
+      paidBlocks: 0,
+      expiresAt: this.now() + TAIL_TTL_MS,
+    });
     this.prune();
     return this.save();
   }

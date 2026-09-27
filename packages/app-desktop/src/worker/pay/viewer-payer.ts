@@ -41,7 +41,8 @@
  *   - **the unpaid tail** (lane P2-owed-viewer, ADR 0018 amendment 2026-09-26). With a `record`
  *     (`UnpaidRecord`), every block received from a seeder with a verified HELLO is recorded
  *     under that seeder's pubkey and core, with the terms of the play session it was received for
- *     (`termsFor`); every ACK of it (accepted, or refused: a PAY is never re-sent) forgets it.
+ *     (`termsFor`); a PAY built for it takes it out at once — never paid twice, even when its ACK
+ *     never comes (as a refused PAY is never re-sent) — and so does any ACK of it.
  *     What is left when a session closes, the app quits or the link drops is the tail. When a
  *     seeder later reports blocks it still counts (`OWED`), only those this record also holds are
  *     handed to the payer (`UpstreamPayer.addOwed`): paid at once, at the terms recorded, under
@@ -167,6 +168,9 @@ export class ViewerPayer {
       pay: async (range, seeder, policy) => {
         // A refusal (`rate-limited:` included) goes back to UpstreamPayer, which retries it.
         const msg = await o.pay(range, seeder, policy);
+        // Built: never offered again from the record, even if its ACK never comes (a seeder that
+        // takes the PAY and drops must not be paid twice by reporting the blocks again).
+        o.record?.remove(seeder.pubkey, range.core, range.fromBlock, range.toBlock);
         this.paid(range, seeder.pubkey, msg);
         return msg;
       },
@@ -189,7 +193,8 @@ export class ViewerPayer {
       ...(o.reportWaitMs !== undefined ? { reportWaitMs: o.reportWaitMs } : {}),
     });
     o.record?.attachReach(() => this.seeders.seederReach());
-    // Every ACK — accepted, or refused (a PAY is never re-sent) — ends what the record owes.
+    // Every ACK — accepted, or refused (a PAY is never re-sent) — ends what the record owes (a
+    // built PAY already took its blocks out; this also covers an ACK of a PAY built elsewhere).
     this.settler.onAck((noiseHex, ack) => {
       const pk = this.pubkeys.get(noiseHex);
       if (pk === undefined) return;
@@ -230,7 +235,9 @@ export class ViewerPayer {
                 const t = this.owedTerms(peer, range);
                 if (t === null) throw new Error('forbidden: those blocks are not in the record');
                 const msg = await payOwed(t.sid, range, seeder, policy, opts.carryIn);
-                // Not this session's spend (the host's wallet shows it): no `onPaid`.
+                // Built: out of the record at once (never paid twice, whatever becomes of its
+                // ACK). Not this session's spend (the host's wallet shows it): no `onPaid`.
+                o.record?.remove(seeder.pubkey, range.core, range.fromBlock, range.toBlock);
                 return msg;
               },
             },

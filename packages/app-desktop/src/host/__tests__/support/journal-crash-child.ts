@@ -76,6 +76,7 @@ async function main(): Promise<void> {
       log: memoryLogger('error'),
       createWallet: mode === 'fund',
       journalDir: join(dir, 'wallet'),
+      tailDir: null, // in memory: not about tail authorisations
     });
   } catch (e) {
     const m = e instanceof Error ? e.message : String(e);
