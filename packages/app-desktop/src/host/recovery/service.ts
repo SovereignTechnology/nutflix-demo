@@ -9,19 +9,20 @@
  *
  *   setup    no phrase yet: generate → show it in main's prompt window (`recovery-show`, word
  *            INDICES) → nothing is kept unless the user answers "I wrote them down" or "Later"
- *            (a closed window discards it) → seal it (NIP-44 to self) + publish the relay copy →
- *            confirm three random words (`recovery-confirm`; "Later" leaves it unconfirmed) →
- *            reopen the money plane, which now derives from it → plan the reissue per mint →
- *            main's NATIVE dialog shows amounts and fees → reissue.
+ *            (a closed window discards it) → seal it (NIP-44 to self) while no money plane holds
+ *            the wallet, and reopen the plane, which now derives from it → publish the relay
+ *            copy → confirm three random words (`recovery-confirm`; "Later" leaves it
+ *            unconfirmed) → plan the reissue per mint → main's NATIVE dialog shows amounts and
+ *            fees → reissue.
  *            A phrase whose reissue did not finish: only the reissue runs again.
  *            A finished phrase: rotation — re-authenticate first, then as above; the old phrase
  *            is kept on this device as `.retired` (restore reads it) and its relay copy retired
- *            once the reissue under the new one completed.
+ *            once the reissue under the new one completed (`replaces`, kept until then).
  *   show     re-authenticate (the local key's passphrase in the prompt window; a native confirm
  *            for a remote signer), then show the words again; an unconfirmed backup may be
  *            confirmed then.
- *   restore  requires this device's own phrase (the seam's restore lives on the seeded wallet,
- *            docs/contract-requests/N2-nut13-desktop.md item 2); an optional typed phrase
+ *   restore  requires this device's own phrase in use (the seam's restore lives on the seeded
+ *            wallet, docs/contract-requests/N2-nut13-desktop.md item 2); an optional typed phrase
  *            (`recovery-restore`, checksum re-checked here by core), this device's phrases
  *            (current and retired) and every relay copy the identity decrypts — read ONLY here —
  *            each scanned from counter 0 at the wallet's mints, with progress, and one report
@@ -30,7 +31,9 @@
  * Secrets: the entropy exists as bytes (zeroed after use), inside the NIP-44 plaintext (a JS
  * string, which cannot be wiped: ADR 0016 §2 residual) and as word indices in the prompt form
  * and answer (numbers, zeroed as far as JS allows). No word, index or entropy is ever logged,
- * returned to the renderer or put in an error: errors are codes and fixed sentences.
+ * returned to the renderer or put in an error: the renderer gets states, counts, amounts and its
+ * own mint URLs; errors are codes and fixed sentences (anything else becomes `internal`), and
+ * log fields are allow-listed reason codes.
  */
 import { randomBytes, randomInt } from 'node:crypto';
 
@@ -48,7 +51,12 @@ import type {
   RecoveryStatusWire,
   RestoreOutcomeWire,
 } from '../../ipc/protocol.js';
-import { MAX_REISSUE_PLANS, RECOVERY_CONFIRM_WORDS, RECOVERY_WORDS } from '../../ipc/protocol.js';
+import {
+  ERROR_CODES,
+  MAX_REISSUE_PLANS,
+  RECOVERY_CONFIRM_WORDS,
+  RECOVERY_WORDS,
+} from '../../ipc/protocol.js';
 import { fail, hostError } from '../errors.js';
 import type { Logger } from '../log.js';
 import type { MoneyPlane } from '../money.js';
@@ -61,7 +69,7 @@ import {
   UNLOCK_ATTEMPTS,
 } from '../signer/desktop-signer.js';
 import type { RecoveryCore } from './core.js';
-import { entropyFromHex, entropyHex, uniqueMints } from './core.js';
+import { entropyFromHex, entropyHex, sameEntropy, uniqueMints } from './core.js';
 import type { RecoveryEnvelope } from './files.js';
 import {
   FileCounterStore,
@@ -70,6 +78,7 @@ import {
   recoveryPath,
   retireCounters,
   retiredPath,
+  unretireCounters,
   writeEnvelope,
 } from './files.js';
 import type { RecoveryRelays } from './relay-copy.js';
@@ -95,7 +104,8 @@ export interface RecoveryServiceOptions {
   readonly plane: () => MoneyPlane | undefined;
   /**
    * Close the money plane, run `beforeOpen` (no plane holds the wallet then), open it again — it
-   * then derives from the phrase `beforeOpen` saved (`DesktopSigner.reopenMoney`).
+   * then derives from the phrase `beforeOpen` saved (`DesktopSigner.reopenMoney`). A failure of
+   * `beforeOpen` is rethrown once the plane is open again.
    */
   readonly reopenMoney: (beforeOpen?: () => Promise<void>) => Promise<void>;
   /** Re-authentication of a local key: does `passphrase` open `pubkey`'s key file? */
@@ -106,13 +116,16 @@ export interface RecoveryServiceOptions {
   /** The throttle's clock (ms). */
   readonly clock?: () => number;
   /** Tests: randomness for device ids and confirmation positions (default `node:crypto`). */
-  readonly random?: { readonly bytes: (n: number) => Uint8Array; readonly int: (max: number) => number };
+  readonly random?: {
+    readonly bytes: (n: number) => Uint8Array;
+    readonly int: (max: number) => number;
+  };
 }
 
 /** What the money plane opens with when this device has a phrase (`seedFor`). */
 export interface PlaneSeed {
   readonly material: walletMod.SeedMaterial;
-  readonly core: Pick<RecoveryCore, 'connections' | 'seeded'>;
+  readonly core: Pick<RecoveryCore, 'seedOption' | 'seeded'>;
 }
 
 const UNAVAILABLE: RecoveryStatusWire = {
@@ -130,11 +143,23 @@ const RANK: Readonly<Record<RestoreOutcomeWire, number>> = {
   restored: 4,
 };
 
-/** The code prefix of an error (`recovery-unreadable`, `rate-limited`, …) — never its detail. */
-function prefix(e: unknown): string {
+/** Reason codes a log line may carry (allow-list: anything else is logged as `error`). */
+const REASONS: ReadonlySet<string> = new Set<string>([
+  ...ERROR_CODES,
+  'recovery-unreadable',
+  'counters-unreadable',
+  'journal-unreadable',
+  'no-wallet',
+]);
+
+/** The allow-listed code of an error — never its message. */
+export function reasonOf(e: unknown): string {
   if (e instanceof IpcError) return e.code;
-  const m = e instanceof Error ? e.message : '';
-  return /^[a-z][a-z0-9-]*(?=:)/.exec(m)?.[0] ?? (e instanceof Error ? e.name : 'unknown');
+  const m = e instanceof Error ? e.message : typeof e === 'string' ? e : '';
+  const p = /^([a-z][a-z0-9-]{0,40}):/.exec(m)?.[1];
+  if (p !== undefined && REASONS.has(p)) return p;
+  const name = e instanceof Error ? e.name : '';
+  return /^[A-Z][A-Za-z]{0,40}Error$/.test(name) ? name : 'error';
 }
 
 function hex(b: Uint8Array): string {
@@ -178,8 +203,9 @@ export class RecoveryService {
   /**
    * Called before a money plane opens for `pubkey`: this device's phrase as seed material (the
    * seed in core's secure memory, the counters file), or `undefined` — no phrase support, no
-   * phrase, or a phrase file that does not open (then the wallet derives nothing from it, the
-   * status says `unreadable`, the file is kept, and setup refuses to replace it).
+   * phrase, or a phrase file that does not open (then the wallet derives nothing from it: its
+   * outputs are random, as without a phrase; the status says `unreadable`, the file is kept, and
+   * setup refuses to replace it).
    */
   async seedFor(signer: Signer, pubkey: NostrPubkey): Promise<PlaneSeed | undefined> {
     this.unreadable.delete(pubkey);
@@ -199,7 +225,7 @@ export class RecoveryService {
       this.unreadable.add(pubkey);
       this.log.error(
         'the recovery phrase on this device did not open: new ecash is not covered, and the file is kept',
-        { reason: prefix(e) },
+        { reason: reasonOf(e) },
       );
       return undefined;
     } finally {
@@ -210,9 +236,8 @@ export class RecoveryService {
   // ---- the renderer's calls --------------------------------------------------------------
 
   async status(): Promise<RecoveryStatusWire> {
-    const core = this.o.core;
     const plane = this.o.plane();
-    if (core === undefined || plane === undefined || this.o.signer() === undefined)
+    if (this.o.core === undefined || plane === undefined || this.o.signer() === undefined)
       return UNAVAILABLE;
     let env: RecoveryEnvelope | null;
     try {
@@ -221,7 +246,7 @@ export class RecoveryService {
       return { state: 'unreadable', reissuePending: false, relayCopy: false };
     }
     if (env === null) return { state: 'not-on-device', reissuePending: false, relayCopy: false };
-    const inUse = !this.unreadable.has(plane.pubkey) && core.seeded(plane.wallet) !== undefined;
+    const inUse = !this.unreadable.has(plane.pubkey) && plane.seeded !== undefined;
     return {
       state: !inUse ? 'unreadable' : env.confirmed ? 'covered' : 'not-confirmed',
       reissuePending: !env.reissued,
@@ -231,17 +256,17 @@ export class RecoveryService {
 
   /** New phrase, finish its reissue, or rotate (see the module comment). */
   setup(): Promise<RecoverySetupWire> {
-    return this.throttled(() => this.exclusive(() => this.setupNow()));
+    return this.flow(() => this.setupNow());
   }
 
   /** Show this device's phrase again, after re-authentication. */
   show(): Promise<undefined> {
-    return this.throttled(() => this.exclusive(() => this.showNow()));
+    return this.flow(() => this.showNow());
   }
 
   /** Scan every phrase the identity reaches and add what is unspent and not held. */
   restore(): Promise<RecoveryRestoreWire> {
-    return this.throttled(() => this.exclusive(() => this.restoreNow()));
+    return this.flow(() => this.restoreNow());
   }
 
   /** Topic `recovery.progress`. */
@@ -253,6 +278,11 @@ export class RecoveryService {
   }
 
   // ---- flows -----------------------------------------------------------------------------
+
+  /** Throttled, one at a time, and nothing but our own coded refusals reaches the renderer. */
+  private flow<T>(f: () => Promise<T>): Promise<T> {
+    return this.throttled(() => this.exclusive(() => this.guarded(f)));
+  }
 
   private ready(): {
     core: RecoveryCore;
@@ -274,7 +304,10 @@ export class RecoveryService {
   private async envelope(pubkey: NostrPubkey): Promise<RecoveryEnvelope | null> {
     try {
       return await readEnvelope(recoveryPath(this.o.dir, pubkey));
-    } catch {
+    } catch (e) {
+      this.log.error('the recovery phrase file on this device cannot be read', {
+        reason: reasonOf(e),
+      });
       fail(
         'forbidden',
         'the recovery phrase file on this device cannot be read: it is kept and not replaced (see the log)',
@@ -286,19 +319,19 @@ export class RecoveryService {
     const { core, signer, pubkey } = this.ready();
     const path = recoveryPath(this.o.dir, pubkey);
     const old = await this.envelope(pubkey);
-    if (this.unreadable.has(pubkey))
+    if (old !== null && this.unreadable.has(pubkey))
       fail(
         'forbidden',
         'the recovery phrase on this device did not open: it is kept and not replaced (see the log)',
       );
     // A phrase whose reissue did not finish: finish it (nothing is revealed or replaced).
-    if (old !== null && !old.reissued) return await this.finishReissue(pubkey, old, null);
+    if (old !== null && !old.reissued) return await this.finishReissue(pubkey, old);
     // Rotation replaces a working phrase: the user proves it is them first.
     if (old !== null) await this.reauth(signer, pubkey);
 
     const entropy = core.phrases.generate();
     let words: number[] = [];
-    let env: RecoveryEnvelope | undefined;
+    let env: RecoveryEnvelope;
     try {
       words = [...core.phrases.toIndices(entropy)];
       if (words.length !== RECOVERY_WORDS) fail('internal', 'the phrase has the wrong length');
@@ -322,22 +355,19 @@ export class RecoveryService {
         confirmed: false,
         reissued: false,
         relayCopy: false,
+        // A replaced phrase's relay copy is retired once the reissue under this one completed
+        // (a still-pending replacement carries over: its copy was never retired either).
+        replaces: old === null ? null : old.device,
         sealed,
       };
-      // Saved while no money plane holds the wallet: a replaced phrase is retired (restore still
-      // reads it), and so is any counters file — the new phrase derives from counter 0. The
-      // plane that opens next derives from the new phrase.
-      await this.o.reopenMoney(async () => {
-        if (old !== null)
-          await writeEnvelope(this.o.dir, retiredPath(this.o.dir, pubkey, old.device), old);
-        await retireCounters(this.o.dir, pubkey, old?.device ?? hex(this.random.bytes(16)));
-        await writeEnvelope(this.o.dir, path, fresh);
-        env = fresh;
-      });
+      await this.o.reopenMoney(() => this.saveNew(pubkey, old, fresh));
       const saved = await readEnvelope(path).catch(() => null);
-      if (env === undefined || saved?.device !== fresh.device)
+      if (saved?.device !== fresh.device)
         fail('internal', 'the recovery phrase could not be saved (nothing was changed)');
-      this.log.info(old === null ? 'recovery phrase saved on this device' : 'recovery phrase replaced');
+      this.log.info(
+        old === null ? 'recovery phrase saved on this device' : 'recovery phrase replaced',
+      );
+      env = fresh;
       const published = await publishRelayCopy({
         signer,
         relays: this.o.relays,
@@ -345,54 +375,87 @@ export class RecoveryService {
         sealed: fresh.sealed,
         now: this.now,
       }).catch(() => false);
-      let cur = fresh;
       if (published) {
-        cur = { ...cur, relayCopy: true };
-        await writeEnvelope(this.o.dir, path, cur);
+        env = { ...env, relayCopy: true };
+        await writeEnvelope(this.o.dir, path, env);
       } else
-        this.log.warn('the recovery phrase copy reached no relay: it is sealed on this device only');
+        this.log.warn(
+          'the recovery phrase copy reached no relay: it is sealed on this device only',
+        );
       if (shown.done && (await this.confirmWords(words))) {
-        cur = { ...cur, confirmed: true };
-        await writeEnvelope(this.o.dir, path, cur);
+        env = { ...env, confirmed: true };
+        await writeEnvelope(this.o.dir, path, env);
       }
-      env = cur;
     } finally {
       entropy.fill(0);
       words.fill(0);
     }
-    return await this.finishReissue(pubkey, env, old);
+    return await this.finishReissue(pubkey, env);
+  }
+
+  /**
+   * While no plane holds the wallet: keep a replaced phrase as `.retired` (restore still reads
+   * it), move its counters aside (the new phrase derives from counter 0), then write the new
+   * phrase — putting the counters back if that last write fails, so the old phrase never loses
+   * them while it stays current.
+   */
+  private async saveNew(
+    pubkey: NostrPubkey,
+    old: RecoveryEnvelope | null,
+    fresh: RecoveryEnvelope,
+  ): Promise<void> {
+    const dir = this.o.dir;
+    if (old !== null) await writeEnvelope(dir, retiredPath(dir, pubkey, old.device), old);
+    const tag = old?.device ?? hex(this.random.bytes(16));
+    const moved = await retireCounters(dir, pubkey, tag);
+    try {
+      await writeEnvelope(dir, recoveryPath(dir, pubkey), fresh);
+    } catch (e) {
+      if (moved)
+        await unretireCounters(dir, pubkey, tag).catch((u: unknown) => {
+          this.log.error('the counters file could not be put back: it is kept aside', {
+            reason: reasonOf(u),
+          });
+        });
+      throw e;
+    }
   }
 
   /** D5: move the balance under the phrase (native confirm with the fees); record the outcome. */
   private async finishReissue(
     pubkey: NostrPubkey,
     env: RecoveryEnvelope,
-    rotatedFrom: RecoveryEnvelope | null,
   ): Promise<RecoverySetupWire> {
     // A plane that is not deriving from the phrase yet (its reopen failed, or never ran) opens
     // again first: the reissue must land in seeded outputs.
-    const core = this.o.core;
     const plane = this.o.plane();
-    if (core !== undefined && plane !== undefined && core.seeded(plane.wallet) === undefined)
+    if (plane !== undefined && plane.seeded === undefined)
       await this.o.reopenMoney().catch((e: unknown) => {
-        this.log.warn('the wallet did not reopen with the recovery phrase', { reason: prefix(e) });
+        this.log.warn('the wallet did not reopen with the recovery phrase', {
+          reason: reasonOf(e),
+        });
       });
     const r = await this.reissueAll(pubkey);
-    let cur = env;
     if (r.complete) {
-      cur = { ...env, reissued: true };
-      await writeEnvelope(this.o.dir, recoveryPath(this.o.dir, pubkey), cur);
+      // The replaced phrase restores nothing held any more: its relay copy goes (best effort,
+      // idempotent — a crash before the write below only repeats it), then ONE write records
+      // both, so a recorded reissue never leaves a copy to retire behind.
       const signer = this.o.signer();
-      if (rotatedFrom !== null && signer !== undefined) {
+      if (env.replaces !== null && signer !== undefined) {
         const retired = await retireRelayCopy({
           signer,
           pubkey,
           relays: this.o.relays,
-          device: rotatedFrom.device,
+          device: env.replaces,
           now: this.now,
         });
         if (!retired) this.log.warn('the replaced phrase’s relay copy may still be on a relay');
       }
+      await writeEnvelope(this.o.dir, recoveryPath(this.o.dir, pubkey), {
+        ...env,
+        reissued: true,
+        replaces: null,
+      });
     }
     return {
       status: await this.status(),
@@ -408,10 +471,8 @@ export class RecoveryService {
     failed: number;
     complete: boolean;
   }> {
-    const core = this.o.core;
     const plane = this.o.plane();
-    const seeded =
-      core === undefined || plane?.pubkey !== pubkey ? undefined : core.seeded(plane.wallet);
+    const seeded = plane?.pubkey === pubkey ? plane.seeded : undefined;
     if (plane === undefined || seeded === undefined) {
       this.log.warn('the wallet is not using the recovery phrase yet: nothing was reissued');
       return { sats: 0, fee: 0, failed: 0, complete: false };
@@ -422,7 +483,9 @@ export class RecoveryService {
     try {
       balances = await plane.wallet.balances();
     } catch (e) {
-      this.log.warn('the balances could not be read: nothing was reissued', { reason: prefix(e) });
+      this.log.warn('the balances could not be read: nothing was reissued', {
+        reason: reasonOf(e),
+      });
       return { sats: 0, fee: 0, failed: 0, complete: false };
     }
     for (const [mint, amount] of balances) {
@@ -430,10 +493,10 @@ export class RecoveryService {
       try {
         const p = await seeded.reissuePlan(mint);
         // Dust whose fee would eat it all stays as it is (nothing sensible to move).
-        if (p.amount > 0 && p.feeSats < p.amount) plans.push(p);
+        if (p.mint === mint && p.amount > 0 && p.feeSats < p.amount) plans.push(p);
       } catch (e) {
         failed++;
-        this.log.warn('no reissue plan at a mint', { reason: prefix(e) });
+        this.log.warn('no reissue plan at a mint', { reason: reasonOf(e) });
       }
     }
     const asked = plans.slice(0, MAX_REISSUE_PLANS);
@@ -462,7 +525,7 @@ export class RecoveryService {
       } catch (e) {
         failed++;
         this.log.warn('the reissue failed at a mint (its balance stays uncovered)', {
-          reason: prefix(e),
+          reason: reasonOf(e),
         });
       }
     }
@@ -480,17 +543,31 @@ export class RecoveryService {
     try {
       try {
         entropy = await this.unseal(signer, pubkey, env);
-      } catch {
+      } catch (e) {
+        this.log.error('the recovery phrase file on this device cannot be read', {
+          reason: reasonOf(e),
+        });
         fail('forbidden', 'the recovery phrase file on this device cannot be read (see the log)');
       }
       words = [...core.phrases.toIndices(entropy)];
       entropy.fill(0);
+      if (words.length !== RECOVERY_WORDS) fail('internal', 'the phrase has the wrong length');
       const a = await this.o.bridge.ask({ kind: 'recovery-show', words: [...words], again: true });
-      if (a?.kind === 'recovery-show' && a.done && !env.confirmed && (await this.confirmWords(words)))
-        await writeEnvelope(this.o.dir, recoveryPath(this.o.dir, pubkey), {
-          ...env,
-          confirmed: true,
-        });
+      if (
+        a?.kind === 'recovery-show' &&
+        a.done &&
+        !env.confirmed &&
+        (await this.confirmWords(words))
+      ) {
+        // Re-read: only the confirmation changes (a concurrent write is not expected, but the
+        // file is the record).
+        const cur = await this.envelope(pubkey);
+        if (cur?.device === env.device)
+          await writeEnvelope(this.o.dir, recoveryPath(this.o.dir, pubkey), {
+            ...cur,
+            confirmed: true,
+          });
+      }
       return undefined;
     } finally {
       entropy?.fill(0);
@@ -500,7 +577,7 @@ export class RecoveryService {
 
   private async restoreNow(): Promise<RecoveryRestoreWire> {
     const { core, signer, plane, pubkey } = this.ready();
-    const seeded = core.seeded(plane.wallet);
+    const seeded = plane.seeded;
     if (seeded === undefined)
       fail(
         'invalid-argument',
@@ -508,11 +585,10 @@ export class RecoveryService {
       );
     const a = await this.o.bridge.ask({ kind: 'recovery-restore' });
     if (a?.kind !== 'recovery-restore') fail('cancelled', 'the restore was not started');
-    const found = new Map<string, walletMod.RecoveryEntropy>();
+    const found: walletMod.RecoveryEntropy[] = [];
     const add = (e: walletMod.RecoveryEntropy): void => {
-      const k = entropyHex(e);
-      if (found.has(k)) e.fill(0);
-      else found.set(k, e);
+      if (found.some((f) => sameEntropy(f, e))) e.fill(0);
+      else found.push(e);
     };
     try {
       if (a.words.length > 0) {
@@ -539,16 +615,18 @@ export class RecoveryService {
           localUnreadable++;
         }
       }
+      // ADR 0016 D2: the relay copies are read HERE only — an explicit restore — never at startup.
       let relayUnreadable = 0;
       try {
         const r = await readRelayCopies({ signer, pubkey, relays: this.o.relays });
         relayUnreadable = r.unreadable;
         for (const c of r.copies) add(entropyFromHex(c.entropy));
       } catch (e) {
-        this.log.warn('the relay copies could not be read', { reason: prefix(e) });
+        this.log.warn('the relay copies could not be read', { reason: reasonOf(e) });
       }
-      const mints = uniqueMints(plane.mints);
-      const phrases = found.size;
+      const listed = await plane.wallet.mints().catch((): readonly MintUrl[] => []);
+      const mints = uniqueMints([...plane.mints, ...listed]);
+      const phrases = found.length;
       this.log.info('restoring from recovery phrases', {
         phrases,
         mints: mints.length,
@@ -557,14 +635,16 @@ export class RecoveryService {
       });
       const rows = new Map<MintUrl, { outcome: RestoreOutcomeWire; restoredSats: number }>();
       for (const m of mints) rows.set(m, { outcome: 'nothing', restoredSats: 0 });
-      let i = 0;
-      for (const entropy of found.values()) {
-        i++;
-        const phrase = i;
-        const seed = await core.phrases.toSeed(entropy);
-        entropy.fill(0);
+      for (let i = 0; i < found.length; i++) {
+        const entropy = found[i];
+        if (entropy === undefined) continue;
+        const phrase = i + 1;
+        let seed: walletMod.RecoverySeed | undefined;
         try {
+          seed = await core.phrases.toSeed(entropy);
+          entropy.fill(0);
           const reports = await seeded.restoreFromSeed(seed, mints, (p) => {
+            if (!rows.has(p.mint)) return;
             this.emit({
               phrase,
               phrases,
@@ -576,15 +656,17 @@ export class RecoveryService {
           for (const r of reports) {
             const row = rows.get(r.mint);
             if (row === undefined) continue;
-            row.restoredSats += r.restoredSats;
+            if (Number.isSafeInteger(r.restoredSats) && r.restoredSats > 0)
+              row.restoredSats += r.restoredSats;
             if (RANK[r.outcome] > RANK[row.outcome]) row.outcome = r.outcome;
           }
         } catch (e) {
-          this.log.warn('a restore pass failed', { reason: prefix(e) });
+          this.log.warn('a restore pass failed', { phrase, reason: reasonOf(e) });
           for (const row of rows.values())
             if (RANK[row.outcome] < RANK.unreachable) row.outcome = 'unreachable';
         } finally {
-          seed.wipe();
+          entropy.fill(0);
+          seed?.wipe();
         }
       }
       const reports = [...rows].map(([mint, r]) => ({
@@ -598,7 +680,7 @@ export class RecoveryService {
       });
       return { phrases, reports };
     } finally {
-      for (const e of found.values()) e.fill(0);
+      for (const e of found) e.fill(0);
     }
   }
 
@@ -637,12 +719,13 @@ export class RecoveryService {
         try {
           ok = await this.o.checkPassphrase(a.value, pubkey);
         } catch {
-          ok = false;
+          // A check that failed is a wrong passphrase.
         } finally {
           signerMod.wipe(a.value);
         }
         if (ok) return;
       }
+      this.log.warn('re-authentication for the recovery phrase failed (wrong passphrase)');
       fail('forbidden', 'wrong passphrase');
     }
     if (!(await this.confirm({ kind: 'recovery-reveal' })))
@@ -658,7 +741,11 @@ export class RecoveryService {
     }
     const positions = pool.slice(0, RECOVERY_CONFIRM_WORDS).sort((a, b) => a - b);
     for (let attempt = 1; attempt <= CONFIRM_ATTEMPTS; attempt++) {
-      const a = await this.o.bridge.ask({ kind: 'recovery-confirm', positions, retry: attempt > 1 });
+      const a = await this.o.bridge.ask({
+        kind: 'recovery-confirm',
+        positions,
+        retry: attempt > 1,
+      });
       if (a?.kind !== 'recovery-confirm') return false;
       const ok =
         a.words.length === positions.length && positions.every((p, k) => a.words[k] === words[p]);
@@ -691,6 +778,21 @@ export class RecoveryService {
     }
   }
 
+  /**
+   * Our own coded refusals (`IpcError`s with fixed sentences) pass; anything else — a library's
+   * or core's message, which this code does not control — becomes `internal`, its allow-listed
+   * reason logged.
+   */
+  private async guarded<T>(f: () => Promise<T>): Promise<T> {
+    try {
+      return await f();
+    } catch (e) {
+      if (e instanceof IpcError) throw e;
+      this.log.warn('a recovery phrase step failed', { reason: reasonOf(e) });
+      throw hostError('internal', 'the recovery phrase step did not finish (see the log)');
+    }
+  }
+
   /** A renderer-started flow: refused while cooling down; a dismissed prompt counts. */
   private async throttled<T>(f: () => Promise<T>): Promise<T> {
     if (this.clock() < this.coolUntil)
@@ -712,7 +814,7 @@ export class RecoveryService {
   }
 
   private async exclusive<T>(f: () => Promise<T>): Promise<T> {
-    if (this.busy) throw hostError('rate-limited', 'a recovery phrase window is already open');
+    if (this.busy) fail('rate-limited', 'a recovery phrase window is already open');
     this.busy = true;
     try {
       return await f();

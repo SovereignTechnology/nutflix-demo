@@ -6,9 +6,10 @@
  *                              (the relay copy's plaintext, `RecoveryRelayCopy`) — useless without
  *                              the nsec. The envelope's other fields hold no secret: the random
  *                              device id (public anyway, as the relay copy's `d`), when it was
- *                              made, and whether the backup was confirmed, the old balance
- *                              reissued and the relay copy published — so the status needs no
- *                              signer round trip.
+ *                              made, whether the backup was confirmed, the old balance
+ *                              reissued and the relay copy published, and which replaced
+ *                              phrase's relay copy is still to be retired — so the status needs
+ *                              no signer round trip.
  *   recovery-<pubkey>.<device>.retired
  *                              a phrase this device replaced (rotation): kept, never derived from
  *                              again, read only by a restore ("phrases from this device").
@@ -65,11 +66,21 @@ function checkPubkey(pubkey: string): void {
 /** The phrase file's envelope (see the module comment); `sealed` is the only secret-bearing field. */
 export interface RecoveryEnvelope {
   readonly v: 1;
+  /** A random id per phrase (the relay copy's `d` suffix). */
   readonly device: string;
   readonly created: number;
+  /** The user typed back three words (`recovery-confirm`). */
   readonly confirmed: boolean;
+  /** The balance held before this phrase was reissued under it (ADR 0016 D5). */
   readonly reissued: boolean;
+  /** The encrypted copy reached at least one write relay (ADR 0016 D2). */
   readonly relayCopy: boolean;
+  /**
+   * The device id of the phrase this one replaced, while that phrase's relay copy is still to be
+   * retired (once this phrase's reissue completed); `null` otherwise.
+   */
+  readonly replaces: string | null;
+  /** NIP-44 to self of the `RecoveryRelayCopy` JSON: the only secret-bearing field. */
   readonly sealed: string;
 }
 
@@ -94,15 +105,17 @@ export function parseEnvelope(raw: unknown): RecoveryEnvelope | null {
   if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return null;
   const o = raw as Record<string, unknown>;
   const keys = Object.keys(o).sort().join(',');
-  if (keys !== 'confirmed,created,device,reissued,relayCopy,sealed,v') return null;
+  if (keys !== 'confirmed,created,device,reissued,relayCopy,replaces,sealed,v') return null;
   if (o['v'] !== 1) return null;
-  const { device, created, confirmed, reissued, relayCopy, sealed } = o;
+  const { device, created, confirmed, reissued, relayCopy, replaces, sealed } = o;
   if (typeof device !== 'string' || !DEVICE_ID.test(device)) return null;
   if (typeof created !== 'number' || !Number.isSafeInteger(created) || created < 0) return null;
   if (typeof confirmed !== 'boolean' || typeof reissued !== 'boolean') return null;
   if (typeof relayCopy !== 'boolean') return null;
+  if (replaces !== null && (typeof replaces !== 'string' || !DEVICE_ID.test(replaces))) return null;
+  if (replaces === device) return null;
   if (typeof sealed !== 'string' || !SEALED.test(sealed)) return null;
-  return { v: 1, device, created, confirmed, reissued, relayCopy, sealed };
+  return { v: 1, device, created, confirmed, reissued, relayCopy, replaces, sealed };
 }
 
 async function readJson(
@@ -135,7 +148,8 @@ export async function readEnvelope(path: string): Promise<RecoveryEnvelope | nul
   );
   if (raw === undefined) return null;
   const env = parseEnvelope(raw);
-  if (env === null) refuse('recovery-unreadable', 'the recovery phrase file is damaged; it is kept');
+  if (env === null)
+    refuse('recovery-unreadable', 'the recovery phrase file is damaged; it is kept');
   return env;
 }
 
@@ -229,11 +243,36 @@ export async function retireCounters(
   const path = countersPath(dir, pubkey);
   await settled(path);
   try {
-    await rename(path, join(dir, `counters-${pubkey}.${tag}.retired`));
+    await rename(path, retiredCountersPath(dir, pubkey, tag));
   } catch (e) {
     if ((e as { code?: unknown }).code === 'ENOENT') return false;
     throw e;
   }
+  await syncDir(dir);
+  return true;
+}
+
+/**
+ * Undo `retireCounters(dir, pubkey, tag)` when the new phrase could not be saved after all: the
+ * old phrase stays current, so its counters must come back (a missing file would make core
+ * probe, a reused counter repeat a secret). Only while no plane is open.
+ */
+export async function unretireCounters(
+  dir: string,
+  pubkey: NostrPubkey,
+  tag: string,
+): Promise<void> {
+  if (!/^[0-9a-f]{32}$/.test(tag)) throw new Error('invalid-argument: not a tag');
+  await rename(retiredCountersPath(dir, pubkey, tag), countersPath(dir, pubkey));
+  await syncDir(dir);
+}
+
+function retiredCountersPath(dir: string, pubkey: NostrPubkey, tag: string): string {
+  checkPubkey(pubkey);
+  return join(dir, `counters-${pubkey}.${tag}.retired`);
+}
+
+async function syncDir(dir: string): Promise<void> {
   try {
     const dh = await open(dir, 'r');
     try {
@@ -244,7 +283,6 @@ export async function retireCounters(
   } catch {
     // Directory fsync is not supported everywhere (Windows); the rename already landed.
   }
-  return true;
 }
 
 /**

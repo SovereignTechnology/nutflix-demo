@@ -54,7 +54,8 @@ export interface PromptWindowLike {
   /**
    * ADR 0016: keep the window out of screenshots and screen sharing
    * (`BrowserWindow.setContentProtection`; macOS and Windows — Linux has none, and the page says
-   * so). Set before the page can fetch a question that carries words.
+   * so). Set before the page can fetch a question that carries words; a window without it is
+   * never given one (fail closed).
    */
   setContentProtection?(on: boolean): void;
   /** Called once when the window is gone (closed by the user or by `close()`). */
@@ -110,8 +111,7 @@ function wipe(a: PromptAnswer | null): void {
 function indices(x: unknown, lengths: readonly number[]): number[] | undefined {
   if (!Array.isArray(x) || !lengths.includes(x.length)) return undefined;
   const out: number[] = [];
-  for (let i = 0; i < x.length; i++) {
-    const w: unknown = x[i];
+  for (const w of x as unknown[]) {
     if (!isWordIndex(w)) return undefined;
     out.push(w);
   }
@@ -375,7 +375,8 @@ export class PromptService {
     if (showsWords(next.form)) {
       try {
         // Before the page can fetch the question: its words never render unprotected.
-        win.setContentProtection?.(true);
+        if (win.setContentProtection === undefined) throw new Error('no content protection');
+        win.setContentProtection(true);
       } catch {
         // Fail closed: no protection, no words.
         this.d.log?.('warn', 'prompt.protection-failed');

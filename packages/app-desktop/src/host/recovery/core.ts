@@ -1,8 +1,8 @@
 /**
  * ADR 0016 (issue #3): what the desktop needs from core's NUT-13 code (lane N1) — the phrase
- * operations, seeded mint connections and a wallet's seeded view — typed by the frozen seam
- * (`@sovit/core` `wallet/recovery-api.ts`) and taken BY INJECTION, so the desktop side builds and
- * is tested without N1's implementation.
+ * operations, the option that seeds mint connections, and a wallet's seeded view — typed by the
+ * frozen seam (`@sovit/core` `wallet/recovery-api.ts`) and taken BY INJECTION, so the desktop
+ * side builds and is tested without N1's implementation.
  *
  * ┌────────────────────────────────────────────────────────────────────────────────────────┐
  * │ WIRING POINT — `recoveryCore()` below is the ONE place the orchestrator fills when lane │
@@ -11,11 +11,17 @@
  * │ With N1 (names as the seam's docs give them; adjust to N1's exports):                   │
  * │                                                                                         │
  * │   return {                                                                              │
- * │     phrases: new walletMod.RecoveryPhrases(),          // core wallet/seed.ts (locked)   │
- * │     connections: ({ request, seed }) =>                                                 │
- * │       new walletMod.CashuMintConnections({ request, seed }),                            │
- * │     seeded: (w) => w.seeded,                           // CashuWallet.seeded            │
+ * │     phrases: new walletMod.RecoveryPhrases(),     // core wallet/seed.ts (locked)       │
+ * │     seedOption: (seed) => ({ seed }),             // the connections' constructor key   │
+ * │     seeded: (w) => w.seeded,                      // CashuWallet.seeded                 │
  * │   };                                                                                    │
+ * │                                                                                         │
+ * │ and give `seedOption` N1's real option type (`Pick<…options, 'seed'>`) so tsc checks    │
+ * │ the key. The money plane keeps its ONE connections constructor (money.ts, pinned by     │
+ * │ mint-transport.test.ts) and spreads this option into it; it hands `CashuWallet` that    │
+ * │ connections instance itself, so a `seeded` read through the wallet's connections works. │
+ * │ A seed the wallet did not take is caught at open (`MoneyPlane`: logged, the seed wiped, │
+ * │ status `unreadable`) — never a silent "covered".                                        │
  * └────────────────────────────────────────────────────────────────────────────────────────┘
  *
  * Tests inject fakes through `HostOptions.recoveryCore` (`__tests__/support/fake-recovery.ts`).
@@ -23,19 +29,15 @@
 import type { MintUrl } from '@sovit/core';
 import type { wallet as walletMod } from '@sovit/core';
 
-/** One mint's request function, as `CashuMintConnections` takes it. */
-export type MintRequest = NonNullable<
-  NonNullable<ConstructorParameters<typeof walletMod.CashuMintConnections>[0]>['request']
->;
-
 export interface RecoveryCore {
   /** Generate, index, decode and seed phrases (core `wallet/seed.ts`, a locked file). */
   readonly phrases: walletMod.RecoveryPhrases;
-  /** Mint connections whose wallets derive from `seed` and draw counters from `seed.counters`. */
-  connections(o: {
-    readonly request: MintRequest;
-    readonly seed: walletMod.SeedMaterial;
-  }): walletMod.CashuMintConnections;
+  /**
+   * The mint connections' constructor option that carries `seed` (the seam: the connections
+   * take `{ request, seed }`). Spread into the money plane's one constructor call; every wallet
+   * over those connections then derives from the seed and draws counters from `seed.counters`.
+   */
+  seedOption(seed: walletMod.SeedMaterial): object;
   /** A wallet's seeded view (`CashuWallet.seeded`); `undefined` over unseeded connections. */
   seeded(wallet: walletMod.CashuWallet): walletMod.SeededWallet | undefined;
 }
@@ -71,6 +73,14 @@ export function entropyHex(entropy: Uint8Array): string {
   let s = '';
   for (const b of entropy) s += b.toString(16).padStart(2, '0');
   return s;
+}
+
+/** Same bytes? (Dedupes phrases without turning either into a string.) */
+export function sameEntropy(a: Uint8Array, b: Uint8Array): boolean {
+  if (a.byteLength !== b.byteLength) return false;
+  let diff = 0;
+  for (let i = 0; i < a.byteLength; i++) diff |= (a[i] ?? 0) ^ (b[i] ?? 0);
+  return diff === 0;
 }
 
 /** Mints a restore scans, in order, without duplicates. */

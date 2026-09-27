@@ -233,7 +233,14 @@ export class MoneyPlane {
     this.closeJournal = () => {
       parts.journal?.close();
     };
-    this.seeded = o.seed?.core.seeded(parts.wallet);
+    // ADR 0016: a seed the wallet did not take (core's option not recognised) is never a silent
+    // "covered": logged, wiped at once, and the recovery status reads `unreadable`.
+    const seeded = o.seed?.core.seeded(parts.wallet);
+    if (o.seed !== undefined && seeded === undefined) {
+      o.log.error('the wallet did not take the recovery phrase: new ecash is not covered');
+      o.seed.material.seed.wipe();
+    }
+    this.seeded = seeded;
     this.closeSeed = () => {
       o.seed?.material.seed.wipe();
     };
@@ -288,26 +295,25 @@ export class MoneyPlane {
       // default, and not for a mint an injected (test) transport leaves out.
       const single = hostMintRequest();
       const gate = new PayMeltGate(o.clock === undefined ? {} : { clock: o.clock });
-      const request = (mint: MintUrl): ReturnType<NonNullable<RequestFn>> =>
-        o.mintRequest?.(mint) ?? single;
-      // ADR 0016: with this device's phrase, every output derives from it (core's connections).
-      const conns =
-        o.seed === undefined
-          ? new walletMod.CashuMintConnections({ request })
-          : o.seed.core.connections({ request, seed: o.seed.material });
+      const conns = new walletMod.CashuMintConnections({
+        request: (mint) => o.mintRequest?.(mint) ?? single,
+        // ADR 0016: with this device's phrase, every output derives from it and draws NUT-13
+        // counters from the counters file (core's option, recovery/core.ts WIRING POINT).
+        ...(o.seed === undefined ? {} : o.seed.core.seedOption(o.seed.material)),
+      });
       // Which mints have loaded (cached by `conns` from then on): a PAY's belt counts no load
-      // round trip for them.
+      // round trip for them. Recorded by wrapping `conns.wallet` on this instance, so the wallet
+      // is handed the connections object itself (ADR 0016: a seeded wallet finds its seed there).
       const loaded = new Set<MintUrl>();
-      const mints: walletMod.MintConnections = {
-        wallet: (mint) =>
-          conns.wallet(mint).then((w) => {
-            loaded.add(mint);
-            return w;
-          }),
-      };
+      const load = conns.wallet.bind(conns);
+      conns.wallet = (mint) =>
+        load(mint).then((w) => {
+          loaded.add(mint);
+          return w;
+        });
       const wallet = new GatedCashuWallet(
         {
-          mints,
+          mints: conns,
           store,
           key: nip60.key,
           configuredMints: [...new Set([...nip60.mints, ...o.defaultMints()])],
