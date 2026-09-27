@@ -504,3 +504,29 @@ what the real-mint lane measured (details: `docs/lanes/N1-nut13-core.md`,
   turned into a seed.
 - **Related findings.** 2: the payout comment now names the real gap. 4: NUT-07, NUT-09, NUT-13 and
   its test vectors vendored from `cashubtc/nuts@8bde3c0` (fetched 2026-09-26).
+
+## Implementation notes (lane W8a-money, final cross-lane review, 2026-09-27)
+
+The decisions stand. What the desktop now does (details: `docs/lanes/W8a-money.md`,
+`docs/reviews/2026-09-27-pre-push-w8a-money.md`):
+
+- **§3, startup restore wired.** After the journal's startup settle, a seeded money plane calls
+  `CashuWallet.restoreUnpublished()` (contract request N1-4), each mint inside the PAY/melt gate.
+- **§2, closing.** The plane runs `CashuWallet.close()`; the swap waits for its drain (bounded,
+  2 s) and a watermark write after that is skipped (`close({ flush })`), so it never lands after
+  the next plane's counters or a rotation's. The desktop keeps one counters store object per
+  identity.
+- **§3, the counters file** takes core's `published` 0 for a keyset with no `next` (a probe moved
+  its cursor, no lease yet) — refused before, which then refused every later save.
+- **§5 step 3, the batch cap.** The host follows core's `resume`: up to 10 calls per phrase and
+  mint per restore, only while a call moves the scan on; an unfinished scan keeps its cursor in the
+  host and reads "could not be reached" until the Settings screen has a "not finished" outcome
+  (`docs/contract-requests/W8a-money.md`). Cameron's open decision on the bound (N1 item 7) stands:
+  this is option 1 with the host doing the continuing.
+- **D5, a reissue is complete** only when no journal entry and no dust is left outside the phrase
+  at a mint; the replaced phrase's relay copy is retired only then.
+- **D2, the relay copy** is retried with a bounded backoff (30 s doubling to 1 h) until a relay
+  takes it; the envelope's `relayCopy` is the persisted pending flag.
+- **§4, journal ids.** A `begin` whose id is still journaled (a counter handed out twice) is
+  refused before anything changes, never a silent replace.
+- **§5, a typed all-zero phrase** ("abandon … about") is refused by name at restore.
