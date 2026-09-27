@@ -1598,6 +1598,27 @@ describe('UpstreamPayer — owed blocks from before (ADR 0018 amendment)', () =>
     expect(r.payer.stats()).toMatchObject({ owedAccepted: 3, owedPaid: 3 });
   });
 
+  it('a core that turns free after its owed blocks were taken: they are not paid (rule 3: free never covers blocks counted before)', async () => {
+    const r = owedRig();
+    r.protocol.remoteHello(hello());
+    r.protocol.remotePrice(priced);
+    // The PAY of block 1 waits for its ACK (one per core in flight), so 7 is still pending when
+    // the core turns free.
+    const unacked = new FakePayProtocol({ autoAck: false });
+    r.payer.attachPeer('cd'.repeat(32), unacked);
+    unacked.remoteHello(hello());
+    unacked.remotePrice(priced);
+    r.payer.onDownload(CORE_A, 1, 'cd'.repeat(32));
+    await r.payer.flush('cd'.repeat(32));
+    expect(r.payer.addOwed('cd'.repeat(32), CORE_A, [7])).toBe(1);
+    unacked.remotePrice({ ...priced, satsPerBlock: 0 as Sats, free: true });
+    unacked.remoteAck({ type: 'ACK', core: CORE_A, fromBlock: 1, toBlock: 1, ok: true });
+    await r.payer.flush('cd'.repeat(32));
+    expect(unacked.sentPays.map((p) => p.range.fromBlock)).toEqual([1]);
+    expect(r.owedCalls).toEqual([]);
+    expect(r.given).toEqual([[7, 7]]);
+  });
+
   it('not payable at the terms recorded (or asked above them): given up — respected, never paid', async () => {
     const none = owedRig({ recorded: null });
     none.protocol.remoteHello(hello());

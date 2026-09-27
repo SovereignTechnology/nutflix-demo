@@ -607,7 +607,12 @@ describe("SeederCredit — the seeder's report (ADR 0018 amendment)", () => {
     const b = r.link(B);
     b.proto.remoteHello(helloFrom(pubkey('b'), { windowBlocks: 8 }));
     b.proto.remoteOwed({ type: 'OWED', core: CORE, ranges: [[3, 1]] });
-    expect(r.credit.reportOf(B)).toMatchObject({ truncated: true });
+    expect(r.credit.reportOf(B)).toMatchObject({ truncated: true, claimed: 0 });
+    expect(r.credit.budget(B, CORE)).toBe(0);
+    // Its report complete (a block asked after open), it still asks nothing: the claim it could
+    // not make is taken as its whole window, not as nothing (mutation M13).
+    r.download(3, B);
+    expect(r.credit.reportOf(B)).toMatchObject({ done: true, truncated: true });
     expect(r.credit.budget(B, CORE)).toBe(0);
   });
 
@@ -813,6 +818,40 @@ describe('CreditSettler — what settled without a payment (issue #8)', () => {
     expect(r.settler.owedOn(CORE, { fromBlock: 4, toBlock: 9 })).toBe(2);
     b.proto.remoteClose('remote'); // a link gone: nothing it was owed counts any more
     expect(r.settler.owedOn(CORE, { fromBlock: 4, toBlock: 9 })).toBe(1);
+  });
+});
+
+// Lane P2-owed-viewer (ADR 0015 amendment): a block from a seeder that serves its core free is owed
+// nothing — the settler settles it on arrival; a predicate that throws owes it (the safe side).
+describe('CreditSettler — servesFree (ADR 0015 amendment)', () => {
+  it('a block from a free-serving seeder settles on arrival, owed nothing; others are owed; a throwing predicate owes', () => {
+    let free = (n: string): boolean => n === A;
+    const pool = new CreditPool(8);
+    const settler = new CreditSettler({
+      credit: pool,
+      logger: silentLogger,
+      payable: () => true,
+      servesFree: (n) => free(n),
+    });
+    const core = fakeCore(CORE);
+    settler.attachCore(core);
+    settler.attachPeer(A, new FakePayProtocol());
+    settler.attachPeer(B, new FakePayProtocol());
+    const got = (i: number, from: string): void => {
+      pool.tryAcquire(CORE, i);
+      core.emit('download', i, 1024, { remotePublicKey: hexBytes(from) });
+    };
+    got(0, A);
+    expect(settler.owedBy(A)).toBe(0);
+    expect(pool.holds(CORE, 0)).toBe(false);
+    got(1, B);
+    expect(settler.owedBy(B)).toBe(1);
+    free = () => {
+      throw new Error('credit gone');
+    };
+    got(2, A);
+    expect(settler.owedBy(A)).toBe(1);
+    expect(pool.holds(CORE, 2)).toBe(true);
   });
 });
 

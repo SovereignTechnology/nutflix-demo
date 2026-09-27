@@ -20,6 +20,11 @@
  *      respected — the viewer never asks beyond window minus the claim;
  *   D. an expired tail authorisation: the host refuses it, nothing is paid, the seeder's count is
  *      respected, no ban.
+ *
+ * TestMint only: the worker's IPC guard admits only `https` mint URLs (by design), and the local
+ * real mints (`scripts/real-mint/`) are plain `http`. The owed PAY at a real mint is exercised by
+ * the seeder lane (`seeder/src/__tests__/owed.integration.test.ts`) and the gateway's real-mint
+ * swarm lane, with `NUTFLIX_REAL_MINT_URL` set.
  */
 import { randomBytes } from 'node:crypto';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
@@ -76,6 +81,7 @@ async function until(cond: () => boolean, ms: number, what: string): Promise<voi
   }
 }
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+const never = (): Promise<never> => new Promise<never>(() => undefined);
 
 const BLOCK = 65_536;
 const MINT = 'https://mint.owed-it.test' as MintUrl;
@@ -339,6 +345,27 @@ describe('the unpaid tail: the seeder reports, the viewer pays what its record h
   const readBlock = (link: string, i: number) =>
     httpGet(link, { Range: `bytes=${String(i * BLOCK)}-${String(i * BLOCK + 99)}` });
 
+  /**
+   * The whole blob over the playback link — failing at once, and saying so, if the daemon bans the
+   * viewer meanwhile (an overrun cuts the stream, which would otherwise just stall).
+   */
+  async function streamUnbanned(v: Viewer, link: string) {
+    const flag = { stop: false };
+    const banned = (async () => {
+      while (!flag.stop) {
+        if (counted(v).banned || upRt.engine.isBanned(v.plane.pubkey))
+          throw new Error('the seeder banned the viewer (an overrun of its window)');
+        await sleep(20);
+      }
+    })();
+    try {
+      return await Promise.race([httpGet(link), banned.then(() => never())]);
+    } finally {
+      flag.stop = true;
+      await banned.catch(() => undefined);
+    }
+  }
+
   const counted = (v: Viewer) =>
     upRt.engine.window(v.plane.pubkey) ?? { uploaded: 0, paid: 0, outstanding: 0, banned: false };
 
@@ -389,7 +416,7 @@ describe('the unpaid tail: the seeder reports, the viewer pays what its record h
     w = await startFor(v);
     const before = await v.plane.wallet.balance(MINT);
     const next = await open(v, w, videos[1]!, false);
-    const got = await httpGet(next.link);
+    const got = await streamUnbanned(v, next.link);
     expect(got.status).toBe(200);
     expect(Buffer.compare(Buffer.from(got.body), Buffer.from(videos[1]!.data))).toBe(0);
     await until(() => counted(v).outstanding === 0, 20_000, 'every block paid');
@@ -434,7 +461,7 @@ describe('the unpaid tail: the seeder reports, the viewer pays what its record h
     v.refuse = false;
     w = await startFor(v);
     const next = await open(v, w, videos[3]!, false);
-    const got = await httpGet(next.link);
+    const got = await streamUnbanned(v, next.link);
     expect(got.status).toBe(200);
     expect(Buffer.compare(Buffer.from(got.body), Buffer.from(videos[3]!.data))).toBe(0);
     await until(
@@ -471,7 +498,7 @@ describe('the unpaid tail: the seeder reports, the viewer pays what its record h
       }, 1);
       try {
         const next = await open(v, w, videos[5]!, false);
-        const got = await httpGet(next.link);
+        const got = await streamUnbanned(v, next.link);
         expect(got.status).toBe(200);
         expect(Buffer.compare(Buffer.from(got.body), Buffer.from(videos[5]!.data))).toBe(0);
         await until(() => counted(v).outstanding === 0, 20_000, 'every real block paid');
@@ -507,7 +534,7 @@ describe('the unpaid tail: the seeder reports, the viewer pays what its record h
     w = await startFor(v);
     const before = await v.plane.wallet.balance(MINT);
     const next = await open(v, w, videos[7]!, false);
-    const got = await httpGet(next.link);
+    const got = await streamUnbanned(v, next.link);
     expect(got.status).toBe(200);
     expect(Buffer.compare(Buffer.from(got.body), Buffer.from(videos[7]!.data))).toBe(0);
     await until(
