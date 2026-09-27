@@ -53,7 +53,9 @@
  *     injectable clock (`clock`; default `monotonicClock()`), never `Date.now()`: a wall-clock
  *     step (NTP, a resume from suspend) must neither write a transient failure off early nor hold
  *     a retry back. A retry timer that fires makes the backoffs due by then retryable whatever
- *     the clock reads, so a clock that stands still cannot stall a retry either.
+ *     the clock reads, so a clock that stands still cannot stall a retry either. A reading that
+ *     goes back, is not a finite number or throws counts as the latest good one: the clock stands
+ *     still (nothing is given up, and the retry timers still bring every retry).
  *
  * Only peers that sent a verified `HELLO` (protocol `open`) are paid; blocks downloaded before
  * it are counted and become payable the moment it arrives. Every `BlockRange` carries `core`
@@ -152,11 +154,13 @@ export interface ClockSources {
  * A monotonic clock in ms for the payer's streaks, backoffs and give-up: `performance.now()` where
  * the runtime has it (Node: the gateway, the host, tests). Bare (the desktop worker) has no
  * `performance`: there it is `Date.now()` made steady — never backwards, and a step forward
- * counts at most `MAX_CLOCK_STEP_MS` per read (during a streak the payer reads it at least every
- * `PAY_RETRY_MAX_MS`, so it keeps time there; between streaks it may fall behind, which nothing
- * measures). A retry timer that fires makes a backoff due whatever this reads.
+ * counts at most `MAX_CLOCK_STEP_MS` per read. During a transient streak — the only thing whose
+ * age matters (the give-up) — the payer reads it at least every `PAY_RETRY_MAX_MS`, so it keeps
+ * time there; elsewhere (a deferred streak, spaced up to `PAY_RETRY_LATER_MAX_MS`; between
+ * streaks) it may fall behind, which only delays a give-up. A retry timer that fires makes a
+ * backoff due whatever this reads.
  */
-export function monotonicClock(src: ClockSources = globalThis as ClockSources): () => number {
+export function monotonicClock(src: ClockSources = globalThis): () => number {
   const perf = src.performance;
   if (perf !== undefined && typeof perf.now === 'function') {
     const now = perf.now as () => number;
@@ -231,7 +235,8 @@ export interface UpstreamPayerOptions {
   readonly boundRange?: (range: BlockRange) => BlockRange;
   /**
    * Lane R6-reconcile: a monotonic clock in ms for failure streaks, backoffs and the give-up
-   * (default `monotonicClock()`). Never the wall clock: see the module comment.
+   * (default `monotonicClock()`). Never the wall clock: see the module comment. A reading that
+   * goes back, is not a finite number or throws is not taken (the latest good one stands).
    */
   readonly clock?: () => number;
 }
@@ -346,6 +351,8 @@ export class UpstreamPayer {
   private readonly onUnpayable: UpstreamPayerOptions['onUnpayable'];
   private readonly boundRange: UpstreamPayerOptions['boundRange'];
   private readonly clock: () => number;
+  /** The latest good reading of `clock` (see `now`). */
+  private lastClock = Number.NEGATIVE_INFINITY;
   /** `dispose()` ran: no timer is armed and no PAY is built any more. */
   private disposed = false;
   /** Ranges being paid now however short their runs (`hurry`: a closing session's tail). */
@@ -401,6 +408,23 @@ export class UpstreamPayer {
   /** Read through a method so TS's narrowing of the field does not survive the `await`s. */
   private isDisposed(): boolean {
     return this.disposed;
+  }
+
+  /**
+   * The payer's time: `clock`, never read backwards. A reading that is not a finite number, one
+   * that goes back, or a clock that throws gives the latest good reading (0 before any) — a bad
+   * injected clock stands still, which gives nothing up (a streak never ages) and cannot loop (a
+   * backoff it cannot end is ended by its retry timer).
+   */
+  private now(): number {
+    let t: number;
+    try {
+      t = this.clock();
+    } catch {
+      t = Number.NaN;
+    }
+    if (Number.isFinite(t) && t > this.lastClock) this.lastClock = t;
+    return Number.isFinite(this.lastClock) ? this.lastClock : 0;
   }
 
   /**
@@ -598,10 +622,11 @@ export class UpstreamPayer {
         // by `at` is over, whatever the clock reads now — a clock that stands still (the steady
         // fallback after a step back) cannot hold a retry back (lane R6-reconcile).
         for (const [core, f] of state.failures)
-          if (f.retryAt <= at) state.failures.set(core, { ...f, retryAt: Number.NEGATIVE_INFINITY });
+          if (f.retryAt <= at)
+            state.failures.set(core, { ...f, retryAt: Number.NEGATIVE_INFINITY });
         this.schedule(state, state.draining || state.due);
       },
-      Math.max(1, at - this.clock()),
+      Math.max(1, at - this.now()),
     );
     (handle as { unref?: () => void }).unref?.();
     state.retryTimer = { at, handle };
@@ -665,7 +690,7 @@ export class UpstreamPayer {
         // A core whose last PAY failed waits out its backoff (fix round 5: bounded in time, not in
         // passes); once it is over, its run is due however short — it was due when it failed.
         const failed = state.failures.get(core);
-        if (failed !== undefined && this.clock() < failed.retryAt) {
+        if (failed !== undefined && this.now() < failed.retryAt) {
           this.armRetry(state, failed.retryAt);
           break;
         }
@@ -761,7 +786,7 @@ export class UpstreamPayer {
       // instead of inheriting an old streak and being written off at once.
       state.failures.delete(core);
     } else {
-      const now = this.clock();
+      const now = this.now();
       const prev = state.failures.get(core);
       const same = prev?.kind === kind ? prev : undefined;
       const n = (same?.n ?? 0) + 1;

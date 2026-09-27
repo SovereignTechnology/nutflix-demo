@@ -1204,6 +1204,47 @@ describe('UpstreamPayer — deferred refusals, streaks and the clock (lane R6-re
     }
   });
 
+  it.each([
+    ['not a number', (): number => Number.NaN],
+    [
+      'throws',
+      (): number => {
+        throw new Error('no clock');
+      },
+    ],
+    [
+      'runs backwards',
+      (
+        (t) => (): number =>
+          (t -= 1_000)
+      )(1e9),
+    ],
+  ] as const)(
+    'a clock that %s stands still: retries come on their timers (never a loop), nothing is given up',
+    async (_what, clock) => {
+      vi.useFakeTimers();
+      try {
+        const r = rig6(() => new Error('backend-down: the host is busy'), { clock });
+        r.payer.onDownload(CORE_A, 0, NOISE);
+        await vi.advanceTimersByTimeAsync(0);
+        expect(r.calls).toHaveLength(1);
+        // No retry inside the first backoff: a clock read as NaN would have armed a 1 ms timer.
+        await vi.advanceTimersByTimeAsync(PAY_RETRY_BASE_MS - 1);
+        expect(r.calls).toHaveLength(1);
+        await vi.advanceTimersByTimeAsync(1);
+        expect(r.calls).toHaveLength(2);
+        // Ten minutes on: spaced by the backoff (at most one try per PAY_RETRY_MAX_MS once it is
+        // at its longest), and never written off — a streak on a clock that stands still never ages.
+        await vi.advanceTimersByTimeAsync(10 * 60_000);
+        expect(r.calls.length).toBeLessThanOrEqual(8 + Math.ceil((10 * 60_000) / PAY_RETRY_MAX_MS));
+        expect(r.calls.length).toBeGreaterThan(MAX_PAY_FAILURES + 10);
+        expect(r.unpayable).toEqual([]);
+      } finally {
+        vi.useRealTimers();
+      }
+    },
+  );
+
   it('dispose(): a PAY that fails after it arms no retry, and nothing more is built', async () => {
     vi.useFakeTimers();
     try {
