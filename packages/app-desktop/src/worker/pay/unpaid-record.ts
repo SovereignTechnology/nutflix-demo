@@ -25,6 +25,11 @@
  * (`StateFs.writeAtomic`: a temp file, fsync, rename): in batches at most every `FLUSH_MS` while
  * anything changed, at once for a write-ahead `full`, and at close. A crash loses at most the
  * last batch of block entries (those blocks are then respected, not paid) — never a `full`.
+ * Lane W8b-p2p (round-8 review): nor a PAY's removal. Blocks a PAY is built for leave the file
+ * BEFORE that PAY is sent (`removeNow`, write-ahead): after a crash the record never offers them
+ * again, so a seeder that reports what it was already paid for (the ACK lost with the crash) is
+ * never paid twice. Only when a removed block is in the file already — blocks received and paid
+ * within one batch never were — so most PAYs cost no write.
  *
  * BOUNDS. Blocks and sessions older than `UNPAID_TTL_MS` (the host's tail authorisations expire
  * with them) are dropped at load; a seeder holds at most `MAX_BLOCKS_PER_SEEDER` blocks and the
@@ -111,6 +116,11 @@ export class UnpaidRecord {
   private readonly before = new Set<string>();
   private reach: (() => readonly SeederReach[]) | null = null;
   private dirty = false;
+  /**
+   * Lane W8b-p2p: blocks (`seeder/core/index`) added since the last write that were not in the
+   * record at it — not in the file, so taking one out needs no write-ahead (`removeNow`).
+   */
+  private readonly unsaved = new Set<string>();
   private timer: ReturnType<typeof setInterval> | null = null;
   private closed = false;
   /** Writes that failed (diagnostics). */
@@ -175,8 +185,11 @@ export class UnpaidRecord {
       e.blocks.set(core, m);
     }
     if (m.get(index) === terms.sid) return;
-    if (!m.has(index) && count(e) >= MAX_BLOCKS_PER_SEEDER) return; // respected, not recorded
+    const fresh = !m.has(index);
+    if (fresh && count(e) >= MAX_BLOCKS_PER_SEEDER) return; // respected, not recorded
     m.set(index, terms.sid);
+    // A new block is in no file yet; one re-recorded under another session may be (kept "saved").
+    if (fresh) this.unsaved.add(blockKey(seeder, core, index));
     if (!this.terms.has(terms.sid)) this.terms.set(terms.sid, { ...terms, at: this.now() });
     e.at = this.now();
     this.dirty = true;
@@ -184,21 +197,45 @@ export class UnpaidRecord {
 
   /** Blocks `from..to` of `core` from `seeder` were paid, or refused for good: forget them. */
   remove(seeder: string, core: string, from: number, to: number): void {
+    this.take(seeder, core, from, to);
+  }
+
+  /**
+   * Lane W8b-p2p (round-8 review): a PAY was built for blocks `from..to` of `core` from `seeder` —
+   * forget them, and when any of them is in the file, write the record NOW, synchronously, before
+   * the PAY is sent (write-ahead: a crash after the send never brings them back to be paid
+   * twice). Returns `false` only when that write failed (logged and counted; the next batch
+   * retries it) — the PAY's proofs are built, so its caller sends it all the same.
+   */
+  removeNow(seeder: string, core: string, from: number, to: number): boolean {
+    if (!this.take(seeder, core, from, to) || this.closed) return true;
+    return this.write();
+  }
+
+  /**
+   * Forget blocks `from..to` of `core` from `seeder`. Returns whether any of them was in the file
+   * (recorded before the last write).
+   */
+  private take(seeder: string, core: string, from: number, to: number): boolean {
     const e = this.seeders.get(seeder);
     const m = e?.blocks.get(core);
-    if (e === undefined || m === undefined) return;
-    if (!Number.isSafeInteger(from) || !Number.isSafeInteger(to) || to < from) return;
-    let changed = false;
+    if (e === undefined || m === undefined) return false;
+    if (!Number.isSafeInteger(from) || !Number.isSafeInteger(to) || to < from) return false;
+    const gone: number[] = [];
     if (to - from < m.size) {
-      for (let i = from; i <= to; i++) if (m.delete(i)) changed = true;
+      for (let i = from; i <= to; i++) if (m.delete(i)) gone.push(i);
     } else
       for (const i of [...m.keys()])
         if (i >= from && i <= to) {
           m.delete(i);
-          changed = true;
+          gone.push(i);
         }
     if (m.size === 0) e.blocks.delete(core);
-    if (changed) this.dirty = true;
+    if (gone.length > 0) this.dirty = true;
+    let saved = false;
+    // A block not added since the last write is in the file.
+    for (const i of gone) if (!this.unsaved.delete(blockKey(seeder, core, i))) saved = true;
+    return saved;
   }
 
   /** The recorded blocks of `core` from `seeder` inside `ranges` (a seeder's `OWED`), ascending. */
@@ -347,6 +384,9 @@ export class UnpaidRecord {
       }
       const gone = oldest ?? oldestFull;
       if (gone === null) return;
+      const e = this.seeders.get(gone);
+      for (const [core, m] of e?.blocks ?? [])
+        for (const i of m.keys()) this.unsaved.delete(blockKey(gone, core, i));
       this.seeders.delete(gone);
       this.dirty = true;
     }
@@ -364,6 +404,7 @@ export class UnpaidRecord {
     try {
       this.o.state.writeAtomic(this.path, text);
       this.dirty = false;
+      this.unsaved.clear(); // every block in memory is in the file now
       return true;
     } catch {
       this.failures++;
@@ -482,6 +523,11 @@ export class UnpaidRecord {
         dropped,
       });
   }
+}
+
+/** A block's key in `unsaved`. */
+function blockKey(seeder: string, core: string, index: number): string {
+  return `${seeder}/${core}/${String(index)}`;
 }
 
 function count(e: SeederEntry): number {

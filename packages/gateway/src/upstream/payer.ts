@@ -73,6 +73,24 @@
  *     connection (contract rule 3; the price it asks may only lower the recorded one). A PAY never
  *     mixes owed blocks with blocks of this connection (another authorisation pays each). What
  *     the seeder reports beyond what is handed over is its claim: never paid here.
+ *
+ * Lane W8b-p2p (round-8 review):
+ *   - **An owed range is never written off for a failure that may pass.** A transient failure of
+ *     an owed PAY (no balance, a mint down, a tail file that could not be written) keeps its
+ *     blocks owed and pending on the connection, retried on its backoff — after `PAY_GIVE_UP_MS`
+ *     on the deferred cadence (up to `PAY_RETRY_LATER_MAX_MS`) — for as long as the connection
+ *     lives; only a final outcome (`session-closed`, `forbidden`) or terms it can never be paid
+ *     at give it up for good. One this connection cannot pay any more (no shared mint, or the
+ *     core no longer priced here) is given up with scope `'connection'`: a later connection may.
+ *   - **Owed and fresh blocks keep separate failure streaks.** A core's owed range failing does
+ *     not hold this connection's blocks of that core back (nor the reverse): a kind waiting out
+ *     its backoff is left out of the pass and the other kind is tried in the same pass.
+ *   - **One bounded answer for `free`.** With `servesFree` (the downloader's `SeederCredit`, whose
+ *     per-connection set is bounded), that is the answer; the payer's own set is bounded the same
+ *     way (`MAX_FREE_CORES_PER_SEEDER`, oldest first), and so is its per-connection price map
+ *     (`MAX_PRICED_CORES_PER_SEEDER`).
+ *   - `holds(peer, core, index)`: whether a block is pending or in flight on a connection, so a
+ *     downloader can keep a second connection of the same seeder from paying it as owed.
  */
 import type {
   BlockRange,
@@ -92,6 +110,7 @@ import { toHex } from '@sovit/seeder';
 
 import type { CreditPool } from './credit.js';
 import type { SeederBatch } from './seeder-credit.js';
+import { MAX_FREE_CORES_PER_SEEDER } from './seeder-credit.js';
 
 /** Policy to pay `core` blocks from this peer under; `null` = do not pay (log + skip). */
 export type UpstreamPolicyResolver = (
@@ -136,6 +155,8 @@ export const PAY_RETRY_MAX_MS = 4000;
  * attempts) before a failing range is given up. Longer than a mint blip or an auto top-up, and
  * longer than the desktop's close drain (5 s), which therefore never writes a transient failure
  * off itself: once the drain is over the session is gone and the next try is refused for good.
+ * Lane W8b-p2p: this connection's blocks only — an owed range (from before) is never given up for
+ * a transient failure; past this long it is asked again on the deferred cadence instead.
  */
 export const PAY_GIVE_UP_MS = 30_000;
 /**
@@ -150,6 +171,13 @@ export const PAY_RETRY_LATER_MAX_MS = 30_000;
  * between two reads: a wall-clock step forward counts at most this much.
  */
 export const MAX_CLOCK_STEP_MS = 2 * PAY_RETRY_MAX_MS;
+/**
+ * Lane W8b-p2p (round-8 review, info): cores whose priced `PRICE` one connection remembers; the
+ * least recently priced go first. A seeder says a price per core we opened with it; one that
+ * names more cores than this on one connection only loses its own oldest terms (its blocks of
+ * such a core are then priced by its HELLO again; owed ones wait for a later connection).
+ */
+export const MAX_PRICED_CORES_PER_SEEDER = 1024;
 
 /** The wait after the `n`th consecutive transient failure (n ≥ 1). */
 function retryDelay(n: number): number {
@@ -260,11 +288,21 @@ export interface UpstreamPayerOptions {
    * so the seeder's credit keeps them for good. Called once per range given up.
    *
    * Lane P2-owed-viewer (independent review): `scope` is `'connection'` for owed blocks (from
-   * before, `addOwed`) that only THIS connection cannot pay — no mint shared with the seeder here
-   * — and that a later connection may pay: the downloader keeps them in its record. Absent, the
-   * range can never be paid.
+   * before, `addOwed`) that only THIS connection cannot pay — no mint shared with the seeder here,
+   * or (lane W8b-p2p) the core no longer priced here — and that a later connection may pay: the
+   * downloader keeps them in its record. Absent, the range can never be paid (a final outcome, or
+   * terms it can never be paid at). An owed range is never given up for a transient failure (lane
+   * W8b-p2p): it stays owed on its connection, retried on its backoff.
    */
   readonly onUnpayable?: (noiseHex: string, range: BlockRange, scope?: 'connection') => void;
+  /**
+   * Lane W8b-p2p (round-8 review, info): whether the seeder `noiseHex` serves `core` outside
+   * payment on its current connection — the downloader's own bounded answer (`SeederCredit`
+   * `servesFree`, which its settler asks too), so the payer never pends what the settler settled
+   * free, nor lets go of what the settler still owes. A throw counts as `false` (owed: the safe
+   * side). Absent (tests), the payer's own bounded set of `PRICE { free: true }` words.
+   */
+  readonly servesFree?: (noiseHex: string, core: CoreKeyHex) => boolean;
   /**
    * Fix round 5: the longest prefix of `range` (same core, same first block) that ONE PAY may
    * cover — the desktop worker ends it where a play session's blob ends, because the host builds a
@@ -316,9 +354,16 @@ interface PeerState {
   readonly noiseHex: string;
   readonly protocol: PayProtocol;
   hello: HelloMessage | null;
-  /** core → the latest priced `PRICE` for it (v5: prices are per core). */
+  /**
+   * core → the latest priced `PRICE` for it (v5: prices are per core); least recently priced
+   * first, at most `MAX_PRICED_CORES_PER_SEEDER`.
+   */
   readonly price: Map<CoreKeyHex, PriceOverride>;
-  /** Cores it serves outside payment on this connection (`PRICE { free: true }`, its last word). */
+  /**
+   * Cores it serves outside payment on this connection (`PRICE { free: true }`, its last word);
+   * least recently said first, at most `MAX_FREE_CORES_PER_SEEDER` (the `servesFree` option, when
+   * given, is the answer instead).
+   */
   readonly free: Set<CoreKeyHex>;
   /** core → pending blocks it reported as owed from before (`addOwed`): paid at once, apart. */
   readonly owed: Map<CoreKeyHex, Set<number>>;
@@ -333,9 +378,16 @@ interface PeerState {
   /**
    * core → its streak of failures to build a PAY (fix round 5; its kind: lane R6-reconcile): how
    * many, since when, and when it may be tried again. Cleared by the core's next PAY that is
-   * built, and when one of its ranges is given up for good (`session-closed`, `forbidden`).
+   * built, and when one of its ranges is given up for good (`session-closed`, `forbidden`). Lane
+   * W8b-p2p: this connection's blocks only — owed blocks keep their own (`owedFailures`).
    */
   readonly failures: Map<CoreKeyHex, FailureStreak>;
+  /**
+   * Lane W8b-p2p: core → the failure streak of its OWED blocks (from before), apart from this
+   * connection's: cleared by the core's next owed PAY that is built, or an owed range given up
+   * for good. Never gives a range up for a transient failure (see the module comment).
+   */
+  readonly owedFailures: Map<CoreKeyHex, FailureStreak>;
   /** Wakes the peer when a failed core may be tried again (fix round 5). */
   retryTimer: { readonly at: number; readonly handle: ReturnType<typeof setTimeout> } | null;
   /** `flush()` is draining: runs unlocked by an ACK are paid however short. */
@@ -393,6 +445,17 @@ function contiguousRuns(sorted: readonly number[]): [number, number][] {
   return runs;
 }
 
+/** Add `core` to a per-connection set as its most recent entry, dropping the oldest past `max`. */
+function remember(set: Set<CoreKeyHex>, core: CoreKeyHex, max: number): void {
+  set.delete(core);
+  set.add(core);
+  while (set.size > max) {
+    const oldest = set.values().next();
+    if (oldest.done === true) break;
+    set.delete(oldest.value);
+  }
+}
+
 /** Some block of `from..to` is in `owed`. */
 function owedIn(owed: ReadonlySet<number> | undefined, from: number, to: number): boolean {
   if (owed === undefined || owed.size === 0) return false;
@@ -409,6 +472,7 @@ export class UpstreamPayer {
   private readonly credit: UpstreamPayerOptions['credit'];
   private readonly seederBatch: UpstreamPayerOptions['seederBatch'];
   private readonly onUnpayable: UpstreamPayerOptions['onUnpayable'];
+  private readonly servesFree: UpstreamPayerOptions['servesFree'];
   private readonly boundRange: UpstreamPayerOptions['boundRange'];
   private readonly clock: () => number;
   private readonly owedPay: OwedPayment | undefined;
@@ -443,6 +507,7 @@ export class UpstreamPayer {
     this.credit = o.credit;
     this.seederBatch = o.seederBatch;
     this.onUnpayable = o.onUnpayable;
+    this.servesFree = o.servesFree;
     this.boundRange = o.boundRange;
     this.clock = o.clock ?? monotonicClock();
     this.owedPay = o.owed;
@@ -534,6 +599,7 @@ export class UpstreamPayer {
       carry: new Map(),
       inflight: new Map(),
       failures: new Map(),
+      owedFailures: new Map(),
       retryTimer: null,
       draining: false,
       due: false,
@@ -557,17 +623,25 @@ export class UpstreamPayer {
       protocol.on('price', (p) => {
         if (p.free === true) {
           // Served outside payment from now on: owed nothing — never a 0-sat price.
-          state.free.add(p.core);
+          remember(state.free, p.core, MAX_FREE_CORES_PER_SEEDER);
           state.price.delete(p.core);
           this.dropPending(state, p.core);
           this.log.info('upstream PRICE: free', { core: p.core });
           return;
         }
         state.free.delete(p.core);
+        // Least recently priced first, bounded (lane W8b-p2p): a flood of PRICEs for cores we
+        // never opened cannot grow this connection's state without limit.
+        state.price.delete(p.core);
         state.price.set(p.core, {
           satsPerBlock: p.satsPerBlock,
           effectiveFromBlock: p.effectiveFromBlock,
         });
+        while (state.price.size > MAX_PRICED_CORES_PER_SEEDER) {
+          const oldest = state.price.keys().next();
+          if (oldest.done === true) break;
+          state.price.delete(oldest.value);
+        }
         this.log.info('upstream PRICE', {
           peer: noiseHex,
           core: p.core,
@@ -626,7 +700,7 @@ export class UpstreamPayer {
   onDownload(core: CoreKeyHex, index: number, noiseHex: string): void {
     const state = this.peers.get(noiseHex);
     if (!state || state.closed) return;
-    if (state.free.has(core)) return; // served free: owed nothing
+    if (this.isFree(state, core)) return; // served free: owed nothing
     if (state.paid.get(core)?.has(index)) return;
     let set = state.pending.get(core);
     if (!set) {
@@ -675,7 +749,7 @@ export class UpstreamPayer {
     const state = this.peers.get(noiseHex);
     if (this.owedPay === undefined || this.disposed) return [];
     if (state === undefined || state.closed || state.hello === null) return [];
-    if (!state.price.has(core) || state.free.has(core)) return [];
+    if (!state.price.has(core) || this.isFree(state, core)) return [];
     const paid = state.paid.get(core);
     let pending = state.pending.get(core);
     let owed = state.owed.get(core);
@@ -695,6 +769,31 @@ export class UpstreamPayer {
     this.counters.owedAccepted += taken.length;
     this.schedule(state, state.draining || state.due);
     return taken.sort((a, b) => a - b);
+  }
+
+  /**
+   * Lane W8b-p2p (round-8 review): whether block `index` of `core` is pending (fresh or owed) or in
+   * the PAY awaiting its ACK on the LIVE connection `noiseHex` — what that connection will pay, or
+   * has just paid. A downloader asks it before handing another connection of the same seeder
+   * those blocks as owed, so one block is never paid on two connections.
+   */
+  holds(noiseHex: string, core: CoreKeyHex, index: number): boolean {
+    const state = this.peers.get(noiseHex);
+    if (state === undefined || state.closed) return false;
+    if (state.pending.get(core)?.has(index) === true) return true;
+    const f = state.inflight.get(core);
+    return f !== undefined && index >= f.fromBlock && index <= f.toBlock;
+  }
+
+  /** The peer serves `core` free on its connection (`servesFree`, else its own bounded set). */
+  private isFree(state: PeerState, core: CoreKeyHex): boolean {
+    const f = this.servesFree;
+    if (f === undefined) return state.free.has(core);
+    try {
+      return f(state.noiseHex, core);
+    } catch {
+      return false;
+    }
   }
 
   /** Blocks `from..to` of `core` overlap a hurried range. */
@@ -740,9 +839,9 @@ export class UpstreamPayer {
         // The timer measured the wait (the runtime's own timers are monotonic): every backoff due
         // by `at` is over, whatever the clock reads now — a clock that stands still (the steady
         // fallback after a step back) cannot hold a retry back (lane R6-reconcile).
-        for (const [core, f] of state.failures)
-          if (f.retryAt <= at)
-            state.failures.set(core, { ...f, retryAt: Number.NEGATIVE_INFINITY });
+        for (const streaks of [state.failures, state.owedFailures])
+          for (const [core, f] of streaks)
+            if (f.retryAt <= at) streaks.set(core, { ...f, retryAt: Number.NEGATIVE_INFINITY });
         this.schedule(state, state.draining || state.due);
       },
       Math.max(1, at - this.now()),
@@ -808,13 +907,22 @@ export class UpstreamPayer {
         if (set.size === 0 || state.inflight.has(core)) break;
         // A core whose last PAY failed waits out its backoff (fix round 5: bounded in time, not in
         // passes); once it is over, its run is due however short — it was due when it failed.
+        // Lane W8b-p2p: per kind — this connection's blocks (`failures`) and owed blocks from
+        // before (`owedFailures`) back off apart, and a kind still waiting is left out of this
+        // pass while the other is tried (an owed range retried for minutes must not hold this
+        // connection's blocks of the core back, which a seeder at its cap would otherwise wait on).
+        const now = this.now();
         const failed = state.failures.get(core);
-        if (failed !== undefined && this.now() < failed.retryAt) {
-          this.armRetry(state, failed.retryAt);
-          break;
-        }
-        const sorted = [...set].sort((a, b) => a - b);
+        const owedFailed = state.owedFailures.get(core);
+        const freshWaits = failed !== undefined && now < failed.retryAt;
+        const owedWaits = owedFailed !== undefined && now < owedFailed.retryAt;
+        if (freshWaits) this.armRetry(state, failed.retryAt);
+        if (owedWaits) this.armRetry(state, owedFailed.retryAt);
         const owedHere = state.owed.get(core);
+        const sorted = [...set]
+          .filter((i) => (owedHere?.has(i) === true ? !owedWaits : !freshWaits))
+          .sort((a, b) => a - b);
+        if (sorted.length === 0) break;
         const run = contiguousRuns(sorted).find(
           ([from, to]) =>
             due ||
@@ -834,10 +942,18 @@ export class UpstreamPayer {
           isOwed ? this.owedPrefix(owedHere, split) : this.freshPrefix(owedHere, split),
           state.noiseHex,
         );
+        if (isOwed && (!state.price.has(core) || this.isFree(state, core))) {
+          // No longer priced here (it turned the core free, or its price was forgotten): not
+          // payable on THIS connection — a later one that prices the core again may pay them, so
+          // they stay in the downloader's record (lane W8b-p2p). Never a 0-sat PAY (rule 3).
+          this.giveUpOwed(state, core, set, range, 'connection');
+          continue;
+        }
         const policy = this.resolvePolicy(state, core, hello, range, isOwed);
         if (policy === null) {
           if (isOwed) {
-            // Not payable at the terms recorded (or no longer priced here): respected, not paid.
+            // Not payable at the terms recorded (none recorded, or it asks more than them):
+            // respected, never paid.
             this.giveUpOwed(state, core, set, range);
             continue;
           }
@@ -870,13 +986,15 @@ export class UpstreamPayer {
               ? await this.owedPay.pay(range, seeder, policy, { carryIn }, state.noiseHex)
               : await this.engine.pay(range, seeder, policy, { carryIn });
         } catch (err) {
-          // Fix round 4: this core only — the peer's other cores are paid as usual.
+          // Fix round 4: this core only — the peer's other cores are paid as usual. Lane W8b-p2p:
+          // given up or kept, the pass goes on with the core — a kind whose streak now waits is
+          // left out (see above), so the other kind is tried and nothing is tried twice.
           if (isClosed(state)) return;
-          if (this.payFailed(state, core, set, range, payOutcome(err))) continue;
-          break;
+          this.payFailed(state, core, set, range, payOutcome(err), isOwed);
+          continue;
         }
         if (isClosed(state)) return;
-        state.failures.delete(core);
+        (isOwed ? state.owedFailures : state.failures).delete(core);
         state.inflight.set(core, { fromBlock: range.fromBlock, toBlock: range.toBlock, carryOut });
         state.protocol.sendPay(msg);
         this.counters.pays++;
@@ -911,6 +1029,12 @@ export class UpstreamPayer {
    * the range up when it can never be paid, else keep it owed and back the core off — deferred
    * (never given up) or transient (given up once the streak has lasted). Returns whether the
    * range was given up (the core's next run may be tried at once).
+   *
+   * Lane W8b-p2p: `owed` ranges (from before) keep their own streak (`owedFailures`) and are never
+   * given up for a transient failure — the seeder keeps counting them whatever we do, and the
+   * failure (no balance, a mint down, the tail file) may pass: they stay owed on this connection,
+   * retried on the transient backoff, and once the streak has lasted `PAY_GIVE_UP_MS` on the
+   * deferred cadence (up to `PAY_RETRY_LATER_MAX_MS`) — never in a loop, never written off.
    */
   private payFailed(
     state: PeerState,
@@ -918,25 +1042,30 @@ export class UpstreamPayer {
     set: Set<number>,
     range: BlockRange,
     code: string,
+    owed = false,
   ): boolean {
     this.counters.payFailures++;
     const kind = payFailureClass(code);
+    const streaks = owed ? state.owedFailures : state.failures;
     let final = kind === 'final';
     if (kind === 'final') {
       // Lane R6-reconcile (the round-5 verifier): the streak ends with the range it gave up, so
       // a later transient failure of the core (another play session's blocks) starts afresh
       // instead of inheriting an old streak and being written off at once.
-      state.failures.delete(core);
+      streaks.delete(core);
     } else {
       const now = this.now();
-      const prev = state.failures.get(core);
+      const prev = streaks.get(core);
       const same = prev?.kind === kind ? prev : undefined;
       const n = (same?.n ?? 0) + 1;
       const since = same?.since ?? now;
-      // Only a transient streak gives up, once it has lasted long enough; a deferred one never.
-      final = kind === 'transient' && n >= MAX_PAY_FAILURES && now - since >= PAY_GIVE_UP_MS;
-      const retryAt = now + (kind === 'deferred' ? laterDelay(n) : retryDelay(n));
-      state.failures.set(core, { kind, n, since, retryAt });
+      const lasted = n >= MAX_PAY_FAILURES && now - since >= PAY_GIVE_UP_MS;
+      // Only a transient streak of this connection's blocks gives up, once it has lasted long
+      // enough; a deferred one never, nor an owed one (lane W8b-p2p): that one slows down instead.
+      final = kind === 'transient' && !owed && lasted;
+      const slow = kind === 'deferred' || (owed && lasted);
+      const retryAt = now + (slow ? laterDelay(n) : retryDelay(n));
+      streaks.set(core, { kind, n, since, retryAt });
       if (!final) this.armRetry(state, retryAt);
     }
     // The outcome code only: the message may name a core, a peer or a range.
@@ -950,10 +1079,10 @@ export class UpstreamPayer {
       paidSet = new Set();
       state.paid.set(core, paidSet);
     }
-    const owed = state.owed.get(core);
+    const owedSet = state.owed.get(core);
     for (let i = range.fromBlock; i <= range.toBlock; i++) {
       set.delete(i);
-      owed?.delete(i);
+      owedSet?.delete(i);
       paidSet.add(i); // never paid: a re-download owes nothing new
     }
     this.counters.unpayableBlocks += range.toBlock - range.fromBlock + 1;
