@@ -93,10 +93,14 @@ async function world() {
         windowBlocks: 0,
       }),
     );
-    await until(() => chan.state === 'open' && session.pubkey === VIEWER_PUBKEY);
+    // Open only (both HELLOs): what a viewer waits for before it asks for blocks. That the
+    // gateway bound the pubkey is awaited separately (`bound`), so a gateway that attached its
+    // seeder side late would be caught serving blocks without their PRICE.
+    await until(() => chan.state === 'open');
     return {
       session,
       chan,
+      bound: () => until(() => session.pubkey === VIEWER_PUBKEY),
       drop: async () => {
         sa.destroy();
         sb.destroy();
@@ -176,6 +180,7 @@ describe("contracts v6 amendment on the gateway's seeder (real replication strea
     }
     expect(seen).toContain(`price:paid:${String(w.r.gateway.price())}`);
     expect(seen).toContain('price:free:free');
+    await c.bound();
     expect(w.r.engine.window(VIEWER_PUBKEY)).toMatchObject({ uploaded: 4, paid: 0 });
     expect(await w.pay(c.chan, paid, 0, 2, 0)).toMatchObject({ ok: true, outstanding: 1 });
   });
@@ -187,6 +192,7 @@ describe("contracts v6 amendment on the gateway's seeder (real replication strea
     if (!put.ok) throw new Error('put failed');
     const core = put.entry.coreKey;
     const c1 = await w.connect(() => undefined);
+    await c1.bound();
     const vcore = await w.viewer.blobs.openCoreByKey(Buffer.from(core, 'hex'));
     for (let i = 0; i < 4; i++)
       expect(await vcore.core.get(i, { wait: true, timeout: 5000 })).not.toBeNull();
@@ -198,6 +204,7 @@ describe("contracts v6 amendment on the gateway's seeder (real replication strea
       chan.on('price', (m) => got.push(m));
       chan.on('owed', (m) => got.push(m));
     });
+    await c2.bound();
     await until(() => got.length >= 2);
     expect(got).toEqual([
       { type: 'PRICE', core, satsPerBlock: w.r.gateway.price(), effectiveFromBlock: 0 },
