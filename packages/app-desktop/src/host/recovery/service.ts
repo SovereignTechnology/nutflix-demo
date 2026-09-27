@@ -107,11 +107,13 @@ export const CONFIRM_ATTEMPTS = 3;
 /**
  * Lane W8a: core calls a restore makes per phrase and mint, each bounded by core (at most
  * `RESTORE_MAX_BATCHES` batches of 100 per keyset past this device's own counters), following the
- * `resume` the previous one returned: 50 × 20 000 = one million counters per keyset per restore. A
- * scan still unfinished keeps its cursor for the next restore (a hostile mint that signs everything
- * cannot hold the restore — and the PAYs its gate refuses at that mint — for longer than this).
+ * `resume` the previous one returned: 10 × 20 000 = 200 000 counters per keyset per restore (about
+ * twelve hours of heavy streaming, by lane N1's count). A scan still unfinished keeps its cursor,
+ * so the next restore goes on from there. The bound is what a hostile mint that signs everything
+ * can add: it holds the restore — and, through the gate, the PAYs at that mint — at most ten times
+ * as long as core's own cap did.
  */
-export const RESTORE_ROUNDS = 50;
+export const RESTORE_ROUNDS = 10;
 
 /** Lane W8a: the relay copy's retry backoff — the first wait, doubled up to the last (ms). */
 export const RELAY_RETRY_FIRST_MS = 30_000;

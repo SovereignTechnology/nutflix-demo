@@ -73,8 +73,11 @@ export interface RecoveryProfile {
   readonly confirms: string[];
   /** Each HostOut as main received it: a structured clone taken when it was posted. */
   readonly posted: HostOut[];
-  /** The renderer calls `method` (IPC wire, webContents 3); resolves with the reply. */
-  invoke(method: string, args?: unknown[]): Promise<ReplyMsg>;
+  /**
+   * The renderer calls `method` (IPC wire, webContents 3); resolves with the reply (waiting at
+   * most `timeoutMs`, default 60 s).
+   */
+  invoke(method: string, args?: unknown[], timeoutMs?: number): Promise<ReplyMsg>;
   /** Connect the local key (made, or imported from `secretKeyHex`); resolves with its pubkey. */
   connect(): Promise<NostrPubkey>;
   close(): Promise<void>;
@@ -146,14 +149,18 @@ export async function recoveryProfile(o: RecoveryProfileOptions): Promise<Recove
   });
   await r.host.adapter.updateSettings({ defaultMints: [...o.mints] });
   await r.ready();
-  const invoke = async (method: string, args: unknown[] = []): Promise<ReplyMsg> => {
+  const invoke = async (
+    method: string,
+    args: unknown[] = [],
+    timeoutMs = 60_000,
+  ): Promise<ReplyMsg> => {
     const id = nextId++;
     r.host.handle({ kind: 'call', wc: 3, msg: { v: IPC_V, id, method, args } });
     const out = await r.until(
       (x): x is Extract<HostOut, { kind: 'reply' }> =>
         x.kind === 'reply' && x.wc === 3 && x.msg.id === id,
       `reply to ${method}`,
-      60_000,
+      timeoutMs,
     );
     return out.msg;
   };

@@ -127,6 +127,46 @@ describe('holdMint: the long operations at a mint run inside the shell’s gate 
   });
 });
 
+describe('holdMint gets its operation once (a sharp edge closed, W8a)', () => {
+  it('a hook that runs the operation twice gets a refusal the second time (a reissue never runs twice); one that resolves without running it counts as a refusal', async () => {
+    const a = mintA();
+    const seed = await newSeed();
+    const d = device({ mints: [a], seed, counters: knownCounters(a.keysetId, 0) });
+    await hold(d.store, MINT_A, a.issue(64));
+    let second: unknown;
+    const twice = new CashuWallet({
+      mints: d.conns,
+      store: d.store,
+      holdMint: async <T>(_mint: MintUrl, run: () => Promise<T>): Promise<T> => {
+        const out = await run();
+        second = await run().catch((e: unknown) => e);
+        return out;
+      },
+    });
+    const plan = await twice.seeded!.reissuePlan(MINT_A);
+    expect(second).toMatchObject({
+      code: 'invalid-argument',
+      message: expect.stringContaining('twice'),
+    });
+    await twice.seeded!.reissue(plan);
+    const swaps = d.net.calls.filter((c) => c === 'POST /v1/swap').length;
+    expect(swaps).toBe(1);
+    // A hook that answers without running: nothing asked, that mint unreachable.
+    const skipping = new CashuWallet({
+      mints: d.conns,
+      store: d.store,
+      holdMint: <T>(): Promise<T> => Promise.resolve(undefined as T),
+    });
+    const before = a.calls.length;
+    const reports = await skipping.seeded!.restoreFromSeed(seed, [MINT_A]);
+    expect(reports).toEqual([{ mint: MINT_A, outcome: 'unreachable', restoredSats: 0 }]);
+    expect(a.calls.length).toBe(before);
+    await expect(skipping.seeded!.reissuePlan(MINT_A)).rejects.toMatchObject({
+      code: 'invalid-argument',
+    });
+  });
+});
+
 describe('a bounded send (SendBound: a PAY build) — W8a', () => {
   it('is asked at its turn, after the operation queued ahead of it at the mint; a refusal there spends and journals nothing', async () => {
     const a = mintA();

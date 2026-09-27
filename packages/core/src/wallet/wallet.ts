@@ -297,10 +297,26 @@ export class CashuWallet implements Wallet {
 
   // ---- NUT-13 (ADR 0016) ----------------------------------------------------------------
 
-  /** `run` inside the shell's per-mint gate (`CashuWalletOptions.holdMint`), or at once. */
-  private hold<T>(mint: MintUrl, run: () => Promise<T>): Promise<T> {
+  /**
+   * `run` inside the shell's per-mint gate (`CashuWalletOptions.holdMint`), or at once. A hook
+   * gets `run` once: a second call is refused (a reissue or restore never runs twice), and a hook
+   * that resolves without running it counts as a refusal.
+   */
+  private async hold<T>(mint: MintUrl, run: () => Promise<T>): Promise<T> {
     const h = this.o.holdMint;
-    return h === undefined ? run() : h(mint, run);
+    if (h === undefined) return run();
+    const call = { started: false };
+    const out = await h(mint, () => {
+      if (call.started)
+        return Promise.reject(
+          new WalletError('invalid-argument', 'holdMint ran an operation twice'),
+        );
+      call.started = true;
+      return run();
+    });
+    if (!call.started)
+      throw new WalletError('invalid-argument', 'holdMint resolved without running the operation');
+    return out;
   }
 
   private async reissuePlan(mint: MintUrl): Promise<ReissuePlan> {

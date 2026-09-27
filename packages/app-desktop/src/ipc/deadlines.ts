@@ -177,12 +177,13 @@ function entries(n: number): number {
  * One PAY build's worst host-side time — or, with `sends`, the worst of its last `sends` sends —
  * with `pending` journal entries at its mint, `loaded` when that mint has loaded (no load round
  * trip), `seeded` when the wallet derives from a recovery phrase (W8a: the extra round trips and
- * counters-file saves above). `payBuildWorstMs(0, false)` is `PAY_BUILD_WORST_MS`.
+ * counters-file saves above). `seeded` is required: leaving it out must not pick the looser
+ * belt. `payBuildWorstMs(0, false, false)` is `PAY_BUILD_WORST_MS`.
  */
 export function payBuildWorstMs(
   pending: number,
   loaded: boolean,
-  seeded = false,
+  seeded: boolean,
   sends: number = PAY_BUILD_SENDS,
 ): number {
   const n = entries(pending);
@@ -217,7 +218,7 @@ export function payBuildWorstMs(
  * what is left of the worker's deadline after that PAY's worst time, never more than
  * `PAY_BUILD_START_BY_MS`. Negative when no start is early enough: the PAY is refused.
  */
-export function payBuildStartByMs(pending: number, loaded: boolean, seeded = false): number {
+export function payBuildStartByMs(pending: number, loaded: boolean, seeded: boolean): number {
   return Math.min(
     PAY_BUILD_START_BY_MS,
     WORKER_HOST_REQUEST_TIMEOUT_MS - payBuildWorstMs(pending, loaded, seeded),

@@ -208,6 +208,7 @@ export interface WalletKey {
  * without NUT-12. The caller's retry then derives past the moved counters.
  */
 export interface SendBound {
+  /** Awaited holding the mint's turn: it must answer at once (read local state, then decide). */
   readonly onTurn: () => void | Promise<void>;
 }
 

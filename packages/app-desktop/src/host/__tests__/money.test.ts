@@ -701,8 +701,8 @@ describe('MoneyPlane: PAY builds and melts never overlap at a mint (ADR 0012 ame
     await settleIo();
     expect(second.done).toBe(false); // waiting its turn
     // Past the belt of a PAY with one entry at a loaded mint — long inside the fixed 105.6 s one.
-    now += payBuildStartByMs(1, true) + 1;
-    expect(payBuildStartByMs(1, true) + 1).toBeLessThan(PAY_BUILD_START_BY_MS);
+    now += payBuildStartByMs(1, true, false) + 1;
+    expect(payBuildStartByMs(1, true, false) + 1).toBeLessThan(PAY_BUILD_START_BY_MS);
     inFlight.release();
     await settleIo();
     await settleIo();

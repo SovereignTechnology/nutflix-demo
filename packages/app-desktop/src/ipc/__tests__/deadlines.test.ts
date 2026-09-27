@@ -56,33 +56,37 @@ describe('money plane deadlines', () => {
   });
 
   it('round 4 (I2 verifier): the belt is per PAY — each journal entry at its mint costs each send a restore and a check; a loaded mint skips the load', () => {
-    expect(payBuildWorstMs(0, false)).toBe(PAY_BUILD_WORST_MS);
+    expect(payBuildWorstMs(0, false, false)).toBe(PAY_BUILD_WORST_MS);
     expect(PAY_BUILD_SENDS).toBe(2);
     expect(PAY_BUILD_SETTLE_ROUND_TRIPS_PER_ENTRY).toBeGreaterThanOrEqual(2); // restore + check
-    expect(payBuildWorstMs(1, false) - payBuildWorstMs(0, false)).toBe(
+    expect(payBuildWorstMs(1, false, false) - payBuildWorstMs(0, false, false)).toBe(
       PAY_BUILD_SENDS * PAY_BUILD_SETTLE_ROUND_TRIPS_PER_ENTRY * MINT_REQUEST_TIMEOUT_MS,
     );
-    expect(payBuildWorstMs(0, false) - payBuildWorstMs(0, true)).toBe(MINT_REQUEST_TIMEOUT_MS);
+    expect(payBuildWorstMs(0, false, false) - payBuildWorstMs(0, true, false)).toBe(
+      MINT_REQUEST_TIMEOUT_MS,
+    );
     // The verifier's count: 2 × (restore + check + swap + follow-up) round trips + 6 publishes.
-    expect(payBuildWorstMs(1, true)).toBe(8 * MINT_REQUEST_TIMEOUT_MS + 6 * RELAY_PUBLISH_WORST_MS);
+    expect(payBuildWorstMs(1, true, false)).toBe(
+      8 * MINT_REQUEST_TIMEOUT_MS + 6 * RELAY_PUBLISH_WORST_MS,
+    );
     // Never looser than the fixed belt; one entry at a loaded mint leaves 15.6 s; one at a mint
     // not loaded, or two, leave none (every PAY there is refused).
-    expect(payBuildStartByMs(0, false)).toBe(PAY_BUILD_START_BY_MS);
-    expect(payBuildStartByMs(0, true)).toBe(PAY_BUILD_START_BY_MS);
-    expect(payBuildStartByMs(1, true)).toBe(15_600);
-    expect(payBuildStartByMs(1, false)).toBeLessThan(0);
-    expect(payBuildStartByMs(2, true)).toBeLessThan(0);
+    expect(payBuildStartByMs(0, false, false)).toBe(PAY_BUILD_START_BY_MS);
+    expect(payBuildStartByMs(0, true, false)).toBe(PAY_BUILD_START_BY_MS);
+    expect(payBuildStartByMs(1, true, false)).toBe(15_600);
+    expect(payBuildStartByMs(1, false, false)).toBeLessThan(0);
+    expect(payBuildStartByMs(2, true, false)).toBeLessThan(0);
     for (const n of [0, 1, 2, 3])
       for (const loaded of [false, true]) {
-        const startBy = payBuildStartByMs(n, loaded);
+        const startBy = payBuildStartByMs(n, loaded, false);
         if (startBy >= 0)
-          expect(startBy + payBuildWorstMs(n, loaded)).toBeLessThanOrEqual(
+          expect(startBy + payBuildWorstMs(n, loaded, false)).toBeLessThanOrEqual(
             WORKER_HOST_REQUEST_TIMEOUT_MS,
           );
       }
     // A count that is not one refuses (read as more entries than any mint holds).
     for (const bad of [-1, 1.5, Number.NaN, Number.POSITIVE_INFINITY])
-      expect(payBuildStartByMs(bad, true)).toBe(Number.NEGATIVE_INFINITY);
+      expect(payBuildStartByMs(bad, true, false)).toBe(Number.NEGATIVE_INFINITY);
   });
 
   it('W8a: a seeded PAY costs what its sends cost — restore AND NUT-07 after a lost answer, a probe, one capped collision batch, the counters-file saves — and its belt shrinks to match', () => {
@@ -100,7 +104,7 @@ describe('money plane deadlines', () => {
     expect(payBuildWorstMs(0, false, false)).toBe(PAY_BUILD_WORST_MS);
     for (const n of [0, 1, 2])
       for (const loaded of [false, true])
-        expect(payBuildWorstMs(n, loaded, true)).toBeGreaterThan(payBuildWorstMs(n, loaded));
+        expect(payBuildWorstMs(n, loaded, true)).toBeGreaterThan(payBuildWorstMs(n, loaded, false));
     // The mint not loaded, or any journal entry at it: no seeded start is early enough (the money
     // plane loads and probes the mint before the turn, so the first case does not stall PAYs).
     expect(payBuildStartByMs(0, false, true)).toBeLessThan(0);
@@ -124,7 +128,7 @@ describe('money plane deadlines', () => {
     );
     expect(sendStartByMs(0, true, true, 2)).toBe(PAY_BUILD_SEEDED_START_BY_MS);
     expect(sendStartByMs(0, true, false, 2)).toBe(
-      WORKER_HOST_REQUEST_TIMEOUT_MS - payBuildWorstMs(0, true),
+      WORKER_HOST_REQUEST_TIMEOUT_MS - payBuildWorstMs(0, true, false),
     );
     for (const n of [0, 1])
       for (const seeded of [false, true])
