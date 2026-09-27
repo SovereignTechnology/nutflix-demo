@@ -14,7 +14,8 @@
  *            copy → confirm three random words (`recovery-confirm`; "Later" leaves it
  *            unconfirmed) → plan the reissue per mint → main's NATIVE dialog shows amounts and
  *            fees → reissue.
- *            A phrase whose reissue did not finish: only the reissue runs again.
+ *            A phrase whose reissue did not finish: only the reissue runs again, for the mints
+ *            not yet reissued under it (each one recorded in the envelope as it moves).
  *            A finished phrase: rotation — re-authenticate first, then as above; the old phrase
  *            is kept on this device as `.retired` (restore reads it) and its relay copy retired
  *            once the reissue under the new one completed (`replaces`, kept until a relay took
@@ -74,6 +75,7 @@ import { entropyFromHex, entropyHex, sameEntropy, uniqueMints } from './core.js'
 import type { RecoveryEnvelope } from './files.js';
 import {
   FileCounterStore,
+  MAX_REISSUED_MINTS,
   listRetired,
   readEnvelope,
   recoveryPath,
@@ -358,6 +360,8 @@ export class RecoveryService {
         created,
         confirmed: false,
         reissued: false,
+        // Every mint's balance is still to be moved under THIS phrase (a rotation included).
+        reissuedMints: [],
         relayCopy: false,
         // A replaced phrase's relay copy is retired once the reissue under this one completed.
         // (`old` is a finished phrase here; should ITS replaced copy still be pending — the retry
@@ -441,17 +445,24 @@ export class RecoveryService {
           reason: reasonOf(e),
         });
       });
-    const r = await this.reissueAll(pubkey);
+    // Each mint reissued is recorded at once, so a retry (a mint refused or unreachable this
+    // time, a plan the dialog cannot show) never moves a covered mint again nor charges its fee
+    // twice (fix round 7).
+    let cur = env;
+    const r = await this.reissueAll(pubkey, env.reissuedMints, async (mint) => {
+      cur = { ...cur, reissuedMints: [...cur.reissuedMints, mint] };
+      await writeEnvelope(this.o.dir, recoveryPath(this.o.dir, pubkey), cur);
+    });
     if (r.complete) {
       // The replaced phrase restores nothing held any more: its relay copy goes (best effort,
       // idempotent — a crash before the write below only repeats it), then ONE write records
       // both. A retirement that did not land keeps `replaces`, so the next setup tries again
       // (independent review IR7).
-      const retired = env.replaces === null || (await this.retireCopy(pubkey, env.replaces));
+      const retired = cur.replaces === null || (await this.retireCopy(pubkey, cur.replaces));
       await writeEnvelope(this.o.dir, recoveryPath(this.o.dir, pubkey), {
-        ...env,
+        ...cur,
         reissued: true,
-        replaces: retired ? null : env.replaces,
+        replaces: retired ? null : cur.replaces,
       });
     }
     return {
@@ -484,7 +495,15 @@ export class RecoveryService {
     return done;
   }
 
-  private async reissueAll(pubkey: NostrPubkey): Promise<{
+  /**
+   * Plan and (after the native dialog) reissue every mint's balance not in `done` — the mints
+   * already reissued under this phrase — calling `record` after each mint that moved.
+   */
+  private async reissueAll(
+    pubkey: NostrPubkey,
+    done: readonly MintUrl[],
+    record: (mint: MintUrl) => Promise<void>,
+  ): Promise<{
     sats: number;
     fee: number;
     failed: number;
@@ -507,8 +526,14 @@ export class RecoveryService {
       });
       return { sats: 0, fee: 0, failed: 0, complete: false };
     }
+    let covered = 0;
     for (const [mint, amount] of balances) {
       if (amount <= 0) continue;
+      // Already under this phrase: its balance is seeded outputs now (fix round 7).
+      if (done.includes(mint)) {
+        covered++;
+        continue;
+      }
       try {
         const p = await seeded.reissuePlan(mint);
         // Dust whose fee would eat it all stays as it is (nothing sensible to move).
@@ -529,7 +554,10 @@ export class RecoveryService {
         this.log.warn('no reissue plan at a mint', { reason: reasonOf(e) });
       }
     }
-    const asked = plans.slice(0, MAX_REISSUE_PLANS);
+    // No more than the envelope has room to record: a mint moved but not recorded would be
+    // planned, and charged, again. What is left out is counted (asked on a later retry).
+    const room = Math.max(0, MAX_REISSUED_MINTS - done.length);
+    const asked = plans.slice(0, Math.min(MAX_REISSUE_PLANS, room));
     failed += plans.length - asked.length;
     if (asked.length === 0) return { sats: 0, fee: 0, failed, complete: failed === 0 };
     const ok = await this.confirm({
@@ -551,18 +579,31 @@ export class RecoveryService {
     let sats = 0;
     let fee = 0;
     for (const p of asked) {
+      let moved: walletMod.ReissueResult;
       try {
-        const done = await seeded.reissue(p);
-        sats += done.reissued;
-        fee += done.feeSats;
+        moved = await seeded.reissue(p);
       } catch (e) {
         failed++;
         this.log.warn('the reissue failed at a mint (its balance stays uncovered)', {
           reason: reasonOf(e),
         });
+        continue;
       }
+      sats += moved.reissued;
+      fee += moved.feeSats;
+      // The balance is under the phrase whatever happens next; a record that did not land only
+      // lets a later retry move this mint once more.
+      await record(p.mint).catch((e: unknown) => {
+        this.log.warn('a reissued mint could not be recorded: a retry may move it again', {
+          reason: reasonOf(e),
+        });
+      });
     }
-    this.log.info('balance reissued under the recovery phrase', { mints: asked.length, failed });
+    this.log.info('balance reissued under the recovery phrase', {
+      mints: asked.length,
+      failed,
+      covered,
+    });
     return { sats, fee, failed, complete: failed === 0 };
   }
 

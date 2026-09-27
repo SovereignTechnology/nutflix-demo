@@ -7,9 +7,10 @@
  *                              the nsec. The envelope's other fields hold no secret: the random
  *                              device id (public anyway, as the relay copy's `d`), when it was
  *                              made, whether the backup was confirmed, the old balance
- *                              reissued and the relay copy published, and which replaced
- *                              phrase's relay copy is still to be retired — so the status needs
- *                              no signer round trip.
+ *                              reissued (and at which mints it already was: a retry never
+ *                              moves those again) and the relay copy published, and which
+ *                              replaced phrase's relay copy is still to be retired — so the
+ *                              status needs no signer round trip.
  *   recovery-<pubkey>.<device>.retired
  *                              a phrase this device replaced (rotation): kept, never derived from
  *                              again, read only by a restore ("phrases from this device").
@@ -30,9 +31,10 @@
 import { open, readdir, rename } from 'node:fs/promises';
 import { join } from 'node:path';
 
-import type { NostrPubkey } from '@sovit/core';
+import type { MintUrl, NostrPubkey } from '@sovit/core';
 import type { wallet as walletMod } from '@sovit/core';
 
+import { isMintUrl } from '../../ipc/guards.js';
 import { ensurePrivateDir, readPrivateFile, writePrivateFile } from '../signer/private-file.js';
 import { KEYSET_ID } from './core.js';
 
@@ -40,7 +42,14 @@ const HEX64 = /^[0-9a-f]{64}$/;
 const DEVICE_ID = /^[0-9a-f]{32}$/;
 /** A NIP-44 v2 payload as base64 (a small plaintext: well under this). */
 const SEALED = /^[A-Za-z0-9+/]{16,4096}={0,2}$/;
-const MAX_RECOVERY_FILE_BYTES = 16 * 1024;
+/**
+ * Mints one phrase's envelope records as reissued at most (`reissuedMints`). Only the dialog's
+ * https mints are ever reissued, 32 per question; the service asks no more than there is room
+ * to record, so a mint is never moved twice (fix round 7).
+ */
+export const MAX_REISSUED_MINTS = 64;
+/** Room for `MAX_REISSUED_MINTS` mint URLs of the longest kind (512) beside the sealed phrase. */
+const MAX_RECOVERY_FILE_BYTES = 64 * 1024;
 const MAX_COUNTERS_FILE_BYTES = 1024 * 1024;
 /** Keysets one counters file may track (every keyset of every mint the wallet ever used). */
 export const MAX_KEYSETS = 4096;
@@ -73,6 +82,13 @@ export interface RecoveryEnvelope {
   readonly confirmed: boolean;
   /** The balance held before this phrase was reissued under it (ADR 0016 D5). */
   readonly reissued: boolean;
+  /**
+   * The mints whose balance was already reissued under THIS phrase (distinct, https, at most
+   * `MAX_REISSUED_MINTS`): a later "Finish backup" plans only the others, so it never moves a
+   * covered mint again or charges its fee twice (fix round 7). A new phrase starts empty. A file
+   * written before this field existed reads as `[]` (the conservative default: plan every mint).
+   */
+  readonly reissuedMints: readonly MintUrl[];
   /** The encrypted copy reached at least one write relay (ADR 0016 D2). */
   readonly relayCopy: boolean;
   /**
@@ -100,14 +116,33 @@ export function countersPath(dir: string, pubkey: NostrPubkey): string {
   return join(dir, `counters-${pubkey}.json`);
 }
 
+const ENVELOPE_KEYS = 'confirmed,created,device,reissued,relayCopy,replaces,sealed,v';
+/** The same with `reissuedMints` (sorted: it falls between `reissued` and `relayCopy`). */
+const ENVELOPE_KEYS_R7 =
+  'confirmed,created,device,reissued,reissuedMints,relayCopy,replaces,sealed,v';
+
+/** Distinct https mint URLs, at most `MAX_REISSUED_MINTS`, or `null`. */
+function mintList(x: unknown): MintUrl[] | null {
+  if (!Array.isArray(x) || x.length > MAX_REISSUED_MINTS) return null;
+  const out: MintUrl[] = [];
+  for (const m of x as unknown[]) {
+    if (!isMintUrl(m) || out.includes(m)) return null;
+    out.push(m);
+  }
+  return out;
+}
+
 /** Exactly an envelope, or `null`. Pure; never throws. */
 export function parseEnvelope(raw: unknown): RecoveryEnvelope | null {
   if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return null;
   const o = raw as Record<string, unknown>;
   const keys = Object.keys(o).sort().join(',');
-  if (keys !== 'confirmed,created,device,reissued,relayCopy,replaces,sealed,v') return null;
+  // Exact keys: the current shape, or one written before `reissuedMints` existed.
+  if (keys !== ENVELOPE_KEYS_R7 && keys !== ENVELOPE_KEYS) return null;
   if (o['v'] !== 1) return null;
   const { device, created, confirmed, reissued, relayCopy, replaces, sealed } = o;
+  const reissuedMints = keys === ENVELOPE_KEYS ? [] : mintList(o['reissuedMints']);
+  if (reissuedMints === null) return null;
   if (typeof device !== 'string' || !DEVICE_ID.test(device)) return null;
   if (typeof created !== 'number' || !Number.isSafeInteger(created) || created < 0) return null;
   if (typeof confirmed !== 'boolean' || typeof reissued !== 'boolean') return null;
@@ -115,7 +150,7 @@ export function parseEnvelope(raw: unknown): RecoveryEnvelope | null {
   if (replaces !== null && (typeof replaces !== 'string' || !DEVICE_ID.test(replaces))) return null;
   if (replaces === device) return null;
   if (typeof sealed !== 'string' || !SEALED.test(sealed)) return null;
-  return { v: 1, device, created, confirmed, reissued, relayCopy, replaces, sealed };
+  return { v: 1, device, created, confirmed, reissued, reissuedMints, relayCopy, replaces, sealed };
 }
 
 async function readJson(

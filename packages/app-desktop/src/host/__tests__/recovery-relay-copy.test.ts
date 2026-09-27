@@ -17,6 +17,17 @@ import {
   retireRelayCopy,
 } from '../recovery/relay-copy.js';
 
+/**
+ * The two cap tests sign 69 and 131 real events (a `LocalSigner` signs AND re-verifies each,
+ * about 30 ms apiece on the dev box) and `readRelayCopies` checks every signature again and
+ * decrypts up to 64 copies: 2.7 s and 3.9 s alone, and the second took 5.2 s and 6.8 s in the
+ * lane verifier's full app-desktop runs (load 12 on 8 cores), past vitest's 5 s default (fix
+ * round 7). The cost is the real crypto these tests exercise, so they get an explicit budget
+ * rather than fakes.
+ */
+const SLOW = { timeout: 30_000 };
+const CAP = String(MAX_RELAY_COPIES);
+
 const W = 'wss://write.test' as RelayUrl;
 const R = 'wss://read.test' as RelayUrl;
 const DEV = 'ab'.repeat(16);
@@ -206,7 +217,7 @@ describe('reading the copies (restore only)', () => {
     expect(pool.queries).toEqual([]);
   });
 
-  it(`at most ${String(MAX_RELAY_COPIES)} copies are decrypted`, async () => {
+  it(`at most ${CAP} copies are decrypted`, SLOW, async () => {
     const s = await me();
     const pool = new nostr.FakeRelayPool();
     let decrypts = 0;
@@ -283,7 +294,7 @@ describe('reading the copies (restore only)', () => {
   });
 
   // Independent review IR10: blanks are dropped before the cap, and the cap is never silent.
-  it(`blanks never crowd out a live copy, and copies beyond ${String(MAX_RELAY_COPIES)} are counted`, async () => {
+  it(`blanks never crowd out a live copy, and copies beyond ${CAP} are counted`, SLOW, async () => {
     const s = await me();
     const pool = new nostr.FakeRelayPool();
     const E1 = '11'.repeat(16);

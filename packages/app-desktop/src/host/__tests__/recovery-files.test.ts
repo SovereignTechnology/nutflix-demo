@@ -20,12 +20,13 @@ import { join } from 'node:path';
 
 import { afterEach, describe, expect, it } from 'vitest';
 
-import type { NostrPubkey } from '@sovit/core';
+import type { MintUrl, NostrPubkey } from '@sovit/core';
 import type { wallet as walletMod } from '@sovit/core';
 
 import {
   FileCounterStore,
   MAX_COUNTER,
+  MAX_REISSUED_MINTS,
   countersPath,
   listRetired,
   parseCounterState,
@@ -60,6 +61,9 @@ const ENV: RecoveryEnvelope = {
   created: 1_760_000_000,
   confirmed: false,
   reissued: false,
+  // Fix round 7 added this required field (the mints already reissued under the phrase); the
+  // shape without it is still read, as `[]` (tested below).
+  reissuedMints: [],
   relayCopy: true,
   replaces: null,
   sealed: 'AgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA',
@@ -137,6 +141,43 @@ describe('the sealed phrase envelope', () => {
     expect(() => recoveryPath('/x', '../../etc' as NostrPubkey)).toThrow(/invalid-argument/);
     expect(() => retiredPath('/x', PK, '../x')).toThrow(/invalid-argument/);
     expect(() => countersPath('/x', 'A1'.repeat(32) as NostrPubkey)).toThrow(/invalid-argument/);
+  });
+
+  // Fix round 7: the mints already reissued under this phrase, so a retry never moves them again.
+  it('reissuedMints: distinct https mints, at most MAX_REISSUED_MINTS; a file from before the field reads as []', async () => {
+    const A = 'https://mint-a.files.test' as MintUrl;
+    const B = 'https://mint-b.files.test' as MintUrl;
+    expect(parseEnvelope({ ...ENV, reissuedMints: [A, B] })).toMatchObject({
+      reissuedMints: [A, B],
+    });
+    const legacy = Object.fromEntries(Object.entries(ENV).filter(([k]) => k !== 'reissuedMints'));
+    expect(Object.keys(legacy)).toHaveLength(8);
+    expect(parseEnvelope(legacy)).toEqual({ ...ENV, reissuedMints: [] });
+    for (const bad of [
+      null,
+      'https://mint-a.files.test',
+      [A, A],
+      ['http://127.0.0.1:3399'],
+      ['https://mint-a.files.test/'],
+      [7],
+      Array.from({ length: MAX_REISSUED_MINTS + 1 }, (_, i) => `https://m${String(i)}.files.test`),
+    ])
+      expect(parseEnvelope({ ...ENV, reissuedMints: bad }), JSON.stringify(bad)).toBeNull();
+    // A legacy file on disk reads, and the next write carries the field.
+    const d = await dir();
+    const p = recoveryPath(d, PK);
+    await mkdir(d, { recursive: true, mode: 0o700 });
+    await writeFile(p, JSON.stringify(legacy), { mode: 0o600 });
+    expect(await readEnvelope(p)).toEqual({ ...ENV, reissuedMints: [] });
+    // The largest record fits the file: MAX_REISSUED_MINTS mint URLs of the longest kind (512).
+    const longest = Array.from({ length: MAX_REISSUED_MINTS }, (_, i) => {
+      const head = `https://m${String(i).padStart(2, '0')}.files.test/`;
+      return `${head}${'p'.repeat(512 - head.length)}` as MintUrl;
+    });
+    expect(longest.every((m) => m.length === 512)).toBe(true);
+    const full = { ...ENV, sealed: `A${'g'.repeat(4094)}==`, reissuedMints: longest };
+    await writeEnvelope(d, p, full);
+    expect(await readEnvelope(p)).toEqual(full);
   });
 
   it('parseEnvelope accepts exactly the shape', () => {
