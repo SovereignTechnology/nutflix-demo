@@ -2094,19 +2094,37 @@ describe('AutoTopUp — lane R6-reconcile: one bound for the whole play', () => 
 // the record through the signer (a NIP-46 bunker may ask its user). A melt that does not start
 // within TOP_UP_MELT_START_BY_MS of the reservation never starts, so a restart can bound when
 // it returned (TOP_UP_MELT_RETURNED_BY_MS).
+//
+// Round 7 (the verifier of R6-3): the start-by counts from the reservation's stamp (the entry's
+// `at`, read at the call), not from after its write, since a restart counts from `at`. The third
+// case gives the write 1 ms on the monotonic clock: read after the write, the start-by would
+// lose that 1 ms and let this melt run.
 describe('AutoTopUp — lane R6-reconcile: a melt starts within TOP_UP_MELT_START_BY_MS of its reservation, or not at all', () => {
   it.each([
-    ['exactly at the start-by: the melt goes', TOP_UP_MELT_START_BY_MS, 'done'],
+    ['exactly at the start-by: the melt goes', 0, TOP_UP_MELT_START_BY_MS, 'done'],
     [
       '1 ms past it: nothing melts, the reservation settles failed (not counted)',
+      0,
       TOP_UP_MELT_START_BY_MS + 1,
+      'failed',
+    ],
+    [
+      'after a reservation whose write took 1 ms, the start-by counted from its stamp: 1 ms past it, nothing melts',
+      1,
+      TOP_UP_MELT_START_BY_MS,
       'failed',
     ],
   ] as const)(
     'a seal that took long (a bunker asking its user), %s',
-    async (_what, sealMs, outcome) => {
+    async (_what, reserveMs, sealMs, outcome) => {
       const s = await setup({ fund: 20_000, amountSats: 2_000 });
       let mono = 0;
+      const reserve = s.ledger.reserve.bind(s.ledger);
+      vi.spyOn(s.ledger, 'reserve').mockImplementation(async (e) => {
+        const id = await reserve(e);
+        mono += reserveMs; // the reservation's write, after the ledger stamped its entry
+        return id;
+      });
       const top = r6Top(s, {
         clock: () => mono,
         vault: (v) => ({
