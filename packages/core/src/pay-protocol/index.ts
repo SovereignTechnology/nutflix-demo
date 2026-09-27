@@ -10,11 +10,18 @@ export type {
   PayWireMessage,
   AckMessage,
   PriceMessage,
+  OwedMessage,
+  OwedRange,
   PayProtocolState,
   PayProtocolEvents,
   MuxLike,
 } from '../contracts/pay-protocol.js';
-export { PAY_PROTOCOL_NAME, PAY_PROTOCOL_VERSION } from '../contracts/pay-protocol.js';
+export {
+  MAX_OWED_BLOCKS,
+  MAX_OWED_RANGES,
+  PAY_PROTOCOL_NAME,
+  PAY_PROTOCOL_VERSION,
+} from '../contracts/pay-protocol.js';
 export {
   MAX_FRAME_BYTES,
   MAX_MINTS,

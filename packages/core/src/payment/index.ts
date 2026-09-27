@@ -38,4 +38,11 @@ export {
   type PendingPay,
 } from './engine.js';
 export { RangeSet } from './range-set.js';
+export {
+  OWED_LIMITS,
+  boundOwed,
+  type OwedCore,
+  type OwedLimits,
+  type UnpaidLedger,
+} from './owed.js';
 export { SeenSecrets, type SeenSecretsOptions } from './seen.js';

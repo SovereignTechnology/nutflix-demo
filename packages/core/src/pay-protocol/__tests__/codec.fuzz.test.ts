@@ -10,18 +10,33 @@
  * `decode` is the first thing untrusted bytes touch) and INV4 (a PAY that decodes must be a
  * structurally complete message before `verify` sees it).
  */
+import c from 'compact-encoding';
 import { describe, expect, it } from 'vitest';
 import * as fc from 'fast-check';
 
-import type { PayProtocolCodec, PayProtocolMessage } from '../../contracts/index.js';
-import { PAY_PROTOCOL_NAME, PAY_PROTOCOL_VERSION } from '../../contracts/index.js';
+import type {
+  CoreKeyHex,
+  OwedMessage,
+  PayProtocolCodec,
+  PayProtocolMessage,
+  PriceMessage,
+  Sats,
+} from '../../contracts/index.js';
+import {
+  MAX_OWED_BLOCKS,
+  MAX_OWED_RANGES,
+  PAY_PROTOCOL_NAME,
+  PAY_PROTOCOL_VERSION,
+} from '../../contracts/index.js';
 import {
   REJECT_REASONS,
   REJECT_REASONS_EXHAUSTIVE,
   ackArb,
   helloArb,
+  isOwedRanges,
   isPayProtocolMessage,
   messageArb,
+  owedArb,
   payWireArb,
   plain,
   priceArb,
@@ -51,7 +66,7 @@ describe('pay/1 protocol constants', () => {
     fc.assert(
       fc.property(messageArb, (m) => {
         expect(isPayProtocolMessage(m)).toBe(true);
-        expect(['HELLO', 'PAY', 'ACK', 'PRICE']).toContain(m.type);
+        expect(['HELLO', 'PAY', 'ACK', 'PRICE', 'OWED']).toContain(m.type);
       }),
       { numRuns: 300 },
     );
@@ -64,6 +79,25 @@ describe('pay/1 protocol constants', () => {
       { type: 'PAY' },
       { type: 'NOPE' },
       { type: 'ACK', ok: 1 },
+      // v6 amendment: a free PRICE with a price, an OWED with no / touching / unsorted ranges.
+      { type: 'PRICE', core: 'ab'.repeat(32), satsPerBlock: 1, effectiveFromBlock: 0, free: true },
+      { type: 'OWED', core: 'ab'.repeat(32), ranges: [] },
+      {
+        type: 'OWED',
+        core: 'ab'.repeat(32),
+        ranges: [
+          [0, 3],
+          [4, 5],
+        ],
+      },
+      {
+        type: 'OWED',
+        core: 'ab'.repeat(32),
+        ranges: [
+          [9, 9],
+          [0, 1],
+        ],
+      },
     ]) {
       expect(isPayProtocolMessage(junk)).toBe(false);
     }
@@ -126,6 +160,7 @@ describe.skipIf(codec === undefined)(`PayProtocolCodec fuzz (${SKIP_REASON})`, (
       ['PAY', payWireArb],
       ['ACK', ackArb],
       ['PRICE', priceArb],
+      ['OWED', owedArb],
     ] as const) {
       fc.assert(
         fc.property(arb as fc.Arbitrary<PayProtocolMessage>, (msg) => {
@@ -281,3 +316,253 @@ describe.skipIf(codec === undefined)(`PayProtocolCodec fuzz (${SKIP_REASON})`, (
     );
   });
 });
+
+// ---------------------------------------------------------------------------------------
+// v6 amendment (2026-09-26): PRICE.free, OWED, ACK.outstanding — the grammar at its edges
+// ---------------------------------------------------------------------------------------
+
+const CORE = 'ab'.repeat(32) as CoreKeyHex;
+
+/** Hand-built frame bytes, bypassing `encode` (whose guards are what the decode tests go around). */
+function frame(write: (s: ReturnType<typeof c.state>, pre: boolean) => void): Uint8Array {
+  const st = c.state();
+  write(st, true);
+  st.buffer = new Uint8Array(st.end);
+  write(st, false);
+  return st.buffer;
+}
+
+function u(s: ReturnType<typeof c.state>, pre: boolean, n: number): void {
+  if (pre) c.uint.preencode(s, n);
+  else c.uint.encode(s, n);
+}
+
+function u8(s: ReturnType<typeof c.state>, pre: boolean, n: number): void {
+  if (pre) c.uint8.preencode(s, n);
+  else c.uint8.encode(s, n);
+}
+
+function core32(s: ReturnType<typeof c.state>, pre: boolean): void {
+  const b = new Uint8Array(32).fill(0xab);
+  if (pre) c.fixed32.preencode(s, b);
+  else c.fixed32.encode(s, b);
+}
+
+/** An OWED frame with these raw ranges (and this count, default their number). */
+function owedFrame(ranges: readonly (readonly [number, number])[], count = ranges.length) {
+  return frame((s, pre) => {
+    u8(s, pre, 5);
+    core32(s, pre);
+    u(s, pre, count);
+    for (const [a, b] of ranges) {
+      u(s, pre, a);
+      u(s, pre, b);
+    }
+  });
+}
+
+function priceFrame(sats: number, from: number, flags: number): Uint8Array {
+  return frame((s, pre) => {
+    u8(s, pre, 4);
+    core32(s, pre);
+    u(s, pre, sats);
+    u(s, pre, from);
+    u8(s, pre, flags);
+  });
+}
+
+/** `n` one-block ranges two apart (canonical), starting at 0. */
+const spaced = (n: number): [number, number][] =>
+  Array.from({ length: n }, (_, i) => [2 * i, 2 * i] as [number, number]);
+
+describe.skipIf(codec === undefined)(
+  'pay/1 v6 amendment grammar (OWED, PRICE.free, ACK.outstanding)',
+  () => {
+    const k = (): PayProtocolCodec => codec!;
+
+    it('OWED: the caps are inclusive — exactly MAX_OWED_RANGES ranges and exactly MAX_OWED_BLOCKS blocks round-trip', () => {
+      expect(MAX_OWED_RANGES).toBe(256);
+      expect(MAX_OWED_BLOCKS).toBe(1024);
+      const many: OwedMessage = { type: 'OWED', core: CORE, ranges: spaced(MAX_OWED_RANGES) };
+      expect(k().decode(k().encode(many))).toStrictEqual(many);
+      const long: OwedMessage = {
+        type: 'OWED',
+        core: CORE,
+        ranges: [[7, 7 + MAX_OWED_BLOCKS - 1]],
+      };
+      expect(k().decode(k().encode(long))).toStrictEqual(long);
+      const top = Number.MAX_SAFE_INTEGER;
+      const high: OwedMessage = { type: 'OWED', core: CORE, ranges: [[top, top]] };
+      expect(k().decode(k().encode(high))).toStrictEqual(high);
+    });
+
+    it('OWED: encode refuses anything outside the grammar, and decode returns null for the same bytes built by hand', () => {
+      const bad: [string, readonly (readonly [number, number])[]][] = [
+        ['no ranges', []],
+        ['one range too many', spaced(MAX_OWED_RANGES + 1)],
+        ['one block too many', [[0, MAX_OWED_BLOCKS]]],
+        [
+          'the cap crossed by the sum',
+          [
+            [0, 511],
+            [513, 1025],
+          ],
+        ],
+        ['a range that ends before it starts', [[5, 4]]],
+        [
+          'overlapping',
+          [
+            [0, 5],
+            [5, 9],
+          ],
+        ],
+        [
+          'adjacent (not canonical)',
+          [
+            [0, 5],
+            [6, 9],
+          ],
+        ],
+        [
+          'descending',
+          [
+            [10, 12],
+            [0, 1],
+          ],
+        ],
+        ['a huge range (length past 2^53)', [[0, Number.MAX_SAFE_INTEGER]]],
+      ];
+      for (const [why, ranges] of bad) {
+        expect(() => k().encode({ type: 'OWED', core: CORE, ranges }), why).toThrow();
+        expect(k().decode(owedFrame(ranges)), why).toBeNull();
+      }
+      // Shapes only a local bug (or a peer, by hand) could produce.
+      for (const ranges of [
+        [[1.5, 2]],
+        [[-1, 2]],
+        [[0]],
+        [[0, 1, 2]],
+        'nope',
+        null,
+        [[0, Number.MAX_SAFE_INTEGER + 1]],
+      ])
+        expect(() => k().encode({ type: 'OWED', core: CORE, ranges } as never)).toThrow();
+      expect(() =>
+        k().encode({ type: 'OWED', core: 'AB'.repeat(32), ranges: [[0, 0]] } as never),
+      ).toThrow();
+      // A count that claims more ranges than follow, or more than the cap before anything is read.
+      expect(k().decode(owedFrame([[0, 0]], 2))).toBeNull();
+      expect(k().decode(owedFrame([[0, 0]], MAX_OWED_RANGES + 1))).toBeNull();
+      expect(k().decode(owedFrame([[0, 0]], 2 ** 40))).toBeNull();
+      // The hand-built frame decodes when it is canonical (the builder is not the reason for null).
+      expect(
+        k().decode(
+          owedFrame([
+            [0, 0],
+            [2, 3],
+          ]),
+        ),
+      ).toStrictEqual({
+        type: 'OWED',
+        core: CORE,
+        ranges: [
+          [0, 0],
+          [2, 3],
+        ],
+      });
+    });
+
+    it('OWED: every decoded OWED is canonical, whatever the bytes (fuzz over OWED-tagged frames)', () => {
+      fc.assert(
+        fc.property(fc.uint8Array({ maxLength: 600 }), (tail) => {
+          const buf = new Uint8Array(1 + 32 + tail.length);
+          buf[0] = 5;
+          buf.fill(0xab, 1, 33);
+          buf.set(tail, 33);
+          const { threw, out } = decodeSafely(k(), buf);
+          expect(threw).toBeUndefined();
+          if (out !== null) {
+            expect((out as PayProtocolMessage).type).toBe('OWED');
+            expect(isOwedRanges((out as OwedMessage).ranges)).toBe(true);
+          }
+        }),
+        { numRuns: 2000 },
+      );
+    });
+
+    it('PRICE.free: free:true only with no price from block 0; flags 2 alone and unknown bits are refused', () => {
+      const free: PriceMessage = {
+        type: 'PRICE',
+        core: CORE,
+        satsPerBlock: 0 as Sats,
+        effectiveFromBlock: 0,
+        free: true,
+      };
+      expect(k().decode(k().encode(free))).toStrictEqual(free);
+      expect(k().decode(priceFrame(0, 0, 3))).toStrictEqual(free);
+      // `free: false` and an absent `free` are distinct, and both round-trip exactly.
+      const priced = {
+        type: 'PRICE',
+        core: CORE,
+        satsPerBlock: 3 as Sats,
+        effectiveFromBlock: 9,
+      } as const;
+      expect(k().decode(k().encode(priced))).toStrictEqual(priced);
+      expect(k().decode(k().encode({ ...priced, free: false }))).toStrictEqual({
+        ...priced,
+        free: false,
+      });
+      expect(k().decode(priceFrame(3, 9, 0))).toStrictEqual(priced);
+      expect(k().decode(priceFrame(3, 9, 1))).toStrictEqual({ ...priced, free: false });
+      // A free core with a price, or from another block: refused both ways.
+      for (const [sats, from] of [
+        [1, 0],
+        [0, 1],
+        [5, 7],
+      ] as const) {
+        expect(() =>
+          k().encode({ ...free, satsPerBlock: sats as Sats, effectiveFromBlock: from }),
+        ).toThrow();
+        expect(k().decode(priceFrame(sats, from, 3))).toBeNull();
+      }
+      expect(() => k().encode({ ...free, free: 'yes' } as never)).toThrow();
+      for (const flags of [2, 4, 5, 0x80, 0xff])
+        expect(k().decode(priceFrame(0, 0, flags))).toBeNull();
+      // The v5 PRICE layout (no flags byte) is a truncated frame now.
+      const v5 = frame((s, pre) => {
+        u8(s, pre, 4);
+        core32(s, pre);
+        u(s, pre, 3);
+        u(s, pre, 9);
+      });
+      expect(k().decode(v5)).toBeNull();
+    });
+
+    it('ACK.outstanding: present or absent round-trips exactly; a negative or fractional count is refused; unknown ACK flag bits are refused', () => {
+      const base = { type: 'ACK', core: CORE, fromBlock: 0, toBlock: 3, ok: true } as const;
+      for (const m of [
+        base,
+        { ...base, outstanding: 0 },
+        { ...base, outstanding: 17 },
+        { ...base, ok: false, reason: 'wrong-amount', outstanding: 4 },
+        { ...base, ok: false, reason: 'range-already-paid' },
+      ] as const)
+        expect(k().decode(k().encode(m))).toStrictEqual(m);
+      for (const outstanding of [-1, 1.5, Number.MAX_SAFE_INTEGER + 1, Number.NaN])
+        expect(() => k().encode({ ...base, outstanding })).toThrow();
+      const ackFrame = (flags: number, tail: number[]): Uint8Array =>
+        frame((s, pre) => {
+          u8(s, pre, 3);
+          core32(s, pre);
+          u(s, pre, 0);
+          u(s, pre, 3);
+          u8(s, pre, flags);
+          for (const n of tail) u(s, pre, n);
+        });
+      expect(k().decode(ackFrame(5, [12]))).toStrictEqual({ ...base, outstanding: 12 });
+      expect(k().decode(ackFrame(5, []))).toBeNull(); // the bit says a count follows
+      expect(k().decode(ackFrame(8 | 1, []))).toBeNull();
+      expect(k().decode(ackFrame(0x80 | 1, []))).toBeNull();
+    });
+  },
+);

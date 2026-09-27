@@ -6,9 +6,11 @@ import type {
   AckMessage,
   HelloMessage,
   MuxLike,
+  OwedMessage,
   PayMessage,
   PayProtocol,
   PayProtocolEvents,
+  PayProtocolMessage,
   PayProtocolState,
   PriceMessage,
 } from '@sovit/core';
@@ -20,6 +22,9 @@ export class FakePayProtocol implements PayProtocol {
   peer: HelloMessage | null = null;
   readonly acks: AckMessage[] = [];
   readonly prices: PriceMessage[] = [];
+  readonly owed: OwedMessage[] = [];
+  /** Everything the seeder sent (PAY, ACK, PRICE, OWED), in order — the wire order. */
+  readonly sent: PayProtocolMessage[] = [];
   readonly sentPays: PayMessage[] = [];
   readonly cuts: Parameters<PayProtocolEvents['close']>[0][] = [];
   private readonly listeners: Listeners = {
@@ -27,6 +32,7 @@ export class FakePayProtocol implements PayProtocol {
     pay: new Set(),
     ack: new Set(),
     price: new Set(),
+    owed: new Set(),
     close: new Set(),
   };
 
@@ -38,12 +44,19 @@ export class FakePayProtocol implements PayProtocol {
   }
   sendPay(msg: PayMessage): void {
     this.sentPays.push(msg);
+    this.sent.push({ type: 'PAY', payload: msg });
   }
   sendAck(ack: Omit<AckMessage, 'type'>): void {
     this.acks.push({ type: 'ACK', ...ack });
+    this.sent.push({ type: 'ACK', ...ack });
   }
   sendPrice(price: Omit<PriceMessage, 'type'>): void {
     this.prices.push({ type: 'PRICE', ...price });
+    this.sent.push({ type: 'PRICE', ...price });
+  }
+  sendOwed(owed: Omit<OwedMessage, 'type'>): void {
+    this.owed.push({ type: 'OWED', ...owed });
+    this.sent.push({ type: 'OWED', ...owed });
   }
   cut(reason: Parameters<PayProtocolEvents['close']>[0]): void {
     this.cuts.push(reason);

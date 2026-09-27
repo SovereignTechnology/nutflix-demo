@@ -13,12 +13,21 @@
  * frame on the wire. The codec checks shape and bounds only; what the fields MEAN (a valid
  * signature, a sane split, the right lock) is checked by the channel and the engine.
  *
- * Layout: `tag:uint8` then the fields of HELLO(1) / PAY(2) / ACK(3) / PRICE(4), in the order of
- * the contract's interfaces. `core` is a fixed 32-byte field. Optional proof fields ride on a
- * flags byte (bit0 dleq, bit1 dleq.r, bit2 witness).
+ * Layout: `tag:uint8` then the fields of HELLO(1) / PAY(2) / ACK(3) / PRICE(4) / OWED(5), in the
+ * order of the contract's interfaces. `core` is a fixed 32-byte field. Optional proof fields ride on
+ * a flags byte (bit0 dleq, bit1 dleq.r, bit2 witness).
+ *
+ * v6 amendment (2026-09-26):
+ *   - ACK's flags byte gains bit2 = `outstanding` present (a uint after the reason);
+ *   - PRICE ends with a flags byte: bit0 = `free` present, bit1 = its value (bit1 alone is invalid);
+ *     `free: true` requires `satsPerBlock` 0 and `effectiveFromBlock` 0;
+ *   - OWED: `core`, a uint count n (1 … MAX_OWED_RANGES), then n × (fromBlock, toBlock) uints —
+ *     canonical: each from ≤ to, ascending, disjoint and not adjacent, at most MAX_OWED_BLOCKS
+ *     blocks in total. The count is checked before anything is read, the total as it is read.
  */
 import c, { type State } from 'compact-encoding';
 
+import { MAX_OWED_BLOCKS, MAX_OWED_RANGES } from '../contracts/index.js';
 import type {
   AckMessage,
   CashuProof,
@@ -27,6 +36,8 @@ import type {
   LockedProofSet,
   MintUrl,
   NostrPubkey,
+  OwedMessage,
+  OwedRange,
   PayMessage,
   PayProtocolCodec,
   PayProtocolMessage,
@@ -42,7 +53,7 @@ export const MAX_STRING_BYTES = 16 * 1024;
 export const MAX_PROOFS = 256;
 export const MAX_MINTS = 64;
 
-const TAG = { HELLO: 1, PAY: 2, ACK: 3, PRICE: 4 } as const;
+const TAG = { HELLO: 1, PAY: 2, ACK: 3, PRICE: 4, OWED: 5 } as const;
 
 /** Wire indexes of the reject reasons — append only, never reorder. */
 export const REJECT_REASON_CODES = [
@@ -127,6 +138,37 @@ function writeCore(state: State, core: string, pre: boolean): void {
   need(typeof core === 'string' && HEX64.test(core), 'core: not 64 lower-case hex');
   if (pre) c.fixed32.preencode(state, hexToBytes(core));
   else c.fixed32.encode(state, hexToBytes(core));
+}
+
+/**
+ * The OWED grammar, one step: range `[from, to]` after a range ending at `prevTo` (`null` before
+ * the first), with `total` blocks so far. Returns the new total. Canonical: from ≤ to, ascending,
+ * disjoint and not adjacent; the total never passes `MAX_OWED_BLOCKS` (checked per range, so the
+ * running sum stays small whatever the indexes are).
+ */
+function owedStep(from: number, to: number, prevTo: number | null, total: number): number {
+  need(from <= to, 'owed: a range ends before it starts');
+  need(prevTo === null || from > prevTo + 1, 'owed: ranges must be ascending and not touch');
+  const len = to - from + 1;
+  need(len <= MAX_OWED_BLOCKS - total, 'owed: more blocks than MAX_OWED_BLOCKS');
+  return total + len;
+}
+
+function checkOwedRanges(ranges: unknown): readonly OwedRange[] {
+  need(Array.isArray(ranges), 'owed.ranges: not an array');
+  const list = ranges as readonly unknown[];
+  need(list.length >= 1 && list.length <= MAX_OWED_RANGES, 'owed.ranges: count out of bounds');
+  let prevTo: number | null = null;
+  let total = 0;
+  for (const r of list) {
+    need(Array.isArray(r) && r.length === 2, 'owed.range: not a [from, to] pair');
+    const [from, to] = r as readonly unknown[];
+    const f = checkUint(from, 'owed.fromBlock');
+    const t = checkUint(to, 'owed.toBlock');
+    total = owedStep(f, t, prevTo, total);
+    prevTo = t;
+  }
+  return list as readonly OwedRange[];
 }
 
 // ---------------------------------------------------------------------------------------
@@ -223,23 +265,50 @@ function messageWriters(m: PayProtocolMessage): Writer[] {
       const idx = reason === undefined ? -1 : REJECT_REASON_CODES.indexOf(reason);
       need(reason === undefined || idx >= 0, 'ack.reason: unknown');
       need(typeof m.ok === 'boolean', 'ack.ok');
+      const outstanding = m.outstanding;
+      if (outstanding !== undefined) checkUint(outstanding, 'ack.outstanding');
       out.push(w(c.uint8, TAG.ACK));
       out.push((s, pre) => {
         writeCore(s, m.core, pre);
       });
       out.push(w(c.uint, checkUint(m.fromBlock, 'ack.fromBlock')));
       out.push(w(c.uint, checkUint(m.toBlock, 'ack.toBlock')));
-      out.push(w(c.uint8, (m.ok ? 1 : 0) | (reason !== undefined ? 2 : 0)));
+      out.push(
+        w(
+          c.uint8,
+          (m.ok ? 1 : 0) | (reason !== undefined ? 2 : 0) | (outstanding !== undefined ? 4 : 0),
+        ),
+      );
       if (reason !== undefined) out.push(w(c.uint8, idx));
+      if (outstanding !== undefined) out.push(w(c.uint, outstanding));
       break;
     }
     case 'PRICE': {
+      const free: unknown = m.free;
+      need(free === undefined || typeof free === 'boolean', 'price.free: not a boolean');
+      const sats = checkUint(m.satsPerBlock, 'price.satsPerBlock');
+      const from = checkUint(m.effectiveFromBlock, 'price.effectiveFromBlock');
+      need(free !== true || (sats === 0 && from === 0), 'price.free: a free core has no price');
       out.push(w(c.uint8, TAG.PRICE));
       out.push((s, pre) => {
         writeCore(s, m.core, pre);
       });
-      out.push(w(c.uint, checkUint(m.satsPerBlock, 'price.satsPerBlock')));
-      out.push(w(c.uint, checkUint(m.effectiveFromBlock, 'price.effectiveFromBlock')));
+      out.push(w(c.uint, sats));
+      out.push(w(c.uint, from));
+      out.push(w(c.uint8, free === undefined ? 0 : free ? 3 : 1));
+      break;
+    }
+    case 'OWED': {
+      const ranges = checkOwedRanges(m.ranges);
+      out.push(w(c.uint8, TAG.OWED));
+      out.push((s, pre) => {
+        writeCore(s, m.core, pre);
+      });
+      out.push(w(c.uint, ranges.length));
+      for (const [from, to] of ranges) {
+        out.push(w(c.uint, from));
+        out.push(w(c.uint, to));
+      }
       break;
     }
     default:
@@ -342,20 +411,45 @@ function readMessage(state: State): PayProtocolMessage {
       const fromBlock = readUint(state, 'ack.fromBlock');
       const toBlock = readUint(state, 'ack.toBlock');
       const flags = c.uint8.decode(state);
-      need((flags & ~3) === 0, 'ack.flags');
-      const ack: AckMessage = { type: 'ACK', core, fromBlock, toBlock, ok: (flags & 1) !== 0 };
-      if ((flags & 2) === 0) return ack;
-      const idx = c.uint8.decode(state);
-      const reason = REJECT_REASON_CODES[idx];
-      if (reason === undefined) throw new CodecError('ack.reason: unknown');
-      return { ...ack, reason };
+      need((flags & ~7) === 0, 'ack.flags');
+      let ack: AckMessage = { type: 'ACK', core, fromBlock, toBlock, ok: (flags & 1) !== 0 };
+      if ((flags & 2) !== 0) {
+        const idx = c.uint8.decode(state);
+        const reason = REJECT_REASON_CODES[idx];
+        if (reason === undefined) throw new CodecError('ack.reason: unknown');
+        ack = { ...ack, reason };
+      }
+      if ((flags & 4) !== 0) ack = { ...ack, outstanding: readUint(state, 'ack.outstanding') };
+      return ack;
     }
     case TAG.PRICE: {
       const core = readCore(state);
       const satsPerBlock = readUint(state, 'price.satsPerBlock') as Sats;
       const effectiveFromBlock = readUint(state, 'price.effectiveFromBlock');
+      const flags = c.uint8.decode(state);
+      need((flags & ~3) === 0 && flags !== 2, 'price.flags');
       const price: PriceMessage = { type: 'PRICE', core, satsPerBlock, effectiveFromBlock };
-      return price;
+      if ((flags & 1) === 0) return price;
+      const free = (flags & 2) !== 0;
+      need(!free || (satsPerBlock === 0 && effectiveFromBlock === 0), 'price.free: priced');
+      return { ...price, free };
+    }
+    case TAG.OWED: {
+      const core = readCore(state);
+      const n = readUint(state, 'owed.ranges');
+      need(n >= 1 && n <= MAX_OWED_RANGES, 'owed.ranges: count out of bounds');
+      const ranges: OwedRange[] = [];
+      let prevTo: number | null = null;
+      let total = 0;
+      for (let i = 0; i < n; i++) {
+        const from = readUint(state, 'owed.fromBlock');
+        const to = readUint(state, 'owed.toBlock');
+        total = owedStep(from, to, prevTo, total);
+        prevTo = to;
+        ranges.push([from, to]);
+      }
+      const owed: OwedMessage = { type: 'OWED', core, ranges };
+      return owed;
     }
     default:
       throw new CodecError('unknown tag');

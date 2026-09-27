@@ -84,14 +84,11 @@ export interface RunDaemonOptions {
 
 /** Resolves with the running seeder; the process exits through the signal hooks. */
 export async function runDaemon(o: RunDaemonOptions): Promise<Seeder> {
-  // Fix round 4: the daemon announces each core's price before its first counted block (unless
-  // configured otherwise), as every seeder this repository builds does — a desktop viewer reading
-  // an image learns the core is sold before our window would cut it.
-  const config: SeederConfig = {
-    ...o.config,
-    announceCorePrices: o.config.announceCorePrices ?? true,
-  };
-  const seeder = await Seeder.create(config, { ...o.deps, logger: o.logger });
+  // Like every seeder this repository builds, the daemon's seeder announces each core's terms
+  // (`PRICE`, priced or free) before its first block to a pay/1 peer — always, with no switch
+  // (contracts v6 amendment): a viewer reading an image learns the core is sold before our window
+  // would cut it.
+  const seeder = await Seeder.create(o.config, { ...o.deps, logger: o.logger });
   try {
     for (const name of o.cores ?? ['blobs']) await seeder.openCore(name);
     o.beforeStart?.(seeder);

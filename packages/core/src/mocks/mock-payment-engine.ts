@@ -41,6 +41,14 @@ import type {
   UnixSeconds,
   VerifyResult,
 } from '../contracts/index.js';
+import {
+  OWED_LIMITS,
+  boundOwed,
+  type OwedCore,
+  type OwedLimits,
+  type UnpaidLedger,
+} from '../payment/owed.js';
+import { RangeSet } from '../payment/range-set.js';
 import { effectiveWindowBlocks, isValidCarry, isValidSplit, splitPay } from '../payment/split.js';
 
 export type MockPaymentMode =
@@ -116,7 +124,7 @@ function target8(p2pk: string): string {
   return p2pk.slice(2, 10);
 }
 
-export class MockPaymentEngine implements PaymentEngine {
+export class MockPaymentEngine implements PaymentEngine, UnpaidLedger {
   readonly config: PaymentEngineConfig;
   mode: MockPaymentMode;
 
@@ -402,6 +410,28 @@ export class MockPaymentEngine implements PaymentEngine {
 
   windows(): readonly PeerWindow[] {
     return [...this.windowMap.values()].map((w) => this.snapshot(w));
+  }
+
+  /** `UnpaidLedger` (pay/1 v6 amendment): the reference model of the real engine's. */
+  outstandingOn(peer: NostrPubkey, core: CoreKeyHex): number {
+    const cs = this.windowMap.get(peer)?.cores.get(core);
+    if (cs === undefined) return 0;
+    let n = 0;
+    for (const b of cs.uploaded) if (!cs.paid.has(b)) n++;
+    return n;
+  }
+
+  unpaid(peer: NostrPubkey, limits: OwedLimits = OWED_LIMITS): readonly OwedCore[] {
+    const w = this.windowMap.get(peer);
+    if (w === undefined) return [];
+    return boundOwed(
+      [...w.cores].map(([core, cs]) => {
+        const left = new RangeSet();
+        for (const b of cs.uploaded) if (!cs.paid.has(b)) left.add(b, b);
+        return [core, left.intervals()] as const;
+      }),
+      limits,
+    );
   }
 
   onWindowExceeded(cb: (w: PeerWindow) => void): () => void {

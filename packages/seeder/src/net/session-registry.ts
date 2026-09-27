@@ -33,8 +33,8 @@ export interface SessionRegistryOptions {
    * unpriced (`{ satsPerBlock: 0 }` → the configured window).
    */
   readonly pricing?: (core: CoreKeyHex) => UploadPricing;
-  /** Forwarded to every session (`PeerSessionOptions.onFirstUpload`). */
-  readonly onFirstUpload?: (session: PeerSession, core: CoreKeyHex) => void;
+  /** Forwarded to every session (`PeerSessionOptions.beforeBlock`). */
+  readonly beforeBlock?: (session: PeerSession, core: CoreKeyHex, free: boolean) => void;
   /** Forwarded to every session (`PeerSessionOptions.accepting`: the pending-PAY cap). */
   readonly accepting?: () => boolean;
   /** Forwarded to every session (`PeerSessionOptions.isFree`: ADR 0015 free cores). */
@@ -52,7 +52,7 @@ export class SessionRegistry {
   private readonly log: Logger;
   private readonly now: (() => number) | undefined;
   private readonly pricing: ((core: CoreKeyHex) => UploadPricing) | undefined;
-  private readonly onFirstUpload: SessionRegistryOptions['onFirstUpload'];
+  private readonly beforeBlock: SessionRegistryOptions['beforeBlock'];
   private readonly accepting: SessionRegistryOptions['accepting'];
   private readonly isFree: SessionRegistryOptions['isFree'];
 
@@ -62,7 +62,7 @@ export class SessionRegistry {
     this.rateLimiter = opts.rateLimiter;
     this.log = opts.logger;
     this.now = opts.now;
-    this.onFirstUpload = opts.onFirstUpload;
+    this.beforeBlock = opts.beforeBlock;
     this.accepting = opts.accepting;
     this.isFree = opts.isFree;
     this.pricing = opts.pricing;
@@ -128,7 +128,7 @@ export class SessionRegistry {
       peerInfo,
       ...(this.now ? { now: this.now } : {}),
       ...(this.pricing ? { pricing: this.pricing } : {}),
-      ...(this.onFirstUpload ? { onFirstUpload: this.onFirstUpload } : {}),
+      ...(this.beforeBlock ? { beforeBlock: this.beforeBlock } : {}),
       ...(this.accepting ? { accepting: this.accepting } : {}),
       ...(this.isFree ? { isFree: this.isFree } : {}),
       onClose: (s) => {

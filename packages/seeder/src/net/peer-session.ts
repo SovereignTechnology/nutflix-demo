@@ -61,8 +61,9 @@ export interface PeerSessionOptions {
   readonly accepting?: () => boolean;
   /**
    * ADR 0015: cores served OUTSIDE payment (a creator's profile core: thumbnails, avatars). Their
-   * blocks are sent without `recordUpload`, without the window check and without a `PRICE`, and
-   * never trip the pending-PAY back-pressure. Default: none.
+   * blocks are sent without `recordUpload`, without the window check, and never trip the
+   * pending-PAY back-pressure; `beforeBlock` still runs (the seeder says `PRICE { free: true }`).
+   * Default: none.
    */
   readonly isFree?: (core: CoreKeyHex) => boolean;
   readonly noiseKey: Uint8Array;
@@ -85,11 +86,14 @@ export interface PeerSessionOptions {
    */
   readonly onBind?: (session: PeerSession, pubkey: NostrPubkey) => void;
   /**
-   * Called synchronously the first time a block of `core` is uploaded on this session, BEFORE it
-   * is written to the wire — where a multi-price seeder announces the core's price (a `PRICE`
-   * sent here precedes the block, so the payer never prices it at the HELLO's ceiling).
+   * Called synchronously before EVERY block this session sends — free (`free: true`, before the
+   * free early return) or counted (after the back-pressure check, before `recordUpload` and the
+   * window check) — BEFORE it is written to the wire (spike S-A). Where the seeder announces the
+   * core's terms (contracts v6 amendment, rule 1): a `PRICE` sent here precedes the block on the
+   * same Protomux stream. The seeder dedupes per session; this hook only says what is served.
+   * `nextIndexFor(core)` still excludes the block being sent (the `effectiveFromBlock` to use).
    */
-  readonly onFirstUpload?: (session: PeerSession, core: CoreKeyHex) => void;
+  readonly beforeBlock?: (session: PeerSession, core: CoreKeyHex, free: boolean) => void;
 }
 
 export class PeerSession {
@@ -113,7 +117,7 @@ export class PeerSession {
   private readonly log: Logger;
   private readonly peerInfo: PeerInfo | null;
   private readonly onBind: ((session: PeerSession, pubkey: NostrPubkey) => void) | undefined;
-  private readonly onFirstUpload: PeerSessionOptions['onFirstUpload'];
+  private readonly beforeBlock: PeerSessionOptions['beforeBlock'];
   private readonly accepting: PeerSessionOptions['accepting'];
   private readonly isFree: PeerSessionOptions['isFree'];
 
@@ -128,7 +132,7 @@ export class PeerSession {
     this.openedAt = (opts.now ?? Date.now)();
     this.log = opts.logger.child({ noiseKey: this.noiseKeyHex });
     this.onBind = opts.onBind;
-    this.onFirstUpload = opts.onFirstUpload;
+    this.beforeBlock = opts.beforeBlock;
     this.accepting = opts.accepting;
     this.isFree = opts.isFree;
     this.stream.once('close', () => {
@@ -206,8 +210,10 @@ export class PeerSession {
    */
   onUpload(coreKeyHex: string, index: number, byteLength: number): PeerWindow | null {
     if (this.cutWith !== null || this.isClosed) return null;
-    // ADR 0015: a free core's block is not a sale — nothing to record, no window, no PRICE.
+    // ADR 0015: a free core's block is not a sale — nothing to record, no window. Its terms are
+    // still announced first (`PRICE { free: true }`, v6 amendment).
     if (this.isFree?.(coreKeyHex as CoreKeyHex) === true) {
+      this.announce(coreKeyHex, true);
       this.uploadedBytesTotal += byteLength; // bytes sent, but not a sold block
       return this.engine.window(this.accountId()) ?? null;
     }
@@ -219,14 +225,8 @@ export class PeerSession {
     }
     this.uploaded++;
     this.uploadedBytesTotal += byteLength;
-    const first = !this.coresUploaded.has(coreKeyHex);
     this.coresUploaded.add(coreKeyHex);
-    if (first && this.onFirstUpload !== undefined)
-      try {
-        this.onFirstUpload(this, coreKeyHex as CoreKeyHex);
-      } catch (err) {
-        this.log.error('first-upload hook threw', { error: err });
-      }
+    this.announce(coreKeyHex, false);
     this.nextIndex.set(coreKeyHex, Math.max(this.nextIndexFor(coreKeyHex), index + 1));
     if (this.pubkeyBound === null) this.provisionalUploads++;
     // v5 (ADR 0010): the block INDEX travels, so `range-not-uploaded` is exact per block
@@ -248,6 +248,16 @@ export class PeerSession {
       this.cut('window-exceeded');
     }
     return w;
+  }
+
+  /** `beforeBlock`, contained: a failing hook never stops the upload gate. */
+  private announce(core: string, free: boolean): void {
+    if (this.beforeBlock === undefined) return;
+    try {
+      this.beforeBlock(this, core as CoreKeyHex, free);
+    } catch (err) {
+      this.log.error('before-block hook threw', { error: err });
+    }
   }
 
   /**

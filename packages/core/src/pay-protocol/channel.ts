@@ -14,6 +14,10 @@
  * - PAY, ACK and PRICE are delivered as they arrive, also before HELLO: Hypercore serves blocks
  *   from the first moment and the seeder accounts them under the provisional Noise identity
  *   (ADR 0004 d), so a PAY racing its sender's HELLO must not be dropped.
+ * - OWED (v6 amendment) is delivered only once the channel is `open`: a seeder sends it after
+ *   both HELLOs verified, after its own HELLO on the same ordered stream, and the viewer sent its
+ *   HELLO before the seeder could verify it — so an OWED that arrives earlier breaks the protocol
+ *   (it would name blocks for a pubkey nobody has bound yet) and is a protocol error.
  * - An undecodable frame or a bad HELLO closes the channel and emits `close('protocol-error')`;
  *   what that costs the peer (a cut, a ban) is the owner's decision — the seeder's session owns
  *   the ban + destroy. `cut()` closes the channel, runs the owner's `onCut` (hyperswarm
@@ -28,6 +32,7 @@ import type {
   AckMessage,
   HelloMessage,
   MuxLike,
+  OwedMessage,
   PayMessage,
   PayProtocol,
   PayProtocolCodec,
@@ -81,6 +86,7 @@ export class PayChannel implements PayProtocol {
     pay: new Set(),
     ack: new Set(),
     price: new Set(),
+    owed: new Set(),
     close: new Set(),
   };
 
@@ -153,6 +159,10 @@ export class PayChannel implements PayProtocol {
 
   sendPrice(price: Omit<PriceMessage, 'type'>): void {
     this.send({ type: 'PRICE', ...price });
+  }
+
+  sendOwed(owed: Omit<OwedMessage, 'type'>): void {
+    this.send({ type: 'OWED', ...owed });
   }
 
   cut(reason: CloseReason): void {
@@ -229,6 +239,13 @@ export class PayChannel implements PayProtocol {
         return;
       case 'PRICE':
         this.emit('price', m);
+        return;
+      case 'OWED':
+        if (this.st !== 'open') {
+          this.protocolError('OWED before both HELLOs');
+          return;
+        }
+        this.emit('owed', m);
         return;
     }
   }
