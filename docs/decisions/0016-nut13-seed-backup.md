@@ -5,7 +5,8 @@ Date: 2026-09-25
 ## Status
 
 Accepted 2026-09-25 with Cameron's answers (below), which differ from the draft's
-recommendations on D2 and D3. Not yet implemented. Cameron (2026-09-24, issue #3): NUT-13 seed
+recommendations on D2 and D3. Core implemented 2026-09-26 (lane N1-nut13-core, see Implementation
+notes at the end); the desktop is lane N2. Cameron (2026-09-24, issue #3): NUT-13 seed
 backup is in Stage 3, design and ADR first, then his multiple-choice answers before any code.
 This builds on ADR 0014 (write-ahead journal + NUT-09 restore) and replaces none of it.
 
@@ -439,3 +440,38 @@ which may not persist counters.
 3. **Old balance:** swap it into backed-up proofs once (recommended), or cover only new payments.
 4. **BIP-39 library:** pin `@scure/bip39` 2.0.1 and add it to the audited list (recommended), keep
    the phrase code outside the locked files, or no words (a 64-hex seed).
+
+## Implementation notes (lane N1-nut13-core, core, 2026-09-26)
+
+The decisions stand. Where the core implementation sharpens or departs from the design text, and
+what the real-mint lane measured (details: `docs/lanes/N1-nut13-core.md`,
+`docs/reviews/2026-09-26-pre-push-nut13-core.md`):
+
+- **§4, the code of a collision.** Real mints do not answer "outputs already signed" with 10002:
+  Nutshell 0.21.0 says 11003 "outputs already signed" (mint, swap, melt); cdk-mintd 0.18.1 says
+  20006 "Invoice already paid or pending" on a mint or melt and 11008 "Duplicate outputs" on a swap.
+  Core therefore does not trust the code: after any coded refusal of a seeded operation it asks
+  NUT-09 once whether the operation's outputs are signed, and signatures send it through the
+  NUT-07 check below. Both mints refuse a melt whose blanks are signed BEFORE they spend or pay.
+- **§4, signatures that are not ours.** A restored signature for another amount or keyset under one
+  of our outputs is another wallet's (a collision) when NUT-07 says the operation never ran, and a
+  lie (the entry kept, as in ADR 0014) when it did.
+- **§4, without a journal** (a store without `pending`; none in production) the guard falls back to
+  the code/message ("already signed").
+- **§3, probe.** Every keyset the counters file does not know is probed before its first
+  derivation, not only when the file is missing (a keyset rotation too): NUT-09 batches of 100
+  from the cursor until one comes back empty. Cost: one request per keyset per device, which shows
+  the mint the next 100 unsigned outputs of this device.
+- **§3, one source per store.** `CashuMintConnections` keeps one live counter source per
+  `CounterStore` object, and a stored lease never moves back (the store is re-read before each
+  write). The shell keeps one `CounterStore` object per identity.
+- **§2, wrappers.** A `MintConnections` wrapper must forward `seeding`; core refuses to operate on a
+  seeded cashu-ts wallet whose context lost it (the desktop's money plane wraps its connections).
+- **§5 step 4.** At a mint without NUT-12 everything unspent is swapped before it counts (one
+  history line); dust the input fee would eat is left.
+- **§5 step 5.** PENDING proofs are left out (the store has no "marked" state); a later restore
+  adds them if the melt failed. Contract request `docs/contract-requests/N1-nut13-core.md` item 2.
+- **Wiped entropy** (16 zero bytes, phrase "abandon … about") is refused before it is shown or
+  turned into a seed.
+- **Related findings.** 2: the payout comment now names the real gap. 4: NUT-07, NUT-09, NUT-13 and
+  its test vectors vendored from `cashubtc/nuts@8bde3c0` (fetched 2026-09-26).
