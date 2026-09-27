@@ -917,9 +917,19 @@ export class DesktopNetworkAdapter implements NetworkAdapter {
     return this.sessions.closeAll();
   }
 
-  /** Lane P2-owed-viewer (quit): every tail authorisation write started so far has landed. */
+  /**
+   * Lane P2-owed-viewer (quit): every tail authorisation write started so far has landed — the
+   * current plane's, and (independent review) those of planes the signer flow closed, its own
+   * shutdown included: `Host.stop` drops the plane before this runs.
+   */
   async flushTails(): Promise<void> {
-    await this.o.money?.()?.flushTails();
+    await Promise.all([
+      this.o
+        .money?.()
+        ?.flushTails()
+        .catch(() => undefined),
+      this.o.signerFlow?.flushTails(),
+    ]);
   }
 
   private onUploadEvent(uploadId: string, p: UploadProgress): void {

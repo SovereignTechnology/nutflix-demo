@@ -137,6 +137,22 @@ describe('real providers: a PAY is built for a session covering its blocks (fix 
     r.p.close?.();
   });
 
+  // Independent review (lane P2-owed-viewer, HIGH): the payer's wrapper dropped `opts` and this
+  // function split the PAY with `carryIn` 0 — the seeder refused it `malformed` after the host had
+  // spent its proofs. A PAY without the carry of its chain is now refused before the host is asked.
+  it('a PAY without the carry of its chain is refused before the host is asked (nothing spent)', async () => {
+    const r = await start(
+      () => [A],
+      () => Promise.resolve(MSG),
+    );
+    await expect(r.p.pay(r.range, SEEDER, POLICY)).rejects.toThrow(/^internal: /);
+    await expect(r.p.pay(r.range, SEEDER, POLICY, {})).rejects.toThrow(/^internal: /);
+    expect(r.asked).toEqual([]);
+    await expect(r.p.pay(r.range, SEEDER, POLICY, { carryIn: 20 })).resolves.toBe(MSG);
+    expect(r.asked).toEqual([A]);
+    r.p.close?.();
+  });
+
   it('no session covers the blocks: refused session-closed without asking the host', async () => {
     const r = await start(
       () => [],

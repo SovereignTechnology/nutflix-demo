@@ -26,11 +26,16 @@
  * anything changed, at once for a write-ahead `full`, and at close. A crash loses at most the
  * last batch of block entries (those blocks are then respected, not paid) — never a `full`.
  *
- * BOUNDS. Entries older than `UNPAID_TTL_MS` (the host's tail authorisations expire with them)
- * are dropped at load; a seeder holds at most `MAX_BLOCKS_PER_SEEDER` blocks and the record at
- * most `MAX_SEEDERS` seeders (the least recently touched go first — their blocks are then only
- * respected). The file is local state, still checked field by field on load: anything malformed
- * is dropped, and a file that does not parse starts an empty record (logged, counts only).
+ * BOUNDS. Blocks and sessions older than `UNPAID_TTL_MS` (the host's tail authorisations expire
+ * with them) are dropped at load; a seeder holds at most `MAX_BLOCKS_PER_SEEDER` blocks and the
+ * record at most `MAX_SEEDERS` seeders (the least recently touched go first — their blocks are
+ * then only respected). A `full` word is kept past the age-out, and the bound takes seeders
+ * holding only blocks before any that holds it (independent review): a seeder keeps counting what
+ * we forget, and one at its window asked a block before its report would cut and ban us. It goes
+ * when the seeder's report says it counts less (the flush), or — only when every seeder beyond the
+ * bound holds one — the least recently touched first. The file is local state, still checked
+ * field by field on load: anything malformed is dropped, and a file that does not parse starts an
+ * empty record (logged, counts only).
  *
  * Nothing here logs a key, a pubkey, a core or a block: counts only.
  */
@@ -40,7 +45,7 @@ import type { Logger } from '@sovit/seeder';
 
 import type { StateFs } from '../runtime.js';
 
-/** How long an unpaid block (and a `full` word) is kept: the host's tail authorisations last as long. */
+/** How long an unpaid block is kept (the host's tail authorisations last as long; a `full` word stays). */
 export const UNPAID_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 /** Batches are written at most this often while anything changed. */
 export const FLUSH_MS = 1000;
@@ -314,22 +319,35 @@ export class UnpaidRecord {
     if (e === undefined) {
       e = { blocks: new Map(), full: false, at: this.now() };
       this.seeders.set(pubkey, e);
-      this.evict();
+      // Never the entry just made: its caller is about to fill it (a block, a `full` word).
+      this.evict(pubkey);
     }
     return e;
   }
 
-  private evict(): void {
+  /**
+   * Beyond `MAX_SEEDERS`: the least recently touched seeder holding only blocks goes first; a
+   * `full` word only when every other seeder holds one (see the header).
+   */
+  private evict(keep?: string): void {
     while (this.seeders.size > MAX_SEEDERS) {
       let oldest: string | null = null;
+      let oldestFull: string | null = null;
       let at = Number.POSITIVE_INFINITY;
-      for (const [pk, e] of this.seeders)
-        if (e.at < at) {
+      let atFull = Number.POSITIVE_INFINITY;
+      for (const [pk, e] of this.seeders) {
+        if (pk === keep) continue;
+        if (!e.full && e.at < at) {
           at = e.at;
           oldest = pk;
+        } else if (e.full && e.at < atFull) {
+          atFull = e.at;
+          oldestFull = pk;
         }
-      if (oldest === null) return;
-      this.seeders.delete(oldest);
+      }
+      const gone = oldest ?? oldestFull;
+      if (gone === null) return;
+      this.seeders.delete(gone);
       this.dirty = true;
     }
   }
@@ -419,12 +437,23 @@ export class UnpaidRecord {
     }
     let dropped = 0;
     for (const [pk, x] of Object.entries(doc.seeders)) {
-      if (!HEX64.test(pk) || !isRecord(x) || !fresh(x['at'])) {
+      if (!HEX64.test(pk) || !isRecord(x)) {
         dropped++;
         continue;
       }
-      const e: SeederEntry = { blocks: new Map(), full: x['full'] === true, at: x['at'] };
-      const blocks = x['blocks'];
+      const at = x['at'];
+      const full = x['full'] === true;
+      // A `full` word outlives the age-out (see the header): kept, with no blocks, when old.
+      if (!fresh(at) && !full) {
+        dropped++;
+        continue;
+      }
+      const e: SeederEntry = {
+        blocks: new Map(),
+        full,
+        at: typeof at === 'number' && Number.isFinite(at) ? Math.min(at, now) : now,
+      };
+      const blocks = fresh(at) ? x['blocks'] : undefined;
       if (isRecord(blocks))
         for (const [core, runs] of Object.entries(blocks)) {
           if (!HEX64.test(core) || !Array.isArray(runs)) continue;

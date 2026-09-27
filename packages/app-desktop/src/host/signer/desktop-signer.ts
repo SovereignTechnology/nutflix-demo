@@ -179,6 +179,12 @@ export class DesktopSigner implements IdentityProvider {
   private rememberedValue = false;
   private lockedPubkey: NostrPubkey | null = null;
   private plane: MoneyPlane | undefined;
+  /**
+   * Lane P2-owed-viewer (independent review): the tail-authorisation writes of every plane closed
+   * so far — `MoneyPlane.close` starts one per session still open. The host's quit waits for them
+   * (`flushTails`), and so does the next plane's open (its book reads the same file).
+   */
+  private retiring: Promise<void> = Promise.resolve();
   /** Why the last money plane did not open (an error code prefix), or `null`. */
   private planeError: string | null = null;
   private busy = false;
@@ -350,12 +356,25 @@ export class DesktopSigner implements IdentityProvider {
     });
   }
 
-  /** Host shutdown: wipe the key, close the money plane and any NIP-46 session. */
+  /**
+   * Host shutdown: wipe the key, close the money plane and any NIP-46 session. The plane is closed
+   * before the first `await`, so its tail writes have started when this returns its promise:
+   * `flushTails` waits for them.
+   */
   async close(): Promise<void> {
     this.closed = true;
-    this.plane?.close();
+    const old = this.plane;
     this.plane = undefined;
+    this.retire(old);
     await this.manager.disconnect().catch(() => undefined);
+  }
+
+  /**
+   * Every tail-authorisation write started so far has landed — those of the planes closed before
+   * (sign-out, lock, a signer swap, shutdown) and of the current one. Never rejects.
+   */
+  async flushTails(): Promise<void> {
+    await Promise.all([this.retiring, this.plane?.flushTails().catch(() => undefined)]);
   }
 
   // ---- flows ---------------------------------------------------------------------------------
@@ -626,9 +645,14 @@ export class DesktopSigner implements IdentityProvider {
       const old = this.plane;
       this.plane = undefined;
       this.planeError = null;
-      old?.close();
+      this.retire(old);
       const s = this.signer();
       if (s === undefined || this.closed) return;
+      // The next plane's tail book reads the file the closed ones are still writing: after them,
+      // or it would miss those tails and its next save would drop them (independent review).
+      await this.retiring;
+      // Shut down meanwhile: no plane after `close` (its key would never be wiped).
+      if (this.isClosed()) return;
       try {
         this.plane = await this.o.openMoney(s, generated);
         return;
@@ -662,6 +686,19 @@ export class DesktopSigner implements IdentityProvider {
       }
     });
     this.emit();
+  }
+
+  /** Read through a call: `closed` may change across an `await` (TypeScript narrows the field). */
+  private isClosed(): boolean {
+    return this.closed;
+  }
+
+  /** Close `plane` (its sessions keep their tails) and remember its tail writes. */
+  private retire(plane: MoneyPlane | undefined): void {
+    if (plane === undefined) return;
+    plane.close();
+    const flushed = plane.flushTails().catch(() => undefined);
+    this.retiring = Promise.all([this.retiring, flushed]).then(() => undefined);
   }
 
   private emit(): void {

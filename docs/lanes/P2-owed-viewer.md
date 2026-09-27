@@ -13,7 +13,9 @@ Commits:
 - `8ae3f1a`: the review's fixes;
 - `17c838d`: lint on old test call sites;
 - `3340a41`: mutation-check gaps closed, ADR and contract-request text;
-- then this record and the review record.
+- `8d14a2f`: this record and the review record;
+- then the independent review's fixes (section 3 below), with this record and the review record
+  updated.
 
 Review record: `docs/reviews/2026-09-26-pre-push-owed-viewer.md`. Decisions: Cameron 2026-09-26,
 the amendments at the end of ADR 0018 (the seeder's count, paying an old tail) and ADR 0015
@@ -131,6 +133,34 @@ durable record and no host to authorise a closed session's tail. What its previo
 unpaid stays counted at the seeder, and the gateway stays under it until that seeder forgets it
 (its own restart). This is documented in `gateway.ts` and in `SeederCredit`'s header.
 
+### 3. The independent review's fixes (2026-09-27)
+
+An independent reviewer made 9 findings on `8d14a2f`; building the test for its HIGH found one
+more defect. The review record ("Independent review") has each finding, scenario and mutation.
+
+- **The carry of every PAY reaches the host (HIGH).** The worker's payer dropped `opts`, so the
+  host split every fresh PAY with `carryIn` 0; after any PAY that left a carry the seeder refused
+  the next one `malformed`, its proofs spent. The wrapper forwards the carry; the worker's pay
+  function now refuses a PAY without one before asking the host (fail closed); the dev wiring
+  forwards it too. Owed and fresh PAYs share one chain.
+- **An empty creator share is a valid PAY (HIGH, new).** At a split where a small PAY gives the
+  creator 0 sats (90/10 at 2 or 3 sats/block), the worker's guard refused the host's PAY after it
+  was built (the contract allows an empty set), and the payer built another: 6 were thrown away
+  in the measured run. A PAY's sets may now be empty; a PAY carries at least one proof in total.
+- **Quit waits for the signer flow's tail writes (MEDIUM).** `DesktopSigner` keeps the tail writes
+  of the planes it closes and `adapter.flushTails()` waits for them, so a quit on the production
+  signer path no longer exits with them in flight. The next plane for an identity opens only after
+  the closed one's writes landed (INFO 5).
+- **Gateway report rule (LOW).** When the channel opens, what is in flight then is counted as
+  `early`, so a reply to a free-core request made before our HELLO no longer completes the report
+  ahead of the `OWED`.
+- **INFO.** A test for the tail re-check at the gate's turn; `onOwed` marks only the blocks the
+  payer took (`addOwedIndexes`); an owed range with no shared mint stays in the record for a later
+  connection (`onUnpayable` scope `'connection'`); the record's `full` word survives the seeder
+  bound and the age-out.
+- **Deferred.** The directory fsync in Bare's `writeAtomic` (R9); a write-ahead tail for a
+  full-app crash (R2, Cameron's call).
+
 ## Files
 
 - **Seeder:** `packages/seeder/src/net/one-peer.ts`: `single`, `free`, `lostOf`, `forgive`.
@@ -162,6 +192,20 @@ unpaid stays counted at the seeder, and the gateway stays under it until that se
   - ADRs 0015 and 0018 ("viewer side as built");
   - `docs/contract-requests/P2-owed-viewer.md`;
   - this record and the review record.
+- **Independent review fixes:**
+  - `worker/pay/viewer-payer.ts` (the carry forwarded; accepted owed indexes; the connection
+    scope), `worker/pay/real-providers.ts` (no PAY without a carry), `worker/dev/dev-mocks.ts`,
+    `worker/dev/fixtures-net.ts`;
+  - `ipc/worker-guards.ts` (a PAY's empty share);
+  - `host/signer/desktop-signer.ts` (`retiring`, `flushTails`), `host/adapter.ts`,
+    `host/host.ts` (a comment);
+  - `gateway/src/upstream/seeder-credit.ts` (`early` at open), `gateway/src/upstream/payer.ts`
+    (`addOwedIndexes`, `onUnpayable` scope);
+  - `worker/pay/unpaid-record.ts` (the `full` word kept);
+  - tests: `host/__tests__/desktop-carry.integration.test.ts` (new); `viewer-payer`,
+    `real-providers-sessions`, `worker-guards`, `desktop-signer`, `signer-host`, `tails`,
+    `unpaid-record`, `seeder-credit` extended;
+  - ADR 0018 "viewer side as built" updated.
 
 ## Tests
 
@@ -225,9 +269,28 @@ unpaid stays counted at the seeder, and the gateway stays under it until that se
 The fix-round-4 probe tests went with the probe (the task: "remove the probe code and the interim
 rules it needed"); `single` replaces the router's probe test with the same shape.
 
-**Mutation checks:** 45, all caught (the review record has the table). M13 and M40 needed a new
-test first. M43–M45 are end to end; with M45 (the ledger's earlier-run word ignored) the daemon
-bans the viewer.
+**The independent review's tests:**
+
+- `desktop-carry.integration` (new; seeder daemon over hyperswarm, real framed IPC, real
+  providers, the host money plane; 3 sats/block at 90/10, so no PAY under 10 blocks leaves a
+  carry of 0 and small PAYs have an empty creator set):
+  - A. a whole video: the first PAY at carry 0, every later one at the non-zero carry its chain
+    held, none refused, every block paid, no ban, the wallet down by exactly the blocks paid;
+  - B. a 1-block tail, a restart, then a new video: the owed PAY opens the chain at 0 and leaves
+    30, every fresh PAY after it carries on; none refused, every block paid, no ban.
+  Before the fixes A failed (5 `invalid-argument`, then `forbidden`) and B timed out.
+- `signer-host` (new describe): a quit on the signer flow's plane leaves the tail on disk when
+  `Host.shutdown` resolves, both when `play.close` reports a tail and when the bound runs out.
+- Units: `viewer-payer` (the carry of fresh PAYs; owed then fresh on one chain; accepted owed
+  indexes only; no shared mint keeps the record), `real-providers-sessions` (no PAY without a
+  carry), `worker-guards` (empty shares), `desktop-signer` (the closed plane's writes: the next
+  open and `flushTails` wait), `tails` (the tail expiring at the gate's turn), `unpaid-record`
+  (the `full` word and the bound, the age-out), `seeder-credit` (a pre-open free-core reply).
+
+**Mutation checks:** 45 in the lane's own review, all caught (the review record has the table).
+M13 and M40 needed a new test first. M43–M45 are end to end; with M45 (the ledger's earlier-run
+word ignored) the daemon bans the viewer. The independent review added M46–M62 (its table; M61 and M62 end to end), plus
+the reviewer's own survivor (money.ts:565), now M54 and caught.
 
 **Real mints:** `gateway/real-mint-swarm.integration` and `seeder/owed.integration`, with
 `NUTFLIX_REAL_MINT_URL` at Nutshell 0.21.0 (`:3399`, `_URL_2` `:3398`) and cdk-mintd 0.18.1
@@ -255,6 +318,22 @@ Run on the final code (`3340a41`; this record and the review record change no co
 - **Mutation checks:** 45 of 45 caught.
 - **Not run:** the Electron e2e (as instructed).
 
+### After the independent review
+
+- **`npx tsc -b --force`**, **`npm run build`** (again after the forced `tsc`, which made the
+  packaging tests' freshness check fail until the bundle was rebuilt), **eslint** and
+  **prettier** on every changed file, **`check:locked`**, **`lint:electron`** (245 files, 0
+  violations), **`check:native`** (43; no dependency changed): all clean.
+- **Touched suites** (23 files, the five desktop integrations and the new `desktop-carry`
+  included): 373 of 373.
+- **Whole suite,** `--maxWorkers=2`, load 12–15 on 8 cores: 223 files; 3432 passed, 2 failed
+  (`auto-topup.test` at its 5 s timeout, a file this lane never touched; 95 of 95 alone, no
+  timeout raised), 45 skipped (23 of them the two packaging files stopped by the stale build; 23
+  of 23 after the rebuild). Net: 3457 passed, 22 skipped, 0 failed. Lane R6's three base failures
+  pass.
+- **Mutation checks:** M46–M62, 17 of 17 caught (M52 after its test was tightened).
+- **Real mints:** `gateway/real-mint-swarm.integration` and `seeder/owed.integration` with `NUTFLIX_REAL_MINT_URL` at Nutshell `:3399` and at cdk-mintd `:3397` (`_URL_2` `:3398`): 11 of 11 at each. `desktop-carry`, like `desktop-owed`, is TestMint-only (the worker's guard admits only `https` mints).
+
 ## Residuals
 
 - **R1: tails outlive their session.** A compromised worker keeps up to `MAX_TAIL_BLOCKS` of each
@@ -273,6 +352,11 @@ Run on the final code (`3340a41`; this record and the review record change no co
 - **R7: ledger writes.** About one small atomic write per second per active seeder.
 - **R8: two live connections with one seeder pubkey.** Each budget ignores the other's live
   blocks. Pre-existing.
+- **R9: power loss** (independent review, finding 8, deferred). Bare's `writeAtomic` does not
+  fsync the directory after its rename: the record's write-ahead word is durable against a
+  process crash, not a power loss.
+- **R10: an unbounded wait on the disk** (independent review). A sign-in after a sign-out waits
+  for the closed plane's tail writes, as the quit does; a disk that never answers holds it.
 - **Lane P1's R1 is resolved:** the viewer no longer reads `free` as sold. **P1's R9 is
   resolved:** the image path marks free before the open.
 
@@ -291,7 +375,7 @@ Run on the final code (`3340a41`; this record and the review record change no co
 ## Proposed `docs/status.md` row
 
 ```
-| Viewer pays the seeder's count + images only where "free" (ADRs 0015/0018 amendments 2026-09-26) | `stage-3/owed-viewer` (off `54f49bb`, owed-seeder + int-reconcile merged) | **done (viewer side)** — image reads ask a seeder only after its `PRICE { free: true }` (no probe; router `free`: a free read that times out leaves no debt; a pricing gateway no longer stops an honest free image); `SeederCredit` starts each seeder from its report (one block at a time until it is in, then window − `OWED`, re-based by every `ACK.outstanding`); the worker keeps a durable record of blocks received and unpaid per seeder pubkey + core with their session terms, plus a write-ahead "may be at its window" ledger; on `OWED` it pays only reported ∩ recorded blocks under the recorded session's id; `play.close` answers the unpaid tail and the host keeps per-identity tail authorisations (≤ 1024 blocks, 7 days, checked like any PAY, budget on disk before the build); the gateway gets credit-from-report and pays no old tail. Four tail scenarios end to end against a seeder daemon over hyperswarm (graceful close, crash, over-claim, expiry), three image scenarios on the testnet, 45 mutation checks, real-mint lanes green at Nutshell and cdk-mintd. Open: R1 (tails outlive their session, capped), R2 (full-app crash leaves no tail authorisation), R3/R4 (no end-of-report marker: 10 s wait; gateway crash-at-window) |
+| Viewer pays the seeder's count + images only where "free" (ADRs 0015/0018 amendments 2026-09-26) | `stage-3/owed-viewer` (off `54f49bb`, owed-seeder + int-reconcile merged) | **done (viewer side)** — image reads ask a seeder only after its `PRICE { free: true }` (no probe; router `free`: a free read that times out leaves no debt; a pricing gateway no longer stops an honest free image); `SeederCredit` starts each seeder from its report (one block at a time until it is in, then window − `OWED`, re-based by every `ACK.outstanding`); the worker keeps a durable record of blocks received and unpaid per seeder pubkey + core with their session terms, plus a write-ahead "may be at its window" ledger; on `OWED` it pays only reported ∩ recorded blocks under the recorded session's id; `play.close` answers the unpaid tail and the host keeps per-identity tail authorisations (≤ 1024 blocks, 7 days, checked like any PAY, budget on disk before the build); the gateway gets credit-from-report and pays no old tail. Four tail scenarios end to end against a seeder daemon over hyperswarm (graceful close, crash, over-claim, expiry), three image scenarios on the testnet, 45 mutation checks, real-mint lanes green at Nutshell and cdk-mintd. Independent review fixed: every desktop PAY now carries its chain's `carryIn` (fresh PAYs went out with 0 — refused `malformed` after any carry, proofs spent) and none is built without one; a PAY with an empty creator share is admitted (the worker's guard refused it after the host built it); quit waits for the signer flow's tail writes; the gateway's report ignores replies to requests made before our HELLO; the record's write-ahead word survives its bound and age-out; `desktop-carry` end to end at 3 sats/block, 90/10; 62 mutation checks. Open: R1 (tails outlive their session, capped), R2 (full-app crash leaves no tail authorisation), R3/R4 (no end-of-report marker: 10 s wait; gateway crash-at-window), R9 (no directory fsync in Bare's `writeAtomic`) |
 ```
 
 ## Proposed `docs/security-review.md` text (§5 or §6)
@@ -312,6 +396,14 @@ Run on the final code (`3340a41`; this record and the review record change no co
 >   range and manifest terms; at most `min(unpaid, remaining, 1024)` blocks; 7 days; persisted
 >   per identity as a private file; each PAY's blocks off the budget on disk before the build.
 > - The gateway pays no old tail.
+> - Every desktop PAY, owed or fresh, is split with the carry of its channel's chain for the core
+>   (ADR 0010); the worker refuses to build one without it, before the host is asked (independent
+>   review: fresh PAYs went out with 0 and were refused `malformed` after their proofs were
+>   spent).
+> - A PAY whose creator (or seeder) share is 0 sats carries an empty set, as contracts v5 allow;
+>   the worker's guard admits it and refuses a PAY with no proof at all (independent review: it
+>   refused the host's PAY after it was built, and the payer built another).
+> - The quit waits for every tail-authorisation write, the signer flow's closed plane included.
 > - Logs carry counts only.
 >
 > **Residual:**
@@ -320,3 +412,5 @@ Run on the final code (`3340a41`; this record and the review record change no co
 > - [Low] A full-app crash's tail is not paid, only respected (R2).
 > - [Low] A report delayed past 10 s for a seeder at its window; the gateway after its own crash
 >   at a seeder's window (R3, R4; contract request for an end-of-report marker).
+> - [Low] Power loss: Bare's `writeAtomic` does not fsync the directory after its rename, so the
+>   record's write-ahead word is durable against a process crash only (R9).

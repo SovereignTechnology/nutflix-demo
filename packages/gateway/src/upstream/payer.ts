@@ -258,8 +258,13 @@ export interface UpstreamPayerOptions {
    * Blocks of `range` downloaded from `noiseHex` will never be paid (their PAY cannot be built:
    * see the module comment). The downloader settles them as UNPAID (`CreditSettler.settleUnpaid`)
    * so the seeder's credit keeps them for good. Called once per range given up.
+   *
+   * Lane P2-owed-viewer (independent review): `scope` is `'connection'` for owed blocks (from
+   * before, `addOwed`) that only THIS connection cannot pay — no mint shared with the seeder here
+   * — and that a later connection may pay: the downloader keeps them in its record. Absent, the
+   * range can never be paid.
    */
-  readonly onUnpayable?: (noiseHex: string, range: BlockRange) => void;
+  readonly onUnpayable?: (noiseHex: string, range: BlockRange, scope?: 'connection') => void;
   /**
    * Fix round 5: the longest prefix of `range` (same core, same first block) that ONE PAY may
    * cover — the desktop worker ends it where a play session's blob ends, because the host builds a
@@ -658,14 +663,23 @@ export class UpstreamPayer {
    * already paid or pending on it. Returns how many were taken.
    */
   addOwed(noiseHex: string, core: CoreKeyHex, indexes: Iterable<number>): number {
+    return this.addOwedIndexes(noiseHex, core, indexes).length;
+  }
+
+  /**
+   * `addOwed`, returning the blocks taken, ascending (independent review: the caller marks as owed
+   * only those — a block skipped because it is pending on this connection stays this
+   * connection's).
+   */
+  addOwedIndexes(noiseHex: string, core: CoreKeyHex, indexes: Iterable<number>): number[] {
     const state = this.peers.get(noiseHex);
-    if (this.owedPay === undefined || this.disposed) return 0;
-    if (state === undefined || state.closed || state.hello === null) return 0;
-    if (!state.price.has(core) || state.free.has(core)) return 0;
+    if (this.owedPay === undefined || this.disposed) return [];
+    if (state === undefined || state.closed || state.hello === null) return [];
+    if (!state.price.has(core) || state.free.has(core)) return [];
     const paid = state.paid.get(core);
     let pending = state.pending.get(core);
     let owed = state.owed.get(core);
-    let n = 0;
+    const taken: number[] = [];
     for (const i of indexes) {
       if (!Number.isSafeInteger(i) || i < 0) continue;
       if (paid?.has(i) === true || pending?.has(i) === true) continue;
@@ -673,14 +687,14 @@ export class UpstreamPayer {
       owed ??= new Set();
       pending.add(i);
       owed.add(i);
-      n++;
+      taken.push(i);
     }
-    if (n === 0) return 0;
+    if (taken.length === 0) return [];
     if (pending !== undefined) state.pending.set(core, pending);
     if (owed !== undefined) state.owed.set(core, owed);
-    this.counters.owedAccepted += n;
+    this.counters.owedAccepted += taken.length;
     this.schedule(state, state.draining || state.due);
-    return n;
+    return taken.sort((a, b) => a - b);
   }
 
   /** Blocks `from..to` of `core` overlap a hurried range. */
@@ -839,7 +853,8 @@ export class UpstreamPayer {
             core,
           });
           if (isOwed) {
-            this.giveUpOwed(state, core, set, range);
+            // This connection's mints only: a later one listing a shared mint may pay them.
+            this.giveUpOwed(state, core, set, range, 'connection');
             continue;
           }
           break;
@@ -990,13 +1005,15 @@ export class UpstreamPayer {
 
   /**
    * Owed blocks of `range` that cannot be paid at the terms recorded: dropped (the seeder keeps
-   * counting them — respected, never paid), reported like any range given up.
+   * counting them — respected, never paid), reported like any range given up. With `scope`
+   * `'connection'`, dropped from this connection only (see `onUnpayable`).
    */
   private giveUpOwed(
     state: PeerState,
     core: CoreKeyHex,
     set: Set<number>,
     range: BlockRange,
+    scope?: 'connection',
   ): void {
     let paidSet = state.paid.get(core);
     if (!paidSet) {
@@ -1011,7 +1028,8 @@ export class UpstreamPayer {
     }
     this.counters.unpayableBlocks += range.toBlock - range.fromBlock + 1;
     try {
-      this.onUnpayable?.(state.noiseHex, range);
+      if (scope === undefined) this.onUnpayable?.(state.noiseHex, range);
+      else this.onUnpayable?.(state.noiseHex, range, scope);
     } catch {
       // the listener's failure is its own
     }

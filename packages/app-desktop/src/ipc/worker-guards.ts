@@ -278,12 +278,29 @@ const isPayBuild = obj({
   policy: isPricePolicy,
   carryIn: int(0, 99),
 });
-const isPayMessage = obj({
-  range: isRange,
-  carryIn: int(0, 99),
-  seederProofs: isLockedSet,
-  creatorProofs: isLockedSet,
+/**
+ * One set of a `PayMessage`: legitimately EMPTY when its share is 0 sats by the split (contracts
+ * v5, `PayMessage`: "still addressed to its recipient") — at 90/10 a PAY of 3 blocks at 2 sats
+ * gives the creator 0. Lane P2-owed-viewer (found building the independent review's 90/10 test):
+ * `isLockedSet` asks for one proof at least, so such a PAY was refused AFTER the host had built it
+ * (its proofs spent, locked to the seeder and the creator) and the payer asked for another.
+ */
+const isPaySet = obj({
+  mint: isMintUrl,
+  unit: literal('sat'),
+  lockedTo: isCashuP2pk,
+  proofs: arrayOf(isProof, MAX_PROOFS, 0),
 });
+/** A PAY carries at least one proof, in one set or the other (a PAY of nothing is malformed). */
+const isPayMessage = safe(
+  (x: unknown): x is HostMethodTable['pay.build'][1] =>
+    obj({
+      range: isRange,
+      carryIn: int(0, 99),
+      seederProofs: isPaySet,
+      creatorProofs: isPaySet,
+    })(x) && x.seederProofs.proofs.length + x.creatorProofs.proofs.length > 0,
+);
 /** A keyset from the host: amount → compressed public key, at most 64 denominations. */
 const isKeys = safe((x: unknown): x is Readonly<Record<string, string>> => {
   if (typeof x !== 'object' || x === null || Array.isArray(x)) return false;

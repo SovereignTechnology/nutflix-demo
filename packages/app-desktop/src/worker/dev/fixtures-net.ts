@@ -179,7 +179,7 @@ export async function createFixtureSeeder(o: FixtureSeederOptions): Promise<Fixt
   );
   const credit = new CreditPool(DEFAULT_WINDOW_BLOCKS);
   const payer = new ViewerPayer({
-    pay: (range, s, policy) => engine.pay(range, s, policy),
+    pay: (range, s, policy, opts) => engine.pay(range, s, policy, opts),
     ownMints: engine.config.acceptedMints,
     credit,
     logger,

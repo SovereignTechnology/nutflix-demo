@@ -269,6 +269,13 @@ export function realProviders(o: RealProviderOptions): RealProviders {
     seederEngine: engine,
     accepting: () => engine.pendingCount() < (o.maxPendingPays ?? WORKER_MAX_PENDING_PAYS),
     pay: async (range, seeder, policy: PricePolicy, opts) => {
+      // The carry of this channel's chain for the core (the payer always passes it). Without it
+      // the host would split with a guess, and a seeder holding another carry refuses the PAY
+      // `malformed` after the proofs were spent (independent review, lane P2-owed-viewer, HIGH):
+      // refused here, before the host is asked.
+      const carryIn = opts?.carryIn;
+      if (carryIn === undefined)
+        throw new Error('internal: a PAY without the carry of its chain is never built');
       const sids = o.sidsFor(range);
       if (sids.length === 0) throw new Error('session-closed: no play session covers these blocks');
       // Fix round 5: a session's refusal ('forbidden', 'session-closed') is not the last word
@@ -282,7 +289,7 @@ export function realProviders(o: RealProviderOptions): RealProviders {
             range,
             seeder,
             policy,
-            carryIn: opts?.carryIn ?? 0,
+            carryIn,
           });
         } catch (err) {
           const code = (err as { code?: unknown } | null)?.code;

@@ -402,6 +402,45 @@ describe('worker → host', () => {
         creatorProofs: LOCKED,
       }),
     ).toBe(true);
+    // Lane P2-owed-viewer (found building the independent review's 90/10 test): a set whose share
+    // is 0 sats by the split is legitimately EMPTY (contracts v5, `PayMessage`) — at 90/10 a PAY
+    // of 3 blocks at 2 sats gives the creator 0. The guard refused such a PAY after the host had
+    // built it (its proofs spent, locked to the seeder), and the payer asked again. A PAY carries
+    // at least one proof, in one set or the other; a set to redeem or nutzap is never empty.
+    const empty = { ...LOCKED, proofs: [] };
+    expect(
+      validateHostResult['pay.build']({
+        range: RANGE,
+        carryIn: 60,
+        seederProofs: LOCKED,
+        creatorProofs: empty,
+      }),
+    ).toBe(true);
+    expect(
+      validateHostResult['pay.build']({
+        range: RANGE,
+        carryIn: 0,
+        seederProofs: empty,
+        creatorProofs: LOCKED,
+      }),
+    ).toBe(true);
+    expect(
+      validateHostResult['pay.build']({
+        range: RANGE,
+        carryIn: 0,
+        seederProofs: empty,
+        creatorProofs: empty,
+      }),
+    ).toBe(false);
+    expect(
+      validateHostResult['pay.build']({
+        range: RANGE,
+        carryIn: 0,
+        seederProofs: LOCKED,
+        creatorProofs: { ...empty, unit: 'usd' },
+      }),
+    ).toBe(false);
+    expect(validateHostArgs['seller.nutzap']({ set: empty, core: R.hyper.core })).toBe(false);
     expect(validateHostResult['seller.keyset'](null)).toBe(true);
     expect(
       validateHostResult['seller.keyset']({

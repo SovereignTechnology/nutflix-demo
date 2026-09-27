@@ -197,6 +197,47 @@ describe('UnpaidRecord: blocks received and not paid', () => {
 });
 
 describe('UnpaidRecord as the SeederLedger: the write-ahead "full" word', () => {
+  // Independent review (lane P2-owed-viewer, info): the LRU eviction and the 7-day age-out took
+  // `full` words too. A seeder left at its window keeps counting whatever our record forgets, so
+  // after a restart it was asked one block before its report: an overrun, and a ban.
+  it('a full word outlives the LRU bound: seeders holding only blocks go first', async () => {
+    let now = 1;
+    // Hundreds of write-ahead words: written to nowhere (the bound is what is tested here).
+    const state: StateFs = { ...nodeStateFs, writeAtomic: () => undefined };
+    const { rec } = await rig({ now: () => now, state });
+    expect(rec.markFull(S1)).toBe(true); // the least recently touched of all
+    const wide = terms(SID_A, { first: 0, last: 10 });
+    for (let i = 0; i < MAX_SEEDERS + 5; i++) {
+      now++;
+      rec.add(i.toString(16).padStart(64, '0'), CORE, 0, wide);
+    }
+    expect(rec.stats().seeders).toBe(MAX_SEEDERS);
+    expect(rec.full(S1)).toBe(true);
+    // Only when every seeder beyond the bound holds the word does the oldest word go.
+    for (let i = 0; i < MAX_SEEDERS + 1; i++) {
+      now++;
+      expect(rec.markFull((0x1000 + i).toString(16).padStart(64, '0'))).toBe(true);
+    }
+    expect(rec.stats()).toMatchObject({ seeders: MAX_SEEDERS, full: MAX_SEEDERS });
+    expect(rec.full(S1)).toBe(false);
+  });
+
+  it('a full word outlives UNPAID_TTL_MS: its blocks age out at load, the word stays (fullBefore)', async () => {
+    let now = 1_000_000_000;
+    const a = await rig({ now: () => now });
+    a.rec.add(S1, CORE, 7, terms(SID_A));
+    expect(a.rec.markFull(S1)).toBe(true);
+    a.rec.add(S2, CORE, 3, terms(SID_A));
+    expect(a.rec.flush()).toBe(true);
+    a.rec.abandon();
+    now += UNPAID_TTL_MS + 1;
+    const b = await rig({ dir: a.dir, now: () => now });
+    expect(b.rec.fullBefore(S1)).toBe(true);
+    expect(b.rec.full(S1)).toBe(true);
+    expect(b.rec.recorded(S1, CORE, [[0, 99]])).toEqual([]);
+    expect(b.rec.stats()).toMatchObject({ seeders: 1, blocks: 0, full: 1 });
+  });
+
   it('markFull is on disk before it returns; the next run reads it as an earlier run’s word (fullBefore), this run’s marks are not', async () => {
     const a = await rig();
     expect(a.rec.full(S1)).toBe(false);

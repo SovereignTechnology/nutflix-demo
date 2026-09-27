@@ -16,7 +16,7 @@ import type {
   PriceMessage,
   PricePolicy,
 } from '@sovit/core';
-import { mocks } from '@sovit/core';
+import { mocks, payment } from '@sovit/core';
 import type Hypercore from 'hypercore';
 import { silentLogger, toHex } from '@sovit/seeder';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -173,6 +173,10 @@ const policy: PricePolicy = {
   // at 2 sats/block keeps each seeder's window at its HELLO's `windowBlocks`.
   minPaySats: mocks.sats(2),
 };
+
+/** The creator carry after a PAY of `amount` sats at `p`'s split (core's one implementation). */
+const mocksSplit = (amount: number, p: PricePolicy, carryIn: number): number =>
+  payment.splitPay(amount, p.split, carryIn).carryOut;
 
 const settle = async (): Promise<void> => {
   for (let i = 0; i < 20; i++) await Promise.resolve();
@@ -729,8 +733,14 @@ describe('ViewerPayer: the record of what is unpaid, and paying what a seeder re
     for (const d of dirs.splice(0)) await rm(d, { recursive: true, force: true });
   });
   async function tailRig(
-    o: { refuseOwed?: () => string | null; refusePay?: () => string | null } = {},
+    o: {
+      refuseOwed?: () => string | null;
+      refusePay?: () => string | null;
+      /** The manifest policy (default: 2 sats/block at 50/50, whose carry is always 0). */
+      policy?: PricePolicy;
+    } = {},
   ) {
+    const terms0 = o.policy ?? policy;
     const dir = await mkdtemp(join(tmpdir(), 'nf-vp-tail-'));
     dirs.push(dir);
     const record = new UnpaidRecord({
@@ -744,24 +754,28 @@ describe('ViewerPayer: the record of what is unpaid, and paying what a seeder re
     const engine = new mocks.MockPaymentEngine();
     const credit = new CreditPool(2);
     const owedCalls: { sid: string; range: [number, number]; carryIn: number }[] = [];
+    /** What each fresh PAY's function was handed as `opts.carryIn` (`undefined`: nothing). */
+    const freshCarry: (number | undefined)[] = [];
     const termsOf = (sid: string): TailTerms => ({
       sid,
       core: CORE_1,
       first: 0,
       last: 99,
-      policy,
+      policy: terms0,
     });
     const payer = new ViewerPayer({
-      pay: (r, sd, p) => {
+      pay: (r, sd, p, opts) => {
         const refusal = o.refusePay?.() ?? null;
         if (refusal !== null)
           return Promise.reject(fromWireError(wireError('session-closed', refusal)));
-        return engine.pay(r, sd, p);
+        freshCarry.push(opts?.carryIn);
+        // As the host does (`real-providers.ts`): the split uses the carry it is handed, else 0.
+        return engine.pay(r, sd, p, { carryIn: opts?.carryIn ?? 0 });
       },
       ownMints: [mocks.MINTS.a],
       credit,
       logger: silentLogger,
-      policyFor: () => policy,
+      policyFor: () => terms0,
       record,
       termsFor: () => termsOf(SID_A),
       payOwed: (sid, range, sd, p, carryIn) => {
@@ -781,7 +795,7 @@ describe('ViewerPayer: the record of what is unpaid, and paying what a seeder re
       core.emit('download', i, 65_536, { remotePublicKey: peerKey });
     };
     const held = (): number[] => record.recorded(SEEDER_PK, CORE_1, [[0, 99]]).map((b) => b.index);
-    return { record, engine, payer, proto, download, owedCalls, termsOf, held };
+    return { record, engine, payer, proto, download, owedCalls, freshCarry, termsOf, held };
   }
   const priced = { core: CORE_1, satsPerBlock: mocks.sats(2), effectiveFromBlock: 0 };
 
@@ -907,6 +921,90 @@ describe('ViewerPayer: the record of what is unpaid, and paying what a seeder re
       [SID_B, [5, 5]],
       [SID_A, [1, 1]],
     ]);
+    expect(r.held()).toEqual([]);
+  });
+
+  // Independent review (lane P2-owed-viewer, HIGH): the engine wrapper dropped `opts`, so every
+  // fresh PAY reached the host with `carryIn` 0 while the seeder holds the chain's carry — refused
+  // `malformed` (engine.ts), its proofs already spent. Every earlier test paid 2 sats/block at
+  // 50/50, whose carry is always 0. At 90/10 one block leaves a carry of 20.
+  it('every fresh PAY is split with the carry of its chain: the pay function is handed carryIn', async () => {
+    const p90: PricePolicy = { ...policy, split: { seeder: 90, creator: 10 } };
+    const r = await tailRig({ policy: p90 });
+    r.proto.hello({ split: p90.split });
+    r.download(0);
+    await r.payer.flush();
+    expect(r.proto.sent.map((p) => [p.range.fromBlock, p.carryIn])).toEqual([[0, 0]]);
+    r.proto.ack(0, 0);
+    r.download(1);
+    await r.payer.flush();
+    const carry = mocksSplit(2, p90, 0);
+    expect(carry).toBe(20);
+    expect(r.freshCarry).toEqual([0, carry]);
+    expect(r.proto.sent.map((p) => [p.range.fromBlock, p.carryIn])).toEqual([
+      [0, 0],
+      [1, carry],
+    ]);
+  });
+
+  it('an owed PAY and the fresh PAYs after it share one carry chain on the core', async () => {
+    const p90: PricePolicy = { ...policy, split: { seeder: 90, creator: 10 } };
+    const r = await tailRig({ policy: p90 });
+    r.record.add(SEEDER_PK, CORE_1, 5, r.termsOf(SID_B));
+    r.proto.hello({ split: p90.split });
+    r.proto.price(priced);
+    r.proto.owed(CORE_1, [[5, 5]]);
+    await r.payer.flush();
+    expect(r.owedCalls).toEqual([{ sid: SID_B, range: [5, 5], carryIn: 0 }]);
+    r.proto.ack(5, 5);
+    // The owed PAY moved the carry: the next fresh PAY of the core is split with it.
+    r.download(1);
+    await r.payer.flush();
+    expect(r.freshCarry).toEqual([mocksSplit(2, p90, 0)]);
+    expect(r.proto.sent.at(-1)?.carryIn).toBe(20);
+  });
+
+  // Independent review (lane P2-owed-viewer, info): every recorded index of an OWED was marked
+  // owed, even those `addOwed` skipped (pending on this link). A fresh range of such a block given
+  // up later then left the record, when it should have stayed as a tail.
+  it('an OWED naming a block pending on this link: only the blocks the payer took are owed; the pending one stays a tail when given up', async () => {
+    let refuse: string | null = null;
+    const r = await tailRig({ refusePay: () => refuse });
+    r.record.add(SEEDER_PK, CORE_1, 5, r.termsOf(SID_B)); // from an earlier run
+    r.proto.hello();
+    r.proto.price(priced);
+    refuse = 'no play session covers these blocks';
+    r.download(3); // this link's block, recorded, its PAY about to be refused for good
+    r.proto.owed(CORE_1, [[3, 5]]); // reports it too (the report may count it: same pubkey)
+    await r.payer.flush();
+    await settle();
+    // 5 was paid as owed; 3 was not taken as owed — refused as this link's block, it stays.
+    expect(r.owedCalls.map((c) => c.range)).toEqual([[5, 5]]);
+    expect(r.payer.stats().owedRecorded).toBe(1);
+    expect(r.held()).toEqual([3]);
+  });
+
+  // Independent review (lane P2-owed-viewer, info): an owed range with no mint shared on this
+  // connection was given up like a refused one — out of the record for good — although a later
+  // connection listing the mint could pay it. It is now dropped from this connection only.
+  it('an owed range with no mint shared on this connection stays in the record; a later connection sharing one pays it', async () => {
+    const r = await tailRig();
+    r.record.add(SEEDER_PK, CORE_1, 5, r.termsOf(SID_B));
+    r.proto.hello({ acceptedMints: [mocks.MINTS.b] }); // not a mint of ours
+    r.proto.price(priced);
+    r.proto.owed(CORE_1, [[5, 5]]);
+    await r.payer.flush();
+    await settle();
+    expect(r.owedCalls).toEqual([]);
+    expect(r.held()).toEqual([5]);
+    r.proto.close();
+    const again = new FakeProto();
+    r.payer.attachPeer(NOISE, again);
+    again.hello();
+    again.price(priced);
+    again.owed(CORE_1, [[5, 5]]);
+    await r.payer.flush();
+    expect(r.owedCalls).toEqual([{ sid: SID_B, range: [5, 5], carryIn: 0 }]);
     expect(r.held()).toEqual([]);
   });
 

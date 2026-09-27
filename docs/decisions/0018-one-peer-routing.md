@@ -193,9 +193,12 @@ The normative text is in `packages/core/src/contracts/pay-protocol.ts`; the choi
 - **Credit from the report** (`SeederCredit`, shared by the desktop worker and the gateway).
   - Per connection, a seeder's report is complete once anything it sent in answer to a frame we
     sent after our HELLO arrives: a block we asked for after `open`, or an ACK. Replies to
-    requests already in flight when its `pay/1` attached do not count; a gateway session may
-    replicate before `pay/1` attaches. Otherwise the report is complete `REPORT_WAIT_MS` (10 s)
-    after the channel opened, which bounds a report that never arrives.
+    requests made before the channel opened do not count: those in flight when its `pay/1`
+    attached (a gateway session may replicate before `pay/1` attaches), and, counted again when
+    the channel opens, those asked since on a core nobody pays for (independent review: such a
+    reply could land before the OWED and complete the report without it). Otherwise the report is
+    complete `REPORT_WAIT_MS` (10 s) after the channel opened, which bounds a report that never
+    arrives.
   - Before the report, `old` is what this process knows of: blocks left unpaid on earlier
     connections, and requests lost with them. It is the report so far instead, if that is
     larger. The seeder is asked ONE block at a time (the router's new `single` option).
@@ -212,7 +215,9 @@ The normative text is in `packages/core/src/contracts/pay-protocol.ts`; the choi
   synchronously before anything is asked that could bring the seeder there, and cleared at a
   flush once it is below. A seeder with that word is asked nothing before its report: not even
   the one block, which would overrun a seeder left exactly at its window. Liveness is bounded by
-  `REPORT_WAIT_MS`.
+  `REPORT_WAIT_MS`. The word outlives the record's 7-day age-out, and the record's seeder bound
+  drops seeders holding only blocks first (independent review): the seeder keeps counting what we
+  forget.
 - **Paying the old tail** (desktop only).
   - The worker's `UnpaidRecord` holds, per seeder pubkey and core, the blocks received and not
     paid, each with its session's id, blob range and manifest policy. It is rewritten atomically
@@ -224,6 +229,13 @@ The normative text is in `packages/core/src/contracts/pay-protocol.ts`; the choi
     (`UpstreamPayer.addOwed`), and only after the core's priced PRICE on this connection. They
     are paid at once, apart from this connection's blocks and on its carry chain, at the recorded
     terms: the asked price may only lower them. They are paid under the recorded session's id.
+    Owed and fresh PAYs of a core share that one chain, and the worker hands the host the carry
+    of every PAY; a PAY without one is refused before the host is asked (independent review: the
+    fresh path dropped it, and a PAY split with 0 against another carry is refused `malformed`
+    after its proofs were spent). A PAY whose creator share is 0 sats carries an empty creator set
+    (contracts v5), which the worker's guard now admits.
+  - An owed range with no mint shared on this connection is dropped from this connection only
+    and stays in the record for a later one. A range the host refuses for good leaves it.
   - The host checks that id as an open session. If the session is closed, it checks its tail
     authorisation: the same core, blob range and terms, and a block budget taken off on disk
     before the PAY is built.
@@ -233,6 +245,8 @@ The normative text is in `packages/core/src/contracts/pay-protocol.ts`; the choi
     `<userData>/tails/<pubkey>.json` (private file).
   - When the worker could not say (it was gone, a quit past its bound, a sign-out with sessions
     open), the host keeps the session's remaining budget, with the same cap.
+  - The quit waits for these writes, including those the signer flow's plane starts as it closes;
+    and a new plane for an identity opens only after the closed plane's writes landed.
   - An expired tail is refused `forbidden`. The worker drops those blocks from its record:
     respected, never paid.
 - **The gateway** gets the credit-from-report part, including the one-block rule before the

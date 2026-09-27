@@ -5,17 +5,29 @@
  * signer's payments in its init, subscribers hear `signer.status`, and a lock restarts it again
  * without them.
  */
+import { existsSync } from 'node:fs';
+import { readFile } from 'node:fs/promises';
+import { join } from 'node:path';
+
+import { getPubKeyFromPrivKey } from '@cashu/cashu-ts';
 import { afterEach, describe, expect, it } from 'vitest';
 
-import type { MintUrl } from '@sovit/core';
+import type { CashuP2pkPubkey, MintUrl, NostrPubkey, Sats } from '@sovit/core';
 import { mocks, signer as signerMod } from '@sovit/core';
 
 import { isHostOut } from '../../ipc/guards.js';
 import type { HostOut, PromptAnswer, PromptForm, ReplyMsg } from '../../ipc/protocol.js';
 import { IPC_V } from '../../ipc/protocol.js';
 import type { WorkerInit } from '../../ipc/worker-protocol.js';
+import { memoryLogger } from '../log.js';
+import { MAX_TAIL_BLOCKS, TAIL_DIR, TAIL_TTL_MS, TailBook } from '../tails.js';
+import { seedVideos } from './support/catalog.js';
+import { coreTestKit } from './support/core-helpers.js';
+import type { FakeWorkerOptions } from './support/fake-worker.js';
 import type { Rig } from './support/rig.js';
 import { eventually, rig } from './support/rig.js';
+
+const kit = await coreTestKit();
 
 const MINT = 'https://mint.signer-host.test' as MintUrl;
 const PASS = 'a long enough passphrase';
@@ -154,4 +166,94 @@ describe('the desktop signer through the host (ADR 0013)', () => {
     expect(!res.ok && res.error.code).toBe('forbidden');
     expect(r.out.some((o) => o.kind === 'prompt')).toBe(false);
   });
+});
+
+// Independent review (lane P2-owed-viewer, MEDIUM): on the production signer path the quit lost
+// the tails of the sessions it closed. `Host.shutdown` closed the sessions, then `stop()` — whose
+// signer flow closes the money plane and DROPS it before its first await — and then asked the
+// adapter to flush the tails of `money()`, by then undefined: nothing was awaited and the process
+// exited while the writes were in flight. Every earlier quit test used an injected identity.
+describe('quit on the signer flow’s money plane waits for its tail authorisations (ADR 0018 amendment)', () => {
+  async function playing(worker: FakeWorkerOptions) {
+    const mint = new mocks.TestMint({ url: MINT, seed: new Uint8Array(32).fill(0x45) });
+    const rr = await rig({
+      mintRequest: () => mint.request,
+      signerCost: signerMod.minimumCost(),
+      worker,
+      onOut: answering((f) => {
+        if (f.kind === 'local-setup')
+          return { kind: 'local-setup', method: 'passphrase', flow: 'generate' };
+        if (f.kind === 'new-passphrase' || f.kind === 'unlock-passphrase')
+          return { kind: 'secret', value: new TextEncoder().encode(PASS) };
+        return null;
+      }, []),
+    });
+    r = rr;
+    await rr.host.adapter.updateSettings({ defaultMints: [MINT] });
+    await rr.ready();
+    const connected = await invoke(rr, 'desktop.signer.connect', [{ kind: 'local' }]);
+    expect(connected.ok).toBe(true);
+    const pubkey = (
+      connected.ok ? (connected.result as { pubkey: string }).pubkey : ''
+    ) as NostrPubkey;
+    await eventually(() => rr.spawned.length === 2, 'the worker restart');
+    await rr.ready();
+    // Money at the video's mint, so the play goes ahead.
+    const wallet = rr.host.adapter.wallet;
+    const q = await wallet.mintQuote(MINT, 500 as Sats);
+    mint.payQuote(q.quoteId);
+    await wallet.pollQuote(q);
+    const base = mocks.VIDEOS[0]!;
+    const creatorP2pk = Buffer.from(getPubKeyFromPrivKey(new Uint8Array(32).fill(0x46))).toString(
+      'hex',
+    ) as CashuP2pkPubkey;
+    const [seeded] = await seedVideos(kit, rr.pool, new kit.TestSigner(), [
+      { ...base, price: { ...base.price, satsPerBlock: 2 as Sats, mints: [MINT], creatorP2pk } },
+    ]);
+    const played = await invoke(rr, 'play', [seeded!.video.id]);
+    expect(played.ok).toBe(true);
+    const tailFile = join(rr.userData, TAIL_DIR, `${pubkey}.json`);
+    expect(existsSync(tailFile)).toBe(false);
+    return { rr, pubkey, tailFile };
+  }
+
+  /** The tails on disk (read on the rig's clock: the host's tails expire on it). */
+  const bookOf = async (tailFile: string, pubkey: NostrPubkey) => {
+    const doc = JSON.parse(await readFile(tailFile, 'utf8')) as {
+      tails: { expiresAt: number }[];
+    };
+    const at = Math.min(...doc.tails.map((t) => t.expiresAt)) - TAIL_TTL_MS;
+    return TailBook.open({
+      dir: join(tailFile, '..'),
+      pubkey,
+      log: memoryLogger('warn'),
+      now: () => at,
+    });
+  };
+
+  it('a session the quit closed with an unpaid tail: its authorisation is on disk when shutdown resolves', async () => {
+    const { rr, pubkey, tailFile } = await playing({
+      handlers: { 'play.close': () => Promise.resolve({ unpaid: 2 }) },
+    });
+    const [session] = rr.host.adapter.sessions.all();
+    await rr.host.shutdown(5000);
+    // Checked synchronously: a write still in flight has not renamed its file into place yet.
+    expect(existsSync(tailFile)).toBe(true);
+    const book = await bookOf(tailFile, pubkey);
+    expect(book.size()).toBe(1);
+    expect(book.get(session!.sid)).toMatchObject({ budgetBlocks: 2, paidBlocks: 0 });
+  }, 30_000);
+
+  it('a session the quit could not close in time: the plane keeps all it had left, on disk when shutdown resolves', async () => {
+    const { rr, pubkey, tailFile } = await playing({
+      // The worker never answers play.close: the quit's bound runs out with the session open.
+      handlers: { 'play.close': () => new Promise<never>(() => undefined) },
+    });
+    const [session] = rr.host.adapter.sessions.all();
+    await rr.host.shutdown(50);
+    expect(existsSync(tailFile)).toBe(true);
+    const book = await bookOf(tailFile, pubkey);
+    expect(book.get(session!.sid)?.budgetBlocks).toBeGreaterThan(0);
+    expect(book.get(session!.sid)?.budgetBlocks).toBeLessThanOrEqual(MAX_TAIL_BLOCKS);
+  }, 30_000);
 });

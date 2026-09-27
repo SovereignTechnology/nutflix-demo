@@ -472,6 +472,40 @@ describe("SeederCredit — the seeder's report (ADR 0018 amendment)", () => {
     expect(r.credit.reportOf(A)).toMatchObject({ done: true, claimed: 1 });
   });
 
+  // Independent review (lane P2-owed-viewer, LOW): a core nobody pays for is asked before the
+  // channel opens (a bounded burst), so a request can leave after pay/1 attached but before our
+  // HELLO (the gateway's sendHello awaits signing). The seeder answers it before it handles our
+  // HELLO — before its report — and that block completed the report: the OWED behind it was
+  // ignored and a restarted gateway asked the full window of a seeder it still owed, and was
+  // banned. What is in flight when the channel opens is now `early` too.
+  it('a reply to a request made after pay/1 attached but before the channel opened does not complete the report', () => {
+    const r = rig({ policies: new Map([[CORE, { ...tight }]]) });
+    const free = fakeCore(OTHER); // routed, nobody pays for it: asked before the channel opens
+    r.credit.attachCore(free);
+    const a = r.link(A); // pay/1 attached: nothing in flight yet
+    const onFree = Object.assign(new FakeReplicator.Peer(), {
+      remotePublicKey: hexBytes(A),
+      inflight: 0,
+      dataProcessing: 0,
+      stats: { wireCancel: { tx: 0 } },
+    });
+    free.replicator.peers.push(onFree);
+    free.emit('peer-add', onFree);
+    expect(r.credit.budget(A, OTHER)).toBe(NO_PAY_INFLIGHT);
+    onFree.inflight = 1; // asked now: before our HELLO went out
+    a.proto.remoteHello(helloFrom(pubkey('a'), { windowBlocks: 3 })); // the channel opens
+    onFree.inflight = 0;
+    free.emit('download', 0, 1024, { remotePublicKey: hexBytes(A) }); // its reply, before the OWED
+    expect(r.credit.reportOf(A)?.done).toBe(false);
+    a.proto.remoteOwed(owed([[0, 2]])); // it still counts its whole window on the paid core
+    expect(r.credit.reportOf(A)).toMatchObject({ claimed: 3 });
+    expect(r.credit.budget(A, CORE)).toBe(0);
+    // A reply to a request made after the channel opened comes after the report: it completes it.
+    free.emit('download', 1, 1024, { remotePublicKey: hexBytes(A) });
+    expect(r.credit.reportOf(A)).toEqual({ done: true, claimed: 3, truncated: false });
+    expect(r.credit.budget(A, CORE)).toBe(0);
+  });
+
   it('never asks beyond window minus what it reports: a report of its whole window asks nothing', () => {
     const r = rig();
     const a = r.link(A);

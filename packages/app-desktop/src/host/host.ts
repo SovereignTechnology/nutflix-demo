@@ -197,6 +197,8 @@ export class Host {
     this.stop();
     // Lane P2-owed-viewer: the sessions just closed (or dropped by `stop`) keep their tails on
     // disk before the process exits. A private-file write: bounded by the disk, not the network.
+    // `stop` has dropped the signer flow's plane by now: the adapter also waits for the writes of
+    // planes the flow closed (independent review, MEDIUM).
     await this.adapter.flushTails().catch(() => undefined);
   }
 

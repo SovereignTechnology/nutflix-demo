@@ -36,8 +36,9 @@
  * and every `ACK` carries `outstanding` — what it counts on that core once the PAY was applied.
  * Its report is complete once anything it sent in answer to a frame we sent after our HELLO
  * arrives — a block we asked for, an ACK (the contract's order rule: it writes the whole report
- * before it handles any later frame; replies to requests already in flight when its `pay/1`
- * attached come first and do not count) — or `REPORT_WAIT_MS` after the channel opened (its
+ * before it handles any later frame; replies to requests made before the channel opened — in
+ * flight when its `pay/1` attached, or asked since on a core nobody pays for — come first and do
+ * not count) — or `REPORT_WAIT_MS` after the channel opened (its
  * report goes out the moment it binds our HELLO; the wait bounds a lost one). So, per connection:
  *   - BEFORE the report: `old` is what we know of (blocks left unpaid on earlier connections of
  *     this process, requests lost with them; with a `ledger`, the whole window when the durable
@@ -167,11 +168,16 @@ interface Report {
   /** `OnePeerRouter.lostOf` when the connection began: what the report replaces. */
   readonly lostAtStart: number;
   /**
-   * Requests to it already in flight when its `pay/1` attached (a gateway session may replicate
-   * before `pay/1` attaches): replies to them come before its report on the stream, so the first
-   * this many blocks it delivers do not complete the report.
+   * Blocks it may still send in answer to frames we sent BEFORE our HELLO: they come before its
+   * report on the stream, so the first this many blocks it delivers do not complete the report.
+   * At attach, the requests already in flight (a gateway session may replicate before `pay/1`
+   * attaches); when the channel OPENS, what it delivered so far plus what is in flight then — a
+   * core nobody pays for is asked before the channel opens (a bounded burst), so a request can
+   * leave after `pay/1` attached but before our HELLO went out (independent review, lane
+   * P2-owed-viewer). A request cancelled meanwhile never delivers (hypercore drops a late answer):
+   * the report then completes one block later, or at `REPORT_WAIT_MS` — the safe side.
    */
-  readonly early: number;
+  early: number;
   /** Blocks it delivered on this connection so far (routed cores). */
   delivered: number;
   timer: ReturnType<typeof setTimeout> | null;
@@ -306,6 +312,8 @@ export class SeederCredit {
     seeder.live = protocol.state !== 'closed';
     const offOpen = protocol.on('open', (hello) => {
       if (seeder.conn !== conn) return;
+      // Everything asked of it so far was asked before our HELLO (see `Report.early`).
+      seeder.report.early = seeder.report.delivered + this.router.inflight(noiseHex);
       this.setHello(noiseHex, seeder, hello);
       this.armReport(noiseHex, seeder, conn);
       this.changed();

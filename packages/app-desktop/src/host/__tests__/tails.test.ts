@@ -176,8 +176,19 @@ describe('TailBook: tail authorisations on disk, per identity', () => {
   });
 });
 
-async function planeRig(o: { dir?: string | null; skew?: { ms: number }; fund?: number } = {}) {
+type RequestFn = mocks.TestMint['request'];
+
+async function planeRig(
+  o: {
+    dir?: string | null;
+    skew?: { ms: number };
+    fund?: number;
+    /** Wraps the mint's transport (holding a request). */
+    wrap?: (inner: RequestFn) => RequestFn;
+  } = {},
+) {
   const mint = new mocks.TestMint({ url: MINT, seed: new Uint8Array(32).fill(0x62) });
+  const request = o.wrap?.(mint.request) ?? mint.request;
   const pool = new nostr.FakeRelayPool();
   const { signer } = await signerMod.LocalSigner.create({
     passphrase: Buffer.from('tails test passphrase'),
@@ -195,7 +206,7 @@ async function planeRig(o: { dir?: string | null; skew?: { ms: number }; fund?: 
       relays: () => [{ url: RELAY, read: true, write: true }],
       defaultMints: () => [MINT],
       log: memoryLogger('warn'),
-      mintRequest: () => mint.request,
+      mintRequest: () => request,
       now: () => t++ as UnixSeconds,
       ...(create ? { createWallet: true } : {}),
     });
@@ -358,6 +369,49 @@ describe('MoneyPlane: tail authorisations (ADR 0018 amendment)', () => {
     expect(b.size()).toBe(0);
     plane.close();
   });
+
+  // Independent review (lane P2-owed-viewer, info): the tail is looked up again when the PAY's turn
+  // at the mint comes (PAYs take turns there); replacing that re-check with the tail found at
+  // arrival left every test green. A tail that expires while its PAY waits must spend nothing.
+  it('a tail that expires while its PAY waits for its turn at the mint: refused session-closed, nothing spent', async () => {
+    const gate: { hold: boolean; release: (() => void) | null } = { hold: false, release: null };
+    const wrap =
+      (inner: RequestFn): RequestFn =>
+      <T>(args: Parameters<RequestFn>[0]): Promise<T> => {
+        const path = `${(args.method ?? 'GET').toUpperCase()} ${new URL(args.endpoint).pathname}`;
+        if (!gate.hold || path !== 'POST /v1/swap') return inner<T>(args);
+        gate.hold = false;
+        return new Promise<T>((resolve, reject) => {
+          gate.release = () => {
+            inner<T>(args).then(resolve, reject);
+          };
+        });
+      };
+    const { plane, skew } = await planeRig({ fund: 200, wrap });
+    const h = plane.handlers();
+    plane.authorizeSession(SID, { core: CORE, blob: BLOB, policy: POLICY }, CREATOR);
+    await plane.revokeSession(SID, 2); // a tail of 2 blocks
+    plane.authorizeSession(SID2, { core: CORE, blob: BLOB, policy: POLICY }, CREATOR);
+    const before = await plane.wallet.balance(MINT);
+    // An open session's PAY holds the mint's turn (its swap held at the mint)…
+    gate.hold = true;
+    const first = h['pay.build']!(build({ sid: SID2 }));
+    for (let i = 0; i < 500 && gate.release === null; i++)
+      await new Promise((r) => setTimeout(r, 2));
+    const release = gate.release;
+    if (release === null) throw new Error('the first PAY never reached the mint');
+    // …the tail's PAY is authorised on arrival and waits for its turn; meanwhile the tail expires.
+    const second = code(
+      h['pay.build']!(build({ range: { core: CORE, fromBlock: 10, toBlock: 10 } })),
+    );
+    await new Promise((r) => setTimeout(r, 30));
+    skew.ms = TAIL_TTL_MS + 1;
+    release();
+    await expect(first).resolves.toMatchObject({ range: { fromBlock: 10, toBlock: 11 } });
+    expect(await second).toBe('session-closed');
+    expect(before - (await plane.wallet.balance(MINT))).toBe(2 * POLICY.satsPerBlock);
+    plane.close();
+  }, 30_000);
 
   it('a plane closed with sessions open (signed out, locked) keeps their tails; a closed plane makes none', async () => {
     const dir = await tmp();
