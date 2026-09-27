@@ -1,15 +1,18 @@
 /**
  * Test support (not a suite): a fake of lane N1's side of the NUT-13 seam
- * (`@sovit/core` `wallet/recovery-api.ts`), injected as `HostOptions.recoveryCore` /
- * `RecoveryServiceOptions.core` so the desktop side is tested without N1's code.
+ * (`@sovit/core` `wallet/recovery-api.ts`), injected as `RecoveryServiceOptions.core` so the
+ * service's flows are unit-tested with a STUB money plane: scripted reissue plans and restore
+ * reports, failures on demand.
+ *
+ * Never with a real `MoneyPlane` (integration fix 2): core's `CashuMintConnections` refuses a
+ * `FakeSeed` (a seed core did not make), so such a plane never opens. The host and money-plane
+ * tests run core's real code instead (`real-recovery.ts`).
  *
  *   phrases   the real BIP-39 conversions (`@scure/bip39`, English), so indices, words and
  *             checksums behave as core's will; `generate` is scriptable; `toSeed` returns a
  *             `FakeSeed` that records which entropy it came from (never a real BIP-39 seed).
- *   seedOption  records the seed material the money plane passed to its connections (the real
- *             `CashuMintConnections` of today ignores the unknown key).
- *   seeded    the `FakeSeededWallet` of the most recent material whose seed is not wiped — what
- *             N1's `CashuWallet.seeded` will be for a plane opened with it.
+ *   seedOption  records the seed material it was handed.
+ *   seeded    the `FakeSeededWallet` of the most recent material whose seed is not wiped.
  *
  * The seeded wallet is scripted per test: reissue plans and results per mint, and restore
  * reports per phrase (keyed by the seed's entropy hex).

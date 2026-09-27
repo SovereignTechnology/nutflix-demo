@@ -50,37 +50,68 @@ const CONTROL_RE = /[\u0000-\u001f\u007f]/g;
  * units, each unit one of:
  *   - a run of white space, taken whole (up to 256 characters, so a pretty-printer's indentation
  *     however deep counts as one: fix round 7);
- *   - one ASCII digit or punctuation character — quotes, brackets, `,` `&` `+` `=` `/` `:` …
- *     (a JSON array, quoted words, a numbered list or a query string: independent review IR3);
+ *   - one ASCII digit or punctuation character other than `\` — quotes, brackets, `,` `&` `+`
+ *     `=` `/` `:` … (a JSON array, quoted words, a numbered list or a query string: independent
+ *     review IR3);
  *   - a percent escape, `%` and two hex digits, a letter among them or not (`%20`, `%2C`, `%2F`,
  *     `%3A`, `%5B`: a URL-encoded list or JSON array, fix round 7), or a lone `%`;
+ *   - a backslash escape, `\` — or `%5C`, a JSON string inside a URL — and one of `n r t b f v`,
+ *     `x` and two hex digits, or `u` and four (`\n`, `\r\n`, `\t`, `\u000b`, `\x0b`, `%5Cn`:
+ *     words joined by newlines or tabs inside a JSON string or a `repr`, integration fix 2), or a
+ *     lone `\`;
  *   - a key a phrase word cannot be: 1 to 16 ASCII letters directly before a digit or `=` that
  *     are not 3 to 8 lower-case letters (`w1=`, `k=`, `Word1=`, `seedWord1=`, `recoveryword1=`;
  *     a lower-case key such as `word1=` is read as a word, which covers it the same: IR3, fix
  *     round 7).
+ * Right after an escape that ends in a letter, a remainder of one or two lower-case letters also
+ * counts as a word, never as a key, whatever follows it. A phrase joined by a lone `%` or `\`
+ * whose next word starts like an escape — `fade` read as `%fa` + `de`, `bag` as `\b` + `ag`, also
+ * numbered (`\tag1`) — so keeps its chain (integration fix 2: the fix round 7 escape rule broke
+ * it for `%`).
  * Short English words ("is", "to"), an opening parenthesis and non-ASCII punctuation (an em
  * dash) do not separate, so our own prose messages keep reading. Over-matches ordinary prose on
  * purpose: a recovery phrase must never reach a log whole, and part of one is still a guessing
  * head start. Not caught (a residual): Title Case or UPPER CASE words, and double-encoded
- * escapes (`%252C`).
+ * escapes (`%252C`, `%255Cn`).
  *
  * Linear: a separator splits into units in exactly one way — a white-space run is maximal, a `%`
- * is an escape exactly when two hex digits follow, a key ends where its letter run ends and is
- * never something a word could be — and neither a word nor a key starts right after a letter
- * unless that letter ends a percent escape (a word never does), so a failed attempt has one way
- * to parse.
+ * is an escape exactly when two hex digits follow (a backslash escape when they are `5C` and a
+ * backslash escape form follows), a `\` exactly when one of its escape forms follows, a key ends
+ * where its letter run ends and is never something a word could be — and neither a word nor a
+ * key starts right after a letter unless that letter ends an escape (a word never does), so a
+ * failed attempt has one way to parse. A remainder is never a word of 3 to 8 letters (it is at
+ * most 2) nor a key (a key never starts where one does), and it ends where its letter run ends.
  */
-const AFTER_NON_LETTER = String.raw`(?<![A-Za-z](?<!%[0-9A-Fa-f][A-Fa-f]))`;
+/** A backslash: bare, or percent-encoded (a JSON string inside a URL). */
+const BACKSLASH = String.raw`(?:\\|%5[Cc])`;
+const BACKSLASH_ESCAPE = String.raw`[nrtbfv]|x[0-9A-Fa-f]{2}|u[0-9A-Fa-f]{4}`;
+/** An escape whose last character is a letter: a word (or a key) may start right after it. */
+const ESCAPE_ENDING_IN_LETTER = [
+  String.raw`%[0-9A-Fa-f][A-Fa-f]`,
+  String.raw`${BACKSLASH}[nrtbfv]`,
+  String.raw`${BACKSLASH}x[0-9A-Fa-f][A-Fa-f]`,
+  String.raw`${BACKSLASH}u[0-9A-Fa-f]{3}[A-Fa-f]`,
+].join('|');
+const AFTER_NON_LETTER = String.raw`(?<![A-Za-z](?<!${ESCAPE_ENDING_IN_LETTER}))`;
+/** What an escape ending in a letter left of a word: one or two lower-case letters. */
+const REMAINDER = String.raw`(?<=${ESCAPE_ENDING_IN_LETTER})[a-z]{1,2}(?![A-Za-z])`;
 const PHRASE_SEP_UNIT = [
   String.raw`\s{1,256}(?!\s)`,
-  String.raw`[!-$&')-@\[-\x60{-~]`,
-  String.raw`%(?:[0-9A-Fa-f]{2}|(?![0-9A-Fa-f]{2}))`,
-  String.raw`${AFTER_NON_LETTER}(?![a-z]{3,8}(?![A-Za-z]))[A-Za-z]{1,16}(?=[0-9=])`,
+  // Every ASCII punctuation character and digit except `\` (its own unit, below).
+  String.raw`[!-$&')-@\[\]-\x60{-~]`,
+  // Not `%5C` before a backslash escape form: that is the backslash escape, below.
+  String.raw`%(?!5[Cc](?:${BACKSLASH_ESCAPE}))(?:[0-9A-Fa-f]{2}|(?![0-9A-Fa-f]{2}))`,
+  String.raw`\\(?:${BACKSLASH_ESCAPE}|(?!${BACKSLASH_ESCAPE}))`,
+  String.raw`%5[Cc](?:${BACKSLASH_ESCAPE})`,
+  // A key is never what a word or a remainder (below) could be.
+  String.raw`${AFTER_NON_LETTER}(?![a-z]{3,8}(?![A-Za-z]))(?!${REMAINDER})[A-Za-z]{1,16}(?=[0-9=])`,
 ].join('|');
 const PHRASE_SEP = `(?:${PHRASE_SEP_UNIT}){1,12}`;
 const PHRASE_WORD = '[a-z]{3,8}';
+/** A word after a separator: a whole word, or the remainder an escape left of one. */
+const CHAINED_WORD = `(?:${PHRASE_WORD}|${REMAINDER})`;
 const PHRASE_RE = new RegExp(
-  String.raw`${AFTER_NON_LETTER}${PHRASE_WORD}(?:${PHRASE_SEP}${PHRASE_WORD}){7,}(?![A-Za-z])`,
+  String.raw`${AFTER_NON_LETTER}${PHRASE_WORD}(?:${PHRASE_SEP}${CHAINED_WORD}){7,}(?![A-Za-z])`,
   'g',
 );
 

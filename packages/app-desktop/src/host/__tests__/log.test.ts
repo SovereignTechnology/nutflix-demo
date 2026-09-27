@@ -173,6 +173,28 @@ describe('redact — word phrases (ADR 0016)', () => {
         return text.slice(text.indexOf('"words"'));
       },
     ],
+    // Integration fix 2 (the N2 round-7 verifier): a JSON string whose words are joined by
+    // newlines, tabs or CRLF carries backslash escapes, which are separators like `%XY`.
+    ['a JSON string, newline-joined', (w) => JSON.stringify(w.join('\n'))],
+    ['a JSON string, tab-joined', (w) => JSON.stringify(w.join('\t'))],
+    ['a JSON string, CRLF-joined', (w) => JSON.stringify(w.join('\r\n'))],
+    ['a JSON string, form-feed-joined', (w) => JSON.stringify(w.join('\f'))],
+    ['a JSON string, vertical-tab-joined (\\u000b)', (w) => JSON.stringify(w.join('\v'))],
+    ['a repr, \\x0b-joined', (w) => w.join('\\x0b')],
+    ['a JSON string of a JSON array', (w) => JSON.stringify(JSON.stringify(w))],
+    [
+      'a JSON string of pretty-printed JSON',
+      (w) => JSON.stringify(JSON.stringify({ words: w }, null, 2)),
+    ],
+    ['a JSON string inside a JSON string', (w) => JSON.stringify(JSON.stringify(w.join('\n')))],
+    [
+      'a JSON string inside a URL, newline-joined (%5Cn)',
+      (w) => encodeURIComponent(JSON.stringify(w.join('\n'))),
+    ],
+    [
+      'a JSON string inside a URL, CRLF-joined',
+      (w) => encodeURIComponent(JSON.stringify(w.join('\r\n'))),
+    ],
   ])('%s', (_what, fmt) => {
     const out = redact(`seed ${fmt(VECTOR)} end`);
     expect(out).toContain('<redacted>');
@@ -213,6 +235,15 @@ describe('redact — word phrases (ADR 0016)', () => {
           (w) => encodeURIComponent(JSON.stringify(w)),
           (w) => w.map((x, i) => `Word${String(i + 1)}=${x}`).join('&'),
           (w) => JSON.stringify({ a: { b: { c: { words: w } } } }, null, 4),
+          // Integration fix 2: backslash escapes, and a lone `%` or `\` before a word that starts
+          // like an escape.
+          (w) => JSON.stringify(w.join('\n')),
+          (w) => JSON.stringify(w.join('\t')),
+          (w) => JSON.stringify(w.join('\r\n')),
+          (w) => JSON.stringify(w.join('\v')),
+          (w) => encodeURIComponent(JSON.stringify(w.join('\n'))),
+          (w) => w.join('%'),
+          (w) => w.join('\\'),
         ),
         (entropy, fmt) => {
           const words = phraseOf(entropy);
@@ -243,11 +274,85 @@ describe('redact — word phrases (ADR 0016)', () => {
       'Ab1='.repeat(1000),
       `${'abc%41%'.repeat(7)}Z`.repeat(80),
       `${'abc%2Cab1=%2CWord1='.repeat(7)}Q`.repeat(30),
+      // Integration fix 2: backslash escapes and lone backslashes, remainders after an escape.
+      '\\n'.repeat(2000),
+      '\\'.repeat(4000),
+      `${'abc\\n'.repeat(7)}abcdefghijk `.repeat(60),
+      `${'abc\\r\\n\\t'.repeat(7)}Z`.repeat(60),
+      `${'abc\\u000b\\x0b\\'.repeat(7)}Z`.repeat(40),
+      `${'abc%fab%fa1='.repeat(7)}Q`.repeat(40),
+      `${'abc\\bag\\ba1='.repeat(7)}Q`.repeat(40),
+      `${'ab\\nab%faab'.repeat(7)}Q`.repeat(40),
+      '%5Cn'.repeat(1000),
+      '%5C'.repeat(1300),
+      `${'abc%5Cn'.repeat(7)}abcdefghijk `.repeat(40),
+      `${'abc%5C%5Cn%5'.repeat(7)}Z`.repeat(40),
+      `${'abc%5Cu000b%5cx0b%5Cr'.repeat(7)}Z`.repeat(20),
     ];
     for (const h of hostile) {
       const t0 = performance.now();
       redact(h);
       expect(performance.now() - t0).toBeLessThan(250);
+    }
+  });
+
+  // Integration fix 2 (the N2 round-7 verifier, info): since fix round 7 a `%` before two hex
+  // digits is always an escape, so a phrase joined by a lone `%` lost its chain at every word that
+  // starts with two hex letters and has at most two more (`fade` read as `%fa` + `de`); a `\`
+  // before `b`, `f`, `n`, `r`, `t` or `v` is now always an escape too (`bag` read as `\b` + `ag`).
+  // The verifier's vector, and 3-letter words that each start with an escape letter.
+  it('a phrase joined by a lone % or \\ stays one phrase where its words start like an escape', () => {
+    const hexStart = [
+      'abandon',
+      'universe',
+      'absolute',
+      'abstract',
+      'language',
+      'question',
+      'faculty',
+      'fade',
+      'face',
+      'add',
+      'deaf',
+      'access',
+    ];
+    const escapeStart = [
+      'bag',
+      'tag',
+      'net',
+      'fan',
+      'van',
+      'rib',
+      'ten',
+      'fox',
+      'bus',
+      'toy',
+      'run',
+      'fee',
+    ];
+    for (const words of [hexStart, escapeStart]) {
+      expect(redact(`X1 ${words.join('%')} Y2`)).toBe('X1 <redacted> Y2');
+      expect(redact(`X1 ${words.join('\\')} Y2`)).toBe('X1 <redacted> Y2');
+      // Numbered: the remainder stays a word before its digit (`\tag1` is not a key `ag`); the
+      // last word's number is not phrase material.
+      for (const sep of ['%', '\\', '%5C'])
+        expect(redact(`X1 ${words.map((w, i) => `${w}${String(i)}`).join(sep)} Y2`)).toBe(
+          'X1 <redacted>11 Y2',
+        );
+      // JSON keeps its quotes; everything between them goes.
+      expect(redact(`X1 ${JSON.stringify(words.join('\n'))} Y2`)).toBe('X1 "<redacted>" Y2');
+      expect(redact(`X1 ${JSON.stringify(words.join('\r\n'))} Y2`)).toBe('X1 "<redacted>" Y2');
+      // `\u000b` and `\x0b` end in a letter: an 8-letter word glued to it would be 9 letters.
+      expect(redact(`X1 ${JSON.stringify(words.join('\v'))} Y2`)).toBe('X1 "<redacted>" Y2');
+      expect(redact(`X1 ${words.join('\\x0b')} Y2`)).toBe('X1 <redacted> Y2');
+      // Inside a URL the backslash is `%5C`, the quotes `%22`.
+      expect(redact(`X1 ${encodeURIComponent(words.join('\\'))} Y2`)).toBe('X1 <redacted> Y2');
+      expect(redact(`X1 ${encodeURIComponent(JSON.stringify(words.join('\n')))} Y2`)).toBe(
+        'X1 %22<redacted>%22 Y2',
+      );
+      expect(redact(`X1 ${encodeURIComponent(JSON.stringify(words.join('\v')))} Y2`)).toBe(
+        'X1 %22<redacted>%22 Y2',
+      );
     }
   });
 

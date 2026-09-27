@@ -5,26 +5,24 @@
  * side builds and is tested without N1's implementation.
  *
  * ┌────────────────────────────────────────────────────────────────────────────────────────┐
- * │ WIRING POINT — `recoveryCore()` below is the ONE place lane N1's code is wired (filled at │
- * │ the merge, 2026-09-27). A host injecting `undefined` has no recovery phrase (status      │
- * │ `unavailable`, every flow refused `payments-unavailable`) and derives nothing.           │
- * │ With N1 (names as the seam's docs give them; adjust to N1's exports):                   │
- * │                                                                                         │
- * │   return {                                                                              │
- * │     phrases: new walletMod.RecoveryPhrases(),     // core wallet/seed.ts (locked)       │
- * │     seedOption: (seed) => ({ seed }),             // the connections' constructor key   │
- * │     seeded: (w) => w.seeded,                      // CashuWallet.seeded                 │
- * │   };                                                                                    │
- * │                                                                                         │
- * │ and give `seedOption` N1's real option type (`Pick<…options, 'seed'>`) so tsc checks    │
- * │ the key. The money plane keeps its ONE connections constructor (money.ts, pinned by     │
- * │ mint-transport.test.ts) and spreads this option into it; it hands `CashuWallet` that    │
- * │ connections instance itself, so a `seeded` read through the wallet's connections works. │
- * │ A seed the wallet did not take is caught at open (`MoneyPlane`: logged, the seed wiped, │
- * │ status `unreadable`) — never a silent "covered".                                        │
+ * │ WIRING POINT — `recoveryCore()` below is the ONE place lane N1's code is wired (filled │
+ * │ at the merge, 2026-09-27). A host injecting `undefined` has no recovery phrase (status │
+ * │ `unavailable`, every flow refused `payments-unavailable`) and derives nothing.         │
+ * │                                                                                        │
+ * │ `seedOption` has core's real option type (`SeedConnectionsOption`, a type-only mention │
+ * │ of the class), so tsc checks the key. The money plane keeps its ONE connections        │
+ * │ constructor (money.ts, pinned by mint-transport.test.ts, which tells a construction    │
+ * │ from a type) and spreads this option into it; it hands `CashuWallet` that connections  │
+ * │ instance itself, so `CashuWallet.seeded` reads the seed there. A seed core refuses     │
+ * │ (not one it made, or wiped) fails the plane's open — payments stay unavailable, never  │
+ * │ random outputs under a phrase; an option the connections ignore is caught at open      │
+ * │ (`MoneyPlane`: logged, the seed wiped, status `unreadable`) — never a silent           │
+ * │ "covered".                                                                             │
  * └────────────────────────────────────────────────────────────────────────────────────────┘
  *
- * Tests inject fakes through `HostOptions.recoveryCore` (`__tests__/support/fake-recovery.ts`).
+ * The host and money-plane tests run core's real code (`__tests__/support/real-recovery.ts`, a
+ * pass-through spy); the service's unit tests, whose plane is a stub, inject fakes
+ * (`__tests__/support/fake-recovery.ts`) — whose seed core would refuse (integration fix 2).
  */
 import type { MintUrl } from '@sovit/core';
 import { wallet as walletMod } from '@sovit/core';

@@ -224,7 +224,7 @@ export class TailBook {
     try {
       raw = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes));
     } catch {
-      this.log.warn('the tail file does not parse: starting empty');
+      this.log.warn('the tail file is not valid JSON: starting empty');
       return;
     }
     const doc = raw as { v?: unknown; tails?: unknown } | null;

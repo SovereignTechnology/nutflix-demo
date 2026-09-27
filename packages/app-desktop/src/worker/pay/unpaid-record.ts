@@ -409,7 +409,7 @@ export class UnpaidRecord {
     try {
       raw = JSON.parse(text);
     } catch {
-      this.log.warn('the unpaid record does not parse: starting empty');
+      this.log.warn('the unpaid record is not valid JSON: starting empty');
       return;
     }
     const doc = raw as { v?: unknown; seeders?: unknown; terms?: unknown } | null;

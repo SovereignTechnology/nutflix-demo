@@ -20,8 +20,8 @@ import { join } from 'node:path';
 
 import { afterEach, describe, expect, it } from 'vitest';
 
-import type { MintUrl, NostrPubkey } from '@sovit/core';
-import type { wallet as walletMod } from '@sovit/core';
+import type { MintUrl, NostrPubkey, Sats } from '@sovit/core';
+import { mocks, wallet as walletMod } from '@sovit/core';
 
 import {
   FileCounterStore,
@@ -39,6 +39,7 @@ import {
   writeEnvelope,
   type RecoveryEnvelope,
 } from '../recovery/files.js';
+import { seedOf } from './support/real-recovery.js';
 
 const PK = 'a1'.repeat(32) as NostrPubkey;
 const V1 = '00ad268c4d1f5826';
@@ -288,6 +289,62 @@ describe('the counters file (core’s CounterStore)', () => {
     );
     expect(parseCounterState({ v: 1, next: many, published: {} })).toBeNull();
     expect(parseCounterState({ v: 1, next: [], published: {} })).toBeNull();
+  });
+
+  // Integration fix 2: core binds the file to its phrase with a `published` entry `ff` + 32 hex
+  // → 0 and no `next` (its contract request 4). The desktop refused that entry — not a keyset id,
+  // a watermark without a `next` — so no lease was ever saved and every seeded operation failed.
+  const BOUND: walletMod.CounterState = {
+    v: 1,
+    next: { [V1]: 64, [V2]: 32 },
+    published: { [V1]: 40, [`ff${'3e'.repeat(16)}`]: 0 },
+  };
+
+  it('core’s phrase binding is kept: a state as core writes it is saved and read back exactly', async () => {
+    expect(parseCounterState(BOUND)).toEqual(BOUND);
+    const d = await dir();
+    const s = new FileCounterStore(d, PK);
+    await s.save(BOUND);
+    expect(await new FileCounterStore(d, PK).load()).toEqual(BOUND);
+  });
+
+  it('only exactly the binding: one entry, in `published`, → 0, `ff` + 32 hex', () => {
+    const tag = (c: string): string => `ff${c.repeat(16)}`;
+    for (const bad of [
+      { v: 1, next: { [V1]: 1 }, published: { [tag('3e')]: 1 } },
+      { v: 1, next: { [V1]: 1 }, published: { [tag('3e')]: 0, [tag('4f')]: 0 } },
+      { v: 1, next: { [V1]: 1, [tag('3e')]: 0 }, published: {} },
+      { v: 1, next: { [V1]: 1 }, published: { [`ff${'3e'.repeat(15)}`]: 0 } },
+      { v: 1, next: { [V1]: 1 }, published: { [`fe${'3e'.repeat(16)}`]: 0 } },
+      { v: 1, next: { [V1]: 1 }, published: { [`${tag('3e')}00`]: 0 } },
+      { v: 1, next: { [V1]: 1 }, published: { [tag('3E')]: 0 } },
+    ])
+      expect(parseCounterState(bad), JSON.stringify(bad)).toBeNull();
+    // A watermark without its keyset's `next` is still refused (only the binding has none).
+    expect(parseCounterState({ v: 1, next: {}, published: { [V1]: 0 } })).toBeNull();
+  });
+
+  it('core’s real counter source over the counters file: a seeded mint saves its lease with the binding, and a new store reads it back', async () => {
+    const d = await dir();
+    const mintUrl = 'https://mint.recovery-files.test' as MintUrl;
+    const mint = new mocks.TestMint({ url: mintUrl, seed: new Uint8Array(32).fill(0x63) });
+    const seed = await seedOf('5a'.repeat(16));
+    const wallet = new walletMod.CashuWallet({
+      mints: new walletMod.CashuMintConnections({
+        request: () => mint.request,
+        seed: { seed, counters: new FileCounterStore(d, PK) },
+      }),
+      store: new walletMod.MemoryProofStore(),
+    });
+    const q = await wallet.mintQuote(mintUrl, 64 as Sats);
+    mint.payQuote(q.quoteId);
+    expect(await wallet.pollQuote(q)).toMatchObject({ state: 'ISSUED', minted: 64 });
+    await wallet.close();
+    const onDisk = await new FileCounterStore(d, PK).load();
+    expect(onDisk?.next[mint.keysetId]).toBeGreaterThan(0);
+    expect(
+      Object.keys(onDisk?.published ?? {}).filter((k) => /^ff[0-9a-f]{32}$/.test(k)),
+    ).toHaveLength(1);
   });
 
   it('retire moves the file aside once pending saves landed; unretire brings it back', async () => {
