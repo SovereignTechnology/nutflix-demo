@@ -246,7 +246,14 @@ describe('restoreFromSeed (ADR 0016 §5)', () => {
     const c = device({ mints: [mint], seed: await newSeed(), restoreLimits: { maxBatches: 5 } });
     const [r] = await c.wallet.seeded!.restoreFromSeed(phrase, [MINT_A]);
     expect(c.net.restores()).toBe(5);
-    expect(r).toEqual({ mint: MINT_A, outcome: 'restored', restoredSats: 5 });
+    // Independent review 2026-09-27, finding 1: this expected the cut-short scan to read as a
+    // plain `restored` — the defect. It now also says where the cap stopped it (5 batches of 100).
+    expect(r).toEqual({
+      mint: MINT_A,
+      outcome: 'restored',
+      restoredSats: 5,
+      resume: { [mint.keysetId]: 500 },
+    });
   });
 
   it('mints that cannot restore (no NUT-09) or cannot be reached are reported; the others restore', async () => {

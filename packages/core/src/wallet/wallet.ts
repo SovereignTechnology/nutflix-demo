@@ -36,12 +36,12 @@ import type {
   WalletHistoryEntry,
 } from '../contracts/index.js';
 import {
-  counterProbe,
   PENDING_SETTLE_AFTER_S,
   seedGuardedOutputs,
   Spender,
   WalletError,
   type MintConnections,
+  type RestoreDetail,
   type Seeding,
   type WalletKey,
 } from './spend.js';
@@ -52,11 +52,10 @@ import type {
   ReissuePlan,
   ReissueResult,
   RestoreProgress,
-  RestoreReport,
   SeededWallet,
   SeedMaterial,
 } from './recovery-api.js';
-import { DurableCounterSource, markSeeded, seedBytes } from './seed.js';
+import { counterBinding, DurableCounterSource, markSeeded, seedBytes } from './seed.js';
 import { heldSecrets, proofTotal, type ProofStore } from './store.js';
 import { cashuRequestFn } from './transport.js';
 
@@ -77,12 +76,23 @@ const DEFAULT_REQUEST: RequestFn = cashuRequestFn(fetchRawHttp());
  * `SeedMaterial` (a reconnect) share it; one whose wallet was closed is replaced by a fresh source,
  * which starts from what is on disk — past every counter the closed one handed out (each lease is
  * written before its counters are). Reopen only after the old wallet's `close()` resolved.
+ *
+ * The source is bound to its phrase (`counterBinding`; independent review 2026-09-27, finding 3):
+ * a store whose live source belongs to ANOTHER phrase is refused — close that wallet first — and a
+ * file another phrase wrote reads as no state, so a rotated phrase starts at its own counter 0
+ * instead of continuing the old phrase's counters past a gap no restore crosses.
  */
 const SOURCES = new WeakMap<CounterStore, DurableCounterSource>();
 
-function counterSourceFor(store: CounterStore): DurableCounterSource {
+function counterSourceFor(store: CounterStore, binding: string): DurableCounterSource {
   let src = SOURCES.get(store);
-  if (src === undefined || src.closed) SOURCES.set(store, (src = new DurableCounterSource(store)));
+  if (src !== undefined && !src.closed && src.boundTo !== binding)
+    throw new WalletError(
+      'invalid-argument',
+      'this counters store is in use by a wallet of another recovery phrase: close it first',
+    );
+  if (src === undefined || src.closed)
+    SOURCES.set(store, (src = new DurableCounterSource(store, { binding })));
   return src;
 }
 
@@ -104,9 +114,9 @@ function counterSourceFor(store: CounterStore): DurableCounterSource {
  * With `seed` (ADR 0016 §2): every wallet gets `bip39seed` (lent BY REFERENCE: `close` on the
  * `CashuWallet` wipes it only once nothing can derive from it, and `seedGuardedOutputs` refuses a
  * wiped one), the ONE `DurableCounterSource` over `seed.counters` (keyed by keyset id across every
- * mint), the policy `'deterministic'` — `'random'` without a seed, never cashu-ts's `'auto'`, which
- * would half-switch the wallet — and a probe the counter source runs before deriving under a keyset
- * its state does not know.
+ * mint, bound to this phrase), and the policy `'deterministic'` — `'random'` without a seed, never
+ * cashu-ts's `'auto'`, which would half-switch the wallet. Throws for a wiped seed, or a counters
+ * store a live wallet of another phrase is using.
  */
 export class CashuMintConnections implements MintConnections {
   private readonly wallets = new Map<MintUrl, Promise<CashuTsWallet>>();
@@ -118,8 +128,18 @@ export class CashuMintConnections implements MintConnections {
       readonly seed?: SeedMaterial;
     } = {},
   ) {
-    if (opts.seed !== undefined)
-      this.seeding = { seed: opts.seed.seed, counters: counterSourceFor(opts.seed.counters) };
+    if (opts.seed !== undefined) {
+      let binding: string;
+      try {
+        binding = counterBinding(opts.seed.seed);
+      } catch {
+        throw new WalletError('invalid-argument', 'the recovery seed is wiped');
+      }
+      this.seeding = {
+        seed: opts.seed.seed,
+        counters: counterSourceFor(opts.seed.counters, binding),
+      };
+    }
   }
 
   wallet(mint: MintUrl): Promise<CashuTsWallet> {
@@ -146,10 +166,9 @@ export class CashuMintConnections implements MintConnections {
             }),
       });
       if (s !== undefined) markSeeded(cashu, s.seed);
-      w = cashu.loadMint().then(() => {
-        s?.counters.addProbe(counterProbe(cashu, s.seed));
-        return cashu;
-      });
+      // No probe is registered here: the `Spender` probes a keyset at the mint an operation runs
+      // at, and only there (independent review 2026-09-27, findings 2 and 6).
+      w = cashu.loadMint().then(() => cashu);
       // A failed load is not cached: the next call retries.
       w.catch(() => this.wallets.delete(mint));
       this.wallets.set(mint, w);
@@ -195,6 +214,25 @@ export function signerWalletKey(signer: Signer, pubkey: CashuP2pkPubkey): Wallet
 // The wallet
 // ---------------------------------------------------------------------------------------
 
+/** Where to continue restores a batch cap (or a failure) stopped early: mint → keyset id → counter. */
+export interface RestoreOptions {
+  readonly resume?: ReadonlyMap<MintUrl, Readonly<Record<string, number>>>;
+}
+
+/**
+ * The seam's `SeededWallet` as core implements it: `restoreFromSeed` also takes where to resume,
+ * and each report says whether its scan was complete (`RestoreDetail.resume`; independent review
+ * 2026-09-27, finding 1). Host-only.
+ */
+export interface CoreSeededWallet extends SeededWallet {
+  restoreFromSeed(
+    seed: RecoverySeed,
+    mints: readonly MintUrl[],
+    onProgress?: (p: RestoreProgress) => void,
+    opts?: RestoreOptions,
+  ): Promise<readonly RestoreDetail[]>;
+}
+
 export interface CashuWalletOptions {
   readonly mints: MintConnections;
   readonly store: ProofStore;
@@ -218,7 +256,16 @@ export class CashuWallet implements Wallet {
    * ADR 0016: present when the connections carry this device's `SeedMaterial` — restore from a
    * phrase (this device's, another device's, or typed in) and reissue (D5). Host-only.
    */
-  readonly seeded: SeededWallet | undefined;
+  readonly seeded: CoreSeededWallet | undefined;
+
+  /**
+   * Keysets whose `[published, next)` range a startup restore has not finished (their mint was
+   * unreachable, refused, or is not among this wallet's mints): their `published` watermark stays
+   * where it is — the range was never scanned, so it is not known published, and moving the
+   * watermark would make the next start skip it. Per keyset: a mint that stays down holds back only
+   * its own keysets, not every startup restore's range everywhere.
+   */
+  private held: ReadonlySet<string> = new Set();
 
   constructor(private readonly o: CashuWalletOptions) {
     this.spender = new Spender({
@@ -235,8 +282,8 @@ export class CashuWallet implements Wallet {
         : {
             reissuePlan: (mint) => this.reissuePlan(mint),
             reissue: (plan) => this.reissue(plan),
-            restoreFromSeed: (seed, mints, onProgress) =>
-              this.restoreFromSeed(seed, mints, onProgress),
+            restoreFromSeed: (seed, mints, onProgress, opts) =>
+              this.restoreFromSeed(seed, mints, onProgress, opts),
           };
   }
 
@@ -262,14 +309,20 @@ export class CashuWallet implements Wallet {
     seed: RecoverySeed,
     mints: readonly MintUrl[],
     onProgress?: (p: RestoreProgress) => void,
-  ): Promise<readonly RestoreReport[]> {
-    const reports: RestoreReport[] = [];
+    opts?: RestoreOptions,
+  ): Promise<readonly RestoreDetail[]> {
+    const reports: RestoreDetail[] = [];
     for (const mint of [...new Set(mints)]) {
       try {
         reports.push(
-          await this.spender.restoreFromSeed(seed, mint, (keysetsDone, keysets) => {
-            onProgress?.({ mint, keysetsDone, keysets });
-          }),
+          await this.spender.restoreFromSeed(
+            seed,
+            mint,
+            (keysetsDone, keysets) => {
+              onProgress?.({ mint, keysetsDone, keysets });
+            },
+            opts?.resume?.get(mint),
+          ),
         );
       } finally {
         await this.afterOperation(mint);
@@ -282,23 +335,36 @@ export class CashuWallet implements Wallet {
    * ADR 0016 §3: at startup, restore this device's own `[published, next)` counter ranges at the
    * wallet's mints — what a crash may have cut off before it reached NIP-60 (an outbox or journal
    * held in memory). Nothing without a seed or with nothing unpublished. Per mint, never throws.
+   * A keyset whose range no mint finished (`unreachable`, `refused`, a range not finished, or its
+   * mint not among this wallet's) keeps its `published` watermark until a later call finishes it —
+   * call this again later (the next start scans it again otherwise).
    */
-  async restoreUnpublished(): Promise<readonly RestoreReport[]> {
+  async restoreUnpublished(): Promise<readonly RestoreDetail[]> {
     const s = this.o.mints.seeding;
     if (s === undefined) return [];
     const ranges = await s.counters.unpublished();
-    if (ranges.length === 0) return [];
-    const reports: RestoreReport[] = [];
-    for (const mint of await this.mints()) {
-      try {
-        const r = await this.spender.restoreUnpublished(mint, ranges);
-        if (r.outcome !== 'nothing') reports.push(r);
-      } catch {
-        reports.push({ mint, outcome: 'unreachable', restoredSats: 0 as Sats });
-      } finally {
-        await this.afterOperation(mint);
+    const open = new Set(ranges.map((r) => r.keysetId));
+    // Held from the start: an operation finishing meanwhile must not move them either.
+    this.held = new Set([...this.held, ...open]);
+    const reports: RestoreDetail[] = [];
+    try {
+      if (ranges.length === 0) return [];
+      for (const mint of await this.mints()) {
+        try {
+          const r = await this.spender.restoreUnpublished(mint, ranges, (done) => {
+            for (const k of done) open.delete(k);
+          });
+          if (r.outcome !== 'nothing') reports.push(r);
+        } catch {
+          reports.push({ mint, outcome: 'unreachable', restoredSats: 0 as Sats });
+        } finally {
+          await this.emitBalanceSafe(mint);
+        }
       }
+    } finally {
+      this.held = open;
     }
+    await this.notePublishedSafe();
     return reports;
   }
 
@@ -317,7 +383,7 @@ export class CashuWallet implements Wallet {
     // Checked again with no await before the mark: the counter source orders the mark ahead of
     // any reservation made after this line.
     if (!this.spender.idle() || (store.unsynced?.() ?? 0) > 0) return;
-    await s.counters.markPublished();
+    await s.counters.markPublished(this.held);
   }
 
   /**

@@ -97,6 +97,7 @@ import type {
 } from './recovery-api.js';
 import {
   COUNTER_LIMIT,
+  COUNTER_PROBE_SPAN,
   RecoverySeedError,
   sameSeed,
   seedBytes,
@@ -147,6 +148,22 @@ export const RESTORE_MAX_BATCHES = 200;
 export const RESTORE_MAX_KEYSETS = 32;
 /** NUT-07 states asked per request. */
 const CHECK_CHUNK = 100;
+
+/**
+ * A mint's restore report (the seam's `RestoreReport`) and, when a scan did not reach its end at
+ * every keyset, where to continue (independent review 2026-09-27, finding 1: a scan the batch cap
+ * ended used to read as complete). Outside the frozen seam, which has no field for it
+ * (docs/contract-requests/N1-nut13-core.md item 7).
+ */
+export interface RestoreDetail extends RestoreReport {
+  /**
+   * Keyset id → the counter to continue from (`CashuWallet.seeded.restoreFromSeed(…, { resume })`):
+   * present only when a keyset's scan stopped early — the batch cap, or a keyset or batch that
+   * could not be asked. Absent: every keyset was scanned to three empty batches past what it found
+   * (and, for this device's own phrase, past its counters file's high-water mark).
+   */
+  readonly resume?: Readonly<Record<string, number>>;
+}
 
 /** The NIP-60 wallet key: its public half, and a NUT-11 witness signer for the private half. */
 export interface WalletKey {
@@ -374,9 +391,23 @@ export class Spender {
     }
   }
 
-  /** The output type of this wallet's own new outputs at `w`: explicit, never cashu-ts's 'auto'. */
-  private own(w: CashuTsWallet): OutputType {
-    return this.seededAt(w) ? { type: 'deterministic', counter: 0 } : { type: 'random' };
+  /**
+   * The output type of this wallet's own new outputs at `w`: explicit, never cashu-ts's 'auto'.
+   * Deterministic ones are derived only once the counter source knows the keyset — probed HERE, at
+   * the mint this operation runs at, and nowhere else (independent review 2026-09-27, finding 2).
+   * A probe that cannot run fails the operation before anything is sent.
+   */
+  private async own(w: CashuTsWallet): Promise<OutputType> {
+    // `seededAt` first: it is what refuses a wrapper that dropped `seeding` (ADR 0016 §2).
+    if (!this.seededAt(w)) return { type: 'random' };
+    const seeding = this.ctx.mints.seeding;
+    if (seeding === undefined) return { type: 'random' }; // unreachable: seededAt checked it
+    try {
+      await seeding.counters.ensureProbed(w.getKeyset().id, counterProbe(w, seeding.seed));
+    } catch (e) {
+      throw new WalletError('mint-error', `the NUT-13 counters cannot be used (${errorName(e)})`);
+    }
+    return { type: 'deterministic', counter: 0 };
   }
 
   /**
@@ -435,13 +466,14 @@ export class Spender {
     if (selected.length === 0 || proofTotal(selected.map(fromCashu)) < amount)
       throw new WalletError('insufficient-funds', `cannot cover ${amount} sat at this mint`);
 
+    // The change is ours: deterministic when seeded (ADR 0016 §4).
+    const keep = await this.own(w);
     const outputs: OutputConfig = {
       send: {
         type: 'p2pk',
         options: { pubkey: opts.p2pk, ...(tags.length > 0 ? { additionalTags: tags } : {}) },
       },
-      // The change is ours: deterministic when seeded (ADR 0016 §4).
-      keep: this.own(w),
+      keep,
     };
     const memo = opts.memo ?? `P2PK send ${String(amount)} sat`;
     let result: { send: Proof[]; keep: Proof[] };
@@ -468,6 +500,7 @@ export class Spender {
         preview.keepOutputs ?? [],
         preview.sendOutputs ?? [],
         preview.inputs.map(fromCashu),
+        keep.type === 'deterministic',
       );
       await this.ctx.store.commit({ mint: opts.mint, spent: [], added: [], begin: op });
       let recovered = false;
@@ -561,7 +594,7 @@ export class Spender {
       return this.twice(async () => {
         let fresh: Proof[];
         try {
-          fresh = await w.receive(inputs, undefined, this.own(w));
+          fresh = await w.receive(inputs, undefined, await this.own(w));
         } catch (e) {
           await this.collided(w, e);
           throw receiveError(e);
@@ -587,13 +620,24 @@ export class Spender {
     const done = recovered.get(opKey('receive', key));
     if (done !== undefined) return done as Sats;
     const prior = left.find((o) => o.kind === 'receive' && keyOf(o.key) === keyOf(key));
+    const output = reuse(prior) ?? (await this.own(w));
     let preview: Awaited<ReturnType<CashuTsWallet['prepareSwapToReceive']>>;
     try {
-      preview = await w.prepareSwapToReceive(inputs, undefined, reuse(prior) ?? this.own(w));
+      preview = await w.prepareSwapToReceive(inputs, undefined, output);
     } catch (e) {
       throw receiveError(e);
     }
-    const op = prior ?? this.newOp('receive', mint, key, preview.keepOutputs ?? [], [], []);
+    const op =
+      prior ??
+      this.newOp(
+        'receive',
+        mint,
+        key,
+        preview.keepOutputs ?? [],
+        [],
+        [],
+        output.type === 'deterministic',
+      );
     if (prior === undefined) await this.ctx.store.commit({ mint, spent: [], added: [], begin: op });
     let fresh: Proof[];
     try {
@@ -688,9 +732,10 @@ export class Spender {
       throw new WalletError('insufficient-funds', 'not enough sats at this mint');
     let res: Awaited<ReturnType<CashuTsWallet['meltProofsBolt11']>>;
     let op: PendingOp | undefined;
+    const blanks = await this.own(w);
     if (!journal) {
       try {
-        res = await w.meltProofsBolt11(q, selected, undefined, this.own(w));
+        res = await w.meltProofsBolt11(q, selected, undefined, blanks);
       } catch (e) {
         await this.reconcile(quote.mint, w, selected);
         await this.collided(w, e);
@@ -699,7 +744,7 @@ export class Spender {
     } else {
       let preview: MeltPreview<MeltQuoteBolt11Response>;
       try {
-        preview = await w.prepareMelt('bolt11', q, selected, undefined, this.own(w));
+        preview = await w.prepareMelt('bolt11', q, selected, undefined, blanks);
       } catch (e) {
         throw new WalletError('mint-error', `melt failed (${errorName(e)})`);
       }
@@ -712,6 +757,7 @@ export class Spender {
           preview.outputData,
           [],
           preview.inputs.map(fromCashu),
+          blanks.type === 'deterministic',
         );
         await this.ctx.store.commit({ mint: quote.mint, spent: [], added: [], begin: op });
       }
@@ -807,7 +853,7 @@ export class Spender {
       if (done !== undefined) return done as Sats;
       prior = left.find((o) => o.kind === 'mint' && keyOf(o.key) === keyOf([quote.quoteId]));
     }
-    const output = reuse(prior) ?? this.own(w);
+    const output = reuse(prior) ?? (await this.own(w));
     let preview: Awaited<ReturnType<CashuTsWallet['prepareMint']>>;
     try {
       // The key is lent to the prepare step only: it computes the NUT-20 signatures.
@@ -828,7 +874,16 @@ export class Spender {
     }
     const op = !journal
       ? undefined
-      : (prior ?? this.newOp('mint', quote.mint, [quote.quoteId], preview.outputData, [], []));
+      : (prior ??
+        this.newOp(
+          'mint',
+          quote.mint,
+          [quote.quoteId],
+          preview.outputData,
+          [],
+          [],
+          output.type === 'deterministic',
+        ));
     if (op !== undefined && prior === undefined)
       await this.ctx.store.commit({ mint: quote.mint, spent: [], added: [], begin: op });
     let proofs: Proof[];
@@ -934,75 +989,132 @@ export class Spender {
   // ---- NUT-13 (ADR 0016) ----------------------------------------------------------------
 
   /**
-   * ADR 0016 §5: scan `seed` from counter 0 at `mint` and add what is unspent and not already held.
-   * `seed` may be another device's phrase: it is read here, and nothing is derived from it later.
-   * When it is this device's own, its counters move past the last signature. Never throws for a
-   * mint (its outcome says what happened); throws for a seed that is wiped or not core's.
+   * ADR 0016 §5: scan `seed` from counter 0 (or from `resume`, keyset id → counter, where an earlier
+   * scan stopped) at `mint` and add what is unspent and not already held. `seed` may be another
+   * device's phrase: it is read here, and nothing is derived from it later. When it is this
+   * device's own, every keyset is scanned at least to its counters file's `next` whatever the gaps
+   * or the batch cap — this device may have used all of it — and its counters move past the last
+   * signature. A keyset scan the batch cap (or a failure) stopped early is REPORTED: the result
+   * then carries `resume` (independent review 2026-09-27, finding 1). Never throws for a mint (its
+   * outcome says what happened); throws for a seed that is wiped or not core's, or a bad `resume`.
    */
   restoreFromSeed(
     seed: RecoverySeed,
     mint: MintUrl,
     onKeyset?: (done: number, total: number) => void,
-  ): Promise<RestoreReport> {
+    resume?: Readonly<Record<string, number>>,
+  ): Promise<RestoreDetail> {
     try {
       seedBytes(seed);
     } catch {
       return Promise.reject(new WalletError('invalid-argument', 'the recovery seed is not usable'));
     }
+    if (resume !== undefined && !isResume(resume))
+      return Promise.reject(new WalletError('invalid-argument', 'a restore resume is malformed'));
     return this.exclusive(mint, async () => {
       const w = await this.restorable(mint);
       if (typeof w === 'string') return report(mint, w, 0);
       const keysets = restorableKeysets(w, this.limit('maxKeysets'));
+      const s = this.ctx.mints.seeding;
+      const own = s !== undefined && sameSeed(seed, s.seed) ? s : undefined;
+      let floors: Record<string, number> = {};
+      if (own !== undefined) {
+        try {
+          floors = await own.counters.leases();
+        } catch {
+          floors = {}; // an unreadable counters file: the plain gap rule, like another phrase
+        }
+      }
       const found: Found[] = [];
       const last = new Map<string, number>();
-      try {
-        for (const [i, ks] of keysets.entries()) {
+      const stopped: Record<string, number> = {};
+      let failed = false;
+      for (const [i, ks] of keysets.entries()) {
+        const from = resume?.[ks.id] ?? 0;
+        try {
           const keyset = ks.hasKeys ? ks : await w.keyChain.ensureKeysetKeys(ks.id);
-          const r = await this.scan(w, seed, keyset, 0);
+          const r = await this.scan(w, seed, keyset, from, floors[ks.id] ?? 0);
           found.push(...r.found);
           if (r.last !== undefined) last.set(ks.id, r.last);
-          try {
-            onKeyset?.(i + 1, keysets.length);
-          } catch {
-            // a progress listener's failure is its own
-          }
+          if (r.stopped !== undefined) stopped[ks.id] = r.stopped;
+          if (r.failed) failed = true;
+        } catch (e) {
+          if (e instanceof RecoverySeedError)
+            throw new WalletError(
+              'invalid-argument',
+              'the recovery seed was wiped during a restore',
+            );
+          // A dishonest answer taints the mint: nothing from it counts (ADR 0016 §5).
+          if (e instanceof RestoreRefused) return report(mint, 'refused', 0);
+          // This keyset could not be asked (its keys could not be fetched): what the other keysets
+          // brought back still counts (independent review 2026-09-27, finding 7).
+          stopped[ks.id] = from;
+          failed = true;
         }
-      } catch (e) {
-        if (e instanceof RecoverySeedError)
-          throw new WalletError('invalid-argument', 'the recovery seed was wiped during a restore');
-        return report(mint, e instanceof RestoreRefused ? 'refused' : 'unreachable', 0);
+        try {
+          onKeyset?.(i + 1, keysets.length);
+        } catch {
+          // a progress listener's failure is its own
+        }
       }
-      const s = this.ctx.mints.seeding;
-      if (s !== undefined && sameSeed(seed, s.seed))
-        for (const [id, c] of last) await s.counters.advanceToAtLeast(id, c + 1);
-      return this.adopt(w, mint, found, 'restored from recovery phrase');
+      if (own !== undefined)
+        for (const [id, c] of last) await own.counters.advanceToAtLeast(id, c + 1);
+      const r = await this.adopt(w, mint, found, 'restored from recovery phrase');
+      return incomplete(r, mint, stopped, failed);
     });
   }
 
   /**
    * ADR 0016 §3: restore this device's own `[published, next)` ranges at `mint` (those of its
    * keysets) — outputs made but maybe never published to NIP-60 (a crash with the outbox or the
-   * journal in memory). One small NUT-09 scan per keyset; same checks as `restoreFromSeed`.
+   * journal in memory). Every range is scanned WHOLE and NEWEST FIRST (independent review
+   * 2026-09-27, finding 1): the range is this device's own counters file, so no mint can stretch
+   * it, and the latest outputs are the ones most likely lost with the outbox. Same checks as
+   * `restoreFromSeed`; a range that could not be finished leaves the outcome `unreachable` unless
+   * something was restored.
    */
-  restoreUnpublished(mint: MintUrl, ranges: readonly UnpublishedRange[]): Promise<RestoreReport> {
+  restoreUnpublished(
+    mint: MintUrl,
+    ranges: readonly UnpublishedRange[],
+    onDone?: (keysetIds: readonly string[]) => void,
+  ): Promise<RestoreDetail> {
     const s = this.ctx.mints.seeding;
     if (s === undefined || ranges.length === 0) return Promise.resolve(report(mint, 'nothing', 0));
     return this.exclusive(mint, async () => {
       const w = await this.restorable(mint);
       if (typeof w === 'string') return report(mint, w, 0);
       const found: Found[] = [];
-      try {
-        for (const r of ranges) {
-          if (!w.keyChain.hasKeyset(r.keysetId)) continue;
+      const stopped: Record<string, number> = {};
+      const scanned: string[] = [];
+      for (const r of ranges) {
+        if (!w.keyChain.hasKeyset(r.keysetId)) continue;
+        try {
           const keyset = await w.keyChain.ensureKeysetKeys(r.keysetId);
-          found.push(...(await this.scan(w, s.seed, keyset, r.from, r.to)).found);
+          const got = await this.scanRange(w, s.seed, keyset, r.from, r.to);
+          found.push(...got.found);
+          if (got.stopped !== undefined) stopped[r.keysetId] = got.stopped;
+          else scanned.push(r.keysetId);
+        } catch (e) {
+          if (e instanceof RecoverySeedError)
+            throw new WalletError(
+              'invalid-argument',
+              'the recovery seed was wiped during a restore',
+            );
+          if (e instanceof RestoreRefused) return report(mint, 'refused', 0);
+          stopped[r.keysetId] = r.to;
         }
-      } catch (e) {
-        if (e instanceof RecoverySeedError)
-          throw new WalletError('invalid-argument', 'the recovery seed was wiped during a restore');
-        return report(mint, e instanceof RestoreRefused ? 'refused' : 'unreachable', 0);
       }
-      return this.adopt(w, mint, found, 'recovered from recovery phrase after a restart');
+      const r = await this.adopt(w, mint, found, 'recovered from recovery phrase after a restart');
+      // The keysets whose whole range was scanned AND whose finds were added: their watermark may
+      // move again (`CashuWallet.restoreUnpublished`).
+      if (r.outcome !== 'unreachable' && r.outcome !== 'refused') {
+        try {
+          onDone?.(scanned);
+        } catch {
+          // the listener's failure is its own
+        }
+      }
+      return incomplete(r, mint, stopped, true);
     });
   }
 
@@ -1071,9 +1183,10 @@ export class Spender {
     held: readonly CashuProof[],
   ): Promise<ReissueResult> {
     const inputs = held.map(toCashu);
+    const output = await this.own(w);
     let preview: Awaited<ReturnType<CashuTsWallet['prepareSwapToReceive']>>;
     try {
-      preview = await w.prepareSwapToReceive(inputs, undefined, this.own(w));
+      preview = await w.prepareSwapToReceive(inputs, undefined, output);
     } catch (e) {
       throw new WalletError('mint-error', `reissue failed (${errorName(e)})`);
     }
@@ -1111,6 +1224,7 @@ export class Spender {
       preview.keepOutputs ?? [],
       [],
       held,
+      output.type === 'deterministic',
     );
     await this.ctx.store.commit({ mint: plan.mint, spent: [], added: [], begin: op });
     let keep: Proof[];
@@ -1170,35 +1284,78 @@ export class Spender {
   }
 
   /**
-   * Restore `seed` under one keyset from `from`: to `to` when given (a known range), otherwise
-   * until `RESTORE_EMPTY_BATCHES` batches in a row come back empty (NUT-13: a gap of 300, what
-   * cashu-ts `batchRestore(300, 100)` does); at most `maxBatches` batches either way.
+   * Restore `seed` under one keyset from `from` until `RESTORE_EMPTY_BATCHES` batches in a row come
+   * back empty (NUT-13: a gap of 300, what cashu-ts `batchRestore(300, 100)` does). Below `floor`
+   * (this device's own counters file's `next`) nothing ends the scan — neither empty batches nor
+   * the cap; past it, at most `maxBatches` batches (ADR 0016 §5, a hostile mint signing something
+   * in every batch), and a scan the cap ends says where it `stopped`. A batch that cannot be asked
+   * ends it too (`failed`), keeping what was found. A dishonest answer throws `RestoreRefused`.
+   * `last` is the last DLEQ-verified signature (what may move this device's counters).
    */
   private async scan(
     w: CashuTsWallet,
     seed: RecoverySeed,
     keyset: Keyset,
     from: number,
-    to?: number,
-  ): Promise<{ found: Found[]; last: number | undefined }> {
+    floor: number,
+  ): Promise<Scanned> {
     const found: Found[] = [];
     let last: number | undefined;
     let empty = 0;
-    let at = from;
-    const end = Math.min(to ?? COUNTER_LIMIT, COUNTER_LIMIT);
-    for (let b = 0; b < this.limit('maxBatches') && at < end; b++) {
-      if (to === undefined && empty >= RESTORE_EMPTY_BATCHES) break;
-      const count = Math.min(RESTORE_BATCH, end - at);
-      const got = await restoreBatch(w, seed, keyset, at, count);
-      if (got.length === 0) empty++;
-      else {
+    let beyond = 0;
+    const max = this.limit('maxBatches');
+    for (let at = from; at < COUNTER_LIMIT;) {
+      const past = at >= floor;
+      if (past && empty >= RESTORE_EMPTY_BATCHES) break;
+      if (past && beyond >= max) return { found, last, stopped: at, failed: false };
+      const count = Math.min(RESTORE_BATCH, COUNTER_LIMIT - at);
+      let got: Found[];
+      try {
+        got = await restoreBatch(w, seed, keyset, at, count);
+      } catch (e) {
+        if (e instanceof RestoreRefused || e instanceof RecoverySeedError) throw e;
+        return { found, last, stopped: at, failed: true };
+      }
+      if (past) beyond++;
+      if (got.length === 0) {
+        if (past) empty++;
+      } else {
         empty = 0;
         found.push(...got);
-        last = Math.max(...got.map((g) => g.counter));
+        // Only a signature the mint PROVED (NUT-12 DLEQ) may move this device's counters: a mint
+        // without NUT-12 announcing another mint's keyset id could otherwise push them ~20 000
+        // ahead from a restore (the analog of independent review finding 2, found fixing it).
+        for (const g of got) if (g.verified) last = Math.max(last ?? g.counter, g.counter);
       }
       at += count;
     }
-    return { found, last };
+    return { found, last, failed: false };
+  }
+
+  /**
+   * Restore `seed` under one keyset over exactly `[from, to)`, newest batch first (the startup
+   * restore of this device's own unpublished range). No cap: the range comes from this device's
+   * counters file, not from a mint. A batch that cannot be asked ends it, keeping what was found.
+   */
+  private async scanRange(
+    w: CashuTsWallet,
+    seed: RecoverySeed,
+    keyset: Keyset,
+    from: number,
+    to: number,
+  ): Promise<Scanned> {
+    const found: Found[] = [];
+    for (let top = Math.min(to, COUNTER_LIMIT); top > from;) {
+      const at = Math.max(from, top - RESTORE_BATCH);
+      try {
+        found.push(...(await restoreBatch(w, seed, keyset, at, top - at)));
+      } catch (e) {
+        if (e instanceof RestoreRefused || e instanceof RecoverySeedError) throw e;
+        return { found, last: undefined, stopped: top, failed: true };
+      }
+      top = at;
+    }
+    return { found, last: undefined, failed: false };
   }
 
   /**
@@ -1292,6 +1449,7 @@ export class Spender {
     keep: readonly OutputDataLike[],
     send: readonly OutputDataLike[],
     spends: readonly CashuProof[],
+    seeded: boolean,
   ): PendingOp {
     const first = keep[0] ?? send[0];
     if (first === undefined)
@@ -1305,6 +1463,8 @@ export class Spender {
       send: send.map((o) => OutputData.serialize(o)),
       spends: [...spends],
       created: this.now(),
+      // Only when true, so an unseeded wallet's entries stay exactly as ADR 0014 wrote them.
+      ...(seeded ? { seeded: true } : {}),
     };
   }
 
@@ -1359,13 +1519,25 @@ export class Spender {
    */
   private async refused(w: CashuTsWallet, op: PendingOp, e: unknown): Promise<boolean> {
     if (!isDefinitive(e) || isAlreadySigned(e)) return false;
-    if (!this.seededAt(w)) return true;
+    // Random outputs cannot collide: a coded refusal is a refusal (ADR 0014).
+    if (!this.mayCollide(op)) return true;
     try {
       const got = await this.restoreOp(w, op);
       return got === null || (got.keep.length === 0 && got.send.length === 0 && got.foreign === 0);
     } catch {
       return false; // a malformed restore answer: not proof of a plain refusal — resolve decides
     }
+  }
+
+  /**
+   * Whether signatures on `op`'s outputs may be another wallet's (a NUT-13 collision), so NUT-07
+   * must also show it ran: its outputs were derived from a phrase (`PendingOp.seeded`), or this
+   * wallet derives from one now — failing closed if a store ever drops the flag. Only an unseeded
+   * wallet's unmarked entry (random outputs) is decided on its signatures alone, as in ADR 0014
+   * (independent review 2026-09-27, finding 4: the daemons and unseeded wallets).
+   */
+  private mayCollide(op: PendingOp): boolean {
+    return op.seeded === true || this.ctx.mints.seeding !== undefined;
   }
 
   private async settle(
@@ -1413,34 +1585,44 @@ export class Spender {
     const got = await this.restoreOp(w, op);
     if (got === null) return { state: 'unknown' };
     if (got.keep.length > 0 || got.send.length > 0 || got.foreign > 0) {
-      // Signed outputs prove nothing alone once outputs are derived from a phrase: the mint must
-      // also show the operation ran, or those signatures are another wallet's (ADR 0016 §4).
-      const ran = await this.ran(w, op);
-      if (ran === 'unknown') return { state: 'unknown' };
-      if (ran === 'pending') return { state: 'waiting' };
-      if (ran === 'no') {
-        // It never ran and never can (its outputs are signed already): the entry goes, a send's
-        // or melt's inputs come back — the mint says they are unspent.
-        await this.drop(op);
-        await this.advancePast(w, op);
-        return { state: 'collision' };
+      if (this.mayCollide(op)) {
+        // Signed outputs prove nothing alone once outputs are derived from a phrase: the mint
+        // must also show the operation ran, or those signatures are another wallet's (ADR 0016
+        // §4). Random outputs cannot collide, so an unseeded entry skips this and is decided on
+        // its signatures alone, as in ADR 0014 — a mint without a working NUT-07 does not strand
+        // it (independent review 2026-09-27, finding 4).
+        const ran = await this.ran(w, op);
+        if (ran === 'unknown') return { state: 'unknown' };
+        if (ran === 'pending') return { state: 'waiting' };
+        if (ran === 'no') {
+          // It never ran and never can (its outputs are signed already): the entry goes, a
+          // send's or melt's inputs come back — the mint says they are unspent.
+          await this.drop(op);
+          await this.advancePast(w, op);
+          return { state: 'collision' };
+        }
       }
       // It ran, so every output it signed is ours, for the amounts we asked: a signature for
       // another amount or keyset under one of them is a lie (ADR 0014) — the entry is kept for
       // an honest answer (`resolveSafe` reads this as unknown).
       if (got.foreign > 0)
         throw new WalletError('bad-mint-response', 'a restored signature does not match');
-      const keep = got.keep.map(fromCashu);
+      // A restore from the phrase may have added some of these outputs already (this entry was
+      // left unresolved then): they are not added, or written into the history, twice
+      // (independent review 2026-09-27, finding 8).
+      const already = new Set((await this.ctx.store.proofs(op.mint)).map((p) => p.secret));
+      const keep = got.keep.map(fromCashu).filter((p) => !already.has(p.secret));
       const kept = proofTotal(keep);
+      const out = op.kind === 'send' || op.kind === 'melt';
       await this.ctx.store.commit({
         mint: op.mint,
         spent: [...op.spends],
         added: keep,
         settle: [op.id],
-        history:
-          op.kind === 'send' || op.kind === 'melt'
-            ? {
-                direction: 'out',
+        ...(out
+          ? {
+              history: {
+                direction: 'out' as const,
                 amount: Math.max(0, proofTotal(op.spends) - kept) as Sats,
                 memo:
                   memo ??
@@ -1449,12 +1631,17 @@ export class Spender {
                     : op.send.length === 0
                       ? `${REISSUE_MEMO} (recovered)`
                       : 'P2PK send (answer lost, change recovered)'),
-              }
-            : {
-                direction: 'in',
-                amount: kept as Sats,
-                memo: `${memo ?? (op.kind === 'mint' ? 'top-up' : 'received ecash')} (recovered)`,
               },
+            }
+          : kept > 0
+            ? {
+                history: {
+                  direction: 'in' as const,
+                  amount: kept as Sats,
+                  memo: `${memo ?? (op.kind === 'mint' ? 'top-up' : 'received ecash')} (recovered)`,
+                },
+              }
+            : {}),
       });
       return { state: 'executed', keep: got.keep, send: got.send };
     }
@@ -1564,7 +1751,12 @@ export class Spender {
         if (!w.keyChain.hasKeyset(id)) continue;
         const keyset = await w.keyChain.ensureKeysetKeys(id);
         const from = (await s.counters.snapshot())[id] ?? 0;
-        const past = await signedPast(w, s.seed, keyset, from);
+        // Without NUT-12 nothing a mint answers is proven: it may skip at most one batch (the
+        // probe's bound, under a restore's gap), never open a gap a later restore stops at.
+        const batches = supports(w, 12)
+          ? RESTORE_MAX_BATCHES
+          : Math.ceil(COUNTER_PROBE_SPAN / RESTORE_BATCH);
+        const past = await signedPast(w, s.seed, keyset, from, batches);
         if (past > from) await s.counters.advanceToAtLeast(id, past);
       } catch {
         // the retry reserves fresh counters anyway; a second collision is reported
@@ -1723,6 +1915,29 @@ interface Found {
   readonly verified: boolean;
 }
 
+/** One keyset's scan: what it found, its last signed counter, and where it stopped early. */
+interface Scanned {
+  readonly found: Found[];
+  readonly last: number | undefined;
+  /** The counter to continue from, when the scan did not reach its end. */
+  readonly stopped?: number;
+  /** It stopped because a batch could not be asked (not the cap). */
+  readonly failed: boolean;
+}
+
+/** A `resume` from the caller: hex keyset ids → counters inside the counter space. */
+function isResume(x: unknown): x is Readonly<Record<string, number>> {
+  if (typeof x !== 'object' || x === null || Array.isArray(x)) return false;
+  return Object.entries(x).every(
+    ([k, v]) =>
+      /^[0-9a-f]{2,128}$/.test(k) &&
+      typeof v === 'number' &&
+      Number.isSafeInteger(v) &&
+      v >= 0 &&
+      v < COUNTER_LIMIT,
+  );
+}
+
 /** A retry's identity: its sorted keys, unambiguous. */
 function keyOf(key: readonly string[]): string {
   return JSON.stringify([...key].sort());
@@ -1851,6 +2066,28 @@ function report(mint: MintUrl, outcome: RestoreOutcome, sats: number): RestoreRe
   return { mint, outcome, restoredSats: sats as Sats };
 }
 
+/**
+ * A restore's report (what `adopt` added), said to be INCOMPLETE when `stopped` (keyset id →
+ * counter) lists keysets a scan did not finish: the result then carries it as `resume`, and with
+ * nothing restored the outcome is never `nothing` — `unreachable` when something could not be
+ * asked (`failed`), `refused` when only the batch cap stopped it (ADR 0016 §5: what a hostile mint
+ * looks like, or a history longer than one call scans; independent review 2026-09-27, finding 1).
+ * When what was found could not be added (NUT-07 unreachable, a refused swap) no `resume` is
+ * offered: continuing from it would skip what was found, so the caller starts over.
+ */
+function incomplete(
+  r: RestoreReport,
+  mint: MintUrl,
+  stopped: Readonly<Record<string, number>>,
+  failed: boolean,
+): RestoreDetail {
+  if (Object.keys(stopped).length === 0) return r;
+  if (r.outcome === 'unreachable' || r.outcome === 'refused') return r;
+  const outcome: RestoreOutcome =
+    r.outcome === 'restored' ? 'restored' : failed ? 'unreachable' : 'refused';
+  return { ...report(mint, outcome, r.restoredSats), resume: { ...stopped } };
+}
+
 /** The mint's input fee for spending `proofs` (cashu-ts: ceil of the summed ppk). */
 function feeOf(w: CashuTsWallet, proofs: readonly CashuProof[]): number {
   return proofs.length === 0 ? 0 : w.getFeesForProofs(proofs.map(toCashu)).toNumber();
@@ -1946,43 +2183,86 @@ async function restoreBatch(
 }
 
 /**
- * The first counter past every one `seed` has signed under `keyset` from `start` on: batches of
- * 100 until one comes back empty. It trusts the mint only to SKIP counters — one that claims
- * more than it signed just burns them; one that hides some leaves a collision the guard handles.
+ * The indices of `outs` a NUT-09 answer shows signed — counting only a signature that answers one
+ * of OUR blinded messages, under `keyset`, for an amount the keyset has a key for, and, at a NUT-12
+ * mint, carries a DLEQ that verifies against that amount's key (cashu-ts `toProof`). Anything else
+ * is skipped, not counted: a mint that copied another mint's public keys (to announce its keyset
+ * id) cannot sign under them, so it cannot move a cursor at a NUT-12 mint (independent review
+ * 2026-09-27, finding 2). A malformed answer throws.
+ */
+function signedIndices(
+  w: CashuTsWallet,
+  keyset: HasKeysetKeys,
+  outs: readonly OutputData[],
+  res: { outputs: { B_: string }[]; signatures: SerializedBlindedSignature[] },
+): number[] {
+  if (
+    !Array.isArray(res.outputs) ||
+    !Array.isArray(res.signatures) ||
+    res.outputs.length !== res.signatures.length
+  )
+    throw new WalletError('bad-mint-response', 'restore answered a malformed list');
+  const index = new Map(outs.map((o, i) => [o.blindedMessage.B_, i]));
+  const dleq = supports(w, 12);
+  const hits: number[] = [];
+  res.outputs.forEach((o, n) => {
+    const sig = res.signatures[n];
+    const i = index.get(o.B_);
+    const out = i === undefined ? undefined : outs[i];
+    if (sig === undefined || i === undefined || out === undefined || sig.id !== keyset.id) return;
+    if (dleq) {
+      if (sig.dleq === undefined) return;
+      try {
+        const a = Amount.from(sig.amount).toNumber();
+        if (!Number.isSafeInteger(a) || a < 1 || keyset.keys[a] === undefined) return;
+        out.toProof(sig, keyset); // throws unless the DLEQ verifies for the claimed amount
+      } catch {
+        return;
+      }
+    }
+    hits.push(i);
+  });
+  return hits;
+}
+
+/**
+ * The first counter past every one `seed` has signed under `keyset` from `start` on (verified as
+ * `signedIndices` says): batches of 100 until one comes back empty, at most `maxBatches`. It
+ * trusts the mint only to SKIP counters — one that claims more than it signed just burns them;
+ * one that hides some leaves a collision the guard handles.
  */
 async function signedPast(
   w: CashuTsWallet,
   seed: RecoverySeed,
   keyset: HasKeysetKeys,
   start: number,
+  maxBatches: number,
 ): Promise<number> {
   let next = start;
-  for (let b = 0, at = start; b < RESTORE_MAX_BATCHES && at < COUNTER_LIMIT; b++) {
+  for (let b = 0, at = start; b < maxBatches && at < COUNTER_LIMIT; b++) {
     const count = Math.min(RESTORE_BATCH, COUNTER_LIMIT - at);
     const outs = derived(seed, keyset, at, count);
     const res = await w.mint.restore({ outputs: outs.map((o) => o.blindedMessage) });
-    const signed = new Set(res.outputs.map((o) => o.B_));
-    let hit = -1;
-    outs.forEach((o, i) => {
-      if (signed.has(o.blindedMessage.B_)) hit = i;
-    });
-    if (hit < 0) return next;
-    next = at + hit + 1;
+    const hits = signedIndices(w, keyset, outs, res);
+    if (hits.length === 0) return next;
+    next = at + Math.max(...hits) + 1;
     at += count;
   }
   return next;
 }
 
 /**
- * The counter source's probe for one mint's wallet (`seed.ts` `DurableCounterSource`): before a
- * keyset the stored counters do not know is derived from, what this seed already signed there.
- * `undefined` when this mint does not serve the keyset or cannot restore (NUT-09).
+ * The counter source's probe at ONE mint's wallet (`seed.ts` `DurableCounterSource.ensureProbed`,
+ * run by the `Spender` for the mint an operation is about to use): what this seed already signed
+ * there under a keyset the stored counters do not know — ONE batch of `COUNTER_PROBE_SPAN` (ADR 0016
+ * §3), verified signatures only. `undefined` when this mint does not serve the keyset or cannot
+ * restore (NUT-09).
  */
 export function counterProbe(w: CashuTsWallet, seed: RecoverySeed): CounterProbe {
   return async (keysetId, start) => {
     if (!supports(w, 9) || !w.keyChain.hasKeyset(keysetId)) return undefined;
     const keyset = await w.keyChain.ensureKeysetKeys(keysetId);
-    return signedPast(w, seed, keyset, start);
+    return signedPast(w, seed, keyset, start, Math.ceil(COUNTER_PROBE_SPAN / RESTORE_BATCH));
   };
 }
 

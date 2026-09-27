@@ -14,6 +14,7 @@ export {
   fromCashu,
   toCashu,
   type MintConnections,
+  type RestoreDetail,
   type Seeding,
   type SpendContext,
   type WalletErrorCode,
@@ -25,6 +26,7 @@ export {
 export {
   COUNTER_LEASE,
   COUNTER_LIMIT,
+  COUNTER_PROBE_SPAN,
   CounterStateError,
   RECOVERY_WORDS,
   RecoveryPhraseError,
@@ -102,6 +104,8 @@ export {
   memoryWalletKey,
   signerWalletKey,
   type CashuWalletOptions,
+  type CoreSeededWallet,
+  type RestoreOptions,
 } from './wallet.js';
 export {
   RECOVERY_D_PREFIX,

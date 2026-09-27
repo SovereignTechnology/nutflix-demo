@@ -24,8 +24,10 @@ import type { CounterState, RecoveryEntropy } from '../recovery-api.js';
 import {
   COUNTER_LEASE,
   COUNTER_LIMIT,
+  COUNTER_PROBE_SPAN,
   CounterStateError,
   DurableCounterSource,
+  counterBinding,
   RecoveryPhraseError,
   RecoverySeedError,
   entropyFromBytes,
@@ -191,6 +193,16 @@ describe('the phrase (RecoveryPhrases)', () => {
     expect(await caught(() => recoveryPhrases.toIndices(e))).toBeInstanceOf(RecoverySeedError);
     expect(await caught(() => recoveryPhrases.toSeed(e))).toBeInstanceOf(RecoverySeedError);
     wipeEntropy(e); // idempotent
+  });
+
+  it('zeroed entropy is refused before it is written as a relay copy (its phrase is public)', async () => {
+    // Independent review 2026-09-27, finding 9: `entropyToHex` checked only the length.
+    const e = recoveryPhrases.generate();
+    wipeEntropy(e);
+    expect(await caught(() => entropyToHex(e))).toBeInstanceOf(RecoverySeedError);
+    expect(await caught(() => entropyToHex(new Uint8Array(3) as RecoveryEntropy))).toBeInstanceOf(
+      RecoveryPhraseError,
+    );
   });
 });
 
@@ -421,21 +433,30 @@ describe('DurableCounterSource: counters never repeat', () => {
 });
 
 describe('DurableCounterSource: a keyset the store does not know is probed first', () => {
+  // Independent review 2026-09-27, finding 2: the probe is no longer a registry of every loaded
+  // mint's probe (`addProbe`), run by `reserve` and maxed across mints — a mint announcing another
+  // mint's keyset id pushed the cursor ~20 000 ahead. The `Spender` now calls `ensureProbed` with
+  // the probe of the ONE mint an operation runs at, and a probe moves the cursor by at most one
+  // batch (`COUNTER_PROBE_SPAN`). The tests below keep each property the registry tests checked,
+  // through that API; "several mints: the furthest wins" and "an unregistered probe is not asked"
+  // were properties of the registry itself and are replaced by the two tests after them.
   it('no state at all: the probe answers, the cursor starts past what the mint signed', async () => {
     const store = new MemoryCounterStore(null);
     const src = new DurableCounterSource(store);
     const asked: [string, number][] = [];
-    src.addProbe((id, from) => {
+    const probe = (id: string, from: number): Promise<number | undefined> => {
       asked.push([id, from]);
-      return Promise.resolve(id === KS_A ? 137 : undefined);
-    });
-    expect((await src.reserve(KS_A, 2)).start).toBe(137);
+      return Promise.resolve(id === KS_A ? 37 : undefined); // was 137: past one batch now (below)
+    };
+    await src.ensureProbed(KS_A, probe);
+    expect((await src.reserve(KS_A, 2)).start).toBe(37);
     expect(asked).toEqual([[KS_A, 0]]);
-    // Probed once per process: the next reservation asks nobody.
-    expect((await src.reserve(KS_A, 1)).start).toBe(139);
+    // Probed once per process: the next operation asks nobody.
+    await src.ensureProbed(KS_A, probe);
+    expect((await src.reserve(KS_A, 1)).start).toBe(39);
     expect(asked).toHaveLength(1);
     // And the probe's answer is covered by the lease on disk.
-    expect(store.state?.next[KS_A]).toBe(139 + COUNTER_LEASE);
+    expect(store.state?.next[KS_A]).toBe(39 + COUNTER_LEASE);
   });
 
   it('a keyset the stored state knows is not probed', async () => {
@@ -443,7 +464,7 @@ describe('DurableCounterSource: a keyset the store does not know is probed first
       new MemoryCounterStore({ v: 1, next: { [KS_A]: 4 }, published: {} }),
     );
     let asked = 0;
-    src.addProbe(() => {
+    await src.ensureProbed(KS_A, () => {
       asked++;
       return Promise.resolve(999);
     });
@@ -451,38 +472,79 @@ describe('DurableCounterSource: a keyset the store does not know is probed first
     expect(asked).toBe(0);
   });
 
-  it('several mints serve the keyset: the cursor starts past the furthest one', async () => {
+  it('a probe moves the cursor by at most one batch, however far the mint claims this seed signed', async () => {
+    expect(COUNTER_PROBE_SPAN).toBe(100);
     const src = new DurableCounterSource(new MemoryCounterStore(null));
-    src.addProbe(() => Promise.resolve(20));
-    src.addProbe(() => Promise.resolve(310));
-    src.addProbe(() => Promise.resolve(undefined));
-    expect((await src.reserve(KS_A, 1)).start).toBe(310);
+    await src.ensureProbed(KS_A, () => Promise.resolve(19_936));
+    expect((await src.reserve(KS_A, 1)).start).toBe(COUNTER_PROBE_SPAN);
   });
 
-  it('nobody can answer (no probe, or no mint serves it): nothing is derived', async () => {
+  it('reserve never asks anyone by itself: an unknown keyset is refused until ensureProbed ran', async () => {
     const src = new DurableCounterSource(new MemoryCounterStore(null));
     await expect(src.reserve(KS_A, 1)).rejects.toMatchObject({ problem: 'unprobed' });
-    src.addProbe(() => Promise.resolve(undefined));
+    await expect(src.reserveAt(KS_A, 3, 1)).rejects.toMatchObject({ problem: 'unprobed' });
+    // One keyset probed says nothing about another.
+    await src.ensureProbed(KS_A, () => Promise.resolve(0));
+    await expect(src.reserve(KS_B, 1)).rejects.toMatchObject({ problem: 'unprobed' });
+  });
+
+  it('nobody can answer (the mint does not serve the keyset): nothing is derived', async () => {
+    const src = new DurableCounterSource(new MemoryCounterStore(null));
+    await expect(src.ensureProbed(KS_A, () => Promise.resolve(undefined))).rejects.toMatchObject({
+      problem: 'unprobed',
+    });
     await expect(src.reserve(KS_A, 1)).rejects.toMatchObject({ problem: 'unprobed' });
   });
 
   it('a probe that fails (the mint cannot be asked) refuses the reservation; a later one works', async () => {
     const src = new DurableCounterSource(new MemoryCounterStore(null));
     let down = true;
-    src.addProbe(() =>
-      down ? Promise.reject(new Error('connect ETIMEDOUT')) : Promise.resolve(3),
-    );
-    await expect(src.reserve(KS_A, 1)).rejects.toThrow('ETIMEDOUT');
+    const probe = (): Promise<number> =>
+      down ? Promise.reject(new Error('connect ETIMEDOUT')) : Promise.resolve(3);
+    await expect(src.ensureProbed(KS_A, probe)).rejects.toThrow('ETIMEDOUT');
+    await expect(src.reserve(KS_A, 1)).rejects.toMatchObject({ problem: 'unprobed' });
     down = false;
+    await src.ensureProbed(KS_A, probe);
     expect((await src.reserve(KS_A, 1)).start).toBe(3);
   });
 
-  it('a probe answering nonsense (negative, fractional, past 2^31) refuses the reservation', async () => {
+  it('a probe answering nonsense (negative, fractional, past 2^31, below the cursor) refuses the reservation', async () => {
     for (const bad of [-1, 2.5, COUNTER_LIMIT + 1, Number.NaN]) {
       const src = new DurableCounterSource(new MemoryCounterStore(null));
-      src.addProbe(() => Promise.resolve(bad));
+      await expect(src.ensureProbed(KS_A, () => Promise.resolve(bad))).rejects.toMatchObject({
+        problem: 'unprobed',
+      });
       await expect(src.reserve(KS_A, 1)).rejects.toMatchObject({ problem: 'unprobed' });
     }
+  });
+
+  it('a slow probe at one mint does not hold up reservations under keysets already known', async () => {
+    // Found fixing finding 2: the probe ran inside the serial chain, so a mint answering slowly
+    // (up to the transport's 30 s) stalled every seeded reservation at every mint.
+    const src = new DurableCounterSource(
+      new MemoryCounterStore({ v: 1, next: { [KS_A]: 0 }, published: {} }),
+    );
+    let release: (n: number) => void = () => undefined;
+    const probing = src.ensureProbed(
+      KS_B,
+      () =>
+        new Promise<number>((res) => {
+          release = res;
+        }),
+    );
+    const other = src.reserve(KS_A, 1);
+    const first = await Promise.race([
+      other.then(() => 'reserved'),
+      new Promise((r) => {
+        setTimeout(() => {
+          r('blocked');
+        }, 500);
+      }),
+    ]);
+    expect(first).toBe('reserved');
+    release(0);
+    await probing;
+    expect((await src.reserve(KS_B, 1)).start).toBe(0);
   });
 
   it('closed during the probe: the reservation is refused', async () => {
@@ -490,25 +552,121 @@ describe('DurableCounterSource: a keyset the store does not know is probed first
     let release: (n: number) => void = () => undefined;
     let asked: () => void = () => undefined;
     const probing = new Promise<void>((res) => (asked = res));
-    src.addProbe(
+    const r = src.ensureProbed(
+      KS_A,
       () =>
         new Promise<number>((res) => {
           release = res;
           asked();
         }),
     );
-    const r = src.reserve(KS_A, 1);
     await probing;
     src.close();
     release(5);
     await expect(r).rejects.toMatchObject({ problem: 'closed' });
+    await expect(src.ensureProbed(KS_A, () => Promise.resolve(0))).rejects.toMatchObject({
+      problem: 'closed',
+    });
+  });
+});
+
+describe('DurableCounterSource: two writers, and the phrase a counters file belongs to', () => {
+  const B1 = 'ff' + '11'.repeat(16);
+  const B2 = 'ff' + '22'.repeat(16);
+
+  it('two sources over one file never hand out the same counter: a lease another writer took moves the cursor past it', async () => {
+    // Independent review 2026-09-27, finding 5 (the shell should never do this: residual 2).
+    const store = new MemoryCounterStore({ v: 1, next: { [KS_A]: 0 }, published: {} });
+    const a = new DurableCounterSource(store);
+    const b = new DurableCounterSource(store);
+    await a.snapshot(); // both loaded before either leased
+    await b.snapshot();
+    const got = [
+      await a.reserve(KS_A, 5),
+      await b.reserve(KS_A, 5),
+      await a.reserve(KS_A, 40), // past a's own lease: b's is on disk above it
+      await b.reserve(KS_A, 3),
+    ];
+    const used = new Set<number>();
+    for (const r of got)
+      for (let c = r.start; c < r.start + r.count; c++) {
+        expect(used.has(c)).toBe(false);
+        used.add(c);
+      }
+    // A caller-fixed range inside another writer's lease is refused, not handed out.
+    const c = new DurableCounterSource(store);
+    const d = new DurableCounterSource(store);
+    await c.snapshot();
+    await d.snapshot();
+    const onDisk = store.state?.next[KS_A] ?? 0;
+    await d.reserve(KS_A, 1);
+    await expect(c.reserveAt(KS_A, onDisk, 1)).rejects.toMatchObject({ problem: 'argument' });
   });
 
-  it('an unregistered probe is not asked any more', async () => {
-    const src = new DurableCounterSource(new MemoryCounterStore(null));
-    const off = src.addProbe(() => Promise.resolve(50));
-    off();
-    await expect(src.reserve(KS_A, 1)).rejects.toMatchObject({ problem: 'unprobed' });
+  it('a file another phrase wrote reads as no state: every keyset is probed from 0, and the file is taken over', async () => {
+    const store = new MemoryCounterStore(null);
+    const first = new DurableCounterSource(store, { binding: B1 });
+    await first.ensureProbed(KS_A, () => Promise.resolve(0));
+    await first.reserve(KS_A, 450);
+    expect(store.state?.published[B1]).toBe(0);
+    first.close();
+    const rotated = new DurableCounterSource(store, { binding: B2 });
+    const asked: number[] = [];
+    await rotated.ensureProbed(KS_A, (_id, from) => {
+      asked.push(from);
+      return Promise.resolve(from);
+    });
+    expect(asked).toEqual([0]); // not 450 + the lease
+    expect((await rotated.reserve(KS_A, 3)).start).toBe(0);
+    // The file is the new phrase's now: its binding, its counters, none of the old ones.
+    expect(store.state?.published[B2]).toBe(0);
+    expect(store.state?.published[B1]).toBeUndefined();
+    expect(store.state?.next[KS_A]).toBe(3 + COUNTER_LEASE);
+    // A restart of the new phrase continues from it without a probe.
+    const again = new DurableCounterSource(store, { binding: B2 });
+    expect((await again.reserve(KS_A, 1)).start).toBe(3 + COUNTER_LEASE);
+  });
+
+  it('a closed source of the old phrase flushing late leaves the file the new phrase took over alone', async () => {
+    const store = new MemoryCounterStore(null);
+    const old = new DurableCounterSource(store, { binding: B1 });
+    await old.ensureProbed(KS_A, () => Promise.resolve(0));
+    await old.reserve(KS_A, 5);
+    await old.markPublished(new Set()); // dirty: a flush would write
+    old.close();
+    const rotated = new DurableCounterSource(store, { binding: B2 });
+    await rotated.ensureProbed(KS_A, () => Promise.resolve(0));
+    await rotated.reserve(KS_A, 2);
+    const taken = structuredClone(store.state);
+    await old.flush();
+    expect(store.state).toEqual(taken);
+  });
+
+  it('a file without a binding (written before it existed) is adopted; the same phrase keeps merging', async () => {
+    const store = new MemoryCounterStore({ v: 1, next: { [KS_A]: 9 }, published: { [KS_A]: 2 } });
+    const src = new DurableCounterSource(store, { binding: B1 });
+    expect((await src.reserve(KS_A, 1)).start).toBe(9);
+    expect(store.state).toEqual({
+      v: 1,
+      next: { [KS_A]: 10 + COUNTER_LEASE },
+      published: { [KS_A]: 2, [B1]: 0 },
+    });
+    expect(isCounterState(store.state)).toBe(true);
+    // A binding that is not one is refused at construction.
+    expect(() => new DurableCounterSource(store, { binding: 'ff00' })).toThrow(CounterStateError);
+  });
+
+  it('counterBinding: the same phrase gives the same binding, another phrase another; never the seed', async () => {
+    const entropy = recoveryPhrases.generate();
+    const a = await recoveryPhrases.toSeed(entropy);
+    const b = await recoveryPhrases.toSeed(entropy);
+    const c = await recoveryPhrases.toSeed(recoveryPhrases.generate());
+    expect(counterBinding(a)).toMatch(/^ff[0-9a-f]{32}$/);
+    expect(counterBinding(a)).toBe(counterBinding(b));
+    expect(counterBinding(a)).not.toBe(counterBinding(c));
+    expect(Buffer.from(seedBytes(a)).toString('hex')).not.toContain(counterBinding(a).slice(2));
+    a.wipe();
+    expect(() => counterBinding(a)).toThrow(RecoverySeedError);
   });
 });
 
@@ -518,7 +676,7 @@ describe('DurableCounterSource: the published watermark (ADR 0016 §3)', () => {
     const src = new DurableCounterSource(store);
     await src.reserve(KS_A, 5);
     expect(await src.unpublished()).toEqual([{ keysetId: KS_A, from: 0, to: 5 + COUNTER_LEASE }]);
-    await src.markPublished();
+    await src.markPublished(new Set());
     // Kept in memory until the next lease or a flush (a stale watermark only restores more).
     expect(store.state?.published).toEqual({});
     await src.flush();
@@ -530,11 +688,22 @@ describe('DurableCounterSource: the published watermark (ADR 0016 §3)', () => {
     ]);
   });
 
+  it('markPublished leaves the keysets it is told to hold (a startup restore did not finish them)', async () => {
+    // `hold` is required (an empty set to hold nothing): forgetting it must not move a held keyset.
+    const store = new MemoryCounterStore({ v: 1, next: { [KS_A]: 0, [KS_B]: 0 }, published: {} });
+    const src = new DurableCounterSource(store);
+    await src.reserve(KS_A, 3);
+    await src.reserve(KS_B, 4);
+    await src.markPublished(new Set([KS_A]));
+    await src.flush();
+    expect(store.state?.published).toEqual({ [KS_B]: 4 });
+  });
+
   it('flush works after close (the wallet closes the source first, then writes the watermark)', async () => {
     const store = new MemoryCounterStore({ v: 1, next: { [KS_A]: 0 }, published: {} });
     const src = new DurableCounterSource(store);
     await src.reserve(KS_A, 3);
-    await src.markPublished();
+    await src.markPublished(new Set());
     src.close();
     await src.flush();
     expect(store.state?.published).toEqual({ [KS_A]: 3 });
@@ -544,7 +713,7 @@ describe('DurableCounterSource: the published watermark (ADR 0016 §3)', () => {
     const store = new MemoryCounterStore({ v: 1, next: { [KS_A]: 0 }, published: {} });
     const old = new DurableCounterSource(store);
     await old.reserve(KS_A, 5);
-    await old.markPublished();
+    await old.markPublished(new Set());
     old.close();
     const successor = new DurableCounterSource(store);
     expect((await successor.reserve(KS_A, 100)).start).toBe(5 + COUNTER_LEASE);

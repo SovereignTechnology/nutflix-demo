@@ -16,8 +16,11 @@
  *     across every mint (two mints announcing one id still never share a counter), persisted
  *     through the shell's `CounterStore` AHEAD of use: before a counter is handed out, a lease
  *     reaching `COUNTER_LEASE` past it is on disk, so a crash burns at most one lease and never
- *     hands a counter out twice. A keyset the stored state does not know is PROBED first (NUT-09:
- *     anything this seed already signed there is skipped), whether the state is new or lost.
+ *     hands a counter out twice. A keyset the stored state does not know is PROBED first, at the
+ *     mint the operation runs at and nowhere else (NUT-09, one batch: anything this seed already
+ *     signed there is skipped), whether the state is new or lost. The stored state is bound to
+ *     ONE phrase (`counterBinding`): a file another phrase wrote reads as no state at all, so a
+ *     rotated phrase starts at its own counter 0 (independent review 2026-09-27, finding 3).
  *
  * Residuals (ADR 0016): the phrase strings the library builds (`entropyToMnemonic`) and the
  * words typed into the prompt window are JS strings, which cannot be wiped; cashu-ts's own
@@ -238,9 +241,13 @@ export function entropyFromHex(hex: string): RecoveryEntropy {
   return b as RecoveryEntropy;
 }
 
-/** Entropy as `RecoveryRelayCopy.entropy`: 32 lower-case hex characters (an unwipeable string). */
+/**
+ * Entropy as `RecoveryRelayCopy.entropy`: 32 lower-case hex characters (an unwipeable string).
+ * Wiped (all-zero) entropy is refused like everywhere it is used: its phrase is public, and a relay
+ * copy of it would be one (independent review 2026-09-27, finding 9).
+ */
 export function entropyToHex(entropy: RecoveryEntropy): string {
-  checkEntropy(entropy);
+  checkLive(entropy);
   let s = '';
   for (const byte of entropy) s += byte.toString(16).padStart(2, '0');
   return s;
@@ -284,6 +291,38 @@ export function seededWith(wallet: object): RecoverySeed | undefined {
   return SEEDED.get(wallet);
 }
 
+/**
+ * The libsodium call `counterBinding` makes (keyed BLAKE2b). Declared here because the package's
+ * ambient `sodium-universal` types (`src/types/audit-deps.d.ts`) list only the members used before;
+ * checked against `sodium-native@5.1.0` `index.js` (`crypto_generichash(output, input, key)`).
+ */
+const generichash = (
+  sodium as unknown as {
+    readonly crypto_generichash: (output: Uint8Array, input: Uint8Array, key?: Uint8Array) => void;
+  }
+).crypto_generichash;
+
+/** The domain key of `counterBinding` (a fixed, public string: it separates this use of the seed). */
+const BINDING_KEY = Uint8Array.from('nutflix/nut13/counters-binding/v1', (c) => c.charCodeAt(0));
+
+/** A binding entry's key: `ff` (no keyset version uses it) + 16 bytes of tag, in hex. */
+const BINDING_ENTRY = /^ff[0-9a-f]{32}$/;
+
+/**
+ * Which phrase a counters file belongs to (independent review 2026-09-27, finding 3): `ff` + the
+ * first 16 bytes of BLAKE2b(seed) keyed with a fixed domain string — libsodium's, no construction
+ * of our own. Stored as a `published` entry of the counters file (the frozen seam's `CounterState`
+ * has no field for it; docs/contract-requests/N1-nut13-core.md item 7). It holds no secret: it can
+ * only confirm a guessed phrase, and a phrase has 128 bits. Throws for a wiped or foreign seed.
+ */
+export function counterBinding(seed: RecoverySeed): string {
+  const tag = new Uint8Array(16);
+  generichash(tag, seedBytes(seed), BINDING_KEY);
+  let s = 'ff';
+  for (const b of tag) s += b.toString(16).padStart(2, '0');
+  return s;
+}
+
 // ---------------------------------------------------------------------------------------
 // Counters
 // ---------------------------------------------------------------------------------------
@@ -304,16 +343,27 @@ export interface CounterRange {
 }
 
 /**
- * What a mint says this seed already signed under `keysetId` from `start` on: the first counter
- * past every signed one (≥ `start`), or `undefined` when this mint does not serve the keyset.
- * Rejects when the mint cannot be asked (the reservation is then refused).
+ * How far one probe may move a keyset's cursor: ONE batch of NUT-09 (ADR 0016 §3, "restore(next,
+ * 100)"), well inside a restore's gap of 300 — so no answer to a probe can open a gap that ends a
+ * later restore early (independent review 2026-09-27, finding 2). A seed that signed further (a
+ * lost counters file) meets a collision instead, and the collision guard moves past it.
+ */
+export const COUNTER_PROBE_SPAN = 100;
+
+/**
+ * What ONE mint — the one an operation is about to run at — says this seed already signed under
+ * `keysetId` from `start` on: the first counter past every signed one (`start` ≤ answer ≤ `start +
+ * COUNTER_PROBE_SPAN`), or `undefined` when that mint does not serve the keyset. Rejects when the
+ * mint cannot be asked (the reservation is then refused).
  */
 export type CounterProbe = (keysetId: string, start: number) => Promise<number | undefined>;
 
 /** A counters file that is not a `CounterState` — refused rather than guessed at. */
 export class CounterStateError extends Error {
   override readonly name = 'CounterStateError';
-  constructor(readonly problem: 'malformed' | 'closed' | 'exhausted' | 'argument' | 'unprobed') {
+  constructor(
+    readonly problem: 'malformed' | 'closed' | 'exhausted' | 'argument' | 'unprobed' | 'contended',
+  ) {
     super(`counters: ${problem}`);
   }
 }
@@ -331,11 +381,20 @@ function isCounterMap(x: unknown): x is Readonly<Record<string, number>> {
   );
 }
 
-/** A stored `CounterState`: version 1, hex keyset ids, counters in `[0, 2^31]`. */
+/**
+ * A stored `CounterState`: version 1, hex keyset ids, counters in `[0, 2^31]`. (The phrase binding,
+ * a `published` entry `ff…` → 0, has that shape too: an older reader ignores it, since a `published`
+ * entry without a `next` entry is dropped on load.)
+ */
 export function isCounterState(x: unknown): x is CounterState {
   if (typeof x !== 'object' || x === null) return false;
   const s = x as Record<string, unknown>;
   return s['v'] === 1 && isCounterMap(s['next']) && isCounterMap(s['published']);
+}
+
+/** The phrase binding a stored state carries (`counterBinding`), if any. */
+function bindingOf(st: CounterState): string | undefined {
+  return Object.keys(st.published).find((k) => BINDING_ENTRY.test(k));
 }
 
 interface Loaded {
@@ -358,26 +417,42 @@ export interface UnpublishedRange {
   readonly to: number;
 }
 
+/** How many times a hand-out re-leases because another writer leased past it first. */
+const MAX_RELEASES = 8;
+
 /**
  * cashu-ts `CounterSource` (structurally: this file imports nothing from cashu-ts), durable
  * through a `CounterStore`. Every call runs one at a time, in call order, so a save and the
  * hand-out it covers are never interleaved with another reservation.
+ *
+ * A keyset the stored state does not know is derived from only after `ensureProbed` asked the
+ * mint the operation runs at (the `Spender` does, before every seeded operation): `reserve` never
+ * asks anyone by itself, and no other mint's answer counts (independent review 2026-09-27,
+ * finding 2 — a mint announcing another mint's keyset id could push the cursor ~20 000 ahead).
+ *
+ * With `binding` (`counterBinding(seed)`; `CashuMintConnections` always passes it) the stored state
+ * belongs to that phrase: a file bound to ANOTHER phrase reads as no state (every keyset probed
+ * from 0), and the first save takes the file over — unless this source is already closed, when
+ * it writes nothing (a late flush must not clobber the phrase that took the file over).
  */
 export class DurableCounterSource {
   private state: Promise<Loaded> | null = null;
   private chain: Promise<unknown> = Promise.resolve();
   private isClosed = false;
-  private readonly probes = new Set<CounterProbe>();
   private readonly lease: number;
+  private readonly binding: string | undefined;
 
   constructor(
     private readonly store: CounterStore,
-    opts: { readonly lease?: number } = {},
+    opts: { readonly lease?: number; readonly binding?: string } = {},
   ) {
     const lease = opts.lease ?? COUNTER_LEASE;
     if (!Number.isSafeInteger(lease) || lease < 1 || lease > 10_000)
       throw new CounterStateError('argument');
+    if (opts.binding !== undefined && !BINDING_ENTRY.test(opts.binding))
+      throw new CounterStateError('argument');
     this.lease = lease;
+    this.binding = opts.binding;
   }
 
   /** `close()` ran: every reservation throws from now on. */
@@ -385,10 +460,40 @@ export class DurableCounterSource {
     return this.isClosed;
   }
 
-  /** A mint's probe (its wallet loaded); returns the unregister function. */
-  addProbe(probe: CounterProbe): () => void {
-    this.probes.add(probe);
-    return () => this.probes.delete(probe);
+  /** The phrase this source's stored state belongs to (`counterBinding`), if bound. */
+  get boundTo(): string | undefined {
+    return this.binding;
+  }
+
+  /**
+   * Before deriving under `keysetId` at one mint: if the stored state does not know the keyset,
+   * ask THAT mint (`probe`, one batch) what this seed already signed there, and start past it —
+   * by at most `COUNTER_PROBE_SPAN`. Nothing is asked for a keyset already known or probed in this
+   * process. No answer (the mint does not serve the keyset, or answers nonsense) refuses
+   * (`unprobed`); a probe that rejects refuses too, and the next operation asks again.
+   */
+  async ensureProbed(keysetId: string, probe: CounterProbe): Promise<void> {
+    checkKeyset(keysetId);
+    const from = await this.serial(async () => {
+      if (this.isClosed) throw new CounterStateError('closed');
+      const s = await this.load();
+      return s.safe.has(keysetId) ? undefined : (s.cursor.get(keysetId) ?? 0);
+    });
+    if (from === undefined) return;
+    // The mint is asked OUTSIDE the serial chain: a slow mint must not hold up reservations at
+    // every other mint. Nothing derives under this keyset meanwhile (it is not yet safe).
+    const answer = await probe(keysetId, from);
+    if (answer === undefined || !isCounter(answer) || answer < from)
+      throw new CounterStateError('unprobed');
+    await this.serial(async () => {
+      // `close()` may have run while the mint answered.
+      if (this.isClosed) throw new CounterStateError('closed');
+      const s = await this.load();
+      if (s.safe.has(keysetId)) return; // probed meanwhile by a concurrent operation
+      const past = Math.min(answer, from + COUNTER_PROBE_SPAN, COUNTER_LIMIT);
+      if (past > (s.cursor.get(keysetId) ?? 0)) s.cursor.set(keysetId, past);
+      s.safe.add(keysetId);
+    });
   }
 
   /** cashu-ts: reserve `n` counters (`n = 0` peeks at the cursor without moving it). */
@@ -398,8 +503,8 @@ export class DurableCounterSource {
       if (!Number.isSafeInteger(n) || n < 0) throw new CounterStateError('argument');
       const s = await this.usable(keysetId);
       const start = s.cursor.get(keysetId) ?? 0;
-      if (n > 0) await this.handOut(s, keysetId, start, n);
-      return { start, count: n };
+      if (n === 0) return { start, count: 0 };
+      return { start: await this.handOut(s, keysetId, start, n, false), count: n };
     });
   }
 
@@ -414,7 +519,7 @@ export class DurableCounterSource {
         throw new CounterStateError('argument');
       const s = await this.usable(keysetId);
       if (start < (s.cursor.get(keysetId) ?? 0)) throw new CounterStateError('argument');
-      if (count > 0) await this.handOut(s, keysetId, start, count);
+      if (count > 0) await this.handOut(s, keysetId, start, count, true);
       else s.cursor.set(keysetId, Math.max(s.cursor.get(keysetId) ?? 0, start));
       return { start, count };
     });
@@ -428,11 +533,9 @@ export class DurableCounterSource {
       if (this.isClosed) throw new CounterStateError('closed');
       const s = await this.load();
       if (minNext <= (s.cursor.get(keysetId) ?? 0)) return;
-      if (minNext > (s.leased.get(keysetId) ?? 0)) {
-        const leased = new Map(s.leased).set(keysetId, minNext);
-        for (const [k, v] of await this.save(s, leased)) s.leased.set(k, v);
-      }
-      s.cursor.set(keysetId, minNext);
+      if (minNext > (s.leased.get(keysetId) ?? 0))
+        await this.save(s, new Map(s.leased).set(keysetId, minNext));
+      s.cursor.set(keysetId, Math.max(minNext, s.cursor.get(keysetId) ?? 0));
     });
   }
 
@@ -442,14 +545,31 @@ export class DurableCounterSource {
   }
 
   /**
+   * Keyset → the stored `next` (everything below it may have been used, by this process or an
+   * earlier one): how far a restore of THIS device's own phrase must scan whatever the gaps
+   * (ADR 0016 §5; independent review 2026-09-27, finding 1).
+   */
+  leases(): Promise<Record<string, number>> {
+    return this.serial(async () => {
+      const s = await this.load();
+      const out: Record<string, number> = {};
+      for (const [k, v] of s.leased) out[k] = Math.max(v, s.cursor.get(k) ?? 0);
+      return out;
+    });
+  }
+
+  /**
    * Every output handed out so far is published (the caller checked: no operation running,
-   * nothing journaled, the store's outbox empty). Kept in memory; written with the next lease
+   * nothing journaled, the store's outbox empty) — except under the keysets in `hold`, whose
+   * earlier range a startup restore has not finished (required: forgetting it must not silently
+   * move a held keyset). Kept in memory; written with the next lease
    * or by `flush` — a stale watermark only restores more at startup.
    */
-  markPublished(): Promise<void> {
+  markPublished(hold: ReadonlySet<string>): Promise<void> {
     return this.serial(async () => {
       const s = await this.load();
       for (const [k, c] of s.cursor) {
+        if (hold.has(k)) continue;
         if ((s.published.get(k) ?? 0) < c) {
           s.published.set(k, c);
           s.dirty = true;
@@ -481,7 +601,7 @@ export class DurableCounterSource {
     return this.serial(async () => {
       if (this.state === null) return;
       const s = await this.load();
-      if (s.dirty) for (const [k, v] of await this.save(s, s.leased)) s.leased.set(k, v);
+      if (s.dirty) await this.save(s, s.leased);
     });
   }
 
@@ -493,11 +613,20 @@ export class DurableCounterSource {
     return run;
   }
 
+  /** Whether a stored state is this source's (or no phrase's yet, which it adopts). */
+  private ours(st: CounterState): boolean {
+    if (this.binding === undefined) return true;
+    const b = bindingOf(st);
+    return b === undefined || b === this.binding;
+  }
+
   /** The stored state, read once (a failed read is retried by the next call). */
   private load(): Promise<Loaded> {
     if (this.state === null) {
-      const p = this.store.load().then((st): Loaded => {
-        if (st !== null && !isCounterState(st)) throw new CounterStateError('malformed');
+      const p = this.store.load().then((raw): Loaded => {
+        if (raw !== null && !isCounterState(raw)) throw new CounterStateError('malformed');
+        // Another phrase's counters say nothing about this one: no state (probe from 0).
+        const st = raw !== null && this.ours(raw) ? raw : null;
         const cursor = new Map<string, number>();
         const leased = new Map<string, number>();
         const published = new Map<string, number>();
@@ -519,55 +648,83 @@ export class DurableCounterSource {
     return this.state;
   }
 
-  /** The state, once `keysetId` may be derived from: open, and known or probed. */
+  /** The state, once `keysetId` may be derived from: open, and known or probed (`ensureProbed`). */
   private async usable(keysetId: string): Promise<Loaded> {
     if (this.isClosed) throw new CounterStateError('closed');
     const s = await this.load();
-    if (s.safe.has(keysetId)) return s;
-    // A keyset the stored state does not know: this seed may have signed there before (the
-    // counters file was lost, or never written). Ask every mint that serves it.
-    const from = s.cursor.get(keysetId) ?? 0;
-    const answers = await Promise.all([...this.probes].map((p) => p(keysetId, from)));
-    const known = answers.filter((a): a is number => a !== undefined);
-    if (known.length === 0 || !known.every(isCounter)) throw new CounterStateError('unprobed');
-    const past = Math.max(from, ...known);
-    // Again after the probe's await: `close()` may have run meanwhile.
-    if (this.closed) throw new CounterStateError('closed');
-    if (past > from) s.cursor.set(keysetId, past);
-    s.safe.add(keysetId);
+    if (!s.safe.has(keysetId)) throw new CounterStateError('unprobed');
     return s;
   }
 
-  /** Hand out `[start, start + n)`: the lease covering it is on disk before the cursor moves. */
-  private async handOut(s: Loaded, keysetId: string, start: number, n: number): Promise<void> {
-    const end = start + n;
-    if (end > COUNTER_LIMIT) throw new CounterStateError('exhausted');
-    if (end > (s.leased.get(keysetId) ?? 0)) {
-      const leased = new Map(s.leased).set(keysetId, Math.min(end + this.lease, COUNTER_LIMIT));
-      for (const [k, v] of await this.save(s, leased)) s.leased.set(k, v);
+  /**
+   * Hand out `n` counters from `start` (or, for `reserve`, from wherever another writer's lease
+   * pushed the cursor): the lease covering them is on disk before the cursor moves. Returns the
+   * start actually handed out. `fixed` (`reserveAt`): the range cannot move, so a lease another
+   * writer took over it refuses instead.
+   */
+  private async handOut(
+    s: Loaded,
+    keysetId: string,
+    start: number,
+    n: number,
+    fixed: boolean,
+  ): Promise<number> {
+    let from = start;
+    for (let i = 0; ; i++) {
+      const end = from + n;
+      if (end > COUNTER_LIMIT) throw new CounterStateError('exhausted');
+      if (end <= (s.leased.get(keysetId) ?? 0)) {
+        s.cursor.set(keysetId, end);
+        return from;
+      }
+      if (i >= MAX_RELEASES) throw new CounterStateError('contended');
+      await this.save(
+        s,
+        new Map(s.leased).set(keysetId, Math.min(end + this.lease, COUNTER_LIMIT)),
+      );
+      // Another writer leased past `from` meanwhile (independent review 2026-09-27, finding 5):
+      // `save` moved the cursor past its lease — start there, never inside it.
+      const c = s.cursor.get(keysetId) ?? 0;
+      if (c > from) {
+        if (fixed) throw new CounterStateError('argument');
+        from = c;
+      }
     }
-    s.cursor.set(keysetId, end);
   }
 
   /**
-   * Write `leased` (and the watermark). A stored lease is never moved back: the store is re-read
-   * and each keyset keeps the higher of the two — a source closed for a reopened wallet may still
-   * flush after its successor leased further (`CashuMintConnections` keeps ONE live source per
-   * store; this covers the one that was closed). Returns what was written.
+   * Write `leased` (and the watermark), then adopt what was written. A stored lease is never moved
+   * back: the store is re-read and each keyset keeps the higher of the two — a source closed for a
+   * reopened wallet may still flush after its successor leased further (`CashuMintConnections`
+   * keeps ONE live source per store; this covers the one that was closed, and a second writer the
+   * shell should not have: a keyset whose stored lease is above what this source believed moves
+   * its cursor past it, burning those counters rather than handing them out twice). A file bound to
+   * another phrase is taken over by an open source (nothing of it is merged) and left alone by a
+   * closed one.
    */
-  private async save(
-    s: Loaded,
-    leased: ReadonlyMap<string, number>,
-  ): Promise<ReadonlyMap<string, number>> {
+  private async save(s: Loaded, leased: ReadonlyMap<string, number>): Promise<void> {
     const next = new Map(leased);
-    const onDisk = await this.store.load();
-    if (onDisk !== null && isCounterState(onDisk))
-      for (const [k, v] of Object.entries(onDisk.next)) if (v > (next.get(k) ?? 0)) next.set(k, v);
+    const raw = await this.store.load();
+    const onDisk = raw !== null && isCounterState(raw) ? raw : null;
+    if (onDisk !== null && !this.ours(onDisk)) {
+      if (this.isClosed) return;
+    } else if (onDisk !== null) {
+      for (const [k, v] of Object.entries(onDisk.next)) {
+        if (v > (next.get(k) ?? 0)) next.set(k, v);
+        // Leased by someone else since this source last read or wrote it: never hand those out
+        // (and a keyset the store now knows needs no probe, as at load).
+        if (v > (s.leased.get(k) ?? 0)) {
+          if (v > (s.cursor.get(k) ?? 0)) s.cursor.set(k, v);
+          s.safe.add(k);
+        }
+      }
+    }
     const published: Record<string, number> = {};
     for (const [k, v] of s.published) published[k] = Math.min(v, next.get(k) ?? 0);
+    if (this.binding !== undefined) published[this.binding] = 0;
     await this.store.save({ v: 1, next: Object.fromEntries(next), published });
     s.dirty = false;
-    return next;
+    for (const [k, v] of next) s.leased.set(k, v);
   }
 }
 

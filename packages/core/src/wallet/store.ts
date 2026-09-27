@@ -61,6 +61,15 @@ export interface PendingOp {
   /** This wallet's proofs the operation consumes (a send, a melt); none for receive and mint. */
   readonly spends: readonly CashuProof[];
   readonly created: UnixSeconds;
+  /**
+   * `true` when `keep` was derived from a NUT-13 recovery phrase (ADR 0016). Signatures on such
+   * outputs may be another wallet's on the same phrase, so they count as this operation's only when
+   * the mint also shows it ran (NUT-07, or the quote ISSUED). Absent — random outputs, or an entry
+   * written before ADR 0016 — an UNSEEDED wallet decides it on its signatures alone, as in ADR 0014
+   * (independent review 2026-09-27, finding 4); a seeded wallet asks NUT-07 anyway, so a store that
+   * lost the flag fails closed (`spend.ts` `mayCollide`).
+   */
+  readonly seeded?: true;
 }
 
 /** The kinds a journal entry may have. */
@@ -131,7 +140,8 @@ export function isPendingOp(x: unknown): x is PendingOp {
     Array.isArray(o['spends']) &&
     o['spends'].every(isStoredProof) &&
     typeof o['created'] === 'number' &&
-    Number.isSafeInteger(o['created'])
+    Number.isSafeInteger(o['created']) &&
+    (o['seeded'] === undefined || o['seeded'] === true)
   );
 }
 

@@ -167,6 +167,38 @@ describe.skipIf(MINT_URL === undefined)(
       ]);
     });
 
+    it('a lost counters file: one probe batch at the mint skips what this seed signed (its real DLEQs verify), so nothing collides', async () => {
+      // Independent review 2026-09-27, finding 2: a probe counts only signatures whose DLEQ
+      // verifies — a real mint's restore answer must pass that check, or every restart on a lost
+      // counters file would collide.
+      const phrase = await newSeed();
+      const k = await activeKeyset(mint);
+      await fund(seededWallet({ seed: phrase }).wallet, mint, 21); // counters 0..2
+      const b = seededWallet({ seed: phrase }); // no counters file: probed first
+      await fund(b.wallet, mint, 8);
+      expect(b.net.st.refused).toEqual([]);
+      expect(b.net.st.restoresByKeyset.get(k)).toBe(1);
+      expect((await b.conns.seeding!.counters.snapshot())[k]).toBe(4);
+    });
+
+    it('this device’s own phrase restores through its counters file’s next, past a gap wider than 300', async () => {
+      // Independent review 2026-09-27, finding 1: the relays dropped this device's 7375 events;
+      // its counters file says how far it got, so the scan does not stop at the first gap.
+      const phrase = await newSeed();
+      const k = await activeKeyset(mint);
+      const counters = new MemoryCounterStore(null);
+      const x = seededWallet({ seed: phrase, counters });
+      await fund(x.wallet, mint, 5); // counters 0..1
+      await x.conns.seeding!.counters.advanceToAtLeast(k, 450);
+      await fund(x.wallet, mint, 8); // counter 450
+      const y = seededWallet({ seed: phrase, counters }); // the same device, an empty store
+      expect(await y.wallet.seeded!.restoreFromSeed(phrase, [mint])).toEqual([
+        { mint, outcome: 'restored', restoredSats: 13 },
+      ]);
+      // [0, 500) up to the file's next (483), then three empty batches past it.
+      expect(y.net.st.restoresByKeyset.get(k)).toBe(8);
+    });
+
     it('a restore answer without DLEQs, or with its amounts doubled, is refused', async () => {
       const phrase = await newSeed();
       await fund(seededWallet({ seed: phrase }).wallet, mint, 21);
