@@ -273,7 +273,7 @@ describe('the desktop app pays a seeder daemon for real (ADR 0012)', () => {
       .map((p) => nostr.parseNutzap(p.event));
     expect(zaps.some((z) => z?.recipient === CREATOR)).toBe(true);
     await worker.call('play.close', { sid });
-    plane.revokeSession(sid);
+    void plane.revokeSession(sid);
   }, 120_000);
 
   // ---- fix round 4 (cross-lane review, HIGH): owed blocks at play.close and at quit ----------
@@ -312,7 +312,7 @@ describe('the desktop app pays a seeder daemon for real (ADR 0012)', () => {
     // play.close answered: the tail was paid AND acknowledged — now the host may revoke.
     expect(counted()).toMatchObject({ outstanding: 0, banned: false });
     expect(counted().paid).toBe(counted().uploaded);
-    plane.revokeSession(sid);
+    void plane.revokeSession(sid);
   }, 60_000);
 
   // ---- fix round 5 (the verifier of fix round 4, HIGH + MEDIUM): a rendition switch ----------
@@ -356,7 +356,7 @@ describe('the desktop app pays a seeder daemon for real (ADR 0012)', () => {
     // given up. (B may be mid-stream: its own blocks are its own business, checked below.)
     expect(unpayable()).toBe(givenUpBefore);
     expect(closeMs).toBeLessThan(CLOSE_DRAIN_MS);
-    plane.revokeSession(sidA);
+    void plane.revokeSession(sidA);
     const got = await streamB;
     expect(got.status).toBe(200);
     expect(Buffer.compare(Buffer.from(got.body), Buffer.from(switchB.data))).toBe(0);
@@ -366,7 +366,7 @@ describe('the desktop app pays a seeder daemon for real (ADR 0012)', () => {
       'every block of both renditions paid',
     );
     await worker.call('play.close', { sid: sidB });
-    plane.revokeSession(sidB);
+    void plane.revokeSession(sidB);
     expect(unpayable()).toBe(givenUpBefore);
     expect(counted()).toMatchObject({ outstanding: 0, banned: false });
     expect(upSeeder.bans()).toEqual([]);
@@ -392,7 +392,7 @@ describe('the desktop app pays a seeder daemon for real (ADR 0012)', () => {
     expect(unpayable()).toBe(givenUpBefore);
     for (const sid of [sidA, sidB]) {
       await worker.call('play.close', { sid });
-      plane.revokeSession(sid);
+      void plane.revokeSession(sid);
     }
     expect(counted()).toMatchObject({ outstanding: 0, banned: false });
     expect(upSeeder.bans()).toEqual([]);
@@ -432,7 +432,7 @@ describe('the desktop app pays a seeder daemon for real (ADR 0012)', () => {
     );
     const sid = await play(second, fresh);
     await second.call('play.close', { sid });
-    plane.revokeSession(sid);
+    void plane.revokeSession(sid);
     expect(upRt.engine.isBanned(plane.pubkey)).toBe(false);
     expect(upSeeder.bans()).toEqual([]);
     expect(counted()).toMatchObject({ outstanding: 0, banned: false });
