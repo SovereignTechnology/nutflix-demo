@@ -247,6 +247,10 @@ The normative text is in `packages/core/src/contracts/pay-protocol.ts`; the choi
     open), the host keeps the session's remaining budget, with the same cap.
   - The quit waits for these writes, including those the signer flow's plane starts as it closes;
     and a new plane for an identity opens only after the closed plane's writes landed.
+  - One tail book owns the file at a time (fix round 7): a closed plane's book writes nothing
+    more, so a tail PAY still waiting for its turn at a mint when the plane closed (a sign-out or
+    lock, then a quick sign-in) cannot overwrite the next plane's book at its turn. The blocks it
+    would have given back stay off the budget: respected, never paid.
   - An expired tail is refused `forbidden`. The worker drops those blocks from its record:
     respected, never paid.
 - **The gateway** gets the credit-from-report part, including the one-block rule before the
