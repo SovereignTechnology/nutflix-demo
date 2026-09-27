@@ -573,7 +573,8 @@ export function assertCurrentBuild(o: CurrentBuildOptions): void {
     } catch {
       fail(`${rel(path)} is missing: cannot tell whether the bundle is current`);
     }
-    if (!st.isFile()) fail(`${rel(path)} is not a regular file: cannot tell whether the bundle is current`);
+    if (!st.isFile())
+      fail(`${rel(path)} is not a regular file: cannot tell whether the bundle is current`);
     if (newest === undefined || st.mtimeMs > newest.mtimeMs) newest = { path, mtimeMs: st.mtimeMs };
   }
   if (newest === undefined) return;

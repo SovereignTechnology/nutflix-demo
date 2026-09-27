@@ -379,9 +379,11 @@ describe('the build the stage copies must be current (cross-lane review, round 4
   // Lane R6-reconcile (the round-5 verifier): the freshness rule watches the bundle's own
   // configuration too. Every tsconfig the script's builds name is watched, and so is every file
   // those configs extend, followed to the end of the chain.
-  it("BUNDLE_CONFIG covers scripts/bundle.ts, every tsconfig it names and everything they extend", () => {
+  it('BUNDLE_CONFIG covers scripts/bundle.ts, every tsconfig it names and everything they extend', () => {
     const script = readFileSync(join(PKG_DIR, 'scripts', 'bundle.ts'), 'utf8');
-    const named = [...new Set([...script.matchAll(/tsconfig:\s*'([^']+)'/g)].map((m) => m[1] ?? ''))];
+    const named = [
+      ...new Set([...script.matchAll(/tsconfig:\s*'([^']+)'/g)].map((m) => m[1] ?? '')),
+    ];
     expect(named.sort()).toEqual(['tsconfig.preload.json', 'tsconfig.renderer.json']);
     const watched = new Set([
       ...BUNDLE_CONFIG.map((f) => join(PKG_DIR, f)),

@@ -127,10 +127,25 @@ refuses when:
    package's newest `src/` stylesheet;
 3. a bundle output the stage copies is older than the newest file the bundle reads: under
    `src/renderer`, `src/preload`, `src/ipc`, `static/`, `@sovit/ui`'s `dist/` or its `src/`
-   (tests and stories excluded). The bundle reads the UI through its package exports, so from
-   its `dist/` (`dist/*.js` and the copied `dist/ui.css`), never its `src/`: round 5 added
-   `dist/` after a bundle made before `tsc` rebuilt the UI staged the old renderer. A test pins
-   the watched set (`bundleInputDirs`) against the real renderer bundle's inputs.
+   (tests and stories excluded), or the bundle's own configuration — `scripts/bundle.ts`, the
+   two tsconfigs its esbuild builds name (`tsconfig.renderer.json`, `tsconfig.preload.json`) and
+   `tsconfig.base.json`, which both extend (lane R6-reconcile: a changed target, JSX setting or
+   entry point changes the output as much as a source does; a configuration file that is missing
+   or not a regular file is refused, since the rule could not be checked). The bundle reads the
+   UI through its package exports, so from its `dist/` (`dist/*.js` and the copied `dist/ui.css`),
+   never its `src/`: round 5 added `dist/` after a bundle made before `tsc` rebuilt the UI staged
+   the old renderer. Tests pin the watched set (`bundleInputDirs`) against the real renderer
+   bundle's inputs, and the configuration (`BUNDLE_CONFIG`, `BUNDLE_CONFIG_ROOT`) against the
+   script and the tsconfigs' `extends` chain.
+
+   What watching `@sovit/ui`'s `src/` adds (round 5 called it "a second, stricter check"; lane
+   R6-reconcile states it exactly, and a test pins it). A real edit there is refused first by
+   rule 1 (tsc would rebuild) or rule 2 (a stylesheet older than its source), so the `src/` watch
+   refuses that same stale build a second time: a belt for rule 1, whose dry run trusts its
+   `.tsbuildinfo`. On its own it refuses only a bundle older than a `src/` file whose content
+   cannot have changed what the bundle reads — a source only touched (rule 1 calls that current),
+   or a file that is neither a tsc input nor a stylesheet. Those refusals are false alarms,
+   cleared by `npm run build`.
 
 (2) and (3) compare mtimes; `npm run build` rewrites each of those files on every run, so the
 remedy is always `npm run build`. The stage never runs the build itself, so it still writes
