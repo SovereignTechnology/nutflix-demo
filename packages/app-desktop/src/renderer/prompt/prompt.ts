@@ -14,7 +14,8 @@
  * from outside this directory): a phrase arrives as 12 INDICES and is shown through that list;
  * a typed word leaves as its index. Main keeps the window out of screen captures while words
  * show (macOS/Windows; on Linux the page says it cannot); the words hide after two minutes or
- * when the window loses focus; nothing offers to copy them.
+ * when the window loses focus; nothing offers to copy them. The matching words offered while a
+ * word is typed are drawn by the page itself (`wordSuggestions`), never in an OS-drawn popup.
  */
 import { validateMnemonic } from '@scure/bip39';
 import { wordlist } from '@scure/bip39/wordlists/english.js';
@@ -64,6 +65,26 @@ export function wordIndex(typed: string): number | undefined {
       hit = i;
     }
   return hit;
+}
+
+/** At most this many matching words are offered under a word field. */
+export const SUGGESTIONS = 6;
+
+/**
+ * The words of the page's own list that start with what was typed (normalised as `wordIndex`
+ * normalises it), in list order, at most `SUGGESTIONS`; none when nothing is typed, nothing
+ * matches, or the only match is exactly what was typed.
+ */
+export function suggestWords(typed: string): string[] {
+  const w = typed.trim().normalize('NFKD').toLowerCase();
+  if (w === '') return [];
+  const out: string[] = [];
+  for (const word of wordlist) {
+    if (!word.startsWith(w)) continue;
+    out.push(word);
+    if (out.length === SUGGESTIONS) break;
+  }
+  return out.length === 1 && out[0] === w ? [] : out;
 }
 
 /** Does this phrase (as indices) carry a valid BIP-39 checksum? (`@scure/bip39`.) */
@@ -144,24 +165,148 @@ function captureNote(): HTMLElement[] {
     : [];
 }
 
-/** One `<datalist>` of the whole list, for the fields that take words. */
-function wordDatalist(id: string): HTMLDataListElement {
-  const list = el('datalist', { id });
-  for (const w of wordlist) list.append(el('option', { value: w }));
-  return list;
-}
+/** The id of the one suggestion list a words window has (`wordSuggestions`). */
+const SUGGEST_ID = 'nf-suggest';
 
-function wordField(id: string, label: string, list: string): HTMLInputElement {
+function wordField(id: string, label: string): HTMLInputElement {
   return el('input', {
     id,
     type: 'text',
-    list,
+    role: 'combobox',
+    'aria-autocomplete': 'list',
+    'aria-expanded': 'false',
+    'aria-controls': SUGGEST_ID,
     autocomplete: 'off',
     spellcheck: 'false',
     autocapitalize: 'off',
     maxlength: '16',
     'aria-label': label,
   });
+}
+
+/**
+ * Round 8 (the final panel): the matching words for the field being typed in, drawn INSIDE the
+ * page — one list, moved under that field. Not a `<datalist>`: Chromium draws a datalist's
+ * suggestions in a popup window of its own, and the prompt window's content protection is per
+ * window (on macOS that popup is outside it), so a screen capture would have seen every typed
+ * word, narrowed to one match. The words come from the page's own list (`suggestWords`).
+ *
+ * Keyboard (a WAI-ARIA combobox): ↓ opens the list or moves down, ↑ moves up (both wrap),
+ * Enter takes the chosen word, Escape closes the list (the next Escape cancels, as everywhere
+ * in this window). A click takes a word. The list closes when its field or the window loses
+ * focus; `onMount` (the view's) watches the window, and its cleanup (the answer sent) empties
+ * the list.
+ */
+function wordSuggestions(fields: readonly HTMLInputElement[]): {
+  readonly list: HTMLElement;
+  readonly onMount: () => () => void;
+} {
+  const list = el('ul', {
+    id: SUGGEST_ID,
+    class: 'suggest',
+    role: 'listbox',
+    'aria-label': 'Matching words',
+    hidden: true,
+  });
+  let owner: HTMLInputElement | undefined;
+  let items: string[] = [];
+  let active = -1;
+  const close = (): void => {
+    list.replaceChildren();
+    list.hidden = true;
+    items = [];
+    active = -1;
+    if (owner !== undefined) {
+      owner.setAttribute('aria-expanded', 'false');
+      owner.removeAttribute('aria-activedescendant');
+    }
+    owner = undefined;
+  };
+  const render = (field: HTMLInputElement): void => {
+    if (owner !== field) close();
+    items = suggestWords(field.value);
+    if (items.length === 0) {
+      close();
+      return;
+    }
+    if (active >= items.length) active = items.length - 1;
+    owner = field;
+    // Under the field: its wrapper is the list's positioning box (prompt.css).
+    if (list.parentElement !== field.parentElement) field.parentElement?.append(list);
+    list.replaceChildren(
+      ...items.map((w, i) =>
+        el(
+          'li',
+          {
+            id: `${SUGGEST_ID}-${String(i)}`,
+            role: 'option',
+            'aria-selected': i === active ? 'true' : 'false',
+          },
+          w,
+        ),
+      ),
+    );
+    list.hidden = false;
+    field.setAttribute('aria-expanded', 'true');
+    if (active >= 0) field.setAttribute('aria-activedescendant', `${SUGGEST_ID}-${String(active)}`);
+    else field.removeAttribute('aria-activedescendant');
+  };
+  const take = (i: number): void => {
+    const field = owner;
+    const word = items[i];
+    if (field === undefined || word === undefined) return;
+    field.value = word;
+    close();
+  };
+  for (const f of fields) {
+    f.addEventListener('input', () => {
+      active = -1;
+      render(f);
+    });
+    f.addEventListener('keydown', (e) => {
+      const open = owner === f && items.length > 0;
+      if (e.key === 'ArrowDown') {
+        e.preventDefault();
+        if (!open) {
+          active = -1;
+          render(f);
+        }
+        if (items.length === 0) return;
+        active = (active + 1) % items.length;
+        render(f);
+      } else if (e.key === 'ArrowUp' && open) {
+        e.preventDefault();
+        active = active <= 0 ? items.length - 1 : active - 1;
+        render(f);
+      } else if (e.key === 'Enter' && open && active >= 0) {
+        // Not the form's submit: this Enter takes a word.
+        e.preventDefault();
+        take(active);
+      } else if (e.key === 'Escape' && open) {
+        // Only the list: the window's own Escape (cancel) waits for the next press.
+        e.preventDefault();
+        e.stopPropagation();
+        close();
+      }
+    });
+    f.addEventListener('blur', close);
+  }
+  // Pressing an option (primary button) must not blur the field first (that closes the list).
+  list.addEventListener('mousedown', (e) => {
+    e.preventDefault();
+    const li = e.target instanceof Element ? e.target.closest('li') : null;
+    if (li !== null && e.button === 0) take([...list.children].indexOf(li));
+  });
+  return {
+    list,
+    onMount: () => {
+      window.addEventListener('blur', close);
+      return () => {
+        window.removeEventListener('blur', close);
+        close();
+      };
+    },
+  };
 }
 
 type Answer =
@@ -683,9 +828,8 @@ function recoveryShow(indices: readonly number[], again: boolean): View {
 
 /** ADR 0016: three words, typed back and sent as indices. */
 function recoveryConfirm(positions: readonly number[], retry: boolean): View {
-  const fields = positions.map((p) =>
-    wordField(`w${String(p)}`, `Word ${String(p + 1)}`, 'nf-words'),
-  );
+  const fields = positions.map((p) => wordField(`w${String(p)}`, `Word ${String(p + 1)}`));
+  const suggest = wordSuggestions(fields);
   const body: (Node | string)[] = [];
   if (retry)
     body.push(
@@ -706,7 +850,7 @@ function recoveryConfirm(positions: readonly number[], retry: boolean): View {
         f,
       ),
     ),
-    wordDatalist('nf-words'),
+    suggest.list,
   );
   return {
     title: 'Confirm your recovery phrase',
@@ -715,6 +859,7 @@ function recoveryConfirm(positions: readonly number[], retry: boolean): View {
     cancelLabel: 'Later',
     ...(fields[0] === undefined ? {} : { focus: fields[0] }),
     secrets: fields,
+    onMount: suggest.onMount,
     collect: () => {
       const words = fields.map((f) => wordIndex(f.value));
       if (words.some((w) => w === undefined))
@@ -727,8 +872,9 @@ function recoveryConfirm(positions: readonly number[], retry: boolean): View {
 /** ADR 0016: an optional typed phrase — 12 words, checked here before they are sent. */
 function recoveryRestore(): View {
   const fields = Array.from({ length: PHRASE_WORDS }, (_, n) =>
-    wordField(`r${String(n)}`, `Word ${String(n + 1)}`, 'nf-words'),
+    wordField(`r${String(n)}`, `Word ${String(n + 1)}`),
   );
+  const suggest = wordSuggestions(fields);
   // Pasting a whole phrase into one field spreads it over the fields (a password manager).
   fields.forEach((f, start) => {
     f.addEventListener('paste', (e) => {
@@ -789,7 +935,7 @@ function recoveryRestore(): View {
           el('div', { class: 'word-field' }, el('label', { for: f.id }, `${String(n + 1)}.`), f),
         ),
       ),
-      wordDatalist('nf-words'),
+      suggest.list,
       el(
         'div',
         { class: 'field' },
@@ -805,6 +951,7 @@ function recoveryRestore(): View {
     submitLabel: 'Restore',
     ...(fields[0] === undefined ? {} : { focus: fields[0] }),
     secrets: fields,
+    onMount: suggest.onMount,
     collect: () => {
       const mints = collectMints();
       if (!Array.isArray(mints)) return mints;
