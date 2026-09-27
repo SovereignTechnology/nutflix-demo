@@ -356,7 +356,7 @@ export class RecoveryService {
         reissued: false,
         relayCopy: false,
         // A replaced phrase's relay copy is retired once the reissue under this one completed
-        // (a still-pending replacement carries over: its copy was never retired either).
+        // (`old` is a finished phrase here, so its own `replaces` is already null).
         replaces: old === null ? null : old.device,
         sealed,
       };
