@@ -479,6 +479,10 @@ what the real-mint lane measured (details: `docs/lanes/N1-nut13-core.md`,
 - **§3, startup restore.** `[published, next)` is scanned whole and newest first (the range is this
   device's file, so no cap is needed). A keyset whose range no mint finished keeps its watermark
   until a later startup restore finishes it (per keyset: one dead mint holds back only its own).
+  The hold starts at the counters file's load, in the counter source, so it fails closed: an
+  operation that finishes before the startup restore runs cannot mark the earlier range published
+  (fix round 7). An unfinished startup restore reports the range's low end as `resume`, where an
+  upward restore of this device's phrase covers it.
 - **§2, wrappers.** A `MintConnections` wrapper must forward `seeding`; core refuses to operate on a
   seeded cashu-ts wallet whose context lost it (the desktop's money plane wraps its connections).
 - **§5 step 4.** At a mint without NUT-12 everything unspent is swapped before it counts (one
@@ -488,7 +492,9 @@ what the real-mint lane measured (details: `docs/lanes/N1-nut13-core.md`,
 - **§5 step 3, the batch cap (open for Cameron).** This device's own phrase is scanned at least to
   its counters file's `next`, whatever the gaps or the cap. Any other scan the 200-batch cap stops
   is reported, with where to resume (`RestoreDetail.resume`, never outcome `nothing`), because a
-  hostile mint and an honest long history look the same from counter 0. Whether to keep the cap per
+  hostile mint and an honest long history look the same from counter 0. The 32-keyset cap is
+  reported the same way: each keyset it leaves out is named in `resume` at 0, and a resumed call
+  scans only the keysets its resume names (fix round 7). Whether to keep the cap per
   call, raise it, or add checkpoints to the relay copy is contract request item 7 (independent
   review 2026-09-27, finding 1: a heavy viewer passes 20 000 counters in about an hour).
 - **§4, journal entries.** A journaled operation records whether its outputs were seeded

@@ -398,3 +398,102 @@ step) is caught.
 - **Two writers over one counters file.** A read-then-write race in `save` can still lose an update
   (residual 2, narrowed by finding 5's fix). The shell keeps one writer.
 - **The counters file carries a 16-byte binding tag** of the seed.
+
+## Round 7 — the lane's independent verifier (2026-09-27)
+
+The verifier re-read `ae639d3` and reported three low findings. Each one was confirmed by a test
+written against `ae639d3` before any fix (the six new `nut13-review.test.ts` tests and the new
+`seed.test` test all failed there, each on the defect itself). None was wrong. The orchestrator
+decided to fix all three.
+
+| # | Sev. | Verdict | Reproduced by (`nut13-review.test.ts` unless named; result on `ae639d3`) | Fix |
+| --- | --- | --- | --- | --- |
+| 1 | low | confirmed | "the mint refused every restore at startup: resuming from the report brings the change back" (`resume` 33, the range top); "a keyset whose keys could not be fetched at startup: the same low end" (33); "a scan stopped halfway down the range: the resume still covers the part below" (183) | `spend.ts:1381` `scanRange` reports `stopped: from`, the range's low end; `spend.ts:1128` the same when a keyset cannot be asked. Doc: `RestoreDetail.resume` (`spend.ts:161`), `CashuWallet.restoreUnpublished`, contract request 7 |
+| 2 | low | confirmed | "never `nothing`: each keyset left out is named at 0; resumed calls scan at most the cap each" (`nothing`, no `resume`); "a keyset a resumed call leaves out keeps the counter it was resumed from" (`nothing`) | `spend.ts:1033` a resumed call scans only the keysets its resume names, then applies the cap; `spend.ts:1052` each keyset past the cap goes into `resume` at 0, or at its resume counter; `spend.ts:1963` an empty resume is refused. `restorableKeysets` no longer slices |
+| 3 | low | confirmed | "an operation that finishes before the startup restore runs does not mark the crash range published" (the watermark went 1 → 35, and `restoreUnpublished` then found nothing); `seed.test` "a keyset whose stored [published, next) is not empty is held from load until a startup restore scanned it" | `seed.ts:414` / `:664` the counter source computes `unscanned` at load: every keyset whose stored range is not empty; `seed.ts:582` `markPublished` skips them; `seed.ts:596` `markScanned` releases a keyset once a startup restore has scanned its whole range; `wallet.ts:365` `restoreUnpublished` calls it, and the wallet keeps no hold of its own any more |
+
+**Finding 1.** Option (b) of the suggestion: report the range's low end. A `resume` now means one
+thing everywhere, "continue UPWARD from here". So `restoreFromSeed(<own phrase>, …, { resume })`
+from a startup report scans `[from, next)` whole, because the own phrase's floor is its counters
+file's `next`, and then three empty batches. It rescans the part the downward scan had already
+done, which is harmless. `Scanned.stopped` carries that meaning in both scanners. Calling
+`restoreUnpublished()` again also covers the range, and only that call releases the watermark.
+
+**Finding 2.** A resumed call is now a continuation: at a mint with a resume entry, only the
+keysets it names are scanned, active first, at most `RESTORE_MAX_KEYSETS` per call. Before, a
+resumed call rescanned every finished keyset from 0, which cost requests and showed the mint every
+`B_` again. A mint with 33 or more keysets is reported as incomplete with nothing restored:
+`refused` plus `resume`, never `nothing`. A chain of resumed calls reaches every keyset, and each
+call is explicit (the same design as the batch cap, contract request 7 option 1). An empty resume is
+refused rather than read as "nothing to restore". A resume that names only keysets the mint no
+longer lists scans nothing and reads `nothing`: nothing is left there that a restore could reach.
+
+**Finding 3.** The first suggestion. The hold lives in `DurableCounterSource`, from its first
+load, and not in the wallet object. So it also holds for a second `CashuWallet` over the same
+connections (a reconnect shares the source, and the test covers it). It survives `close()`: the held
+watermark is flushed unchanged, and the successor source holds the range again. No startup order is
+required. `markPublished(hold)` keeps its required parameter (the S5 test and mutation still hold);
+the wallet now passes an empty set, since the source holds the rest. Cost: a shell that never calls
+`restoreUnpublished` never moves those watermarks (contract request 4 now says to call it at every
+start). And after a clean close, the unused lease (at most 32 counters per keyset) is held until the
+startup restore scans it, which it already did.
+
+### Own pass (differential-review and sharp-edges on the round's diff)
+
+- **Blast radius.** `restoreFromSeed`'s resume semantics changed. Callers: `CashuWallet.seeded` and
+  tests; N2 is not built yet. `markPublished` has one production caller. `markScanned` is new and
+  called only from `restoreUnpublished`. The hold is stricter now, so a caller can only see the
+  watermark move later than before, never earlier.
+- **Locked files.** `spend.ts` and `seed.ts` have no new import, log line or error text.
+  `check:locked` passes.
+- **`resume` input.** Keysets are filtered with `Object.hasOwn`, so an inherited property never
+  selects a keyset. Every value read comes from an own, validated entry.
+- **Residual found (not fixed, pre-existing since the per-keyset release).** A keyset is released
+  when ANY mint finishes its range. Suppose a mint in the user's own list copies another mint's
+  keyset id and answers empty, while the real mint is unreachable at that start. That mint releases
+  the hold, so the next start skips the range. The money is not lost: a restore of the own phrase
+  scans to the counters file's `next`. It cannot be closed per keyset: an unreachable mint's
+  keysets are unknown, and the seam's `CounterState` names no mint. Holding every keyset while any
+  mint is down would undo the per-keyset release.
+- **Resume size.** A mint that announces thousands of keysets gets a `resume` entry for each one
+  (host-side only, validated), and each continuation is an explicit call.
+
+### Mutation checks (round 7; script `n1r7/mutate.py` in the lane scratchpad)
+
+Each guard was broken alone and the named tests were run. The file was then restored from a backup
+and checked by sha256. All 13 are caught. K3 and H2 were re-run to confirm the failure is an
+assertion, not a transform error.
+
+| # | Guard broken | Caught by |
+| --- | --- | --- |
+| T1 | `scanRange` reports where the downward scan stopped (`stopped: top`) | "the mint refused every restore at startup…", "a scan stopped halfway down…" |
+| T2 | a keyset that could not be asked reports the range top | "a keyset whose keys could not be fetched at startup…" |
+| K1 | keysets past the cap not reported | "never `nothing`…", `nut13-restore` "…within the keyset cap" |
+| K2 | cap applied before the resume filter (a resume cannot reach past it) | "never `nothing`…" |
+| K3 | a resumed call ignores which keysets its resume names | "never `nothing`…" |
+| K4 | a keyset a resumed call leaves out is named at 0, not its counter | "…keeps the counter it was resumed from" |
+| K5 | an empty resume accepted | "…keeps the counter it was resumed from" |
+| H1 | `markPublished` ignores the source's own hold | `seed.test` "…held from load…", "the startup hold fails closed…" |
+| H2 | the hold starts empty at load | the same two |
+| H3 | `markScanned` releases nothing | the same two, and "the mint was unreachable at startup…" |
+| H4 | the startup restore releases every range, finished or not | "the mint was unreachable at startup…", "per keyset…" |
+| H5 | the startup restore never calls `markScanned` | "the startup hold fails closed…", "unfinished startup restore holds…" |
+| H6 | the load-time test inverted (`published > next`) | `seed.test` "…held from load…", "the startup hold fails closed…" |
+
+### Tests and gates of round 7
+
+- New tests: 6 in `nut13-review.test.ts` (3 for finding 1, 2 for finding 2, 1 for finding 3) and 1
+  in `seed.test.ts`. One expectation changed, with a comment citing the finding: `nut13-restore`
+  "inactive keysets are scanned too, active first, within the keyset cap" had no `resume` after a
+  one-keyset cap, which encoded finding 2. Its property ("scans only the active one", 4 sat) is
+  kept, and it now also expects the left-out keyset at 0.
+- `npx vitest run packages/core packages/seeder --maxWorkers=2`: core all green. One seeder failure,
+  `one-peer-router` "the probe option…", is a timing flake: the lane touches no seeder code and the
+  test imports no wallet code. It passed 2 of 3 runs alone at a load average of about 16.
+- Whole suite once, after `npm run build`: 3418 passed, 5 failed, 28 skipped. The failures are the 3
+  known R6 ones, plus two `money.test` 5 s timeouts under load; that file passes 17 of 17 alone.
+- `npx tsc -b --force`: clean. `npm run build`: clean. eslint and `prettier --check` on every
+  changed file: clean. `npm run check:locked`: OK. No app-desktop change, so no `lint:electron`.
+- Opt-in real mints on the final code: `nut13-real-mint` (7) and `journal-real-mint` (10), 17 of 17
+  on Nutshell 0.21.0 (:3399) and on cdk-mintd 0.18.1 (:3397), both with
+  `NUTFLIX_REAL_MINT_URL_2=:3398`.

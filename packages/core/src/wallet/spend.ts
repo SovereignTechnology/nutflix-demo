@@ -144,7 +144,10 @@ export const RESTORE_BATCH = 100;
 export const RESTORE_EMPTY_BATCHES = 3;
 /** ADR 0016 §5: at most this many batches per keyset (a hostile mint signing everything). */
 export const RESTORE_MAX_BATCHES = 200;
-/** ADR 0016 §5: at most this many keysets per mint. */
+/**
+ * ADR 0016 §5: at most this many keysets per mint per call; the rest are reported in
+ * `RestoreDetail.resume` (fix round 7: they used to be dropped silently).
+ */
 export const RESTORE_MAX_KEYSETS = 32;
 /** NUT-07 states asked per request. */
 const CHECK_CHUNK = 100;
@@ -157,10 +160,19 @@ const CHECK_CHUNK = 100;
  */
 export interface RestoreDetail extends RestoreReport {
   /**
-   * Keyset id → the counter to continue from (`CashuWallet.seeded.restoreFromSeed(…, { resume })`):
-   * present only when a keyset's scan stopped early — the batch cap, or a keyset or batch that
-   * could not be asked. Absent: every keyset was scanned to three empty batches past what it found
-   * (and, for this device's own phrase, past its counters file's high-water mark).
+   * Keyset id → the counter to continue from, for `CashuWallet.seeded.restoreFromSeed(…,
+   * { resume })`, which scans each named keyset UPWARD from its counter (and only the named ones).
+   * Present only when some keyset was not scanned to its end: the batch cap stopped it, a keyset
+   * or batch could not be asked, or the keyset cap left it out (named at the counter it would have
+   * started from — 0 for a first call). Absent: every restorable keyset was scanned to three empty
+   * batches past what it found (and, for this device's own phrase, past its counters file's
+   * high-water mark).
+   *
+   * On a startup restore's report (`CashuWallet.restoreUnpublished`) it names the LOW end of each
+   * `[published, next)` range left unfinished, whatever part of it was scanned (that scan runs
+   * newest first): a `restoreFromSeed` of THIS device's phrase from there covers the whole range
+   * (fix round 7: it used to name where the downward scan stopped, and continuing upward from
+   * there skipped what was left).
    */
   readonly resume?: Readonly<Record<string, number>>;
 }
@@ -989,14 +1001,18 @@ export class Spender {
   // ---- NUT-13 (ADR 0016) ----------------------------------------------------------------
 
   /**
-   * ADR 0016 §5: scan `seed` from counter 0 (or from `resume`, keyset id → counter, where an earlier
-   * scan stopped) at `mint` and add what is unspent and not already held. `seed` may be another
-   * device's phrase: it is read here, and nothing is derived from it later. When it is this
-   * device's own, every keyset is scanned at least to its counters file's `next` whatever the gaps
-   * or the batch cap — this device may have used all of it — and its counters move past the last
-   * signature. A keyset scan the batch cap (or a failure) stopped early is REPORTED: the result
-   * then carries `resume` (independent review 2026-09-27, finding 1). Never throws for a mint (its
-   * outcome says what happened); throws for a seed that is wiped or not core's, or a bad `resume`.
+   * ADR 0016 §5: scan `seed` at `mint` and add what is unspent and not already held — every
+   * restorable keyset from counter 0, or with `resume` (keyset id → counter, a report's
+   * `RestoreDetail.resume`) only the keysets it names, each from its counter: a continuation. At
+   * most `RESTORE_MAX_KEYSETS` keysets per call, active first; the rest are reported in `resume` at
+   * the counter they would have started from (fix round 7: they used to be dropped silently). `seed`
+   * may be another device's phrase: it is read here, and nothing is derived from it later. When it
+   * is this device's own, every keyset scanned is scanned at least to its counters file's `next`
+   * whatever the gaps or the batch cap — this device may have used all of it — and its counters
+   * move past the last signature. A keyset scan the batch cap (or a failure) stopped early is
+   * REPORTED: the result then carries `resume` (independent review 2026-09-27, finding 1). Never
+   * throws for a mint (its outcome says what happened); throws for a seed that is wiped or not
+   * core's, or a `resume` that is malformed or empty.
    */
   restoreFromSeed(
     seed: RecoverySeed,
@@ -1014,7 +1030,11 @@ export class Spender {
     return this.exclusive(mint, async () => {
       const w = await this.restorable(mint);
       if (typeof w === 'string') return report(mint, w, 0);
-      const keysets = restorableKeysets(w, this.limit('maxKeysets'));
+      const wanted = restorableKeysets(w).filter(
+        (k) => resume === undefined || Object.hasOwn(resume, k.id),
+      );
+      const max = this.limit('maxKeysets');
+      const keysets = wanted.slice(0, max);
       const s = this.ctx.mints.seeding;
       const own = s !== undefined && sameSeed(seed, s.seed) ? s : undefined;
       let floors: Record<string, number> = {};
@@ -1028,6 +1048,8 @@ export class Spender {
       const found: Found[] = [];
       const last = new Map<string, number>();
       const stopped: Record<string, number> = {};
+      // Past the keyset cap: not scanned in this call, so named where a resumed call starts them.
+      for (const ks of wanted.slice(max)) stopped[ks.id] = resume?.[ks.id] ?? 0;
       let failed = false;
       for (const [i, ks] of keysets.entries()) {
         const from = resume?.[ks.id] ?? 0;
@@ -1071,7 +1093,9 @@ export class Spender {
    * 2026-09-27, finding 1): the range is this device's own counters file, so no mint can stretch
    * it, and the latest outputs are the ones most likely lost with the outbox. Same checks as
    * `restoreFromSeed`; a range that could not be finished leaves the outcome `unreachable` unless
-   * something was restored.
+   * something was restored, and its `resume` entry is the range's LOW end `from` — what an upward
+   * `restoreFromSeed` of this phrase must start at to cover what the downward scan left (fix
+   * round 7; `RestoreDetail.resume`).
    */
   restoreUnpublished(
     mint: MintUrl,
@@ -1101,7 +1125,7 @@ export class Spender {
               'the recovery seed was wiped during a restore',
             );
           if (e instanceof RestoreRefused) return report(mint, 'refused', 0);
-          stopped[r.keysetId] = r.to;
+          stopped[r.keysetId] = r.from;
         }
       }
       const r = await this.adopt(w, mint, found, 'recovered from recovery phrase after a restart');
@@ -1335,7 +1359,10 @@ export class Spender {
   /**
    * Restore `seed` under one keyset over exactly `[from, to)`, newest batch first (the startup
    * restore of this device's own unpublished range). No cap: the range comes from this device's
-   * counters file, not from a mint. A batch that cannot be asked ends it, keeping what was found.
+   * counters file, not from a mint. A batch that cannot be asked ends it, keeping what was found;
+   * it then says it `stopped` at `from`, the range's low end — a continuation scans UPWARD
+   * (`restoreFromSeed`), so starting where this downward scan broke off would skip everything
+   * below it (fix round 7).
    */
   private async scanRange(
     w: CashuTsWallet,
@@ -1351,7 +1378,7 @@ export class Spender {
         found.push(...(await restoreBatch(w, seed, keyset, at, top - at)));
       } catch (e) {
         if (e instanceof RestoreRefused || e instanceof RecoverySeedError) throw e;
-        return { found, last: undefined, stopped: top, failed: true };
+        return { found, last: undefined, stopped: from, failed: true };
       }
       top = at;
     }
@@ -1919,22 +1946,29 @@ interface Found {
 interface Scanned {
   readonly found: Found[];
   readonly last: number | undefined;
-  /** The counter to continue from, when the scan did not reach its end. */
+  /** The counter an UPWARD continuation starts from, when the scan did not reach its end. */
   readonly stopped?: number;
   /** It stopped because a batch could not be asked (not the cap). */
   readonly failed: boolean;
 }
 
-/** A `resume` from the caller: hex keyset ids → counters inside the counter space. */
+/**
+ * A `resume` from the caller: hex keyset ids → counters inside the counter space, at least one (an
+ * empty one would continue nothing and read as "nothing to restore").
+ */
 function isResume(x: unknown): x is Readonly<Record<string, number>> {
   if (typeof x !== 'object' || x === null || Array.isArray(x)) return false;
-  return Object.entries(x).every(
-    ([k, v]) =>
-      /^[0-9a-f]{2,128}$/.test(k) &&
-      typeof v === 'number' &&
-      Number.isSafeInteger(v) &&
-      v >= 0 &&
-      v < COUNTER_LIMIT,
+  const entries = Object.entries(x);
+  return (
+    entries.length > 0 &&
+    entries.every(
+      ([k, v]) =>
+        /^[0-9a-f]{2,128}$/.test(k) &&
+        typeof v === 'number' &&
+        Number.isSafeInteger(v) &&
+        v >= 0 &&
+        v < COUNTER_LIMIT,
+    )
   );
 }
 
@@ -2068,10 +2102,11 @@ function report(mint: MintUrl, outcome: RestoreOutcome, sats: number): RestoreRe
 
 /**
  * A restore's report (what `adopt` added), said to be INCOMPLETE when `stopped` (keyset id →
- * counter) lists keysets a scan did not finish: the result then carries it as `resume`, and with
- * nothing restored the outcome is never `nothing` — `unreachable` when something could not be
- * asked (`failed`), `refused` when only the batch cap stopped it (ADR 0016 §5: what a hostile mint
- * looks like, or a history longer than one call scans; independent review 2026-09-27, finding 1).
+ * counter) lists keysets a scan did not finish (or the keyset cap left out): the result then
+ * carries it as `resume`, and with nothing restored the outcome is never `nothing` — `unreachable`
+ * when something could not be asked (`failed`), `refused` when only a cap stopped it (ADR 0016 §5:
+ * what a hostile mint looks like, or a history longer than one call scans; independent review
+ * 2026-09-27, finding 1; the keyset cap: fix round 7).
  * When what was found could not be added (NUT-07 unreachable, a refused swap) no `resume` is
  * offered: continuing from it would skip what was found, so the caller starts over.
  */
@@ -2094,10 +2129,11 @@ function feeOf(w: CashuTsWallet, proofs: readonly CashuProof[]): number {
 }
 
 /**
- * The keysets a restore scans (ADR 0016 §5): the mint's `sat` keysets with a hex v1 or v2 id —
- * those NUT-13 derives for — active ones first, at most `max`.
+ * The keysets a restore may scan (ADR 0016 §5): the mint's `sat` keysets with a hex v1 or v2 id —
+ * those NUT-13 derives for — active ones first. The caller applies the keyset cap and reports what
+ * it leaves out.
  */
-function restorableKeysets(w: CashuTsWallet, max: number): Keyset[] {
+function restorableKeysets(w: CashuTsWallet): Keyset[] {
   let all: Keyset[];
   try {
     all = w.keyChain.getKeysets();
@@ -2106,8 +2142,7 @@ function restorableKeysets(w: CashuTsWallet, max: number): Keyset[] {
   }
   return all
     .filter((k) => k.unit === 'sat' && k.hasHexId && (k.version === 0 || k.version === 1))
-    .sort((a, b) => Number(b.isActive) - Number(a.isActive))
-    .slice(0, max);
+    .sort((a, b) => Number(b.isActive) - Number(a.isActive));
 }
 
 /** `count` deterministic outputs of `seed` under `keyset` from `start` (amounts left to the mint). */

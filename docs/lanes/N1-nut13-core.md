@@ -13,7 +13,9 @@ fix what was wrong (below, and in the review record), and add every test.
 
 An independent review (2026-09-27) found 1 high, 2 medium, 1 low and 5 info items; all are fixed
 in core as far as core can go, and one decision is left for Cameron (the restore bound, contract
-request 7). See §(g) and the review record's "Independent review" section.
+request 7). See §(g) and the review record's "Independent review" section. The lane's independent
+verifier then found 3 low items in that fix pass (fix round 7); all three are fixed. See §(h) and
+the review record's "Round 7" section.
 
 No dependency, lockfile or `package.json` change. `docs/contract-requests/N1-nut13-core.md` lists
 seven items, none blocking (all worked around; item 7 also asks Cameron for a decision). Nothing outside the allowlist; `docs/status.md` and
@@ -173,13 +175,37 @@ Found while fixing them (the round's own differential-review and sharp-edges pas
 - the `seeded` flag failed open if a store dropped it;
 - `markPublished`'s default discarded the hold.
 
+### (h) Fix round 7: the lane's independent verifier (2026-09-27)
+
+Three low findings against `ae639d3`, each confirmed by a test that failed there first:
+
+1. **A startup restore's `resume` pointed the wrong way.** It named where the newest-first scan
+   stopped, but `restoreFromSeed` continues UPWARD, so "continue restoring" from a startup report
+   skipped the range and said `nothing`. Now the report names the range's low end. `resume` means
+   "continue upward from here" everywhere: `scanRange` reports `stopped: from`, and so does a keyset
+   that could not be asked.
+2. **Keysets past the 32-keyset cap were dropped silently.** The report read complete, and no
+   `resume` could name them. Now each keyset the cap leaves out goes into `resume` at 0 (or at its
+   resume counter), and a capped call with nothing restored reads `refused`, never `nothing`. A
+   resumed call scans only the keysets its resume names, so a chain of calls reaches every keyset,
+   at most 32 per call. An empty resume is refused.
+3. **The watermark hold started empty.** An operation that finished before the shell called
+   `restoreUnpublished` marked the crash range published, and the startup restore then skipped it.
+   Now the hold is the counter source's own, from the counters file's first load: every keyset
+   whose stored `[published, next)` is not empty stays held until a startup restore has scanned it
+   (`DurableCounterSource.markScanned`). This holds in any wallet object over the same source, and
+   across `close()`. The wallet keeps no hold of its own any more.
+
+API: `DurableCounterSource.markScanned` (new). `restoreFromSeed`'s `resume` is now a continuation
+(named keysets only). `RestoreDetail.resume` and `RestoreOptions` document the direction.
+
 API added outside the frozen seam:
 
 - `RestoreDetail`;
 - `CoreSeededWallet` (the type of `CashuWallet.seeded`) and `RestoreOptions`;
 - `COUNTER_PROBE_SPAN`;
-- `DurableCounterSource.ensureProbed` / `leases` / `markPublished(hold)` (the class is exported as a
-  type only);
+- `DurableCounterSource.ensureProbed` / `leases` / `markPublished(hold)` / `markScanned` (fix
+  round 7) (the class is exported as a type only);
 - `PendingOp.seeded?: true`.
 
 `CashuMintConnections` now throws for a wiped seed, and for a counters store a live wallet of
@@ -237,6 +263,10 @@ had a load average of ~25 — the 5 s default fails there on timing alone.
   has its own test). Added: two writers, the phrase binding (4), a slow probe, the hold, and
   `entropyToHex` refusing wiped entropy. `nut13-restore.test.ts`: the hostile-mint cap test now also
   expects `resume` (it had encoded the defect).
+- Fix round 7: 6 more in `nut13-review.test.ts` (29 in all) and 1 more in `seed.test.ts`, each
+  failing on `ae639d3` first. One expectation changed, with a comment citing why: `nut13-restore`
+  "…within the keyset cap" had no `resume` after a one-keyset cap, which encoded finding 2. It keeps
+  its property (only the active keyset is scanned) and now expects the left-out keyset at 0.
 - `wallet/__tests__/nut13-rig.ts`: the shared rig, with its own check.
 - `wallet/__tests__/nut13-real-mint.integration.test.ts` (5, opt-in `NUTFLIX_REAL_MINT_URL`, melt
   with `_URL_2`): restore from the words on a real mint (spent filtered; exactly four restore
@@ -276,7 +306,9 @@ Commits: `fc324fb` (vendored specs, first agent), `88fafaf` (the wip, first agen
 per store), `fc7c4de` (a wrapper that drops seeding is refused), `441d663` (a stronger
 foreign-phrase test), then the docs commit (this file, the review record, the contract requests,
 ADR 0016 implementation notes) `c7f81b8`. The independent-review round adds `0150563` (the
-fixes with their tests), then its docs commit.
+fixes with their tests), then its docs commit `ae639d3`. Fix round 7 adds `4ffc864` (the three
+findings with their tests), then a docs commit (this file, the review record's "Round 7" section,
+contract requests 4 and 7, the ADR 0016 notes).
 
 Gates of the independent-review round (2026-09-27, final tree):
 
@@ -295,7 +327,38 @@ Gates of the independent-review round (2026-09-27, final tree):
   record.
 - No app-desktop change, so no `lint:electron`; no dependency change, so no `check:native`.
 
+Gates of fix round 7 (2026-09-27, final tree, shared box at load average ~16):
+
+- `npx vitest run --maxWorkers=2`, whole suite once after `npm run build`: 3418 passed, 5 failed,
+  28 skipped (219 files). Three failures are the known R6 ones: the two viewer-payer "I2-paygate
+  rate-limited" tests, and `stage.test` "host bundle carries none of core's test doubles"
+  (`QUIT_FLUSH_MS`). The other two are `money.test` 5 s timeouts under load ("pay.build is
+  authorised…", "the belt…"). That file passes 17 of 17 alone, and no timeout was raised.
+- `npx vitest run packages/core packages/seeder --maxWorkers=2`: core all green. The one seeder
+  failure, `one-peer-router` "the probe option…", is a timing flake: it touches no lane code, passed
+  2 of 3 runs alone, and passed in the whole-suite run.
+- `npx tsc -b --force`: clean. `npm run build`: clean. eslint and `prettier --check` on every
+  changed file: clean. `npm run check:locked`: OK.
+- Opt-in real mints on the final code: `nut13-real-mint` (7) and `journal-real-mint` (10), 17 of 17
+  on Nutshell 0.21.0 (:3399) and cdk-mintd 0.18.1 (:3397), both with `NUTFLIX_REAL_MINT_URL_2=:3398`.
+- Mutation checks: 13 guards broken one at a time, all caught (the table is in the review record's
+  "Round 7" section).
+- No app-desktop change, so no `lint:electron`. No dependency change.
+
 ## Residuals
+
+Added by fix round 7:
+
+- **A keyset id copied by another mint in the user's list can release the startup hold.** If that
+  mint answers the range empty while the real mint is unreachable, the next start skips the range.
+  The money stays restorable from the own phrase, which scans through the counters file's `next`.
+  This was already true of the per-keyset release, and it cannot be closed per keyset: the seam's
+  `CounterState` names no mint.
+- **A shell that never calls `restoreUnpublished`** never moves the watermark of a keyset that had
+  a range at load. That is the price of failing closed; contract request 4 says to call it at every
+  start.
+- **A mint that announces many keysets** gets a `resume` entry for each one past the cap. Each
+  continuation is an explicit call of at most 32 keysets.
 
 Added by the independent-review round (details in the review record):
 
@@ -349,7 +412,7 @@ From the first round:
 
 ## Proposed `docs/status.md` row
 
-| NUT-13 seed backup, core (issue #3, ADR 0016) | `stage-3/nut13-core` | **done (core), one decision open** — a 12-word phrase per device (`@scure/bip39`, entropy and seed in secure memory, errors never quote a word); durable counters leased ahead and bound to their phrase (a crash never repeats one; a lost file is probed at the operating mint, one batch, verified signatures only; one source per store; a rotated phrase starts at 0); deterministic change/receive/mint/melt/reissue outputs, P2PK sends unchanged; the collision guard (NUT-07 decides for seeded entries; the mint's code is not trusted — Nutshell 11003, cdk 20006/11008); restore from any phrase (three empty batches of 100, this device's own phrase through its counters file's high-water mark, DLEQ required at NUT-12 mints, amount lies refused, spent filtered, one history line; a scan the cap stops is reported with a resume cursor); reissue with the fee shown; startup restore of `[published, next)`, whole and newest first; close waits before wiping. Independent review: 9 findings fixed. Open for Cameron: the restore bound for phrases with no known high-water mark (contract request 7). Proven on Nutshell 0.21.0 and cdk-mintd 0.18.1. Desktop wiring: lane N2 |
+| NUT-13 seed backup, core (issue #3, ADR 0016) | `stage-3/nut13-core` | **done (core), one decision open** — a 12-word phrase per device (`@scure/bip39`, entropy and seed in secure memory, errors never quote a word); durable counters leased ahead and bound to their phrase (a crash never repeats one; a lost file is probed at the operating mint, one batch, verified signatures only; one source per store; a rotated phrase starts at 0); deterministic change/receive/mint/melt/reissue outputs, P2PK sends unchanged; the collision guard (NUT-07 decides for seeded entries; the mint's code is not trusted — Nutshell 11003, cdk 20006/11008); restore from any phrase (three empty batches of 100, this device's own phrase through its counters file's high-water mark, DLEQ required at NUT-12 mints, amount lies refused, spent filtered, one history line; a scan either cap stops — 200 batches, 32 keysets — is reported with a resume cursor, never as nothing); reissue with the fee shown; startup restore of `[published, next)`, whole and newest first, its watermark held from the counters file's load until it has scanned; close waits before wiping. Independent review: 9 findings fixed; the verifier's round 7: 3 more fixed. Open for Cameron: the restore bound for phrases with no known high-water mark (contract request 7). Proven on Nutshell 0.21.0 and cdk-mintd 0.18.1. Desktop wiring: lane N2 |
 
 ## Proposed `docs/security-review.md` text
 
@@ -382,9 +445,11 @@ From the first round:
 > A restore requires NUT-12 DLEQs where advertised, checked against the claimed amount's key, so an
 > amount lie is refused. At mints without NUT-12 it swaps proofs before counting them. It drops
 > SPENT proofs, dedupes by secret (the history too), and is bounded: 32 keysets × 200 batches of
-> 100 per call past this device's own high-water mark. A scan the bound stops is reported with a
-> resume cursor, never as "nothing". The startup restore scans this device's unpublished range
-> whole, newest first, and holds a keyset's watermark until it is scanned.
+> 100 per call past this device's own high-water mark. A scan either bound stops is reported with a
+> resume cursor (keysets past the cap included), never as "nothing". The startup restore scans this
+> device's unpublished range whole, newest first. A keyset's watermark is held from the counters
+> file's load until that restore has scanned it, so an operation that runs first cannot mark the
+> range published.
 >
 > Residuals: phrase strings and library intermediates cannot be wiped. A hostile mint can make a
 > restore slow (within the caps per call) and links the scanned outputs. Bounding restores of a

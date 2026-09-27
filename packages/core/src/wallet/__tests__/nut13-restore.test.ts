@@ -214,6 +214,7 @@ describe('restoreFromSeed (ADR 0016 §5)', () => {
     const mint = mintAt(MINT_A);
     const phrase = await newSeed();
     await fund(device({ mints: [mint], seed: phrase }), mint, 3);
+    const old = mint.keysetId;
     mint.rotateKeyset();
     await fund(device({ mints: [mint], seed: phrase }), mint, 4);
     const c = device({ mints: [mint], seed: await newSeed() });
@@ -221,10 +222,17 @@ describe('restoreFromSeed (ADR 0016 §5)', () => {
     const [r] = await c.wallet.seeded!.restoreFromSeed(phrase, [MINT_A], (p) => progress.push(p));
     expect(r).toEqual({ mint: MINT_A, outcome: 'restored', restoredSats: 7 });
     expect(progress.at(-1)).toMatchObject({ keysetsDone: 2, keysets: 2 });
-    // A cap of one keyset scans only the active one.
+    // A cap of one keyset scans only the active one. Fix round 7 (independent verifier, finding 2):
+    // this expectation had no `resume`, encoding the defect — the keyset the cap left out was
+    // dropped silently and could not be reached. It is now named at 0, where a resume starts it.
     const d = device({ mints: [mint], seed: await newSeed(), restoreLimits: { maxKeysets: 1 } });
     const [r1] = await d.wallet.seeded!.restoreFromSeed(phrase, [MINT_A]);
-    expect(r1).toEqual({ mint: MINT_A, outcome: 'restored', restoredSats: 4 });
+    expect(r1).toEqual({
+      mint: MINT_A,
+      outcome: 'restored',
+      restoredSats: 4,
+      resume: { [old]: 0 },
+    });
   });
 
   it('a v1 (00…) keyset restores through the BIP-32 path', async () => {

@@ -214,7 +214,12 @@ export function signerWalletKey(signer: Signer, pubkey: CashuP2pkPubkey): Wallet
 // The wallet
 // ---------------------------------------------------------------------------------------
 
-/** Where to continue restores a batch cap (or a failure) stopped early: mint → keyset id → counter. */
+/**
+ * Where to continue restores a cap (or a failure) stopped early: mint → keyset id → counter, as a
+ * report's `RestoreDetail.resume` gave it. At a mint with an entry only the keysets it names are
+ * scanned, each UPWARD from its counter (at most `RESTORE_MAX_KEYSETS` of them; the rest come back
+ * in `resume` again); a mint without one is scanned from the start. An empty entry is refused.
+ */
 export interface RestoreOptions {
   readonly resume?: ReadonlyMap<MintUrl, Readonly<Record<string, number>>>;
 }
@@ -257,15 +262,6 @@ export class CashuWallet implements Wallet {
    * phrase (this device's, another device's, or typed in) and reissue (D5). Host-only.
    */
   readonly seeded: CoreSeededWallet | undefined;
-
-  /**
-   * Keysets whose `[published, next)` range a startup restore has not finished (their mint was
-   * unreachable, refused, or is not among this wallet's mints): their `published` watermark stays
-   * where it is — the range was never scanned, so it is not known published, and moving the
-   * watermark would make the next start skip it. Per keyset: a mint that stays down holds back only
-   * its own keysets, not every startup restore's range everywhere.
-   */
-  private held: ReadonlySet<string> = new Set();
 
   constructor(private readonly o: CashuWalletOptions) {
     this.spender = new Spender({
@@ -335,34 +331,40 @@ export class CashuWallet implements Wallet {
    * ADR 0016 §3: at startup, restore this device's own `[published, next)` counter ranges at the
    * wallet's mints — what a crash may have cut off before it reached NIP-60 (an outbox or journal
    * held in memory). Nothing without a seed or with nothing unpublished. Per mint, never throws.
-   * A keyset whose range no mint finished (`unreachable`, `refused`, a range not finished, or its
-   * mint not among this wallet's) keeps its `published` watermark until a later call finishes it —
-   * call this again later (the next start scans it again otherwise).
+   *
+   * The watermark hold is the counter source's, from the counters file's load (fix round 7): a
+   * keyset whose range was not empty then keeps its `published` watermark until a call of this
+   * scans that range whole and adds what it found — whatever operations run first, in this wallet
+   * object or another over the same connections. So there is no required order, but a shell should
+   * call this at startup. A keyset whose range no mint finished (`unreachable`, `refused`, a range
+   * not finished, or its mint not among this wallet's) stays held: call this again later (the next
+   * start scans it again otherwise). A report's `resume` names the low end of each range left unfinished, for
+   * `seeded.restoreFromSeed` of THIS device's phrase (which scans up from it, through the counters
+   * file's `next`); calling this again also covers it, and only this releases the hold.
    */
   async restoreUnpublished(): Promise<readonly RestoreDetail[]> {
     const s = this.o.mints.seeding;
     if (s === undefined) return [];
     const ranges = await s.counters.unpublished();
-    const open = new Set(ranges.map((r) => r.keysetId));
-    // Held from the start: an operation finishing meanwhile must not move them either.
-    this.held = new Set([...this.held, ...open]);
+    if (ranges.length === 0) return [];
+    const scanned = new Set<string>();
     const reports: RestoreDetail[] = [];
-    try {
-      if (ranges.length === 0) return [];
-      for (const mint of await this.mints()) {
-        try {
-          const r = await this.spender.restoreUnpublished(mint, ranges, (done) => {
-            for (const k of done) open.delete(k);
-          });
-          if (r.outcome !== 'nothing') reports.push(r);
-        } catch {
-          reports.push({ mint, outcome: 'unreachable', restoredSats: 0 as Sats });
-        } finally {
-          await this.emitBalanceSafe(mint);
-        }
+    for (const mint of await this.mints()) {
+      try {
+        const r = await this.spender.restoreUnpublished(mint, ranges, (done) => {
+          for (const k of done) scanned.add(k);
+        });
+        if (r.outcome !== 'nothing') reports.push(r);
+      } catch {
+        reports.push({ mint, outcome: 'unreachable', restoredSats: 0 as Sats });
+      } finally {
+        await this.emitBalanceSafe(mint);
       }
-    } finally {
-      this.held = open;
+    }
+    try {
+      await s.counters.markScanned(scanned);
+    } catch {
+      // still held: the next call (or start) scans them again
     }
     await this.notePublishedSafe();
     return reports;
@@ -381,9 +383,10 @@ export class CashuWallet implements Wallet {
     if (store.pending !== undefined)
       for (const m of await store.mints()) if ((await store.pending(m)).length > 0) return;
     // Checked again with no await before the mark: the counter source orders the mark ahead of
-    // any reservation made after this line.
+    // any reservation made after this line. Nothing extra to hold: the counter source holds every
+    // keyset a startup restore has not scanned yet (`restoreUnpublished`).
     if (!this.spender.idle() || (store.unsynced?.() ?? 0) > 0) return;
-    await s.counters.markPublished(this.held);
+    await s.counters.markPublished(new Set());
   }
 
   /**

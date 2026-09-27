@@ -17,6 +17,13 @@
  *                       away the mint's restore; a restore and a settle wrote one operation twice
  *                       into the history;
  *   (found in review)   a startup restore that did not finish still let the watermark move.
+ *
+ * Fix round 7 (the lane's independent verifier), each test failing on `ae639d3` first:
+ *   a startup restore's `resume` named where its downward scan stopped, so continuing upward from
+ *   it skipped the range (now the range's low end); keysets past the keyset cap were dropped
+ *   silently (now named in `resume`, which a resumed call reaches); the watermark hold started
+ *   empty, so an operation before the startup restore marked the crash range published (now held
+ *   from the counters file's load).
  */
 import { describe, expect, it, vi } from 'vitest';
 
@@ -551,5 +558,218 @@ describe('found in review: an unfinished startup restore holds the watermark', (
     await b.wallet.restoreUnpublished();
     await b.conns.seeding!.counters.flush();
     expect(onDisk.state?.published[B.keysetId]).toBeGreaterThan(0);
+  });
+});
+
+// ---- Fix round 7 (independent verifier of the lane, 2026-09-27) ----------------------------
+
+/** A store whose relay outbox holds `outbox()` events: the watermark moves only while it is 0. */
+function withOutbox(inner: MemoryProofStore, outbox: () => number): ProofStore {
+  return {
+    mints: () => inner.mints(),
+    proofs: (m) => inner.proofs(m),
+    commit: (tx) => inner.commit(tx),
+    history: (o) => inner.history(o),
+    pending: (m) => inner.pending(m),
+    unsynced: outbox,
+  };
+}
+
+/**
+ * The crash of these tests: a top-up of 64 at counter 0, published and on disk (`published` = 1),
+ * then a send of 5 whose 59 sat of change (counters 1..5, inside the lease `next` = 33) never
+ * reached the durable store. `a` keeps running with its outbox never draining.
+ */
+async function crashWithChange(mint: TestMint, phrase: Awaited<ReturnType<typeof newSeed>>) {
+  const counters = new MemoryCounterStore(null);
+  const live = new MemoryProofStore();
+  let outbox = 0;
+  const a = device({
+    mints: [mint],
+    seed: phrase,
+    counters,
+    store: withOutbox(live, () => outbox),
+  });
+  await fund(a, mint, 64);
+  await a.conns.seeding!.counters.flush();
+  expect(counters.state?.published[mint.keysetId]).toBe(1);
+  const durable = new MemoryProofStore();
+  await hold(durable, MINT_A, await live.proofs(MINT_A));
+  outbox = 1;
+  await a.wallet.send(sats(5), { p2pk: TO, mint: MINT_A });
+  return { a, counters, durable };
+}
+
+describe('fix round 7: a startup restore’s `resume` is what `restoreFromSeed` continues from (upward)', () => {
+  it('the mint refused every restore at startup: resuming from the report brings the change back', async () => {
+    const mint = mintAt(MINT_A);
+    const phrase = await newSeed();
+    const k = mint.keysetId;
+    const { counters, durable } = await crashWithChange(mint, phrase);
+    const onDisk = new MemoryCounterStore(counters.state);
+    expect(onDisk.state?.next[k]).toBe(33);
+    const b = device({ mints: [mint], seed: phrase, counters: onDisk, store: durable });
+    b.net.before = (path) => (path.endsWith('/v1/restore') ? refuse() : Promise.resolve());
+    const [r] = await b.wallet.restoreUnpublished();
+    // The range's LOW end: `restoreFromSeed` scans up from it (it used to say 33, the top).
+    expect(r).toEqual({
+      mint: MINT_A,
+      outcome: 'unreachable',
+      restoredSats: 0,
+      resume: { [k]: 1 },
+    });
+    b.net.before = null;
+    const [again] = await b.wallet.seeded!.restoreFromSeed(phrase, [MINT_A], undefined, {
+      resume: new Map([[MINT_A, r!.resume!]]),
+    });
+    expect(again).toEqual({ mint: MINT_A, outcome: 'restored', restoredSats: 59 });
+  });
+
+  it('a keyset whose keys could not be fetched at startup: the same low end', async () => {
+    const mint = mintAt(MINT_A);
+    const phrase = await newSeed();
+    const old = mint.keysetId;
+    const { counters, durable } = await crashWithChange(mint, phrase);
+    mint.rotateKeyset(); // the crash range is under a keyset whose keys are fetched on demand
+    const b = device({
+      mints: [mint],
+      seed: phrase,
+      counters: new MemoryCounterStore(counters.state),
+      store: durable,
+    });
+    b.net.before = (path) => (path.endsWith(`/v1/keys/${old}`) ? refuse() : Promise.resolve());
+    const [r] = await b.wallet.restoreUnpublished();
+    expect(r).toEqual({
+      mint: MINT_A,
+      outcome: 'unreachable',
+      restoredSats: 0,
+      resume: { [old]: 1 },
+    });
+    b.net.before = null;
+    const [again] = await b.wallet.seeded!.restoreFromSeed(phrase, [MINT_A], undefined, {
+      resume: new Map([[MINT_A, r!.resume!]]),
+    });
+    expect(again).toEqual({ mint: MINT_A, outcome: 'restored', restoredSats: 59 });
+  });
+
+  it('a scan stopped halfway down the range: the resume still covers the part below', async () => {
+    const mint = mintAt(MINT_A);
+    const phrase = await newSeed();
+    const k = mint.keysetId;
+    const { a, counters, durable } = await crashWithChange(mint, phrase);
+    await a.conns.seeding!.counters.advanceToAtLeast(k, 250);
+    await fund(a, mint, 8); // counter 250: never durable either; the range is now [1, 283)
+    const b = device({
+      mints: [mint],
+      seed: phrase,
+      counters: new MemoryCounterStore(counters.state),
+      store: durable,
+    });
+    let asked = 0;
+    b.net.before = (path) =>
+      path.endsWith('/v1/restore') && ++asked === 2 ? refuse() : Promise.resolve();
+    const [r] = await b.wallet.restoreUnpublished();
+    // The newest batch [183, 283) came back (the 8); [83, 183) could not be asked.
+    expect(r).toEqual({ mint: MINT_A, outcome: 'restored', restoredSats: 8, resume: { [k]: 1 } });
+    b.net.before = null;
+    const [again] = await b.wallet.seeded!.restoreFromSeed(phrase, [MINT_A], undefined, {
+      resume: new Map([[MINT_A, r!.resume!]]),
+    });
+    expect(again).toEqual({ mint: MINT_A, outcome: 'restored', restoredSats: 59 });
+  });
+});
+
+describe('fix round 7: keysets past the keyset cap are reported, and a resume reaches them', () => {
+  it('never `nothing`: each keyset left out is named at 0; resumed calls scan at most the cap each', async () => {
+    const mint = mintAt(MINT_A);
+    const phrase = await newSeed();
+    await fund(device({ mints: [mint], seed: phrase }), mint, 3);
+    const first = mint.keysetId;
+    mint.rotateKeyset();
+    await fund(device({ mints: [mint], seed: phrase }), mint, 4);
+    const second = mint.keysetId;
+    mint.rotateKeyset(); // the active keyset holds nothing
+    const c = device({ mints: [mint], seed: await newSeed(), restoreLimits: { maxKeysets: 1 } });
+    const [r1] = await c.wallet.seeded!.restoreFromSeed(phrase, [MINT_A]);
+    expect(r1).toEqual({
+      mint: MINT_A,
+      outcome: 'refused',
+      restoredSats: 0,
+      resume: { [first]: 0, [second]: 0 },
+    });
+    const progress: { keysets: number }[] = [];
+    const [r2] = await c.wallet.seeded!.restoreFromSeed(phrase, [MINT_A], (p) => progress.push(p), {
+      resume: new Map([[MINT_A, r1!.resume!]]),
+    });
+    expect(progress.at(-1)).toMatchObject({ keysetsDone: 1, keysets: 1 });
+    expect(r2?.outcome).toBe('restored');
+    const left = Object.keys(r2!.resume ?? {});
+    expect(left).toHaveLength(1);
+    expect(r2!.resume![left[0]!]).toBe(0);
+    expect(r2!.restoredSats).toBe(left[0] === first ? 4 : 3);
+    const [r3] = await c.wallet.seeded!.restoreFromSeed(phrase, [MINT_A], undefined, {
+      resume: new Map([[MINT_A, r2!.resume!]]),
+    });
+    expect(r3).toEqual({
+      mint: MINT_A,
+      outcome: 'restored',
+      restoredSats: left[0] === first ? 3 : 4,
+    });
+    expect(await c.wallet.balance(MINT_A)).toBe(7);
+  });
+
+  it('a keyset a resumed call leaves out keeps the counter it was resumed from', async () => {
+    const mint = mintAt(MINT_A);
+    const phrase = await newSeed();
+    const first = mint.keysetId;
+    mint.rotateKeyset();
+    const second = mint.keysetId;
+    const c = device({ mints: [mint], seed: await newSeed(), restoreLimits: { maxKeysets: 1 } });
+    const [r] = await c.wallet.seeded!.restoreFromSeed(phrase, [MINT_A], undefined, {
+      resume: new Map([[MINT_A, { [first]: 150, [second]: 250 }]]),
+    });
+    // The active keyset is scanned (from 250: three empty batches); the other is named at 150.
+    expect(r).toEqual({
+      mint: MINT_A,
+      outcome: 'refused',
+      restoredSats: 0,
+      resume: { [first]: 150 },
+    });
+    // An empty resume continues nothing: refused, not read as "nothing to restore".
+    await expect(
+      c.wallet.seeded!.restoreFromSeed(phrase, [MINT_A], undefined, {
+        resume: new Map([[MINT_A, {}]]),
+      }),
+    ).rejects.toMatchObject({ code: 'invalid-argument' });
+  });
+});
+
+describe('fix round 7: the startup hold fails closed (held from the counters file’s load)', () => {
+  it('an operation that finishes before the startup restore runs does not mark the crash range published', async () => {
+    const mint = mintAt(MINT_A);
+    const phrase = await newSeed();
+    const k = mint.keysetId;
+    const { counters, durable } = await crashWithChange(mint, phrase);
+    const onDisk = new MemoryCounterStore(counters.state);
+    const b = device({ mints: [mint], seed: phrase, counters: onDisk, store: durable });
+    expect(await b.conns.seeding!.counters.unpublished()).toEqual([
+      { keysetId: k, from: 1, to: 33 },
+    ]);
+    // The restart runs a top-up first, with nothing in flight (a NIP-60 store: its outbox drained).
+    await fund(b, mint, 8);
+    // So does a second wallet object over the same counters store (a reconnect shares its source).
+    const b2 = device({ mints: [mint], seed: phrase, counters: onDisk, store: durable });
+    expect(b2.conns.seeding!.counters).toBe(b.conns.seeding!.counters);
+    await fund(b2, mint, 2);
+    await b.conns.seeding!.counters.flush();
+    expect(onDisk.state?.published[k]).toBe(1);
+    const [range] = await b.conns.seeding!.counters.unpublished();
+    expect(range).toMatchObject({ keysetId: k, from: 1 });
+    // The startup restore still scans the crash range, and only then does the watermark move.
+    expect(await b.wallet.restoreUnpublished()).toEqual([
+      { mint: MINT_A, outcome: 'restored', restoredSats: 59 },
+    ]);
+    await b.conns.seeding!.counters.flush();
+    expect(onDisk.state?.published[k]).toBeGreaterThan(33);
   });
 });

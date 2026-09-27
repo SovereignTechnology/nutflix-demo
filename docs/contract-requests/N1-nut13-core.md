@@ -76,6 +76,12 @@ and one `CounterStore` OBJECT per identity per process (see 4).
   counters file.
 - Probing is per operation: the counter source asks only the mint an operation runs at, one batch
   (finding 2). Nothing registers probes at wallet load any more.
+- (Fix round 7.) **Call `CashuWallet.restoreUnpublished()` at every start.** The startup hold is
+  the counter source's own, from the counters file's first load: a keyset whose stored
+  `[published, next)` was not empty keeps its `published` watermark until a startup restore scans
+  that range whole. Operations may run before it (in this wallet object or another over the same
+  connections) without losing the range; nothing has to be ordered. But a shell that never calls
+  it never moves those watermarks, and the next start's range only grows.
 
 **Proposal.** Say so in the seam's `SeedMaterial` comment, and keep one counters file per phrase
 (for example `counters-<pubkey>-<device id>.json`, the relay copy's random id) — core's binding
@@ -120,11 +126,23 @@ with the default window). Past that, a restore from the words stopped short and 
   restored, an unfinished scan is never reported `nothing`: `refused` when only the cap stopped it
   (ADR 0016 treats hitting the cap as a hostile mint), `unreachable` when a keyset or batch could
   not be asked.
+- **(Fix round 7) What `resume` means, precisely.** Each entry is a counter a restore continues
+  UPWARD from. At a mint with an entry, a resumed call scans only the keysets the entry names; a
+  mint without one is scanned from the start; an empty entry is refused. The 32-keyset cap is
+  reported the same way as the batch cap: each keyset it leaves out is named at 0 (or at the
+  counter a resumed call was given for it), and a resumed call reaches it even when it sorts past
+  the cap, at most 32 keysets per call. On a report of `CashuWallet.restoreUnpublished()` (the
+  startup restore), `resume` names the LOW end of each `[published, next)` range left unfinished,
+  so `restoreFromSeed(<this device's own phrase>, …, { resume })` covers the whole range. Calling
+  `restoreUnpublished()` again covers it too, and only that call releases the watermark hold
+  (item 4).
 
 **Proposal (seam).** Add `'partial'` to `RestoreOutcome` and `resume?: Readonly<Record<string,
 number>>` to `RestoreReport`, and an optional `resume` to `SeededWallet.restoreFromSeed`. N2 should
 offer "continue restoring" when `resume` is present, keeping the cursor in the host (the renderer
-only names the action).
+only names the action). For a startup-restore report, "continue" means `restoreFromSeed` of this
+device's own phrase with that `resume`, or `restoreUnpublished()` again. It must not use any other
+phrase.
 
 **Decision for Cameron.** A hostile mint and an honest long history look the same to a scan from
 counter 0 (both keep returning signed outputs; a hostile mint can sign anything under its own keys,
