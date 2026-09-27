@@ -26,17 +26,23 @@ export const PAY_PROTOCOL_VERSION = 1 as const;
  * this repository builds (the daemon, the gateway, the desktop worker's seeder, the dev fixtures).
  * Additive: `PAY_PROTOCOL_VERSION` stays 1 (see `version.ts`).
  *
- * 1. **A core's terms before its first block.** Before a seeder sends a peer the first block of a
- *    core on a connection with `pay/1` attached, it sends that core's `PRICE` on the same
- *    connection: priced, or `{ free: true }` for a core it serves outside payment. Protomux keeps
- *    one order per stream, so the `PRICE` precedes the block on the wire (a viewer attaches `pay/1`
- *    before it asks for blocks). Priced: `effectiveFromBlock` is one past the highest block of that
- *    core the seeder COUNTED on this connection (0 when none). It sends a new `PRICE` for the core
- *    whenever what it serves changes — a price change (security review F9), a core that turns free,
- *    or a free core that turns sold (before its next block) — and never repeats the terms it last
- *    said on this connection. A core with no terms at all (no price of its own, no default, not
- *    free) gets no `PRICE`; its blocks are counted and cannot be paid, so no seeder of this
- *    repository should serve one (see the lane record for the one known window).
+ * 1. **A core's terms when the peer opens it, and before its first block.** As soon as a peer has
+ *    a core open with the seeder on a connection with `pay/1` attached (both ends of the core's
+ *    replication channel open — whichever of that and the `pay/1` attach comes last), the seeder
+ *    sends that core's `PRICE` on the same connection, unprompted: priced, or `{ free: true }` for
+ *    a core it serves outside payment. A viewer can therefore wait for the terms before it asks
+ *    for anything (ADR 0015: an image read asks a peer only after its `{ free: true }`), and
+ *    silence means the peer has no terms to say. In any case the `PRICE` goes out before the
+ *    first block of the core to that peer; Protomux keeps one order per stream, so it precedes the
+ *    block on the wire (a viewer attaches `pay/1` before it asks for blocks). Priced:
+ *    `effectiveFromBlock` is one past the highest block of that core the seeder COUNTED on this
+ *    connection (0 when none). It sends a new `PRICE` for the core whenever what it serves changes
+ *    — a price change (security review F9), a core that turns free, or a free core that turns
+ *    sold (at once to a peer that has the core open, and in any case before its next block) — and
+ *    never repeats the terms it last said on this connection. A core with no terms at all (no
+ *    price of its own, no default, not free) gets no `PRICE`; its blocks are counted and cannot
+ *    be paid, so no seeder of this repository should serve one (see the lane record for the one
+ *    known window).
  * 2. **`OWED` once, when both HELLOs are verified.** When the connection opens (both HELLOs
  *    verified and the viewer's pubkey bound; a banned pubkey is cut instead), the seeder sends one
  *    `OWED` per core where it counts unpaid blocks for the viewer's HELLO pubkey — blocks sent on
@@ -56,12 +62,15 @@ export const PAY_PROTOCOL_VERSION = 1 as const;
  * 3. **Owed blocks are payable at the core's terms.** Before a sold core's `OWED` the seeder sends
  *    that core's priced `PRICE` (unless it already did on this connection). An owed range is then
  *    an ordinary `PAY` on this connection: verified at the terms this connection was told for its
- *    first block (that `PRICE`, or a later one), with the carry of a new channel (`carryIn` 0 for
- *    that core, ADR 0010). An accepted one clears those blocks. An `OWED` whose core got no priced
- *    `PRICE` on this connection names blocks the seeder counts but takes no payment for here (a
- *    core it serves free since, or one with no terms): `free` covers the blocks served while it
- *    holds, not blocks counted before it. The viewer counts them against the seeder's window and
- *    does not pay them.
+ *    first block (that `PRICE`, or a later one), inside this connection's carry chain for that
+ *    core (ADR 0010). The chain restarts at 0 on a new channel and moves with every accepted PAY
+ *    of the core, owed or not: an owed range's `carryIn` is 0 only when it is the first PAY of
+ *    that core on this connection, else the `carryOut` of the last accepted one (a PAY with any
+ *    other `carryIn` is refused as `malformed`). An accepted one clears those blocks. An `OWED`
+ *    whose core got no priced `PRICE` on this connection names blocks the seeder counts but takes
+ *    no payment for here (a core it serves free since, or one with no terms): `free` covers the
+ *    blocks served while it holds, not blocks counted before it. The viewer counts them against
+ *    the seeder's window and does not pay them.
  * 4. **`ACK.outstanding` in every ACK:** after the PAY was applied, the blocks of the ACK's core
  *    the seeder counts unpaid for this account (see `AckMessage.outstanding`).
  *

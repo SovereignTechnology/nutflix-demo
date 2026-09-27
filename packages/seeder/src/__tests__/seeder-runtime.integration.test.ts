@@ -161,8 +161,15 @@ interface ViewerNode {
   readonly acks: AckMessage[];
 }
 
-/** A viewer: a Seeder as a swarm client, pay/1 + its own HELLO, a real viewer engine. */
-async function viewer(mint: mocks.TestMint): Promise<ViewerNode> {
+/**
+ * A viewer: a Seeder as a swarm client, pay/1 + its own HELLO, a real viewer engine. `onChannel`
+ * sees each pay/1 channel before it is attached (where a test hooks events that may come before
+ * any block is asked for).
+ */
+async function viewer(
+  mint: mocks.TestMint,
+  onChannel?: (c: payProtocol.PayChannel) => void,
+): Promise<ViewerNode> {
   const t = await tmpDir('nutflix-runtime-viewer-');
   const log = capturedLogger('warn');
   const node = await Seeder.create(
@@ -187,6 +194,7 @@ async function viewer(mint: mocks.TestMint): Promise<ViewerNode> {
     const mux = session.mux!;
     const binding = payProtocol.bindingFromMux(mux)!;
     const c = new payProtocol.PayChannel({ binding });
+    onChannel?.(c);
     c.attach(mux);
     c.on('open', (h) => {
       seen = h;
@@ -399,18 +407,28 @@ describe('the seeder daemon runtime over hyperswarm', () => {
     const pool = new nostr.FakeRelayPool();
     const { dataDir, creds } = await setup();
     const d = await daemon(dataDir, creds, mint, pool, new Map());
-    const v = await viewer(mint);
+    // The PRICEs are recorded from the channel's creation: since the independent review of
+    // 2026-09-27 a core's terms go out as soon as the viewer opens it (before it asks for
+    // anything), so the video's PRICE arrives while `connect` runs. This listener used to be added
+    // after `connect`, which only worked while PRICEs waited for a block request.
+    const seen: string[] = [];
+    let name = (c: string): string => c;
+    const v = await viewer(mint, (c) => {
+      c.on('price', (p) =>
+        seen.push(`price:${p.core}:${p.free === true ? 'free' : String(p.satsPerBlock)}`),
+      );
+    });
     // A core served free (a creator's profile core, ADR 0015), opened before the daemon starts.
     const profile = await d.seeder.openCore('profile');
     const image = await profile.blobs.put(new Uint8Array(BLOCK * 3).fill(7));
     expect(d.seeder.setFreeCore(profile.keyHex, true)).toBe(true);
     const { core, vcore } = await connect(d, v, 4);
     const vfree = await v.seeder.blobs.openCoreByKey(Buffer.from(profile.keyHex, 'hex'));
-    const name = (c: string): string => (c === core ? 'paid' : c === profile.keyHex ? 'free' : '?');
-    const seen: string[] = [];
-    v.channel()!.on('price', (p) =>
-      seen.push(`price:${name(p.core)}:${p.free === true ? 'free' : String(p.satsPerBlock)}`),
-    );
+    name = (c: string): string => (c === core ? 'paid' : c === profile.keyHex ? 'free' : '?');
+    const named = (): string[] =>
+      seen.map((e) =>
+        e.startsWith('price:') ? `price:${name(e.split(':')[1]!)}:${e.split(':')[2]!}` : e,
+      );
     for (const [vc, n] of [
       [vcore, 'paid'],
       [vfree, 'free'],
@@ -420,14 +438,15 @@ describe('the seeder daemon runtime over hyperswarm', () => {
       expect(await vfree.core.get(i, { wait: true, timeout: 5000 })).not.toBeNull();
     for (let i = 0; i < 4; i++)
       expect(await vcore.core.get(i, { wait: true, timeout: 5000 })).not.toBeNull();
+    const log = named();
     for (const n of ['paid', 'free']) {
-      const price = seen.findIndex((e) => e.startsWith(`price:${n}:`));
-      expect(price, seen.join(' ')).toBeGreaterThanOrEqual(0);
-      expect(seen.findIndex((e) => e.startsWith(`download:${n}:`))).toBeGreaterThan(price);
-      expect(seen.filter((e) => e.startsWith(`price:${n}:`))).toHaveLength(1);
+      const price = log.findIndex((e) => e.startsWith(`price:${n}:`));
+      expect(price, log.join(' ')).toBeGreaterThanOrEqual(0);
+      expect(log.findIndex((e) => e.startsWith(`download:${n}:`))).toBeGreaterThan(price);
+      expect(log.filter((e) => e.startsWith(`price:${n}:`))).toHaveLength(1);
     }
-    expect(seen).toContain('price:paid:2');
-    expect(seen).toContain('price:free:free');
+    expect(log).toContain('price:paid:2');
+    expect(log).toContain('price:free:free');
     // The free core was never counted; the video's four blocks are, until paid.
     expect(d.rt.engine.window(v.pubkey)).toMatchObject({ uploaded: 4, paid: 0 });
     await payRange(v, vcore, core, 0, 1);

@@ -23,6 +23,7 @@ import type {
   UnixSeconds,
 } from '@sovit/core';
 import type { BlobReadStream } from 'hyperblobs';
+import type Hypercore from 'hypercore';
 import type { ReplicationStream, ReplicationStreamOptions } from 'hypercore';
 import type { PeerInfo, SwarmConnection } from 'hyperswarm';
 
@@ -122,7 +123,7 @@ export class Seeder {
    */
   private readonly gates = new Map<
     string,
-    { readonly core: object; readonly detach: () => void }
+    { readonly core: Hypercore; readonly detach: () => void }
   >();
   private readonly protocols = new Map<PeerSession, PayProtocol>();
   private readonly unsubs: (() => void)[] = [];
@@ -178,6 +179,12 @@ export class Seeder {
       // Contracts v6 amendment, rule 1 — always on: a core's terms precede its blocks.
       beforeBlock: (session, core, free) => {
         this.announceTerms(session, core, free);
+      },
+      // …and are said as soon as the peer opens the core, before it asks for anything: ADR 0015's
+      // viewer asks for an image block only after a `PRICE { free: true }` (independent review,
+      // 2026-09-27). The registry contains what this throws; `beforeBlock` stays the backstop.
+      onPeerAdd: (session, core) => {
+        this.announceTerms(session, core, this.freeCores.has(core));
       },
     });
     this.blobs = new BlobStore({
@@ -403,6 +410,11 @@ export class Seeder {
     });
     this.protocols.set(session, protocol);
     session.stream.once('close', () => this.protocols.delete(session));
+    // Cores this peer opened before pay/1 was attached: their `peer-add` found nothing to say the
+    // terms on, so say them now (rule 1, unprompted).
+    for (const [core, g] of this.gates)
+      if (this.sessions.pairedSessions(g.core).includes(session))
+        this.tellTerms(session, core as CoreKeyHex);
     return () => {
       this.protocols.delete(session);
       detach();
@@ -522,6 +534,28 @@ export class Seeder {
   }
 
   /**
+   * `announceTerms` at the core's current kind, for a peer that has the core open but asked for
+   * nothing yet (unprompted, rule 1). Never throws: a failure is logged, and the core's next block
+   * to that peer says the terms first or is not sent (`beforeBlock` fails closed).
+   */
+  private tellTerms(session: PeerSession, core: CoreKeyHex): void {
+    try {
+      this.announceTerms(session, core, this.freeCores.has(core));
+    } catch (err) {
+      this.log.error('terms not said unprompted — the next block says them first', {
+        error: err,
+      });
+    }
+  }
+
+  /** `tellTerms` to every live session `core` is paired on now (its kind or price changed). */
+  private tellPaired(core: CoreKeyHex): void {
+    const g = this.gates.get(core);
+    if (g === undefined) return;
+    for (const session of this.sessions.pairedSessions(g.core)) this.tellTerms(session, core);
+  }
+
+  /**
    * Contracts v6 amendment, rules 2–3: the channel is open (both HELLOs verified, the pubkey bound)
    * — report, once, every core where this peer's pubkey still owes blocks, oldest first and within
    * the `OWED` caps, each after that core's priced `PRICE` (the terms an owed range is paid at). A
@@ -552,7 +586,9 @@ export class Seeder {
   /**
    * Set (or with `null` clear) the policy for one core. When that changes the core's price, every
    * live `pay/1` peer that downloaded it gets a `PRICE` for the core (v5 `PRICE` names its core),
-   * and blocks it was already sent stay at the old price (F9). `announce: false` skips that.
+   * and blocks it was already sent stay at the old price (F9). A peer that has the core open and
+   * was told it free (or nothing) is told the price now (rule 1, unprompted). `announce: false`
+   * skips both; the core's next block to a peer still says its terms first.
    */
   setCorePolicy(
     core: CoreKeyHex,
@@ -567,8 +603,10 @@ export class Seeder {
       this.freeCores.delete(core);
     }
     const next = this.corePolicies.get(core) ?? this.policyOverride;
-    if (!(opts.announce ?? true) || prev === null || next === null) return;
-    if (prev.satsPerBlock !== next.satsPerBlock) this.announcePrice(core, prev, next);
+    if (!(opts.announce ?? true)) return;
+    if (prev !== null && next !== null && prev.satsPerBlock !== next.satsPerBlock)
+      this.announcePrice(core, prev, next);
+    this.tellPaired(core);
   }
 
   /** Per-core policies currently set (does not include the default). */
@@ -581,15 +619,19 @@ export class Seeder {
    * stop. A free core's blocks are never recorded against a peer's window. Fix round 4: a core
    * with its own price policy is never marked free (`false` is returned and nothing changes), and
    * `setCorePolicy` clears the mark — so a caller that names a paid core by mistake (an image URL
-   * pointing at a video) cannot give that video away.
+   * pointing at a video) cannot give that video away. A change reaches every peer that has the
+   * core open now, unprompted (rule 1): `{ free: true }`, or back to its price.
    */
   setFreeCore(core: CoreKeyHex, free: boolean): boolean {
     if (!free) {
-      this.freeCores.delete(core);
+      if (this.freeCores.delete(core)) this.tellPaired(core);
       return true;
     }
     if (this.corePolicies.has(core)) return false;
-    this.freeCores.add(core);
+    if (!this.freeCores.has(core)) {
+      this.freeCores.add(core);
+      this.tellPaired(core);
+    }
     return true;
   }
 
@@ -688,6 +730,8 @@ export class Seeder {
     if (had?.core !== sc.core) {
       had?.detach();
       this.gates.set(sc.keyHex, { core: sc.core, detach: this.sessions.attachUploadGate(sc.core) });
+      // A peer paired while the core was still opening had its `peer-add` before the gate was here.
+      this.tellPaired(sc.keyHex);
     }
     if (this.started && this.swarm) this.swarm.join(sc.core.discoveryKey);
   }

@@ -93,13 +93,20 @@ from seeders that said so.**
   the core; silence or a price means the peer is never asked. No probe, nothing counted.
   Images held only by older or third-party seeders show the placeholder.
 
-Seeder side as built (2026-09-27, lane P1-owed-seeder): `Seeder` sends a core's `PRICE` from the
-synchronous upload hook, before the block is written — `{ free: true }` (`satsPerBlock` and
-`effectiveFromBlock` 0) for a core marked with `setFreeCore`, else the core's price — once per
-connection, and again whenever that changes (a free core turned sold, or back). The option that
-switched this off (`announceCorePrices`) is gone, so every seeder the repository builds (the
-daemon, the gateway, the desktop worker, the dev fixtures) does it; a test on each composition
-shows the reader receives the `PRICE` before the core's first block, for both kinds. `free`
-covers the blocks served while it holds; blocks counted before a core turned free stay counted
-(they appear in `OWED`, with no priced `PRICE`, and are not payable). A seeder that cannot send
-the `PRICE` for a block cuts the connection (`local`, no ban) instead of sending the block.
+Seeder side as built (2026-09-27, lane P1-owed-seeder): `Seeder` says a core's terms —
+`{ free: true }` (`satsPerBlock` and `effectiveFromBlock` 0) for a core marked with `setFreeCore`,
+else the core's price — **unprompted, as soon as the peer has the core open** on a connection with
+pay/1 attached (Hypercore's `peer-add`; for a core paired before pay/1 was attached, at the attach;
+for a core paired before the `Seeder` opened it, at that open), so a viewer that asks for nothing
+still learns the terms (the independent review of 2026-09-27 found the first build said them only
+in reply to a block request, which left this decision's viewer with silence). The synchronous
+upload hook stays the backstop: before any block is written, the terms go out if they have not
+been said, and a seeder that cannot send them cuts the connection (`local`, no ban) instead of
+sending the block. Said once per connection, and again whenever they change — a free core turned
+sold, or back, reaches every peer that has the core open at once (`setFreeCore`,
+`setCorePolicy`). The option that switched this off (`announceCorePrices`) is gone, so every
+seeder the repository builds (the daemon, the gateway, the desktop worker, the dev fixtures) does
+it; tests on each composition show the reader receives the `PRICE` before the core's first block,
+for both kinds, and with nothing asked at all. `free` covers the blocks served while it holds;
+blocks counted before a core turned free stay counted (they appear in `OWED`, with no priced
+`PRICE`, and are not payable).

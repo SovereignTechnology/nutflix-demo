@@ -185,6 +185,39 @@ describe("contracts v6 amendment on the gateway's seeder (real replication strea
     expect(await w.pay(c.chan, paid, 0, 2, 0)).toMatchObject({ ok: true, outstanding: 1 });
   });
 
+  // ADR 0015 amendment: a viewer's image read asks a peer for blocks only after its
+  // `PRICE { free: true }`, with no probe (independent review 2026-09-27).
+  it('a viewer that opens both cores and asks for NOTHING receives their terms: { free: true } and the gateway price — nothing downloaded, nothing counted', async () => {
+    const w = await world();
+    const put = await w.r.gateway.seeder.putBytes(new Uint8Array(BLOCK * 2).fill(4), {
+      mime: 'video/mp4',
+    });
+    if (!put.ok) throw new Error('put failed');
+    const paid = put.entry.coreKey;
+    const profile = await w.r.gateway.seeder.openCore('profile');
+    await profile.blobs.put(new Uint8Array(BLOCK).fill(5));
+    expect(w.r.gateway.seeder.setFreeCore(profile.keyHex, true)).toBe(true);
+    const name = (c: string): string => (c === paid ? 'paid' : c === profile.keyHex ? 'free' : '?');
+    const seen: string[] = [];
+    const c = await w.connect((chan) => {
+      chan.on('price', (p: PriceMessage) =>
+        seen.push(`price:${name(p.core)}:${p.free === true ? 'free' : String(p.satsPerBlock)}`),
+      );
+    });
+    for (const k of [paid, profile.keyHex]) {
+      const vc = await w.viewer.blobs.openCoreByKey(Buffer.from(k, 'hex'));
+      vc.core.on('download', (i: number) => seen.push(`download:${name(k)}:${String(i)}`));
+    }
+    await until(() => seen.length >= 2);
+    await settle(200); // anything more would show here
+    expect([...seen].sort()).toEqual([
+      'price:free:free',
+      `price:paid:${String(w.r.gateway.price())}`,
+    ]);
+    await c.bound();
+    expect(w.r.engine.window(VIEWER_PUBKEY)?.uploaded ?? 0).toBe(0);
+  });
+
   it('a returning viewer (new Noise key, same HELLO pubkey) gets the PRICE then OWED for what the first connection left unpaid, and paying it there clears it', async () => {
     const w = await world();
     const data = new Uint8Array(BLOCK * 6).map((_, i) => (i * 3 + 2) % 256);

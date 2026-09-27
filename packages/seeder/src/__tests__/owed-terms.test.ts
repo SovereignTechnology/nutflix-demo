@@ -13,6 +13,8 @@
  */
 import { MAX_OWED_BLOCKS, MAX_OWED_RANGES, mocks, payProtocol } from '@sovit/core';
 import type { NostrPubkey, PricePolicy } from '@sovit/core';
+import type Hypercore from 'hypercore';
+import type { ReplicationPeer } from 'hypercore';
 import { afterEach, describe, expect, it } from 'vitest';
 
 import { Seeder } from '../seeder.js';
@@ -138,6 +140,176 @@ describe('rule 1 — a core’s PRICE before its first block (always on)', () =>
     expect(protocol.prices.filter((p) => p.core === CORE_B)).toEqual([
       { type: 'PRICE', core: CORE_B, satsPerBlock: 0, effectiveFromBlock: 0, free: true },
     ]);
+  });
+});
+
+/**
+ * A peer of `core` on `stream`, the shape Hypercore's replicator hands to `peer-add` / `upload`
+ * (`remotePublicKey` and `stream`, `lib/replicator.js` `Peer`).
+ */
+const peerOn = (stream: FakeStream): ReplicationPeer => ({
+  remotePublicKey: stream.remotePublicKey!,
+  stream,
+});
+
+/**
+ * `core.peers` (the replicator's paired peers) set to `streams` for this test — the list the seeder
+ * reads when pay/1 is attached, when a core opens and when a core's kind changes. Restored after.
+ */
+function pairedOn(core: Hypercore, ...streams: FakeStream[]): void {
+  Object.defineProperty(core, 'peers', {
+    configurable: true,
+    get: () => streams.map(peerOn),
+  });
+  cleanups.push(() => {
+    delete (core as { peers?: unknown }).peers;
+    return Promise.resolve();
+  });
+}
+
+describe('rule 1, unprompted — a core’s terms as soon as the peer opens it (independent review 2026-09-27)', () => {
+  it('peer-add: a free core gets PRICE { free: true } and a sold core its price before anything is asked, once; the blocks that follow add nothing; no terms, no pay/1, or another stream of the same Noise key: nothing', async () => {
+    const s = await make();
+    const profile = await s.seeder.openCore('profile');
+    const video = await s.seeder.openCore('video');
+    expect(s.seeder.setFreeCore(profile.keyHex, true)).toBe(true);
+    const { stream, session, protocol } = s.connect();
+    profile.core.emit('peer-add', peerOn(stream));
+    video.core.emit('peer-add', peerOn(stream));
+    expect(protocol.prices).toEqual([
+      { type: 'PRICE', core: profile.keyHex, satsPerBlock: 0, effectiveFromBlock: 0, free: true },
+      { type: 'PRICE', core: video.keyHex, satsPerBlock: 2, effectiveFromBlock: 0 },
+    ]);
+    expect(s.engine.window(session.accountId())).toBeUndefined(); // nothing asked, nothing counted
+    // Said once: the first blocks, and a renegotiated channel (a second peer-add), add nothing.
+    session.onUpload(profile.keyHex, 0, BLOCK);
+    session.onUpload(video.keyHex, 0, BLOCK);
+    profile.core.emit('peer-add', peerOn(stream));
+    video.core.emit('peer-add', peerOn(stream));
+    expect(protocol.prices).toHaveLength(2);
+    // The priced PRICE is the F9 boundary for this peer: a PAY for block 0 verifies at price 2.
+    expect(
+      s.seeder.policyForRange(session, video.keyHex, {
+        core: video.keyHex,
+        fromBlock: 0,
+        toBlock: 0,
+      }),
+    ).toEqual(s.policy(2));
+
+    // A second connection from the SAME Noise key is another session: a peer-add on the first
+    // stream is the first session's, never the second's.
+    const second = s.seeder.sessions.admit(new FakeStream(stream.remotePublicKey))!;
+    const secondPay = new FakePayProtocol();
+    s.seeder.attachPayProtocol(second, secondPay);
+    const other = await s.seeder.openCore('other');
+    other.core.emit('peer-add', peerOn(stream));
+    expect(secondPay.prices).toEqual([]);
+    expect(protocol.prices.at(-1)).toEqual({
+      type: 'PRICE',
+      core: other.keyHex,
+      satsPerBlock: 2,
+      effectiveFromBlock: 0,
+    });
+    // A stream that was never admitted, and an admitted one without pay/1: nothing, no throw.
+    const stranger = new FakeStream(noiseKey(91));
+    expect(() => video.core.emit('peer-add', peerOn(stranger))).not.toThrow();
+    const bareStream = new FakeStream(noiseKey(92));
+    s.seeder.sessions.admit(bareStream);
+    expect(() => video.core.emit('peer-add', peerOn(bareStream))).not.toThrow();
+    expect(s.seeder.sessions.get(noiseKey(91))).toBeUndefined(); // looked up, never admitted
+
+    // No terms at all (no policy, no default, not free): nothing to say.
+    const bare = await make({ withDefault: false });
+    const c = bare.seeder.openCore('untermed');
+    const conn = bare.connect();
+    (await c).core.emit('peer-add', peerOn(conn.stream));
+    expect(conn.protocol.prices).toEqual([]);
+  });
+
+  it('a peer-add whose PRICE cannot be sent is contained (nothing reaches Hypercore) and cuts nothing; the core’s next block then fails closed', async () => {
+    const s = await make();
+    const video = await s.seeder.openCore('video');
+    const { stream, session, protocol } = s.connect();
+    protocol.sendPrice = (): void => {
+      throw new Error('encode failed');
+    };
+    expect(() => video.core.emit('peer-add', peerOn(stream))).not.toThrow();
+    expect(session.cutReason).toBeNull();
+    expect(s.log.lines.join('\n')).toContain('peer-add hook threw');
+    session.onUpload(video.keyHex, 0, BLOCK);
+    expect(session.cutReason).toBe('local');
+    expect(s.engine.window(session.accountId())).toBeUndefined();
+  });
+
+  it('pay/1 attached after the peer opened a core: its terms go out at attach, for the cores paired on THIS stream only', async () => {
+    const s = await make();
+    const profile = await s.seeder.openCore('profile');
+    const video = await s.seeder.openCore('video');
+    const unpaired = await s.seeder.openCore('unpaired');
+    s.seeder.setFreeCore(profile.keyHex, true);
+    const stream = new FakeStream(noiseKey(60));
+    const elsewhere = new FakeStream(noiseKey(61));
+    const session = s.seeder.sessions.admit(stream)!;
+    s.seeder.sessions.admit(elsewhere);
+    pairedOn(profile.core, stream);
+    pairedOn(video.core, elsewhere, stream);
+    pairedOn(unpaired.core, elsewhere);
+    const protocol = new FakePayProtocol();
+    s.seeder.attachPayProtocol(session, protocol);
+    expect(protocol.prices).toEqual([
+      { type: 'PRICE', core: profile.keyHex, satsPerBlock: 0, effectiveFromBlock: 0, free: true },
+      { type: 'PRICE', core: video.keyHex, satsPerBlock: 2, effectiveFromBlock: 0 },
+    ]);
+  });
+
+  it('a core turned free, or sold again, is re-announced at once to every peer that has it open (setFreeCore, setCorePolicy); unchanged terms are not repeated; announce: false leaves it to the next block', async () => {
+    const s = await make();
+    const core = await s.seeder.openCore('flip');
+    const k = core.keyHex;
+    const a = s.connect();
+    const b = s.connect();
+    const idle = s.connect(); // connected, but has not opened the core
+    pairedOn(core.core, a.stream, b.stream);
+    // Default-priced first (the peers opened it before any of this).
+    core.core.emit('peer-add', peerOn(a.stream));
+    core.core.emit('peer-add', peerOn(b.stream));
+    const free = { type: 'PRICE', core: k, satsPerBlock: 0, effectiveFromBlock: 0, free: true };
+    expect(s.seeder.setFreeCore(k, true)).toBe(true);
+    expect(s.seeder.setFreeCore(k, true)).toBe(true); // no change: nothing repeated
+    for (const c of [a, b])
+      expect(c.protocol.prices).toEqual([
+        { type: 'PRICE', core: k, satsPerBlock: 2, effectiveFromBlock: 0 },
+        free,
+      ]);
+    s.seeder.setFreeCore(k, false);
+    expect(a.protocol.prices.at(-1)).toEqual({
+      type: 'PRICE',
+      core: k,
+      satsPerBlock: 2,
+      effectiveFromBlock: 0,
+    });
+    s.seeder.setFreeCore(k, true);
+    // A per-core price clears the free mark: its price, at once.
+    s.seeder.setCorePolicy(k, s.policy(5));
+    expect(b.protocol.prices.slice(-2)).toEqual([
+      free,
+      { type: 'PRICE', core: k, satsPerBlock: 5, effectiveFromBlock: 0 },
+    ]);
+    expect(idle.protocol.prices).toEqual([]);
+    // announce: false (a composition's own choice of when to say it): nothing now…
+    s.seeder.setCorePolicy(k, null);
+    expect(s.seeder.setFreeCore(k, true)).toBe(true);
+    const before = a.protocol.prices.length;
+    s.seeder.setCorePolicy(k, s.policy(7), { announce: false });
+    expect(a.protocol.prices.length).toBe(before);
+    // …and the next block still says it first (rule 1's backstop).
+    a.session.onUpload(k, 0, BLOCK);
+    expect(a.protocol.prices.at(-1)).toEqual({
+      type: 'PRICE',
+      core: k,
+      satsPerBlock: 7,
+      effectiveFromBlock: 0,
+    });
   });
 });
 
@@ -364,7 +536,7 @@ describe('rule 4 — outstanding in every ACK', () => {
 });
 
 describe('the bridge’s v6 hooks, alone', () => {
-  it('an outstanding that is not a safe count is left out; onOpen runs only after a bind, and a throwing onOpen is contained', async () => {
+  it('an outstanding that is not a safe count is left out; onOpen runs only after a bind, and a throwing onOpen cuts the session (local, no ban)', async () => {
     const { attachPayBridge } = await import('../payment/pay-bridge.js');
     const { PeerSession } = await import('../net/peer-session.js');
     const { loadedBanList } = await import('./helpers.js');
@@ -405,7 +577,6 @@ describe('the bridge’s v6 hooks, alone', () => {
         outstanding: () => bad,
         onOpen: () => {
           opened++;
-          throw new Error('hook failure');
         },
       });
       const who = pubkey(`bridge-${String(bad)}`);
@@ -421,7 +592,44 @@ describe('the bridge’s v6 hooks, alone', () => {
       ]);
       expect(session.cutReason).toBeNull();
     }
-    expect(log.lines.join('\n')).toContain('open hook failed');
+    // A throwing onOpen (the OWED report failing part-way) CUTS the session, `local`, no ban. This
+    // assertion used to read `cutReason` null (the report's failure was only logged): the
+    // independent review of 2026-09-27 found that fails open — a viewer that got part of the report
+    // reads the missing cores as nothing owed, asks its full window and is banned for
+    // `window-exceeded`. Now it fails closed, like a throwing `beforeBlock`.
+    {
+      const key = noiseKey(9);
+      const stream = new FakeStream(key);
+      const session = new PeerSession({
+        noiseKey: key,
+        stream,
+        engine,
+        banList,
+        logger: log.logger,
+      });
+      const protocol = new FakePayProtocol();
+      let opened = 0;
+      attachPayBridge({
+        session,
+        protocol,
+        policy: () => policy,
+        scheduler: { notePaidBlocks: () => undefined },
+        logger: log.logger,
+        onOpen: () => {
+          opened++;
+          throw new Error('hook failure');
+        },
+      });
+      const who = pubkey('bridge-throws');
+      protocol.remoteHello(hello(who));
+      expect(opened).toBe(1);
+      expect(session.cutReason).toBe('local');
+      expect(stream.destroyed).toBe(true); // in the same tick as the HELLO
+      expect(engine.isBanned(who)).toBe(false);
+      expect(banList.isPubkeyBanned(who)).toBe(false);
+      expect(banList.isNoiseBanned(key)).toBe(false);
+      expect(log.lines.join('\n')).toContain('open hook failed');
+    }
     // A refused bind (a banned pubkey) never reaches onOpen.
     const who = pubkey('bridge-banned');
     engine.ban(who, 'test');
@@ -481,6 +689,33 @@ describe('fail closed', () => {
       expect(banList.isNoiseBanned(key)).toBe(false);
     }
     expect(log.lines.join('\n')).toContain('not sending the block');
+  });
+
+  it('an OWED report that fails part-way cuts the session (local, no ban) in the same tick: a short report is never left standing', async () => {
+    const s = await make();
+    const who = pubkey('owed-partial');
+    const first = s.connect();
+    first.protocol.remoteHello(hello(who));
+    first.session.onUpload(CORE_A, 0, BLOCK);
+    first.session.onUpload(CORE_B, 0, BLOCK);
+    first.stream.destroy();
+    await first.stream.closed();
+    const again = s.connect();
+    const send = again.protocol.sendOwed.bind(again.protocol);
+    again.protocol.sendOwed = (o): void => {
+      if (again.protocol.owed.length === 1) throw new Error('encode failed'); // the second core
+      send(o);
+    };
+    again.protocol.remoteHello(hello(who));
+    expect(again.protocol.owed.map((o) => o.core)).toEqual([CORE_A]);
+    expect(again.session.cutReason).toBe('local');
+    expect(again.stream.destroyed).toBe(true);
+    expect(s.engine.isBanned(who)).toBe(false);
+    expect(s.seeder.bans()).toEqual([]);
+    // Still counted, so the next connection reports both cores again.
+    const third = s.connect();
+    third.protocol.remoteHello(hello(who));
+    expect(third.protocol.owed.map((o) => o.core)).toEqual([CORE_A, CORE_B]);
   });
 
   it('on the seeder: a PRICE that cannot be sent cuts the session before the block; a seeder with no ledger is refused at create', async () => {

@@ -3,7 +3,7 @@
  * `PeerSession`:
  *
  *   HELLO (open)  → `session.bindPubkey()`      (banned pubkey → cut); bound → `onOpen()`
- *                   (the seeder's `OWED` report, contracts v6 amendment)
+ *                   (the seeder's `OWED` report, contracts v6 amendment; a throw cuts, `local`)
  *   PAY           → `session.verifyPay(msg, policy(range.core))` → `sendAck()` (naming the
  *                   core, v5; with `outstanding` on that core, v6 amendment); accepted blocks
  *                   feed the scheduler
@@ -41,7 +41,12 @@ export interface PayBridgeOptions {
    * safe count (the codec would refuse the frame).
    */
   readonly outstanding?: (core: CoreKeyHex) => number;
-  /** Runs once the channel opened and the pubkey bound (not after a refused bind). */
+  /**
+   * Runs once the channel opened and the pubkey bound (not after a refused bind). Fails closed: if
+   * it throws, the session is cut (`local`, no ban) in the same tick — for the seeder's `OWED`
+   * report a partial report is the unsafe direction (the viewer reads a missing core as nothing
+   * owed, asks its full window and is cut for `window-exceeded`; independent review 2026-09-27).
+   */
   readonly onOpen?: () => void;
 }
 
@@ -56,7 +61,8 @@ export function attachPayBridge(opts: PayBridgeOptions): () => void {
       try {
         opts.onOpen?.();
       } catch (err) {
-        log.error('open hook failed', { error: err });
+        log.error('open hook failed — cutting the session', { error: err });
+        session.cut('local');
       }
     }),
   );

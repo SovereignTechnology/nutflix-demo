@@ -62,8 +62,9 @@
  *       bounded by `MAX_OWED_RANGES` 256 / `MAX_OWED_BLOCKS` 1024); `AckMessage.outstanding?`
  *       (after the PAY, the blocks of that core still counted); `PayProtocolEvents.owed` and
  *       `PayProtocol.sendOwed`. Normative for every seeder this repository builds: a core's
- *       `PRICE` (priced, or `free`) before its first block to a peer, `OWED` once both HELLOs
- *       verify (with the core's priced `PRICE` first), `outstanding` in every ACK
+ *       `PRICE` (priced, or `free`) as soon as a peer has the core open on a pay/1 connection,
+ *       unprompted, and in any case before its first block to that peer; `OWED` once both HELLOs
+ *       verify (with the core's priced `PRICE` first); `outstanding` in every ACK
  *       (`pay-protocol.ts`). `PAY_PROTOCOL_VERSION` stays 1: a priced `PRICE` is byte-for-byte the
  *       v5 frame (its flags byte is written only with `free`), while an older build's codec
  *       refuses `OWED`, a `free` PRICE and an ACK carrying `outstanding`, and closes pay/1 (no

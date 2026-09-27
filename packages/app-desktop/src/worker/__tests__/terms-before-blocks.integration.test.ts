@@ -158,76 +158,142 @@ describe("contracts v6 amendment on the desktop worker's PeerNode (real hyperswa
     expect(a.engine.unpaid(b.pubkey)).toEqual([{ core: paid, ranges: [[0, 2]] }]);
   });
 
-  it('the dev fixtures do the same over the loopback pay/1 hub: PRICE (priced, or free) before the first block of each core', async () => {
+  // ADR 0015 amendment: a viewer's image read asks a peer for blocks only after its
+  // `PRICE { free: true }`, with no probe — so the terms must come with nothing asked (independent
+  // review 2026-09-27).
+  it('a viewer that opens both cores and asks for NOTHING receives their terms: { free: true } for the profile core, the price for the video — nothing downloaded, nothing counted', async () => {
     const testnet = await startDevTestnet();
     cleanups.push(() => testnet.destroy());
-    const seen: string[] = [];
-    let readerNoise = '';
-    let name = (_c: string): string => '?';
-    /** Records the PRICEs the READER's ends receive. */
-    class RecordingHub extends LoopbackPayHub {
-      override endpoint(link: PayLink) {
-        const end = super.endpoint(link);
-        if (link.localNoise === readerNoise)
-          end.on('price', (p: PriceMessage) =>
-            seen.push(`price:${name(p.core)}:${p.free === true ? 'free' : String(p.satsPerBlock)}`),
-          );
-        return end;
-      }
-    }
-    const hub = new RecordingHub();
-    const fixture = async (n: string) => {
-      const t = await tempDir(`nutflix-terms-fx-${n}-`);
-      const f = await createFixtureSeeder({
-        name: n,
-        dataDir: t.dir,
-        fs: nodeFs,
-        crypto: sodiumCrypto,
-        hub,
-        bootstrap: testnet.bootstrap,
-        logger: silentLogger,
-        policy: devFixturePolicy(),
-        windowBlocks: 16,
-      });
-      cleanups.push(async () => {
-        await f.close();
-        await t.rm();
-      });
-      return f;
+    const a = await peer(testnet, 'a');
+    const policy: PricePolicy = {
+      satsPerBlock: 4 as Sats,
+      blockSize: BLOCK,
+      mints: [mocks.MINTS.a],
+      split: { seeder: 50, creator: 50 },
+      creatorP2pk: ('02' + 'c7'.repeat(32)) as CashuP2pkPubkey,
     };
-    const a = await fixture('a');
-    const put = await a.seeder.putBytes(new Uint8Array(BLOCK * 2).fill(9), { mime: 'video/mp4' });
+    const put = await a.seeder.putBytes(new Uint8Array(BLOCK * 2).fill(8), { mime: 'video/mp4' });
     if (!put.ok) throw new Error('put failed');
     const paid = put.entry.coreKey;
+    a.seeder.setCorePolicy(paid, policy);
     const profile = await a.seeder.openCore('nutflix-profile');
-    const image = await profile.blobs.put(new Uint8Array(BLOCK * 2).fill(4));
+    await profile.blobs.put(new Uint8Array(BLOCK).fill(6));
     expect(a.seeder.setFreeCore(profile.keyHex, true)).toBe(true);
-    name = (c) => (c === paid ? 'paid' : c === profile.keyHex ? 'free' : '?');
+    const name = (c: string): string => (c === paid ? 'paid' : c === profile.keyHex ? 'free' : '?');
     for (const k of [paid, profile.keyHex])
       a.node.join(a.seeder.blobs.coreByKey(k)!.core.discoveryKey, { server: true, client: false });
     await a.node.flush();
-    const b = await fixture('b');
-    readerNoise = b.noiseKeyHex();
-    const vpaid = await b.seeder.blobs.openCoreByKey(Buffer.from(paid, 'hex'));
-    const vfree = await b.seeder.blobs.openCoreByKey(Buffer.from(profile.keyHex, 'hex'));
-    for (const [vc, n] of [
-      [vpaid, 'paid'],
-      [vfree, 'free'],
-    ] as const) {
-      vc.core.on('download', (i: number) => seen.push(`download:${n}:${String(i)}`));
+
+    const seen: string[] = [];
+    const b = await peer(testnet, 'b', (c) => {
+      c.on('price', (p: PriceMessage) =>
+        seen.push(`price:${name(p.core)}:${p.free === true ? 'free' : String(p.satsPerBlock)}`),
+      );
+    });
+    for (const k of [paid, profile.keyHex]) {
+      const vc = await b.seeder.blobs.openCoreByKey(Buffer.from(k, 'hex'));
+      vc.core.on('download', (i: number) => seen.push(`download:${name(k)}:${String(i)}`));
       b.node.join(vc.core.discoveryKey, { server: false, client: true });
     }
     await b.node.flush();
-    for (let i = image.blockOffset; i < image.blockOffset + image.blockLength; i++)
-      expect(await vfree.core.get(i, { wait: true, timeout: 10_000 })).not.toBeNull();
-    for (let i = 0; i < 2; i++)
-      expect(await vpaid.core.get(i, { wait: true, timeout: 10_000 })).not.toBeNull();
-    for (const n of ['paid', 'free']) {
-      const price = seen.findIndex((e) => e.startsWith(`price:${n}:`));
-      expect(price, seen.join(' ')).toBeGreaterThanOrEqual(0);
-      expect(seen.findIndex((e) => e.startsWith(`download:${n}:`))).toBeGreaterThan(price);
-    }
-    expect(seen).toContain(`price:paid:${String(devFixturePolicy().satsPerBlock)}`);
-    expect(seen).toContain('price:free:free');
+    await poll(() => seen.length >= 2, 10_000, 'both PRICEs, unprompted');
+    await sleep(200); // anything more would show here
+    expect([...seen].sort()).toEqual(['price:free:free', 'price:paid:4']);
+    expect(a.engine.window(b.pubkey)?.uploaded ?? 0).toBe(0);
   });
+
+  for (const ask of [true, false])
+    it(
+      ask
+        ? 'the dev fixtures do the same over the loopback pay/1 hub: PRICE (priced, or free) before the first block of each core'
+        : "the dev fixtures say both cores' terms with NOTHING asked (ADR 0015 amendment: an image read waits for { free: true })",
+      async () => {
+        const testnet = await startDevTestnet();
+        cleanups.push(() => testnet.destroy());
+        const seen: string[] = [];
+        let readerNoise = '';
+        let name = (_c: string): string => '?';
+        /** Records the PRICEs the READER's ends receive. */
+        class RecordingHub extends LoopbackPayHub {
+          override endpoint(link: PayLink) {
+            const end = super.endpoint(link);
+            if (link.localNoise === readerNoise)
+              end.on('price', (p: PriceMessage) =>
+                seen.push(
+                  `price:${name(p.core)}:${p.free === true ? 'free' : String(p.satsPerBlock)}`,
+                ),
+              );
+            return end;
+          }
+        }
+        const hub = new RecordingHub();
+        const fixture = async (n: string) => {
+          const t = await tempDir(`nutflix-terms-fx-${n}-`);
+          const f = await createFixtureSeeder({
+            name: n,
+            dataDir: t.dir,
+            fs: nodeFs,
+            crypto: sodiumCrypto,
+            hub,
+            bootstrap: testnet.bootstrap,
+            logger: silentLogger,
+            policy: devFixturePolicy(),
+            windowBlocks: 16,
+          });
+          cleanups.push(async () => {
+            await f.close();
+            await t.rm();
+          });
+          return f;
+        };
+        const a = await fixture('a');
+        const put = await a.seeder.putBytes(new Uint8Array(BLOCK * 2).fill(9), {
+          mime: 'video/mp4',
+        });
+        if (!put.ok) throw new Error('put failed');
+        const paid = put.entry.coreKey;
+        const profile = await a.seeder.openCore('nutflix-profile');
+        const image = await profile.blobs.put(new Uint8Array(BLOCK * 2).fill(4));
+        expect(a.seeder.setFreeCore(profile.keyHex, true)).toBe(true);
+        name = (c) => (c === paid ? 'paid' : c === profile.keyHex ? 'free' : '?');
+        for (const k of [paid, profile.keyHex])
+          a.node.join(a.seeder.blobs.coreByKey(k)!.core.discoveryKey, {
+            server: true,
+            client: false,
+          });
+        await a.node.flush();
+        const b = await fixture('b');
+        readerNoise = b.noiseKeyHex();
+        const vpaid = await b.seeder.blobs.openCoreByKey(Buffer.from(paid, 'hex'));
+        const vfree = await b.seeder.blobs.openCoreByKey(Buffer.from(profile.keyHex, 'hex'));
+        for (const [vc, n] of [
+          [vpaid, 'paid'],
+          [vfree, 'free'],
+        ] as const) {
+          vc.core.on('download', (i: number) => seen.push(`download:${n}:${String(i)}`));
+          b.node.join(vc.core.discoveryKey, { server: false, client: true });
+        }
+        await b.node.flush();
+        if (!ask) {
+          await poll(() => seen.length >= 2, 10_000, 'both PRICEs, unprompted');
+          await sleep(200); // anything more would show here
+          expect([...seen].sort()).toEqual([
+            'price:free:free',
+            `price:paid:${String(devFixturePolicy().satsPerBlock)}`,
+          ]);
+          return;
+        }
+        for (let i = image.blockOffset; i < image.blockOffset + image.blockLength; i++)
+          expect(await vfree.core.get(i, { wait: true, timeout: 10_000 })).not.toBeNull();
+        for (let i = 0; i < 2; i++)
+          expect(await vpaid.core.get(i, { wait: true, timeout: 10_000 })).not.toBeNull();
+        for (const n of ['paid', 'free']) {
+          const price = seen.findIndex((e) => e.startsWith(`price:${n}:`));
+          expect(price, seen.join(' ')).toBeGreaterThanOrEqual(0);
+          expect(seen.findIndex((e) => e.startsWith(`download:${n}:`))).toBeGreaterThan(price);
+        }
+        expect(seen).toContain(`price:paid:${String(devFixturePolicy().satsPerBlock)}`);
+        expect(seen).toContain('price:free:free');
+      },
+    );
 });

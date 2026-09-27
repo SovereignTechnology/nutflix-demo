@@ -176,8 +176,9 @@ The normative text is in `packages/core/src/contracts/pay-protocol.ts`; the choi
   first block it asks for, so "a block arrived, no `OWED`" means nothing is owed. Tested on real
   streams for both HELLO orders.
 - **Terms.** Before a sold core's `OWED` the seeder sends its priced `PRICE`; owed ranges are
-  verified at the terms this connection was told (the core's current policy), with a new
-  channel's carry. The seeder keeps no per-block record of the price a block was delivered at, so
+  verified at the terms this connection was told (the core's current policy), inside this
+  connection's carry chain for the core: it restarts at 0 on the new channel and moves with every
+  accepted PAY of the core, so an owed range carries 0 only if it is the core's first PAY here. The seeder keeps no per-block record of the price a block was delivered at, so
   a price change between two connections moves the owed blocks to the new price — the viewer,
   which pays only at the terms it recorded, then leaves them unpaid (a residual, below). An `OWED`
   with no priced `PRICE` (a core served free since, or with no terms) is counted and not payable.

@@ -49,6 +49,15 @@ afterEach(async () => {
 
 const settle = (ms = 100): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
+/** Polls `cond` every 20 ms until it holds; throws after `ms`. */
+async function until(cond: () => boolean, ms: number): Promise<void> {
+  const end = Date.now() + ms;
+  while (!cond()) {
+    if (Date.now() > end) throw new Error(`condition not met within ${String(ms)} ms`);
+    await settle(20);
+  }
+}
+
 async function newSigner(): Promise<signerMod.LocalSigner> {
   const { signer: s } = await signerMod.LocalSigner.create({
     passphrase: new TextEncoder().encode('integration pw'),
@@ -368,6 +377,88 @@ describe('contracts v6 amendment on a real replication stream', () => {
     // The free core's blocks were never counted; the sold core's four were.
     expect(r.engine.window(r.viewerPubkey)).toMatchObject({ uploaded: 4, paid: 0 });
     expect(r.engine.unpaid(r.viewerPubkey)).toEqual([{ core: paid, ranges: [[0, 3]] }]);
+  });
+
+  // ADR 0015 amendment: a viewer's image read asks a peer for blocks only AFTER its
+  // `PRICE { free: true }` — no probe. So the terms must arrive with nothing asked (independent
+  // review 2026-09-27: they used to go out only in reply to a block request, so such a viewer got
+  // silence from every seeder this repository builds).
+  it('a viewer that opens a core and asks for NOTHING receives its terms: { free: true } for a free core, the price for a sold one — nothing downloaded, nothing counted', async () => {
+    const r = await rig(8);
+    const put = await r.seeder.putBytes(new Uint8Array(BLOCK * 3).fill(1), { mime: 'video/mp4' });
+    if (!put.ok) throw new Error('put failed');
+    const paid = put.entry.coreKey;
+    r.seeder.setCorePolicy(paid, r.policy);
+    const profile = await r.seeder.openCore('profile');
+    await profile.blobs.put(new Uint8Array(BLOCK * 2).fill(9));
+    const free = profile.keyHex;
+    expect(r.seeder.setFreeCore(free, true)).toBe(true);
+    const name = (core: string): string => (core === paid ? 'paid' : core === free ? 'free' : '?');
+
+    const seen: string[] = [];
+    const c = await r.connect(({ viewerChan }) => {
+      viewerChan.on('price', (p: PriceMessage) =>
+        seen.push(`price:${name(p.core)}:${p.free === true ? 'free' : String(p.satsPerBlock)}`),
+      );
+    });
+    // pay/1 is open on both ends; now the viewer opens both cores — and asks for no block.
+    for (const key of [free, paid]) {
+      const vc = await r.viewerNode.blobs.openCoreByKey(Buffer.from(key, 'hex'));
+      vc.core.on('download', (i: number) => seen.push(`download:${name(key)}:${String(i)}`));
+      await until(() => vc.core.peers.length === 1, 3000); // the core's channel is open
+    }
+    await until(() => seen.length >= 2, 3000);
+    await settle(200); // anything more would show here
+    expect(seen.sort()).toEqual(['price:free:free', 'price:paid:2']);
+    expect(r.engine.window(r.viewerPubkey)?.uploaded ?? 0).toBe(0);
+    expect(c.session.cutReason).toBeNull();
+  });
+
+  it('a core the viewer opened BEFORE pay/1 was attached, and one it had paired before the seeder opened it: both get their terms with nothing asked', async () => {
+    const r = await rig(8);
+    r.seeder.setPolicy(r.policy); // a default price: both cores are sold
+    const put = await r.seeder.putBytes(new Uint8Array(BLOCK * 2).fill(2), { mime: 'video/mp4' });
+    if (!put.ok) throw new Error('put failed');
+    const early = put.entry.coreKey;
+    // A core the corestore has open (a session of our own), which the Seeder has not opened yet.
+    const raw = r.seeder.blobs.store.get({ name: 'late' });
+    await raw.ready();
+    await raw.append(new Uint8Array(BLOCK).fill(3));
+    const late = toHex(raw.key);
+    const name = (core: string): string =>
+      core === early ? 'early' : core === late ? 'late' : '?';
+    for (const key of [early, late])
+      await r.viewerNode.blobs.openCoreByKey(Buffer.from(key, 'hex'));
+
+    // Replication first, pay/1 later: both cores pair on the bare stream.
+    const sa = r.seeder.replicate(true);
+    const sb = r.viewerNode.replicate(false);
+    sa.on('error', () => undefined);
+    sb.on('error', () => undefined);
+    sa.pipe(sb).pipe(sa);
+    await sb.noiseStream.opened;
+    const gated = r.seeder.blobs.coreByKey(early)!.core;
+    await until(() => gated.peers.length === 1 && raw.peers.length === 1, 3000);
+    const session = r.seeder.session(toHex(sb.noiseStream.publicKey!))!;
+    const seederChan = new payProtocol.PayChannel({ destroyOnCut: false });
+    const viewerChan = new payProtocol.PayChannel();
+    seederChan.attach(session.mux!);
+    viewerChan.attach(sb.noiseStream.userData as MuxLike);
+    const seen: string[] = [];
+    viewerChan.on('price', (p: PriceMessage) =>
+      seen.push(`price:${name(p.core)}:${String(p.satsPerBlock)}`),
+    );
+    r.seeder.attachPayProtocol(session, seederChan);
+    await until(() => seen.length >= 1, 3000);
+    expect(seen).toEqual(['price:early:2']);
+    // The Seeder opens the core that was already paired: its peer-add is long past.
+    await r.seeder.openCore('late');
+    await until(() => seen.length >= 2, 3000);
+    await settle(100);
+    expect(seen).toEqual(['price:early:2', 'price:late:2']);
+    expect(r.engine.window(session.accountId())?.uploaded ?? 0).toBe(0);
+    sa.destroy();
+    sb.destroy();
   });
 
   it('blocks a dropped connection left unpaid come back as OWED on the next connection (new Noise key, same HELLO pubkey), after the PRICE; paying them there clears them and playback continues', async () => {
