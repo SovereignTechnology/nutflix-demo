@@ -31,6 +31,7 @@ import { FakePayProtocol, helloFrom } from './fake-pay-protocol.js';
 import {
   BLOCK,
   CREATOR_P2PK,
+  GW_PUBKEY,
   MINT_A,
   MINT_B,
   basePolicy,
@@ -395,12 +396,12 @@ describe('UpstreamPayer (integration): gateway pulls from a real upstream seeder
     for (const c of closers.splice(0).reverse()) await c();
   });
 
-  async function upstream() {
+  async function upstream(windowBlocks = 100) {
     const t = await tmpDir('nutflix-l3-upstream-');
     const engine = new mocks.MockPaymentEngine({
       mode: 'honest',
       config: {
-        windowBlocks: 100,
+        windowBlocks,
         acceptedMints: [MINT_A, MINT_B],
         ownP2pk: UP_P2PK,
         ownPubkey: UP_PUBKEY,
@@ -515,6 +516,91 @@ describe('UpstreamPayer (integration): gateway pulls from a real upstream seeder
     expect(forwarded.every((m) => m.seederProofs.lockedTo === UP_P2PK)).toBe(true);
     // And the blob is now served by the gateway as its own (Blossom index is the seeder's).
     expect(r.gateway.seeder.blobs.coreByKey(coreKey)).toBeDefined();
+  });
+
+  // Lane P2-owed-viewer (ADR 0018 amendment): the gateway has no durable record and no host to
+  // authorise an old tail, so it pays none — but it must stay under what the upstream seeder says
+  // it still counts for it, or a restarted gateway is banned for its previous run's tail.
+  it('the gateway stays under what the upstream reports it still counts (OWED, ACK.outstanding), pays none of that old tail, and is never banned', async () => {
+    const BLOCKS = 9;
+    const WIN = 6;
+    const up = await upstream(WIN);
+    const data = fixtureBytes(BLOCKS, 23);
+    const put = await up.seeder.putBytes(data, { mime: 'video/mp4' });
+    if (!put.ok) throw new Error(put.error.code);
+    const coreKey = put.entry.coreKey;
+    // What an earlier run of the gateway left unpaid there: two blocks (past this blob).
+    up.engine.recordUpload(GW_PUBKEY, { core: coreKey, fromBlock: 50, toBlock: 51 }, basePolicy(3));
+    expect(up.engine.window(GW_PUBKEY)).toMatchObject({ outstanding: 2 });
+
+    const r = await rig({ windowBlocks: 100, raw: { upstream: { payEveryBlocks: 2 } } });
+    const gwStream = r.gateway.seeder.replicate(true);
+    const upStream = up.seeder.replicate(false);
+    gwStream.on('error', () => undefined);
+    upStream.on('error', () => undefined);
+    gwStream.pipe(upStream).pipe(gwStream);
+    const upProto = new FakePayProtocol();
+    await until(() => r.protocols.length === 1);
+    const gwProto = r.protocols[0]!;
+    const upSession = await (async () => {
+      await until(() => up.seeder.sessionInfos().length === 1);
+      return up.seeder.session(up.seeder.sessionInfos()[0]!.noiseKeyHex)!;
+    })();
+    up.seeder.attachPayProtocol(upSession, upProto);
+    // Bridge the two fakes: PAY up; ACK, PRICE and OWED down.
+    const origSendPay = gwProto.sendPay.bind(gwProto);
+    gwProto.sendPay = (msg) => {
+      origSendPay(msg);
+      upProto.remotePay(msg);
+    };
+    upProto.sendAck = (ack) => {
+      gwProto.remoteAck({ type: 'ACK', ...ack });
+    };
+    upProto.sendPrice = (price) => {
+      gwProto.remotePrice({ type: 'PRICE', ...price });
+    };
+    upProto.sendOwed = (owed) => {
+      gwProto.remoteOwed({ type: 'OWED', ...owed });
+    };
+    r.gateway.setUpstreamPolicy(coreKey, basePolicy(3));
+    const sc = await r.gateway.openUpstreamCore(coreKey);
+    // Both HELLOs: the upstream binds the gateway's pubkey and reports what it still counts.
+    gwProto.remoteHello(
+      helloFrom(UP_PUBKEY, {
+        acceptedMints: [MINT_A, MINT_B],
+        satsPerBlock: 3 as Sats,
+        p2pk: UP_P2PK,
+        windowBlocks: WIN,
+      }),
+    );
+    upProto.remoteHello(helloFrom(GW_PUBKEY, { acceptedMints: [MINT_A], windowBlocks: 0 }));
+    let worst = 0;
+    const sample = setInterval(() => {
+      worst = Math.max(worst, up.engine.window(GW_PUBKEY)?.outstanding ?? 0);
+    }, 1);
+    try {
+      const got = await sc.blobs.get(put.entry.blob, { wait: true, timeout: 15_000 });
+      expect(Buffer.from(got!).equals(Buffer.from(data))).toBe(true);
+      await r.gateway.payer.flush();
+      await until(() => up.engine.window(GW_PUBKEY)?.outstanding === 2, 10_000);
+    } finally {
+      clearInterval(sample);
+    }
+    const upNoise = toHex(upStream.noiseStream.publicKey!);
+    expect(r.gateway.seeders.reportOf(upNoise)).toMatchObject({ done: true, truncated: false });
+    // It paid this blob, and none of the old tail (no record, no host: it cannot know it got them).
+    const covered = gwProto.sentPays.flatMap((p) =>
+      Array.from(
+        { length: p.range.toBlock - p.range.fromBlock + 1 },
+        (_, i) => p.range.fromBlock + i,
+      ),
+    );
+    expect([...covered].sort((a, b) => a - b)).toEqual([...Array(BLOCKS).keys()]);
+    expect(r.gateway.payer.stats()).toMatchObject({ owedAccepted: 0, owedPaid: 0 });
+    // Never beyond window minus the reported count: never banned, never past the window.
+    expect(worst).toBeLessThanOrEqual(WIN);
+    expect(up.engine.window(GW_PUBKEY)).toMatchObject({ outstanding: 2, banned: false });
+    expect(up.engine.bans()).toEqual([]);
   });
 
   it('pays each core under its MANIFEST policy (creator P2PK from the manifest); a core without one is not paid (F2)', async () => {
@@ -1371,5 +1457,162 @@ describe('UpstreamPayer — deferred refusals, streaks and the clock (lane R6-re
       const d = monotonicClock({ performance: { now: 'x' }, dateNow: () => 7 });
       expect(d()).toBe(0);
     });
+  });
+});
+
+// ---- lane P2-owed-viewer (contracts v6 amendment; ADRs 0015 and 0018 amendments) ------------
+
+describe('UpstreamPayer — PRICE { free: true } is not a price (ADR 0015 amendment)', () => {
+  it('blocks of a core the seeder serves free are never pended nor paid (no 0-sat PAY); a later priced PRICE ends it', async () => {
+    const { payer, protocol } = unit(1);
+    protocol.remoteHello(hello());
+    payer.onDownload(CORE_A, 0, NOISE);
+    await payer.flush();
+    expect(protocol.sentPays).toHaveLength(1);
+    // Free from now on: pending blocks of it are dropped, later ones never pended.
+    payer.onDownload(CORE_A, 1, NOISE);
+    protocol.remotePrice({
+      type: 'PRICE',
+      core: CORE_A,
+      satsPerBlock: 0 as Sats,
+      effectiveFromBlock: 0,
+      free: true,
+    });
+    payer.onDownload(CORE_A, 2, NOISE);
+    await payer.flush();
+    expect(protocol.sentPays).toHaveLength(1);
+    // Another core is paid as ever; free is per core.
+    payer.onDownload(CORE_B, 0, NOISE);
+    await payer.flush();
+    expect(protocol.sentPays.map((p) => p.range.core)).toEqual([CORE_A, CORE_B]);
+    // Sold again: at its price, never at 0.
+    protocol.remotePrice({
+      type: 'PRICE',
+      core: CORE_A,
+      satsPerBlock: 3 as Sats,
+      effectiveFromBlock: 3,
+    });
+    payer.onDownload(CORE_A, 3, NOISE);
+    await payer.flush();
+    expect(protocol.sentPays).toHaveLength(3);
+    const last = protocol.sentPays[2]!;
+    expect(last.range).toEqual({ core: CORE_A, fromBlock: 3, toBlock: 3 });
+    const total = [...last.seederProofs.proofs, ...last.creatorProofs.proofs].reduce(
+      (n, p) => n + p.amount,
+      0,
+    );
+    expect(total).toBe(3);
+  });
+});
+
+describe('UpstreamPayer — owed blocks from before (ADR 0018 amendment)', () => {
+  const RECORDED = basePolicy(MANIFEST_PRICE);
+  function owedRig(o: { owed?: boolean; recorded?: PricePolicy | null } = {}) {
+    const engine = new mocks.MockPaymentEngine({ mode: 'honest' });
+    const owedCalls: { range: [number, number]; carryIn: number; peer: string }[] = [];
+    const given: [number, number][] = [];
+    const payer = new UpstreamPayer({
+      engine,
+      logger: capturedLogger().logger,
+      payEveryBlocks: 4,
+      tailMs: 0,
+      ownMints: [MINT_A, MINT_B],
+      policyFor: () => basePolicy(MANIFEST_PRICE),
+      onUnpayable: (_n, r) => given.push([r.fromBlock, r.toBlock]),
+      ...(o.owed === false
+        ? {}
+        : {
+            owed: {
+              policyFor: () => (o.recorded === undefined ? RECORDED : o.recorded),
+              pay: (range, seeder, policy, opts, peer) => {
+                owedCalls.push({
+                  range: [range.fromBlock, range.toBlock],
+                  carryIn: opts.carryIn,
+                  peer,
+                });
+                return engine.pay(range, seeder, policy, opts);
+              },
+            },
+          }),
+    });
+    const protocol = new FakePayProtocol({ autoAck: true });
+    payer.attachPeer(NOISE, protocol);
+    return { payer, protocol, owedCalls, given };
+  }
+  const priced = {
+    type: 'PRICE',
+    core: CORE_A,
+    satsPerBlock: 3 as Sats,
+    effectiveFromBlock: 0,
+  } as const;
+
+  it('taken only on an open connection, after the core’s priced PRICE, with an owed engine; never twice', async () => {
+    const r = owedRig();
+    expect(r.payer.addOwed(NOISE, CORE_A, [1, 2])).toBe(0); // not open yet
+    r.protocol.remoteHello(hello());
+    expect(r.payer.addOwed(NOISE, CORE_A, [1, 2])).toBe(0); // no priced PRICE for it here
+    r.protocol.remotePrice({ ...priced, satsPerBlock: 0 as Sats, free: true });
+    expect(r.payer.addOwed(NOISE, CORE_A, [1, 2])).toBe(0); // free now: rule 3, not payable
+    r.protocol.remotePrice(priced);
+    expect(r.payer.addOwed('ab'.repeat(32), CORE_A, [1])).toBe(0); // unknown peer
+    expect(r.payer.addOwed(NOISE, CORE_A, [1, 2, -1, 1.5])).toBe(2);
+    await r.payer.flush();
+    expect(r.payer.addOwed(NOISE, CORE_A, [1, 2])).toBe(0); // paid already on this connection
+    const gw = owedRig({ owed: false }); // the gateway: no owed engine, no old tail paid
+    gw.protocol.remoteHello(hello());
+    gw.protocol.remotePrice(priced);
+    expect(gw.payer.addOwed(NOISE, CORE_A, [1])).toBe(0);
+    expect(gw.payer.stats()).toMatchObject({ owedAccepted: 0, owedPaid: 0 });
+  });
+
+  it('paid at once and apart — never in one PAY with this connection’s blocks — on the connection’s carry chain, at the seeder’s asked price', async () => {
+    const r = owedRig();
+    r.protocol.remoteHello(hello());
+    r.protocol.remotePrice(priced);
+    // Blocks 4..5 of this connection are pending below a batch; 2..3 and 6 are owed from before.
+    r.payer.onDownload(CORE_A, 4, NOISE);
+    r.payer.onDownload(CORE_A, 5, NOISE);
+    expect(r.payer.addOwed(NOISE, CORE_A, [2, 3, 6])).toBe(3);
+    await r.payer.flush();
+    const ranges = r.protocol.sentPays.map((p) => [p.range.fromBlock, p.range.toBlock]);
+    expect(ranges).toEqual([
+      [2, 3],
+      [4, 5],
+      [6, 6],
+    ]);
+    // The owed ones through the owed engine (with the peer), the fresh ones through the payer's.
+    expect(r.owedCalls.map((c) => c.range)).toEqual([
+      [2, 3],
+      [6, 6],
+    ]);
+    expect(r.owedCalls.every((c) => c.peer === NOISE)).toBe(true);
+    // One carry chain for the core on this connection: 0 only for its first PAY.
+    expect(r.owedCalls[0]!.carryIn).toBe(0);
+    for (const p of r.protocol.sentPays) {
+      const n = [...p.seederProofs.proofs, ...p.creatorProofs.proofs].reduce(
+        (a, b) => a + b.amount,
+        0,
+      );
+      expect(n).toBe((p.range.toBlock - p.range.fromBlock + 1) * 3); // the seeder's asked 3 ≤ 5
+    }
+    expect(r.payer.stats()).toMatchObject({ owedAccepted: 3, owedPaid: 3 });
+  });
+
+  it('not payable at the terms recorded (or asked above them): given up — respected, never paid', async () => {
+    const none = owedRig({ recorded: null });
+    none.protocol.remoteHello(hello());
+    none.protocol.remotePrice(priced);
+    none.payer.addOwed(NOISE, CORE_A, [7, 8]);
+    await none.payer.flush();
+    expect(none.protocol.sentPays).toHaveLength(0);
+    expect(none.given).toEqual([[7, 8]]);
+    const dear = owedRig({ recorded: basePolicy(2) });
+    dear.protocol.remoteHello(hello());
+    dear.protocol.remotePrice(priced); // asks 3 > the recorded 2
+    dear.payer.addOwed(NOISE, CORE_A, [7]);
+    await dear.payer.flush();
+    expect(dear.protocol.sentPays).toHaveLength(0);
+    expect(dear.given).toEqual([[7, 7]]);
+    expect(dear.payer.stats()).toMatchObject({ owedAccepted: 1, owedPaid: 0, unpayableBlocks: 1 });
   });
 });

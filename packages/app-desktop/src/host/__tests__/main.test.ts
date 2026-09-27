@@ -25,7 +25,11 @@ import { eventually } from './support/rig.js';
 const dirs: string[] = [];
 const hosts: Host[] = [];
 afterEach(async () => {
-  for (const h of hosts.splice(0)) h.stop();
+  for (const h of hosts.splice(0)) {
+    h.stop();
+    // Lane P2-owed-viewer: tail authorisations of sessions `stop` dropped land before the rm.
+    await h.adapter.flushTails().catch(() => undefined);
+  }
   for (const d of dirs.splice(0)) await rm(d, { recursive: true, force: true });
 });
 

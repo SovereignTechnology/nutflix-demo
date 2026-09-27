@@ -60,6 +60,19 @@
  * Only peers that sent a verified `HELLO` (protocol `open`) are paid; blocks downloaded before
  * it are counted and become payable the moment it arrives. Every `BlockRange` carries `core`
  * (v3/v5).
+ *
+ * Lane P2-owed-viewer (contracts v6 amendment, ADRs 0015 and 0018 amendments):
+ *   - **`PRICE { free: true }` is not a price.** It says the seeder serves that core outside
+ *     payment on this connection: its blocks of that core are owed nothing and never paid (they
+ *     are not even pended), and a later priced `PRICE` ends that. It never becomes a 0-sat price.
+ *   - **Blocks a seeder reported as owed from before** (`OWED`) are paid only when the downloader
+ *     hands them over (`addOwed`: the ones its own record says it received from that seeder) and
+ *     it gave an `owed` engine (the desktop; the gateway has none and pays no old tail). They are
+ *     paid at once, on THIS connection's carry chain for the core, at the terms the downloader
+ *     recorded (`owed.policyFor`) and only after the seeder's priced `PRICE` for the core on this
+ *     connection (contract rule 3; the price it asks may only lower the recorded one). A PAY never
+ *     mixes owed blocks with blocks of this connection (another authorisation pays each). What
+ *     the seeder reports beyond what is handed over is its claim: never paid here.
  */
 import type {
   BlockRange,
@@ -85,7 +98,30 @@ export type UpstreamPolicyResolver = (
   core: CoreKeyHex,
   hello: HelloMessage,
   peer: string,
+  /** The range about to be paid (lane P2-owed-viewer); resolvers of one policy per core ignore it. */
+  range?: BlockRange,
 ) => PricePolicy | null;
+
+/**
+ * Lane P2-owed-viewer: how blocks a seeder reported as owed from before are paid (`addOwed`). Only
+ * the desktop has it (its worker's record, the host's tail authorisations).
+ */
+export interface OwedPayment {
+  /** The terms `range` was recorded at when it was downloaded; `null` = not payable. */
+  readonly policyFor: UpstreamPolicyResolver;
+  /** Build the PAY for owed `range` (the host checks it like any PAY). A throw is a failed PAY. */
+  readonly pay: (
+    range: BlockRange,
+    seeder: {
+      readonly pubkey: HelloMessage['pubkey'];
+      readonly p2pk: HelloMessage['p2pk'];
+      readonly mint: MintUrl;
+    },
+    policy: PricePolicy,
+    opts: { readonly carryIn: number },
+    peer: string,
+  ) => Promise<PayMessage>;
+}
 
 /** How long a short tail waits for more blocks before it is paid anyway. */
 export const DEFAULT_TAIL_MS = 2000;
@@ -232,13 +268,18 @@ export interface UpstreamPayerOptions {
    * different core or first block, an empty or longer range, a throw) is ignored: the range is
    * paid as it is. Default: no bound.
    */
-  readonly boundRange?: (range: BlockRange) => BlockRange;
+  readonly boundRange?: (range: BlockRange, noiseHex: string) => BlockRange;
   /**
    * Lane R6-reconcile: a monotonic clock in ms for failure streaks, backoffs and the give-up
    * (default `monotonicClock()`). Never the wall clock: see the module comment. A reading that
    * goes back, is not a finite number or throws is not taken (the latest good one stands).
    */
   readonly clock?: () => number;
+  /**
+   * Lane P2-owed-viewer: pays blocks a seeder reported as owed from before (`addOwed`). Absent
+   * (the gateway), `addOwed` takes nothing: no old tail is paid.
+   */
+  readonly owed?: OwedPayment;
 }
 
 interface PriceOverride {
@@ -270,8 +311,12 @@ interface PeerState {
   readonly noiseHex: string;
   readonly protocol: PayProtocol;
   hello: HelloMessage | null;
-  /** core → the latest `PRICE` for it (v5: prices are per core). */
+  /** core → the latest priced `PRICE` for it (v5: prices are per core). */
   readonly price: Map<CoreKeyHex, PriceOverride>;
+  /** Cores it serves outside payment on this connection (`PRICE { free: true }`, its last word). */
+  readonly free: Set<CoreKeyHex>;
+  /** core → pending blocks it reported as owed from before (`addOwed`): paid at once, apart. */
+  readonly owed: Map<CoreKeyHex, Set<number>>;
   /** core → sorted set of downloaded-but-unpaid block indexes. */
   readonly pending: Map<CoreKeyHex, Set<number>>;
   /** core → indexes already paid (replay guard). */
@@ -316,6 +361,9 @@ export interface UpstreamPayerStats {
   readonly payFailures: number;
   /** Blocks given up: their PAY could not be built for good (settled as unpaid). */
   readonly unpayableBlocks: number;
+  /** Lane P2-owed-viewer: owed blocks (from before) handed over, and those paid (PAYs sent). */
+  readonly owedAccepted: number;
+  readonly owedPaid: number;
 }
 
 /** Read through a function so TS's property narrowing does not survive the `await`s. */
@@ -340,6 +388,13 @@ function contiguousRuns(sorted: readonly number[]): [number, number][] {
   return runs;
 }
 
+/** Some block of `from..to` is in `owed`. */
+function owedIn(owed: ReadonlySet<number> | undefined, from: number, to: number): boolean {
+  if (owed === undefined || owed.size === 0) return false;
+  for (const i of owed) if (i >= from && i <= to) return true;
+  return false;
+}
+
 export class UpstreamPayer {
   private readonly engine: PaymentEngineViewer;
   private readonly log: Logger;
@@ -351,6 +406,7 @@ export class UpstreamPayer {
   private readonly onUnpayable: UpstreamPayerOptions['onUnpayable'];
   private readonly boundRange: UpstreamPayerOptions['boundRange'];
   private readonly clock: () => number;
+  private readonly owedPay: OwedPayment | undefined;
   /** The latest good reading of `clock` (see `now`). */
   private lastClock = Number.NEGATIVE_INFINITY;
   /** `dispose()` ran: no timer is armed and no PAY is built any more. */
@@ -369,6 +425,8 @@ export class UpstreamPayer {
     skippedOverpriced: 0,
     payFailures: 0,
     unpayableBlocks: 0,
+    owedAccepted: 0,
+    owedPaid: 0,
   };
 
   constructor(o: UpstreamPayerOptions) {
@@ -382,6 +440,7 @@ export class UpstreamPayer {
     this.onUnpayable = o.onUnpayable;
     this.boundRange = o.boundRange;
     this.clock = o.clock ?? monotonicClock();
+    this.owedPay = o.owed;
     this.tailMs = o.tailMs ?? DEFAULT_TAIL_MS;
     // Pressure: pay whatever is held so the pool can refill.
     this.offPressure =
@@ -460,8 +519,11 @@ export class UpstreamPayer {
     const state: PeerState = {
       noiseHex,
       protocol,
-      hello: protocol.peer,
+      // Only an OPEN channel's HELLO (both done): nothing is paid before our own HELLO went out.
+      hello: protocol.state === 'open' ? protocol.peer : null,
       price: new Map(),
+      free: new Set(),
+      owed: new Map(),
       pending: new Map(),
       paid: new Map(),
       carry: new Map(),
@@ -488,6 +550,15 @@ export class UpstreamPayer {
         this.schedule(state, false);
       }),
       protocol.on('price', (p) => {
+        if (p.free === true) {
+          // Served outside payment from now on: owed nothing — never a 0-sat price.
+          state.free.add(p.core);
+          state.price.delete(p.core);
+          this.dropPending(state, p.core);
+          this.log.info('upstream PRICE: free', { core: p.core });
+          return;
+        }
+        state.free.delete(p.core);
         state.price.set(p.core, {
           satsPerBlock: p.satsPerBlock,
           effectiveFromBlock: p.effectiveFromBlock,
@@ -550,6 +621,7 @@ export class UpstreamPayer {
   onDownload(core: CoreKeyHex, index: number, noiseHex: string): void {
     const state = this.peers.get(noiseHex);
     if (!state || state.closed) return;
+    if (state.free.has(core)) return; // served free: owed nothing
     if (state.paid.get(core)?.has(index)) return;
     let set = state.pending.get(core);
     if (!set) {
@@ -576,6 +648,39 @@ export class UpstreamPayer {
     return () => {
       this.hurried.delete(r);
     };
+  }
+
+  /**
+   * Lane P2-owed-viewer: blocks of `core` the seeder `noiseHex` reported as owed from before, which
+   * the downloader's own record says it received from that seeder — pay them now, apart from this
+   * connection's blocks (see the module comment). Taken only on an open connection, with an `owed`
+   * engine, after the seeder's priced `PRICE` for `core` here (contract rule 3), and not for blocks
+   * already paid or pending on it. Returns how many were taken.
+   */
+  addOwed(noiseHex: string, core: CoreKeyHex, indexes: Iterable<number>): number {
+    const state = this.peers.get(noiseHex);
+    if (this.owedPay === undefined || this.disposed) return 0;
+    if (state === undefined || state.closed || state.hello === null) return 0;
+    if (!state.price.has(core) || state.free.has(core)) return 0;
+    const paid = state.paid.get(core);
+    let pending = state.pending.get(core);
+    let owed = state.owed.get(core);
+    let n = 0;
+    for (const i of indexes) {
+      if (!Number.isSafeInteger(i) || i < 0) continue;
+      if (paid?.has(i) === true || pending?.has(i) === true) continue;
+      pending ??= new Set();
+      owed ??= new Set();
+      pending.add(i);
+      owed.add(i);
+      n++;
+    }
+    if (n === 0) return 0;
+    if (pending !== undefined) state.pending.set(core, pending);
+    if (owed !== undefined) state.owed.set(core, owed);
+    this.counters.owedAccepted += n;
+    this.schedule(state, state.draining || state.due);
+    return n;
   }
 
   /** Blocks `from..to` of `core` overlap a hurried range. */
@@ -695,18 +800,35 @@ export class UpstreamPayer {
           break;
         }
         const sorted = [...set].sort((a, b) => a - b);
+        const owedHere = state.owed.get(core);
         const run = contiguousRuns(sorted).find(
           ([from, to]) =>
-            due || failed !== undefined || to - from + 1 >= batch || this.isHurried(core, from, to),
+            due ||
+            failed !== undefined ||
+            to - from + 1 >= batch ||
+            this.isHurried(core, from, to) ||
+            owedIn(owedHere, from, to),
         );
         if (run === undefined) break;
         // One PAY per core in flight: the first price segment of the first payable run now, the
         // rest when its ACK arrives.
         const [split] = this.splitAtPrice(state, { core, fromBlock: run[0], toBlock: run[1] });
         if (split === undefined) break;
-        const range = this.bound(split);
-        const policy = this.resolvePolicy(state, core, hello, range);
-        if (policy === null) break;
+        // Lane P2-owed-viewer: owed blocks (from before) and this connection's never share a PAY.
+        const isOwed = owedHere?.has(split.fromBlock) === true;
+        const range = this.bound(
+          isOwed ? this.owedPrefix(owedHere, split) : this.freshPrefix(owedHere, split),
+          state.noiseHex,
+        );
+        const policy = this.resolvePolicy(state, core, hello, range, isOwed);
+        if (policy === null) {
+          if (isOwed) {
+            // Not payable at the terms recorded (or no longer priced here): respected, not paid.
+            this.giveUpOwed(state, core, set, range);
+            continue;
+          }
+          break;
+        }
         const mint = hello.acceptedMints.find(
           (m) => this.ownMints.includes(m) && policy.mints.includes(m),
         );
@@ -716,6 +838,10 @@ export class UpstreamPayer {
             peer: state.noiseHex,
             core,
           });
+          if (isOwed) {
+            this.giveUpOwed(state, core, set, range);
+            continue;
+          }
           break;
         }
         const carryIn = state.carry.get(core) ?? 0;
@@ -723,12 +849,11 @@ export class UpstreamPayer {
         const carryOut = payment.splitPay(amount, policy.split, carryIn).carryOut;
         let msg: PayMessage;
         try {
-          msg = await this.engine.pay(
-            range,
-            { pubkey: hello.pubkey, p2pk: hello.p2pk, mint },
-            policy,
-            { carryIn },
-          );
+          const seeder = { pubkey: hello.pubkey, p2pk: hello.p2pk, mint };
+          msg =
+            isOwed && this.owedPay !== undefined
+              ? await this.owedPay.pay(range, seeder, policy, { carryIn }, state.noiseHex)
+              : await this.engine.pay(range, seeder, policy, { carryIn });
         } catch (err) {
           // Fix round 4: this core only — the peer's other cores are paid as usual.
           if (isClosed(state)) return;
@@ -741,6 +866,7 @@ export class UpstreamPayer {
         state.protocol.sendPay(msg);
         this.counters.pays++;
         this.counters.blocksPaid += range.toBlock - range.fromBlock + 1;
+        if (isOwed) this.counters.owedPaid += range.toBlock - range.fromBlock + 1;
         let paidSet = state.paid.get(core);
         if (!paidSet) {
           paidSet = new Set();
@@ -749,6 +875,7 @@ export class UpstreamPayer {
         for (let i = range.fromBlock; i <= range.toBlock; i++) {
           paidSet.add(i);
           set.delete(i);
+          owedHere?.delete(i);
         }
         this.log.debug('PAY sent upstream', {
           peer: state.noiseHex,
@@ -808,8 +935,10 @@ export class UpstreamPayer {
       paidSet = new Set();
       state.paid.set(core, paidSet);
     }
+    const owed = state.owed.get(core);
     for (let i = range.fromBlock; i <= range.toBlock; i++) {
       set.delete(i);
+      owed?.delete(i);
       paidSet.add(i); // never paid: a re-download owes nothing new
     }
     this.counters.unpayableBlocks += range.toBlock - range.fromBlock + 1;
@@ -822,12 +951,12 @@ export class UpstreamPayer {
   }
 
   /** `range` cut to what one PAY may cover (`boundRange`); a bad answer is ignored. */
-  private bound(range: BlockRange): BlockRange {
+  private bound(range: BlockRange, noiseHex: string): BlockRange {
     const f = this.boundRange;
     if (f === undefined) return range;
     let b: BlockRange;
     try {
-      b = f(range);
+      b = f(range, noiseHex);
     } catch {
       return range;
     }
@@ -842,6 +971,62 @@ export class UpstreamPayer {
     return b.toBlock === range.toBlock
       ? range
       : { core: range.core, fromBlock: range.fromBlock, toBlock: b.toBlock };
+  }
+
+  /** The prefix of `r` (whose first block is owed) made of owed blocks only. */
+  private owedPrefix(owed: ReadonlySet<number> | undefined, r: BlockRange): BlockRange {
+    let to = r.fromBlock;
+    while (to < r.toBlock && owed?.has(to + 1) === true) to++;
+    return to === r.toBlock ? r : { core: r.core, fromBlock: r.fromBlock, toBlock: to };
+  }
+
+  /** The prefix of `r` (whose first block is not owed) with no owed block in it. */
+  private freshPrefix(owed: ReadonlySet<number> | undefined, r: BlockRange): BlockRange {
+    if (owed === undefined || owed.size === 0) return r;
+    let to = r.fromBlock;
+    while (to < r.toBlock && !owed.has(to + 1)) to++;
+    return to === r.toBlock ? r : { core: r.core, fromBlock: r.fromBlock, toBlock: to };
+  }
+
+  /**
+   * Owed blocks of `range` that cannot be paid at the terms recorded: dropped (the seeder keeps
+   * counting them — respected, never paid), reported like any range given up.
+   */
+  private giveUpOwed(
+    state: PeerState,
+    core: CoreKeyHex,
+    set: Set<number>,
+    range: BlockRange,
+  ): void {
+    let paidSet = state.paid.get(core);
+    if (!paidSet) {
+      paidSet = new Set();
+      state.paid.set(core, paidSet);
+    }
+    const owed = state.owed.get(core);
+    for (let i = range.fromBlock; i <= range.toBlock; i++) {
+      set.delete(i);
+      owed?.delete(i);
+      paidSet.add(i);
+    }
+    this.counters.unpayableBlocks += range.toBlock - range.fromBlock + 1;
+    try {
+      this.onUnpayable?.(state.noiseHex, range);
+    } catch {
+      // the listener's failure is its own
+    }
+  }
+
+  /** `core` turned free at this peer: nothing pending of it will be paid (owed nothing). */
+  private dropPending(state: PeerState, core: CoreKeyHex): void {
+    const set = state.pending.get(core);
+    if (set === undefined || set.size === 0) return;
+    const owed = state.owed.get(core);
+    for (const i of [...set]) {
+      // Blocks it reported as owed from before stay counted: rule 3, never forgiven by `free`.
+      if (owed?.has(i) === true) continue;
+      set.delete(i);
+    }
   }
 
   private splitAtPrice(state: PeerState, r: BlockRange): BlockRange[] {
@@ -863,8 +1048,13 @@ export class UpstreamPayer {
     core: CoreKeyHex,
     hello: HelloMessage,
     range: BlockRange,
+    owed = false,
   ): PricePolicy | null {
-    const base = this.policyFor(core, hello, state.noiseHex);
+    if (owed && !state.price.has(core)) return null; // contract rule 3: a priced PRICE here first
+    const base =
+      owed && this.owedPay !== undefined
+        ? this.owedPay.policyFor(core, hello, state.noiseHex, range)
+        : this.policyFor(core, hello, state.noiseHex, range);
     if (base === null) {
       this.counters.skippedNoPolicy++;
       this.log.warn('no policy for upstream core — not paying', { peer: state.noiseHex, core });
@@ -902,19 +1092,23 @@ export function manifestPolicyResolver(
 export { CreditCancelled, CreditPool, type CreditWaiter } from './credit.js';
 export {
   CreditSettler,
+  type AckListener,
   type CreditSettlerOptions,
   type CreditSettlerStats,
   type SettleListener,
 } from './settle.js';
 export {
-  MAX_IMAGE_VERDICTS_PER_SEEDER,
+  MAX_FREE_CORES_PER_SEEDER,
   MAX_POOL_CREDIT,
   MAX_REMEMBERED_SEEDERS,
   MAX_SEEDER_CREDIT,
   NO_PAY_INFLIGHT,
+  REPORT_WAIT_MS,
   SeederCredit,
-  type ImageVerdict,
   type SeederBatch,
   type SeederCreditOptions,
   type SeederCreditStats,
+  type SeederLedger,
+  type SeederReach,
+  type SeederReport,
 } from './seeder-credit.js';

@@ -48,6 +48,7 @@ import {
   unavailableReason,
 } from './wallet.js';
 import { WALLET_DIR } from './wallet-journal.js';
+import { TAIL_DIR } from './tails.js';
 import type { Nip46Connector } from './signer/desktop-signer.js';
 import { DesktopSigner } from './signer/desktop-signer.js';
 import { MainBridge } from './signer/main-bridge.js';
@@ -194,6 +195,9 @@ export class Host {
       clearTimeout(timer);
     }
     this.stop();
+    // Lane P2-owed-viewer: the sessions just closed (or dropped by `stop`) keep their tails on
+    // disk before the process exits. A private-file write: bounded by the disk, not the network.
+    await this.adapter.flushTails().catch(() => undefined);
   }
 
   stop(): void {
@@ -340,6 +344,8 @@ export async function createHost(o: HostOptions): Promise<Host> {
       log: log.child('money'),
       // ADR 0014 amendment (issue #8): the wallet journal, sealed, per identity.
       journalDir: join(o.userData, WALLET_DIR),
+      // Lane P2-owed-viewer: closed sessions' tail authorisations, per identity.
+      tailDir: join(o.userData, TAIL_DIR),
       ...(create ? { createWallet: true } : {}),
       ...(o.mintRequest === undefined ? {} : { mintRequest: o.mintRequest }),
       ...(o.now === undefined ? {} : { now: o.now }),

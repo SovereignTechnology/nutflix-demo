@@ -96,7 +96,9 @@ const RESULTS: { readonly [M in WorkerMethod]: readonly WorkerMethodTable[M][1][
   'play.pause': [undefined],
   'play.resume': [undefined],
   'play.prefetch': [undefined],
-  'play.close': [undefined],
+  // Lane P2-owed-viewer: play.close answers the session's unpaid tail (it answered nothing before;
+  // the host now keeps a tail authorisation for what is left — ADR 0018 amendment).
+  'play.close': [{ unpaid: 0 }, { unpaid: 12 }],
   'seeder.status': [status],
   'seeder.configure': [undefined],
   'seeder.melt': [{ paid: true }],
@@ -310,6 +312,17 @@ describe('host → worker', () => {
       validateWorkerResult['play.open']({ key: R.hyper.core, link: 'http://127.0.0.1:0/x' }),
     ).toBe(false);
     expect(validateWorkerResult.init({})).toBe(false);
+    // Lane P2-owed-viewer: the unpaid tail is a bounded count, exact keys, nothing else.
+    for (const bad of [
+      undefined,
+      {},
+      { unpaid: -1 },
+      { unpaid: 1.5 },
+      { unpaid: '3' },
+      { unpaid: 2 ** 21 },
+      { unpaid: 1, extra: true },
+    ])
+      expect(validateWorkerResult['play.close'](bad), JSON.stringify(bad)).toBe(false);
     expect(validateWorkerResult['image.fetch']({ hex: 'abc' })).toBe(false); // odd length
     expect(validateWorkerResult['image.fetch']({ hex: 'ZZ' })).toBe(false);
     expect(isHostToWorker({ op: 'req', id: 1, m: 'studio.publish', a: draft })).toBe(false); // wrong direction

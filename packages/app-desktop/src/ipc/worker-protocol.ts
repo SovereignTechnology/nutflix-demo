@@ -132,8 +132,14 @@ export interface WorkerMethodTable {
   'play.pause': [args: { readonly sid: SessionId }, result: undefined];
   'play.resume': [args: { readonly sid: SessionId }, result: undefined];
   'play.prefetch': [args: { readonly sid: SessionId; readonly seconds: number }, result: undefined];
-  /** Closes the session; its link 404s afterwards. Idempotent. */
-  'play.close': [args: { readonly sid: SessionId }, result: undefined];
+  /**
+   * Closes the session; its link 404s afterwards. Idempotent. Lane P2-owed-viewer: answers once
+   * the session's tail was paid or its drain ran out, with `unpaid` — the blocks received for this
+   * session that are still unpaid (the worker's durable record); the host then keeps a tail
+   * authorisation for them (ADR 0018 amendment). A second call for a session already gone
+   * answers 0.
+   */
+  'play.close': [args: { readonly sid: SessionId }, result: { readonly unpaid: number }];
   'seeder.status': [args: Record<string, never>, result: SeederStatusWire];
   /** Pushed by the host whenever Settings.seeding changes. */
   'seeder.configure': [args: Settings['seeding'], result: undefined];

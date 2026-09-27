@@ -27,6 +27,15 @@
  *     terms (creator key, split, block size, mints; a price at most the manifest's), and only up
  *     to a block budget of twice the blob (headroom for the duplicate deliveries of F33). A
  *     compromised worker cannot pay a stranger, pay for another video, or drain the wallet.
+ *   - Lane P2-owed-viewer (ADR 0018 amendment): a session that closes with blocks still unpaid
+ *     (`revokeSession(sid, unpaid)`: what the worker's `play.close` reported, or `null` when the
+ *     worker could not say — gone, or the app quitting past its bound) leaves a TAIL
+ *     authorisation (`tails.ts`): the same core, blob range and manifest terms, a budget of at
+ *     most what the session had left, persisted per identity for `TAIL_TTL_MS`. A later
+ *     `pay.build` naming that session is checked against it exactly like an open session's; its
+ *     blocks come off the budget on disk before the PAY is built. So a seeder that reports those
+ *     blocks on a later connection is paid for what the worker's record holds, and never more
+ *     than the session could have paid.
  *   - PAY builds and melts at one mint never overlap (`pay-melt-gate.ts`, ADR 0012 amendment
  *     2026-09-25): every melt of this wallet — the user's withdrawal, an auto top-up's funding
  *     melt — goes through the gate (`GatedCashuWallet.melt`), and a PAY is refused at once, with
@@ -73,6 +82,7 @@ import { hostError } from './errors.js';
 import type { Logger } from './log.js';
 import { hostMintRequest } from './mint-transport.js';
 import { PayMeltGate } from './pay-melt-gate.js';
+import { TailBook } from './tails.js';
 import type { TopUpVault } from './topup/auto-topup.js';
 import { openWalletJournal } from './wallet-journal.js';
 import type { HostRequestHandlers } from './worker/supervisor.js';
@@ -102,6 +112,13 @@ export interface MoneyPlaneOptions {
    * where a crash loses an operation whose answer was lost.
    */
   readonly journalDir: string | null;
+  /**
+   * Lane P2-owed-viewer: where closed sessions' tail authorisations live (`<userData>/tails`,
+   * created 0700). Absent or `null` (tests): in memory, lost with the process.
+   */
+  readonly tailDir?: string | null;
+  /** Tests: the tail authorisations' wall clock in ms (default: `now`, else `Date.now`). */
+  readonly tailClock?: () => number;
   /**
    * Make a NEW wallet key when the relays hold none — only for an explicit "create my wallet".
    * Default false: at startup a miss may just be unreachable relays, and creating then would
@@ -178,6 +195,8 @@ export class MoneyPlane {
    */
   readonly settles: walletMod.SettleLoop;
   private readonly sessions = new Map<SessionId, SessionBudget>();
+  /** Lane P2-owed-viewer: closed sessions' tails, per identity (see the module comment). */
+  private readonly tails: TailBook;
   private readonly creators = new Map<string, NostrPubkey>();
   private readonly viewer: payment.RealPaymentEngine;
   /** PAY builds and melts at one mint never overlap (`pay-melt-gate.ts`). */
@@ -205,9 +224,11 @@ export class MoneyPlane {
       readonly pubkey: NostrPubkey;
       readonly nip60: walletMod.Nip60Wallet;
       readonly journal: walletMod.SealedJournal | undefined;
+      readonly tails: TailBook;
     },
   ) {
     this.wallet = parts.wallet;
+    this.tails = parts.tails;
     this.gate = parts.gate;
     this.store = parts.store;
     this.conns = parts.conns;
@@ -263,6 +284,14 @@ export class MoneyPlane {
       // Sealed to this identity; a file that does not open refuses the wallet (and is kept).
       if (o.journalDir !== null)
         journal = await openWalletJournal({ dir: o.journalDir, signer: o.signer, pubkey });
+      const now = o.now;
+      const tailClock = o.tailClock ?? (now === undefined ? undefined : () => now() * 1000);
+      const tails = await TailBook.open({
+        dir: o.tailDir ?? null,
+        pubkey,
+        log: o.log,
+        ...(tailClock === undefined ? {} : { now: tailClock }),
+      });
       const store = await walletMod.Nip60ProofStore.load({
         signer: o.signer,
         relays,
@@ -305,6 +334,7 @@ export class MoneyPlane {
         pubkey,
         nip60,
         journal,
+        tails,
       });
       // What a crash cut off (a request sent, its answer never seen) is settled now: NUT-09
       // restores what the mint signed; every operation at a mint settles it first anyway.
@@ -371,8 +401,23 @@ export class MoneyPlane {
     if (creator !== undefined) this.rememberCreator(s.policy.creatorP2pk, creator);
   }
 
-  revokeSession(sid: SessionId): void {
+  /**
+   * The session closed: nothing more is paid for it as a session. Lane P2-owed-viewer: with blocks
+   * still unpaid (`unpaid` > 0, what the worker reported at `play.close`; `null` = unknown, the
+   * worker could not say), it leaves a tail authorisation for at most what it had left (see the
+   * module comment). Resolves once that is on disk (a failed write is logged; the tail is then
+   * not payable after a restart — respected, never paid).
+   */
+  revokeSession(sid: SessionId, unpaid: number | null = 0): Promise<void> {
+    const s = this.sessions.get(sid);
     this.sessions.delete(sid);
+    if (s === undefined || this.closed) return Promise.resolve();
+    return this.keepTail(sid, s, unpaid);
+  }
+
+  /** Every tail write started so far has finished (the host's quit waits for it). */
+  flushTails(): Promise<void> {
+    return this.tails.flush();
   }
 
   /** A creator seen in a manifest: nutzaps for proofs locked to `p2pk` go to `pubkey`. */
@@ -451,6 +496,9 @@ export class MoneyPlane {
   close(): void {
     if (this.closed) return;
     this.closed = true;
+    // Lane P2-owed-viewer: signed out or locked with sessions open — the worker is restarted
+    // without saying what they left unpaid, so each keeps its remaining budget as a tail.
+    for (const [sid, s] of this.sessions) void this.keepTail(sid, s, null);
     this.sessions.clear();
     this.settles.stop();
     this.closeKey();
@@ -463,7 +511,13 @@ export class MoneyPlane {
     // The belt's clock starts when the request arrives (`PAY_BUILD_START_BY_MS`).
     const arrived = this.gate.now();
     this.open();
-    const s = this.sessions.get(a.sid);
+    // An open session, else (lane P2-owed-viewer) a closed session's tail: checked alike.
+    const open = this.sessions.get(a.sid);
+    const found = open === undefined ? this.tails.lookup(a.sid) : undefined;
+    if (found === 'expired')
+      throw hostError('forbidden', 'the tail authorisation of that session has expired');
+    const tail = found;
+    const s: SessionBudget | undefined = open ?? tail;
     if (s === undefined) throw hostError('session-closed', 'no open play session for this PAY');
     if (a.range.core !== s.core) throw hostError('forbidden', 'the PAY is for another video');
     if (a.range.fromBlock < s.first || a.range.toBlock > s.last)
@@ -484,6 +538,16 @@ export class MoneyPlane {
     if (s.paidBlocks + blocks > s.budgetBlocks)
       throw hostError('forbidden', 'the session has paid for its whole budget');
     s.paidBlocks += blocks;
+    if (tail !== undefined) {
+      // A tail's blocks leave its budget ON DISK before anything is spent (a crash can never
+      // leave more authorised than was left).
+      try {
+        await this.tails.save();
+      } catch {
+        s.paidBlocks -= blocks;
+        throw hostError('internal', 'the tail authorisation could not be updated');
+      }
+    }
     try {
       // Refused at once (`rate-limited:`, nothing spent) while a melt is pending or in flight at
       // this mint, or once the PAY has waited too long for its turn there (the gate's rules):
@@ -497,7 +561,8 @@ export class MoneyPlane {
         async () => {
           // The turn may have come after a sign-out or the session's end: spend nothing then.
           this.open();
-          if (this.sessions.get(a.sid) !== s)
+          const still = tail === undefined ? this.sessions.get(a.sid) : this.tails.get(a.sid);
+          if (still !== s)
             throw hostError('session-closed', 'the play session closed before the PAY was built');
           try {
             return await this.viewer.pay(a.range, a.seeder, p, { carryIn: a.carryIn });
@@ -510,10 +575,35 @@ export class MoneyPlane {
       );
     } catch (err) {
       s.paidBlocks -= blocks;
+      if (tail !== undefined) void this.tails.save().catch(() => undefined);
       if (err instanceof walletMod.WalletError && err.code === 'insufficient-funds')
         throw hostError('no-balance', 'not enough sats at this mint to keep streaming');
       throw err;
     }
+  }
+
+  /** Keep `s`'s tail (see `revokeSession`): at most what it had left. */
+  private keepTail(sid: SessionId, s: SessionBudget, unpaid: number | null): Promise<void> {
+    const left = s.budgetBlocks - s.paidBlocks;
+    const want =
+      unpaid === null
+        ? left
+        : Number.isSafeInteger(unpaid) && unpaid > 0
+          ? Math.min(unpaid, left)
+          : 0;
+    if (want < 1) return Promise.resolve();
+    return this.tails
+      .add({
+        sid,
+        core: s.core,
+        first: s.first,
+        last: s.last,
+        policy: s.policy,
+        budgetBlocks: want,
+      })
+      .catch(() => {
+        this.o.log.warn('a tail authorisation could not be written (not payable after a restart)');
+      });
   }
 
   private paidAt(mint: MintUrl): void {

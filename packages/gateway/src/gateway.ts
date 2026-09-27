@@ -183,13 +183,26 @@ export class Gateway {
     this.credit = new CreditPool(config.upstream.creditBlocks);
     const payable = (core: CoreKeyHex): boolean =>
       deps.upstreamPolicy !== undefined || this.upstreamPolicies.has(core);
-    this.settler = new CreditSettler({ credit: this.credit, logger: this.log, payable });
+    this.settler = new CreditSettler({
+      credit: this.credit,
+      logger: this.log,
+      payable,
+      // ADR 0015 amendment: a core a seeder serves free is owed nothing.
+      servesFree: (noiseHex, core) => this.seeders.servesFree(noiseHex, core),
+    });
     this.seeders = new SeederCredit({
       settler: this.settler,
       pool: this.credit,
       policyFor: (core) => this.upstreamPolicies.get(core) ?? null,
       logger: this.log,
     });
+    // Lane P2-owed-viewer (ADR 0018 amendment): the gateway has no durable record of what it
+    // received and no host to authorise a closed session's tail, so it pays no OLD tail (no
+    // `owed` engine: an `OWED` is never paid here). It stays under what each seeder reports it
+    // still counts (`SeederCredit`: one block at a time until the report is in, then its window
+    // less what it reported, re-based by every `ACK.outstanding`), so a restarted gateway is not
+    // banned for the blocks its previous run left unpaid; those stay counted at the seeder until
+    // that seeder forgets them (a restart of its own).
     this.payer = new UpstreamPayer({
       engine: deps.viewerEngine,
       logger: this.log,

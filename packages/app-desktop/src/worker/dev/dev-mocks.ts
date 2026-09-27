@@ -131,6 +131,8 @@ export function devMockProviders(o: DevMockOptions): DevMockProviders {
     engine,
     seederEngine: engine,
     pay: (range, seeder, policy) => engine.pay(range, seeder, policy),
+    // A dev identity is new every run (nothing is recorded for it): mid-run tails only.
+    payOwed: (_sid, range, seeder, policy) => engine.pay(range, seeder, policy),
     viewerMints: engine.config.acceptedMints,
     payWiring: {
       protocol: (link) => o.hub.endpoint(link),

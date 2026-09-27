@@ -225,7 +225,8 @@ export class FakeWorker extends EventEmitter implements WorkerProcess {
       }
       case 'play.close':
         this.sessions.delete((a as { sid: string }).sid);
-        return Promise.resolve(undefined);
+        // Lane P2-owed-viewer: the session's unpaid tail (none, unless a test sets a handler).
+        return Promise.resolve({ unpaid: 0 });
       case 'seeder.status':
         return Promise.resolve(FAKE_SEEDER_STATUS);
       case 'seeder.melt':

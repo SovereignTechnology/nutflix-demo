@@ -295,6 +295,28 @@ describe('closing a session: revoked only once the worker has paid its tail (fix
     expect(m).toBe(2);
   });
 
+  // Lane P2-owed-viewer (ADR 0018 amendment): the money plane keeps a tail authorisation for what
+  // the worker reported still unpaid — so the settle hooks must learn it, and learn "unknown" when
+  // the worker could not say.
+  it('onSettled learns what the worker reported unpaid at play.close; null when it could not say (a failing close, a worker gone)', async () => {
+    const s = bare(() => Promise.resolve({ unpaid: 3 }));
+    const seen: (number | null)[] = [];
+    s.onSettled((u) => seen.push(u));
+    await s.closeAsync();
+    s.onSettled((u) => seen.push(u)); // registered late: the same answer
+    expect(seen).toEqual([3, 3]);
+    const failing = bare(() => Promise.reject(new Error('backend-down: x')));
+    const f: (number | null)[] = [];
+    failing.onSettled((u) => f.push(u));
+    await failing.closeAsync();
+    expect(f).toEqual([null]);
+    const gone = bare((() => new Promise(() => undefined)) as unknown as WorkerCall);
+    const g: (number | null)[] = [];
+    gone.onSettled((u) => g.push(u));
+    gone.markClosed();
+    expect(g).toEqual([null]);
+  });
+
   it('the adapter revokes the session on the money plane only after the worker answered play.close', async () => {
     const { r, videos } = await devRig();
     const s = await r.host.adapter.openSession(3, videos[0]!.video.id);

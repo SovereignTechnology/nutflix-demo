@@ -468,15 +468,19 @@ describe('OnePeerRouter', () => {
     expect((w.uploads[0] ?? 0) + (w.uploads[1] ?? 0)).toBe(N);
   });
 
-  // Fix round 4 (cross-lane review, HIGH): an image read probes a seeder one block at a time
-  // until it has served the core free (`SeederCredit.probing`).
-  it('the probe option: a probed peer is asked ONE block of the core at a time, within its credit; a throwing probe probes; off again, it pipelines', async () => {
-    let probe: () => boolean = () => true;
+  // Lane P2-owed-viewer (ADR 0018 amendment): until a seeder's pay/1 report of what it still counts
+  // for us is in, it is asked ONE block at a time (`SeederCredit`'s `single`). This replaces the
+  // fix-round-4 `probe` option and its test (ADR 0015 amendment 2026-09-26: an image read no longer
+  // probes — it asks only a seeder that said `free`); the narrow cap it pinned is the same.
+  it('the single option: a peer awaiting its report is asked ONE block at a time, within its credit; a throwing predicate narrows; off again, it pipelines', async () => {
+    let single: () => boolean = () => true;
     const w = await world(12, 1);
-    const r = routed(w.viewer, { budget: () => 8, probe: () => probe() });
+    const r = routed(w.viewer, { budget: () => 8, single: () => single() });
     const peer = w.viewer.peers[0]!;
     const remote = w.remotes[0]!;
-    expect(peer.getMaxInflight()).toBe(peer.inflight + 1);
+    // The sync's last message may still be being verified (it counts as `dataProcessing`).
+    await until(() => peer.inflight + peer.dataProcessing === 0, 5000, 'the sync to settle');
+    expect(peer.getMaxInflight()).toBe(1);
     let worst = 0;
     const sample = setInterval(() => {
       worst = Math.max(worst, (w.uploads[0] ?? 0) - w.downloads.length);
@@ -488,12 +492,123 @@ describe('OnePeerRouter', () => {
     }
     expect(w.downloads).toHaveLength(6);
     expect(worst).toBeLessThanOrEqual(1);
-    probe = () => {
+    single = () => {
       throw new Error('ledger bug');
     };
     expect(peer.getMaxInflight()).toBe(peer.inflight + 1);
-    probe = () => false;
+    single = () => false;
     expect(peer.getMaxInflight()).toBe(peer.inflight + 8 - r.used(remote));
+  });
+
+  // Lane P2-owed-viewer (ADR 0015 amendment): a seeder that said `PRICE { free: true }` for a core
+  // counts nothing it sends of it. Its requests there must neither be held back by what it may
+  // count elsewhere nor ever become debt — a free image read that times out or is stopped leaves
+  // nothing owed. The counted phase first shows the same requests DO become debt when not free.
+  it('the free option: capped by the budget alone, and in-flight / released requests of a free core are never used or debt; counted, they are', async () => {
+    // One seeder serving two cores over ONE stream: a video it sells and an image it serves free.
+    const origin = await store();
+    const video = coreOf(origin, { name: 'video' });
+    const image = coreOf(origin, { name: 'image' });
+    for (const c of [video, image]) {
+      await c.ready();
+      await c.append(Array.from({ length: 8 }, (_, i) => new Uint8Array(BLOCK).fill(i + 1)));
+    }
+    const vs = await store();
+    const v = coreOf(vs, { key: video.key });
+    const im = coreOf(vs, { key: image.key });
+    await v.ready();
+    await im.ready();
+    let sent = 0;
+    for (const c of [video, image]) c.on('upload', () => sent++);
+    const link = connect(origin, vs);
+    const remote = await link.remote();
+    await until(() => v.peers.length === 1 && im.peers.length === 1, 10_000, 'both cores to pair');
+    await v.update({ wait: true });
+    await im.update({ wait: true });
+    let free = false;
+    const imageHex = toHex(im.key);
+    const r = new OnePeerRouter({
+      budget: () => 4,
+      free: (_remote, core) => free && core === imageHex,
+      logger: silentLogger,
+    });
+    cleanups.push(() => {
+      r.close();
+      link.destroy();
+      return Promise.resolve();
+    });
+    r.attachCore(v);
+    r.attachCore(im);
+    const vp = v.peers[0]!;
+    const ip = im.peers[0]!;
+    await until(
+      () => vp.inflight + vp.dataProcessing + ip.inflight + ip.dataProcessing === 0,
+      5000,
+      'the syncs to settle',
+    );
+    // Counted: two video requests into the void, abandoned — cancelled after they went out.
+    link.hold();
+    const lost = [v.get(0, { timeout: 300 }), v.get(1, { timeout: 300 })];
+    await Promise.allSettled(lost);
+    expect(sent).toBe(2);
+    expect(r.used(remote)).toBe(2);
+    expect(r.debt(remote)).toBe(2);
+    // The image, counted: what it may count on the video holds it back…
+    expect(ip.getMaxInflight()).toBe(4 - 2);
+    // …served free: its own cap only.
+    free = true;
+    expect(ip.getMaxInflight()).toBe(4);
+    const reads = [0, 1, 2].map((i) => im.get(i, { timeout: 20_000 }));
+    for (const p of reads) p.catch(() => undefined);
+    await until(() => sent >= 5, 5000, 'three image requests at the seeder');
+    expect(ip.inflight).toBe(3);
+    // In flight on the free core: not used, not in flight, not debt.
+    expect(r.used(remote)).toBe(2);
+    expect(r.inflight(remote)).toBe(0);
+    expect(r.debt(remote)).toBe(2);
+    // The read is abandoned: both cores let go of (parked) with the three still out — owed nothing.
+    r.close();
+    expect(r.debt(remote)).toBe(2);
+    expect(r.lostOf(remote)).toBe(2);
+    // Counted instead (a throwing predicate counts: the safe side), the same three would be debt.
+    const r2 = new OnePeerRouter({
+      budget: () => 4,
+      free: () => {
+        throw new Error('ledger bug');
+      },
+      logger: silentLogger,
+    });
+    const im2 = coreOf(vs, { key: image.key });
+    await im2.ready();
+    r2.attachCore(im2);
+    expect(r2.used(remote)).toBe(3);
+    r2.close();
+    expect(r2.debt(remote)).toBe(3);
+    link.release();
+    await Promise.allSettled(reads);
+  });
+
+  it('forgive(remote, n): drops at most n of the requests remembered as lost to it, nothing for junk', async () => {
+    const w = await world(4, 1);
+    const r = routed(w.viewer, { budget: () => 4 });
+    const remote = w.remotes[0]!;
+    w.links[0]!.hold();
+    const lost = [0, 1, 2].map((i) => w.viewer.get(i, { timeout: 20_000 }));
+    for (const p of lost) p.catch(() => undefined);
+    await until(() => (w.uploads[0] ?? 0) >= 3, 5000, 'three requests at the seeder');
+    w.links[0]!.destroy();
+    await until(() => w.viewer.peers.length === 0, 5000, 'the peer to leave');
+    expect(r.lostOf(remote)).toBe(3);
+    for (const junk of [0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY]) r.forgive(remote, junk);
+    expect(r.lostOf(remote)).toBe(3);
+    r.forgive(remote, 1);
+    expect(r.lostOf(remote)).toBe(2);
+    expect(r.debt(remote)).toBe(2);
+    r.forgive(remote, 99);
+    expect(r.lostOf(remote)).toBe(0);
+    expect(r.used(remote)).toBe(0);
+    r.forgive('ab'.repeat(32), 5); // unknown: nothing
+    expect(r.lostOf('ab'.repeat(32))).toBe(0);
   });
 
   it('after a failover the replacement seeder vanishes too: the block goes to a third one, never stuck', async () => {

@@ -70,8 +70,10 @@ export class HostPlaySession implements PlaySession {
   private readonly peerCbs = new Set<(p: readonly PeerSpend[]) => void>();
   private readonly spendCbs = new Set<(s: SpendPayload) => void>();
   private readonly closeCbs = new Set<() => void>();
-  private readonly settledCbs = new Set<() => void>();
+  private readonly settledCbs = new Set<(unpaid: number | null) => void>();
   private settledValue = false;
+  /** What the worker reported unpaid at `play.close` (`null`: it could not say). */
+  private unpaidValue: number | null = null;
 
   constructor(init: SessionInit, deps: SessionDeps) {
     this.sid = init.sid;
@@ -176,40 +178,45 @@ export class HostPlaySession implements PlaySession {
    * `onSettled` hooks (the money plane's revocation of this session) run only once the worker has
    * answered `play.close` — it pays the session's tail before it answers, and a PAY needs the
    * session to be authorised — or once that call failed (the worker's own bound, or it is gone).
+   * Lane P2-owed-viewer: they learn what the worker reported still unpaid (`null` when it could
+   * not say), for the money plane's tail authorisation.
    */
   async closeAsync(): Promise<void> {
     if (this.closedValue) return;
     this.closeLocally();
+    let unpaid: number | null = null;
     try {
-      await this.d.worker('play.close', { sid: this.sid });
+      unpaid = (await this.d.worker('play.close', { sid: this.sid })).unpaid;
     } catch {
       this.d.log.debug('play.close failed (worker down?); link already revoked');
     } finally {
-      this.settle();
+      this.settle(unpaid);
     }
   }
 
-  /** The worker is gone: drop everything without asking it (nothing more can be paid). */
+  /** The worker is gone: drop everything without asking it (nothing more can be paid now). */
   markClosed(): void {
     this.closeLocally();
-    this.settle();
+    this.settle(null);
   }
 
   /**
-   * Called once nothing more will be paid for this session: after the worker answered
-   * `play.close` (its tail paid), or when the worker is gone. Where the money plane revokes it.
+   * Called once nothing more will be paid for this session as a session: after the worker
+   * answered `play.close` (its tail paid, or what is left of it counted: `unpaid`), or when the
+   * worker is gone (`unpaid` null: unknown). Where the money plane revokes it — and keeps a tail.
    */
-  onSettled(cb: () => void): void {
-    if (this.settledValue) cb();
+  onSettled(cb: (unpaid: number | null) => void): void {
+    if (this.settledValue) cb(this.unpaidValue);
     else this.settledCbs.add(cb);
   }
 
-  private settle(): void {
+  private settle(unpaid: number | null): void {
     if (this.settledValue) return;
     this.settledValue = true;
+    this.unpaidValue = unpaid;
     for (const cb of this.settledCbs) {
       try {
-        cb();
+        cb(unpaid);
       } catch {
         // listeners must not break closing
       }

@@ -128,6 +128,9 @@ export async function rig(o: RigOptions = {}): Promise<Rig> {
       eventually(() => out.find(pred), what, ms),
     close: async () => {
       host.stop();
+      // Lane P2-owed-viewer: sessions dropped by `stop` keep their tails on disk (as a quit does:
+      // `Host.shutdown` waits for these writes) — let them land before the directory goes.
+      await host.adapter.flushTails().catch(() => undefined);
       await rm(userData, { recursive: true, force: true });
     },
   };

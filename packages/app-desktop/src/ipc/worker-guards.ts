@@ -162,6 +162,12 @@ export const validateWorkerArgs: {
   'profile.putImage': safe(obj({ hex: isImageHex })),
 };
 
+/**
+ * Lane P2-owed-viewer: the most blocks a `play.close` may report unpaid (the worker's record holds
+ * at most 1024 per seeder; the host caps a tail authorisation at the session's remaining budget).
+ */
+const MAX_TAIL_BLOCKS = 1 << 20;
+
 const isUndefined = (x: unknown): x is undefined => x === undefined;
 /** JSON has no `undefined`: a void result arrives as an absent `r`, i.e. `undefined`. */
 const isVoid = isUndefined;
@@ -189,7 +195,9 @@ export const validateWorkerResult: {
   'play.pause': isVoid,
   'play.resume': isVoid,
   'play.prefetch': isVoid,
-  'play.close': isVoid,
+  // Lane P2-owed-viewer: a session's unpaid tail (a seeder's credit is at most 1024 blocks per
+  // seeder; the host caps the authorisation at the session's remaining budget anyway).
+  'play.close': safe(obj({ unpaid: int(0, MAX_TAIL_BLOCKS) })),
   'seeder.status': safe(isSeederStatusWire),
   'seeder.configure': isVoid,
   'seeder.melt': safe(obj({ paid: bool })),

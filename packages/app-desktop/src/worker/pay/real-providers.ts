@@ -5,7 +5,9 @@
  *   viewer   every PAY is built by the host (`pay.build`) for the play session whose blocks it
  *            covers — the host checks the session, the range, the manifest terms and the
  *            session's budget. Two sessions of one core (a rendition switch, two windows) each
- *            pay their own blocks (fix round 5);
+ *            pay their own blocks (fix round 5). A tail a seeder reports owed (lane
+ *            P2-owed-viewer) is paid under the id of the session it was recorded for: the host
+ *            checks that session while it is open, and its persisted tail authorisation after;
  *   HELLO    signed by the host over this connection's `pay/1` challenge (`pay.hello`); the price
  *            it states is a ceiling (the highest price among the cores we serve) and each core's
  *            own price follows as `PRICE` on its first block (always, contracts v6 amendment);
@@ -290,6 +292,10 @@ export function realProviders(o: RealProviderOptions): RealProviders {
       }
       throw refusal;
     },
+    // Lane P2-owed-viewer: the recorded session's id — never another session's (the host pays a
+    // tail only under its own authorisation, like any PAY).
+    payOwed: (sid, range, seeder, policy, carryIn) =>
+      request('pay.build', { sid: sid as SessionId, range, seeder, policy, carryIn }),
     viewerMints: payments.mints,
     payWiring: {
       protocol: () =>

@@ -22,7 +22,7 @@ import type {
 } from '@sovit/core';
 
 import type { PayWiring } from './net/peer-node.js';
-import type { PayFn } from './pay/viewer-payer.js';
+import type { PayFn, PayOwedFn } from './pay/viewer-payer.js';
 
 export interface WorkerProviders {
   /**
@@ -36,6 +36,12 @@ export interface WorkerProviders {
     };
   /** Builds OUR `PAY` for blocks we downloaded (viewer side; `PaymentEngineViewer.pay`). */
   readonly pay: PayFn;
+  /**
+   * Lane P2-owed-viewer (ADR 0018 amendment): builds OUR `PAY` for blocks of a session's tail — a
+   * seeder reported them owed and our record holds them — under that session's id (open or
+   * closed: the host checks its session or its tail authorisation). Absent: no old tail is paid.
+   */
+  readonly payOwed?: PayOwedFn;
   /** Mints the viewer's wallet can pay with. */
   readonly viewerMints: readonly MintUrl[];
   /** One `pay/1` per connection + the HELLO we send. */

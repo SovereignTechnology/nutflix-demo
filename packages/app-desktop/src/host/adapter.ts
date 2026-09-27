@@ -561,7 +561,7 @@ export class DesktopNetworkAdapter implements NetworkAdapter {
         prefetchSeconds,
       });
     } catch (err) {
-      plane?.revokeSession(sid);
+      void plane?.revokeSession(sid);
       throw err;
     }
     const session = new HostPlaySession(
@@ -589,9 +589,10 @@ export class DesktopNetworkAdapter implements NetworkAdapter {
     );
     this.sessions.add(session);
     // Fix round 4: revoked once the worker has paid the session's tail (its answer to
-    // `play.close`), not when the renderer closes it — a PAY for those blocks needs it.
-    session.onSettled(() => {
-      plane?.revokeSession(sid);
+    // `play.close`), not when the renderer closes it — a PAY for those blocks needs it. Lane
+    // P2-owed-viewer: what it left unpaid (or, unknown, what it had left) stays payable as a tail.
+    session.onSettled((unpaid) => {
+      void plane?.revokeSession(sid, unpaid);
     });
     // Main learns the link BEFORE anyone learns the token (HostOut ordering, protocol.ts).
     this.o.mediaLink(token, res.link);
@@ -914,6 +915,11 @@ export class DesktopNetworkAdapter implements NetworkAdapter {
   /** Fix round 4 (quit): close every play session through the worker — each tail paid first. */
   closeAllSessions(): Promise<void> {
     return this.sessions.closeAll();
+  }
+
+  /** Lane P2-owed-viewer (quit): every tail authorisation write started so far has landed. */
+  async flushTails(): Promise<void> {
+    await this.o.money?.()?.flushTails();
   }
 
   private onUploadEvent(uploadId: string, p: UploadProgress): void {

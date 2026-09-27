@@ -162,7 +162,16 @@ export function startWorker(
     readonly handlers?: HostHandlers;
     readonly runtime?: WorkerRuntime;
   } & Partial<
-    Pick<WorkerHostOptions, 'uploadPreset' | 'logLevel' | 'providers' | 'testBootstrap'>
+    Pick<
+      WorkerHostOptions,
+      | 'uploadPreset'
+      | 'logLevel'
+      | 'providers'
+      | 'testBootstrap'
+      | 'imageTimeoutMs'
+      | 'reportWaitMs'
+      | 'unpaidFlushMs'
+    >
   > = {},
 ): WorkerClient {
   const events: WorkerEvent[] = [];
@@ -239,6 +248,9 @@ export function startWorker(
     ...(opts.logLevel !== undefined ? { logLevel: opts.logLevel } : {}),
     ...(opts.providers !== undefined ? { providers: opts.providers } : {}),
     ...(opts.testBootstrap !== undefined ? { testBootstrap: opts.testBootstrap } : {}),
+    ...(opts.imageTimeoutMs !== undefined ? { imageTimeoutMs: opts.imageTimeoutMs } : {}),
+    ...(opts.reportWaitMs !== undefined ? { reportWaitMs: opts.reportWaitMs } : {}),
+    ...(opts.unpaidFlushMs !== undefined ? { unpaidFlushMs: opts.unpaidFlushMs } : {}),
   });
   rpc = new WorkerRpc({
     write: (bytes) => {
