@@ -65,10 +65,12 @@ export const PAY_PROTOCOL_VERSION = 1 as const;
  * 4. **`ACK.outstanding` in every ACK:** after the PAY was applied, the blocks of the ACK's core
  *    the seeder counts unpaid for this account (see `AckMessage.outstanding`).
  *
- * The viewer's side (ADR 0018 amendment): a viewer starts its credit toward a seeder from what the
- * seeder reports, and pays reported blocks only when its own durable record says it received them
- * from that seeder, at the terms it recorded — a seeder that claims more is respected (never asked
- * beyond its window) and never paid the difference. An `OWED` before the channel is `open` is a
+ * The viewer's side (ADR 0018 amendment): `OWED`, `ACK.outstanding` and `free` are the seeder's
+ * CLAIMS. A viewer starts its credit toward a seeder from what the seeder reports, and pays
+ * reported blocks only when its own durable record says it received them from that seeder, at the
+ * terms it recorded — a seeder that claims more is respected (never asked beyond its window) and
+ * never paid the difference. An honest seeder sends one `OWED` per core per connection; a viewer
+ * may ignore any later one for the same core. An `OWED` before the channel is `open` is a
  * protocol error (`PayProtocolEvents.owed`).
  */
 
@@ -162,8 +164,10 @@ export interface PriceMessage {
    * counts none of the blocks it sends of it against the peer's window, never cuts for them, and no
    * PAY for them is due (blocks it counted before stay counted — rule 3). `satsPerBlock` and
    * `effectiveFromBlock` are 0 then (the codec refuses anything else). Absent or `false`: a priced
-   * `PRICE`, as before (`false` is never sent by this repository's seeders). A viewer reading a
-   * core for display asks a peer for its blocks only after that peer's `{ free: true }` for it.
+   * `PRICE`, as before (`false` is never sent by this repository's seeders). Only `true` means
+   * free: `{ satsPerBlock: 0 }` WITHOUT `free` is a sold core at no price — its blocks are counted
+   * and cleared only by (empty-set) PAYs, like any other sold core. A viewer reading a core for
+   * display asks a peer for its blocks only after that peer's `{ free: true }` for it.
    */
   readonly free?: boolean;
 }

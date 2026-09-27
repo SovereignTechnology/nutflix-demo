@@ -134,16 +134,26 @@ describe('boundOwed (the OWED caps over a whole report)', () => {
     ]);
   });
 
-  it('limits never raise the caps; junk limits report nothing (never more)', () => {
+  // Written (in the interrupted lane's wip commit) as "junk limits report nothing". That is the
+  // unsafe direction: a short report lets the viewer think it owes less and overrun the window.
+  // Junk limits now fall back to the caps (which keep any report inside the OWED grammar).
+  it('limits never raise the caps, a smaller one is kept, and a junk one falls back to the cap (never a shorter report)', () => {
     const big = boundOwed([[CORE_A, [[0, 5000]]]], { maxRanges: 10_000, maxBlocks: 10_000 });
     expect(big).toEqual([{ core: CORE_A, ranges: [[0, MAX_OWED_BLOCKS - 1]] }]);
+    expect(boundOwed([[CORE_A, [[0, 9]]]], { maxRanges: 1, maxBlocks: 4 })).toEqual([
+      { core: CORE_A, ranges: [[0, 3]] },
+    ]);
     for (const bad of [
       { maxRanges: Number.NaN, maxBlocks: 10 },
       { maxRanges: 10, maxBlocks: -1 },
       { maxRanges: 0, maxBlocks: 10 },
       { maxRanges: 1.5, maxBlocks: 10 },
+      { maxRanges: '3', maxBlocks: 10 } as never,
     ])
-      expect(boundOwed([[CORE_A, [[0, 3]]]], bad)).toEqual([]);
+      expect(boundOwed([[CORE_A, [[0, 3]]]], bad)).toEqual([{ core: CORE_A, ranges: [[0, 3]] }]);
+    expect(
+      boundOwed([[CORE_A, [[0, 5000]]]], { maxRanges: Number.NaN, maxBlocks: Number.NaN }),
+    ).toEqual([{ core: CORE_A, ranges: [[0, MAX_OWED_BLOCKS - 1]] }]);
     expect(boundOwed([[CORE_A, []]])).toEqual([]);
   });
 });

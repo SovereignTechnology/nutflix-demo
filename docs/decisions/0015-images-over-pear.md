@@ -92,3 +92,14 @@ from seeders that said so.**
 - A viewer's image read asks a peer for blocks only after that peer's `PRICE { free: true }` for
   the core; silence or a price means the peer is never asked. No probe, nothing counted.
   Images held only by older or third-party seeders show the placeholder.
+
+Seeder side as built (2026-09-27, lane P1-owed-seeder): `Seeder` sends a core's `PRICE` from the
+synchronous upload hook, before the block is written — `{ free: true }` (`satsPerBlock` and
+`effectiveFromBlock` 0) for a core marked with `setFreeCore`, else the core's price — once per
+connection, and again whenever that changes (a free core turned sold, or back). The option that
+switched this off (`announceCorePrices`) is gone, so every seeder the repository builds (the
+daemon, the gateway, the desktop worker, the dev fixtures) does it; a test on each composition
+shows the reader receives the `PRICE` before the core's first block, for both kinds. `free`
+covers the blocks served while it holds; blocks counted before a core turned free stay counted
+(they appear in `OWED`, with no priced `PRICE`, and are not payable). A seeder that cannot send
+the `PRICE` for a block cuts the connection (`local`, no ban) instead of sending the block.

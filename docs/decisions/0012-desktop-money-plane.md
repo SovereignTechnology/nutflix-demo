@@ -69,6 +69,10 @@ is preceded by `PRICE { core, satsPerBlock, effectiveFromBlock: 0 }` (sent from 
 upload hook, before the block is written). A payer keeps blocks owed while the asked price is
 above the manifest, so no block is ever paid at the wrong price.
 
+*Superseded in part 2026-09-26 (contracts v6 amendment, ADR 0015 amendment):* `announceCorePrices`
+is gone — every `Seeder` sends each core's `PRICE` (priced, or `{ free: true }`) before its first
+block to a `pay/1` peer, with no switch.
+
 ## 5. Other changes
 
 - `WorkerInit.payments` (the user's public pubkey, wallet P2PK and mints) turns the real providers

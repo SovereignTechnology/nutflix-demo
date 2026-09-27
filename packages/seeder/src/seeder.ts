@@ -215,6 +215,13 @@ export class Seeder {
 
   /** Open storage, load the ban list + CAS index, size the disk cap. Does not touch the network. */
   static async create(userConfig: SeederConfig, deps: SeederDeps): Promise<Seeder> {
+    // Checked here, not at the first connection: an engine without the ledger would otherwise
+    // fail inside every session (no OWED report; every PAY cutting its session).
+    const ledger: Partial<payment.UnpaidLedger> = deps.engine;
+    if (typeof ledger.outstandingOn !== 'function' || typeof ledger.unpaid !== 'function')
+      throw new TypeError(
+        'Seeder: the engine must be an UnpaidLedger (outstandingOn, unpaid) — contracts v6 amendment',
+      );
     const config = resolveConfig(userConfig, deps.fs.join.bind(deps.fs), deps.engine.config);
     const log = (deps.logger ?? silentLogger).child({ component: 'seeder' });
     await deps.fs.mkdir(config.dataDir, { recursive: true });
@@ -494,22 +501,24 @@ export class Seeder {
     if (protocol === undefined || session.closed) return;
     const told = this.toldOf(session);
     const said = told.get(core);
+    // `told` is set only once the PRICE is out: a send that throws is retried on the next block
+    // (the session cuts this one, `PeerSession.onUpload`).
     if (free) {
       if (said === 'free') return;
-      told.set(core, 'free');
       protocol.sendPrice({ core, satsPerBlock: 0 as Sats, effectiveFromBlock: 0, free: true });
+      told.set(core, 'free');
       return;
     }
     if (said === 'priced') return;
     const policy = this.corePolicies.get(core) ?? this.policyOverride;
     if (policy === null) return;
     const fromBlock = session.nextIndexFor(core);
+    protocol.sendPrice({ core, satsPerBlock: policy.satsPerBlock, effectiveFromBlock: fromBlock });
     const byCore = this.historyOf(session);
     const list = fromBlock === 0 ? [] : (byCore.get(core) ?? []);
     list.push({ fromBlock, policy });
     byCore.set(core, list);
     told.set(core, 'priced');
-    protocol.sendPrice({ core, satsPerBlock: policy.satsPerBlock, effectiveFromBlock: fromBlock });
   }
 
   /**

@@ -159,3 +159,30 @@ from zero, overruns that seeder and is banned. Cameron's answers:
 Implemented on `stage-3/owed-seeder` (seeder side: codec, engine, announcements) and
 `stage-3/owed-viewer` (viewer side: credit, payer, the worker's record, the host's tail
 authorisations).
+
+### Seeder side as built (2026-09-27, lane P1-owed-seeder)
+
+The normative text is in `packages/core/src/contracts/pay-protocol.ts`; the choices it fixes:
+
+- **When and what.** The report goes out when the seeder's channel opens and the viewer's pubkey
+  binds (a banned pubkey is cut instead). It names what the engine counts unpaid for that pubkey:
+  earlier connections under any Noise key, and this one's blocks sent before the HELLO (merged by
+  the bind). Cores in first-counted order, ranges ascending, the whole report capped at 256
+  ranges / 1024 blocks (`MAX_OWED_RANGES` / `MAX_OWED_BLOCKS`); what the caps leave out is still
+  in `ACK.outstanding`.
+- **Order.** The seeder handles the opening HELLO — bind and the whole report — before any frame
+  after it on the stream, and when its own HELLO goes out last the report follows it directly. A
+  viewer that asks nothing before its channel is `open` therefore has the whole report before the
+  first block it asks for, so "a block arrived, no `OWED`" means nothing is owed. Tested on real
+  streams for both HELLO orders.
+- **Terms.** Before a sold core's `OWED` the seeder sends its priced `PRICE`; owed ranges are
+  verified at the terms this connection was told (the core's current policy), with a new
+  channel's carry. The seeder keeps no per-block record of the price a block was delivered at, so
+  a price change between two connections moves the owed blocks to the new price — the viewer,
+  which pays only at the terms it recorded, then leaves them unpaid (a residual, below). An `OWED`
+  with no priced `PRICE` (a core served free since, or with no terms) is counted and not payable.
+- **In memory.** The engine's counts live for the seeder process; a restarted seeder counts
+  nothing old and reports nothing.
+- **Residuals.** A report past the caps (heavily fragmented debts) is short until the first
+  `ACK.outstanding`. Owed blocks are priced at the current terms, not the delivery-time terms.
+  `OWED` has no end marker; the order rule above is what tells a viewer the report is complete.

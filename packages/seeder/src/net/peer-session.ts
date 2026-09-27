@@ -92,6 +92,8 @@ export interface PeerSessionOptions {
    * core's terms (contracts v6 amendment, rule 1): a `PRICE` sent here precedes the block on the
    * same Protomux stream. The seeder dedupes per session; this hook only says what is served.
    * `nextIndexFor(core)` still excludes the block being sent (the `effectiveFromBlock` to use).
+   * If it throws, the block is NOT sent: the session is cut (`local`, no ban) in the same tick —
+   * a block never goes out without its terms.
    */
   readonly beforeBlock?: (session: PeerSession, core: CoreKeyHex, free: boolean) => void;
 }
@@ -213,7 +215,7 @@ export class PeerSession {
     // ADR 0015: a free core's block is not a sale — nothing to record, no window. Its terms are
     // still announced first (`PRICE { free: true }`, v6 amendment).
     if (this.isFree?.(coreKeyHex as CoreKeyHex) === true) {
-      this.announce(coreKeyHex, true);
+      if (!this.announce(coreKeyHex, true)) return null;
       this.uploadedBytesTotal += byteLength; // bytes sent, but not a sold block
       return this.engine.window(this.accountId()) ?? null;
     }
@@ -223,10 +225,11 @@ export class PeerSession {
       this.cut('local');
       return null;
     }
+    // The core's terms first (v6 amendment, rule 1); a block whose terms cannot be said is not sent.
+    if (!this.announce(coreKeyHex, false)) return null;
     this.uploaded++;
     this.uploadedBytesTotal += byteLength;
     this.coresUploaded.add(coreKeyHex);
-    this.announce(coreKeyHex, false);
     this.nextIndex.set(coreKeyHex, Math.max(this.nextIndexFor(coreKeyHex), index + 1));
     if (this.pubkeyBound === null) this.provisionalUploads++;
     // v5 (ADR 0010): the block INDEX travels, so `range-not-uploaded` is exact per block
@@ -250,13 +253,20 @@ export class PeerSession {
     return w;
   }
 
-  /** `beforeBlock`, contained: a failing hook never stops the upload gate. */
-  private announce(core: string, free: boolean): void {
-    if (this.beforeBlock === undefined) return;
+  /**
+   * `beforeBlock`. Fails closed: a hook that throws means this block's terms were not said, so
+   * the session is cut (`local`, no ban — a local fault, not the peer's) before the block is
+   * written, and `false` tells `onUpload` to record nothing.
+   */
+  private announce(core: string, free: boolean): boolean {
+    if (this.beforeBlock === undefined) return true;
     try {
       this.beforeBlock(this, core as CoreKeyHex, free);
+      return true;
     } catch (err) {
-      this.log.error('before-block hook threw', { error: err });
+      this.log.error('before-block hook threw — not sending the block', { error: err });
+      this.cut('local');
+      return false;
     }
   }
 

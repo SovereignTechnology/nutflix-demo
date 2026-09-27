@@ -449,3 +449,61 @@ describe('the bridge’s v6 hooks, alone', () => {
     expect(opened).toBe(0);
   });
 });
+
+describe('fail closed', () => {
+  it('a block whose terms cannot be said is not sent: the session is cut (local, no ban) and nothing is recorded — free or counted', async () => {
+    const { PeerSession } = await import('../net/peer-session.js');
+    const { loadedBanList } = await import('./helpers.js');
+    const t = await tmpDir();
+    cleanups.push(t.rm);
+    const engine = new mocks.MockPaymentEngine({ config: { windowBlocks: 8 } });
+    const banList = await loadedBanList(t.dir);
+    const log = capturedLogger();
+    for (const free of [false, true]) {
+      const key = noiseKey(free ? 21 : 20);
+      const session = new PeerSession({
+        noiseKey: key,
+        stream: new FakeStream(key),
+        engine,
+        banList,
+        logger: log.logger,
+        isFree: () => free,
+        beforeBlock: () => {
+          throw new Error('cannot send the PRICE');
+        },
+      });
+      expect(session.onUpload(CORE_A, 0, BLOCK)).toBeNull();
+      expect(session.cutReason).toBe('local');
+      expect(session.stream.destroyed).toBe(true);
+      expect(session.uploadedBlocks).toBe(0);
+      expect(engine.window(session.accountId())).toBeUndefined();
+      expect(engine.isBanned(session.accountId())).toBe(false);
+      expect(banList.isNoiseBanned(key)).toBe(false);
+    }
+    expect(log.lines.join('\n')).toContain('not sending the block');
+  });
+
+  it('on the seeder: a PRICE that cannot be sent cuts the session before the block; a seeder with no ledger is refused at create', async () => {
+    const s = await make();
+    const { session, protocol } = s.connect();
+    protocol.sendPrice = (): void => {
+      throw new Error('encode failed');
+    };
+    session.onUpload(CORE_B, 0, BLOCK);
+    expect(session.cutReason).toBe('local');
+    expect(s.engine.window(session.accountId())).toBeUndefined();
+    const t = await tmpDir();
+    cleanups.push(t.rm);
+    const bare = new mocks.MockPaymentEngine();
+    const noLedger = Object.assign(Object.create(bare) as object, {
+      outstandingOn: undefined,
+      unpaid: undefined,
+    }) as unknown as mocks.MockPaymentEngine;
+    await expect(
+      Seeder.create(
+        { dataDir: t.dir, diskCapBytes: 1 << 20, swarm: null },
+        { engine: noLedger, logger: capturedLogger().logger, ...adapters },
+      ),
+    ).rejects.toThrow(/UnpaidLedger/);
+  });
+});

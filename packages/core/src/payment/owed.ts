@@ -32,15 +32,21 @@ export interface UnpaidLedger {
    * The blocks counted for `peer` and not paid, per core: cores in the order they were first
    * counted for `peer` (a `rebind` keeps the target's order and appends the source's new cores),
    * each core's ranges ascending. The whole report is bounded by `limits` (default and ceiling:
-   * `OWED_LIMITS`); what is past them is left out, oldest kept, and a range crossing the block cap
-   * is cut short. Cores with nothing unpaid are absent. Never throws.
+   * `OWED_LIMITS`; a limit that is not a positive safe integer is the ceiling); what is past them
+   * is left out, oldest kept, and a range crossing the block cap is cut short. Cores with nothing
+   * unpaid are absent. Never throws.
    */
   unpaid(peer: NostrPubkey, limits?: OwedLimits): readonly OwedCore[];
 }
 
-/** A limit as given, if it is a positive safe integer — never above `cap`; anything else is 0. */
+/**
+ * A limit as given, if it is a positive safe integer, never above `cap`; anything else (0, a
+ * negative, a fraction, NaN, not a number) is `cap`. A short report is the unsafe direction — the
+ * viewer would think it owes less and could overrun the window — and the caps already keep any
+ * report inside the `OWED` grammar.
+ */
 function clampLimit(n: unknown, cap: number): number {
-  return Number.isSafeInteger(n) && (n as number) > 0 ? Math.min(n as number, cap) : 0;
+  return Number.isSafeInteger(n) && (n as number) > 0 ? Math.min(n as number, cap) : cap;
 }
 
 /**
