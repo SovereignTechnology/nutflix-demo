@@ -35,6 +35,11 @@ const fx = vi.hoisted(() => {
     primary: true,
     dialogs: [] as unknown[],
     dialogAnswer: 0,
+    /**
+     * Round 8: a dialog nobody answers — open until its `signal` aborts (then Cancel, as
+     * Electron's `showMessageBox` does).
+     */
+    dialogHold: false,
     /** ADR 0013: `safeStorage` — off (a Linux box with no keyring) unless a test turns it on. */
     keychain: false,
     keychainBackend: 'gnome_libsecret',
@@ -160,8 +165,14 @@ vi.mock('electron', () => {
     },
     dialog: {
       showMessageBox: (...a: unknown[]) => {
-        fx.dialogs.push(a.at(-1));
-        return Promise.resolve({ response: fx.dialogAnswer });
+        const box = a.at(-1) as { signal?: AbortSignal; cancelId?: number };
+        fx.dialogs.push(box);
+        if (!fx.dialogHold) return Promise.resolve({ response: fx.dialogAnswer });
+        return new Promise((resolve) => {
+          box.signal?.addEventListener('abort', () => {
+            resolve({ response: box.cancelId ?? 0 });
+          });
+        });
       },
     },
     webContents: { fromId: () => undefined },
@@ -238,6 +249,7 @@ beforeEach(() => {
   fx.primary = true;
   fx.dialogs.length = 0;
   fx.dialogAnswer = 0;
+  fx.dialogHold = false;
   fx.keychain = false;
   fx.keychainBackend = 'gnome_libsecret';
   fx.opened.length = 0;
@@ -1023,5 +1035,54 @@ describe('main.ts wiring (fake electron)', () => {
         { kind: 'confirm-result', req: 32, ok: true },
       ],
     );
+  });
+
+  // Round 8 (final panel, packaging): the host's confirm deadline passed and main's dialog
+  // stayed on screen — a later "Move it" moved nothing, and every other host confirm was
+  // refused while it was up. `confirm-cancel` (and a host that went away) now closes it.
+  it('ADR 0016: confirm-cancel closes the open dialog, sends no answer, and the next confirm gets a dialog', async () => {
+    await boot();
+    const child = fx.children[0];
+    const deliver = (m: unknown): void => {
+      for (const l of child?.listeners.get('message') ?? []) l(m);
+    };
+    const tick = (): Promise<void> =>
+      new Promise<void>((r) => {
+        setTimeout(r, 0);
+      });
+    const results = (): unknown[] =>
+      child?.posted.filter((m) => (m as { kind?: string }).kind === 'confirm-result') ?? [];
+    fx.dialogHold = true;
+    deliver({ kind: 'confirm', req: 41, form: { kind: 'recovery-reveal' } });
+    await tick();
+    const first = fx.dialogs[0] as { signal?: AbortSignal } | undefined;
+    expect(first?.signal).toBeInstanceOf(AbortSignal);
+    expect(first?.signal?.aborted).toBe(false);
+    // A cancel for another request, or a malformed one, closes nothing.
+    deliver({ kind: 'confirm-cancel', req: 40 });
+    deliver({ kind: 'confirm-cancel', req: 41, ok: false });
+    await tick();
+    expect(first?.signal?.aborted).toBe(false);
+    deliver({ kind: 'confirm-cancel', req: 41 });
+    expect(first?.signal?.aborted).toBe(true);
+    await tick();
+    expect(results()).toEqual([]);
+    // Not refused as busy: the next confirm opens its own dialog and is answered.
+    fx.dialogHold = false;
+    fx.dialogAnswer = 1;
+    deliver({ kind: 'confirm', req: 42, form: { kind: 'recovery-rotate' } });
+    await tick();
+    expect(fx.dialogs).toHaveLength(2);
+    expect(results()).toEqual([{ kind: 'confirm-result', req: 42, ok: true }]);
+    // A host that goes away takes its open dialog with it.
+    fx.dialogHold = true;
+    deliver({ kind: 'confirm', req: 43, form: { kind: 'recovery-reveal' } });
+    await tick();
+    const third = fx.dialogs[2] as { signal?: AbortSignal } | undefined;
+    expect(third?.signal?.aborted).toBe(false);
+    for (const l of child?.listeners.get('exit') ?? []) l(1);
+    expect(third?.signal?.aborted).toBe(true);
+    await tick();
+    expect(results()).toEqual([{ kind: 'confirm-result', req: 42, ok: true }]);
   });
 });

@@ -244,6 +244,23 @@ describe('the host’s native-dialog questions (ConfirmForm) and their answer', 
     expect(isHostIn({ kind: 'confirm-result', req: 1, ok: true, words: [] })).toBe(false);
   });
 
+  // Round 8 (final panel): the host closes a dialog it stopped waiting for.
+  it('HostOut confirm-cancel is exact (a request id and nothing else)', () => {
+    expect(isHostOut({ kind: 'confirm-cancel', req: 1 })).toBe(true);
+    expect(isHostOut({ kind: 'confirm-cancel', req: 0x7fffffff })).toBe(true);
+    for (const bad of [
+      { kind: 'confirm-cancel' },
+      { kind: 'confirm-cancel', req: -1 },
+      { kind: 'confirm-cancel', req: 1.5 },
+      { kind: 'confirm-cancel', req: '1' },
+      { kind: 'confirm-cancel', req: 1, ok: false },
+      { kind: 'confirm-cancel', req: 1, form: { kind: 'recovery-reveal' } },
+    ])
+      expect(isHostOut(bad), JSON.stringify(bad)).toBe(false);
+    // Host → main only: main never sends it to the host.
+    expect(isHostIn({ kind: 'confirm-cancel', req: 1 })).toBe(false);
+  });
+
   it('a host prompt carrying a words form passes only with indices', () => {
     expect(
       isHostOut({

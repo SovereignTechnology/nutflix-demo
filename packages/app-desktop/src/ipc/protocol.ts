@@ -822,7 +822,12 @@ export type HostOut =
       readonly value?: Uint8Array;
     }
   /** ADR 0016: ask the user in main's native dialog (data only); answered by `confirm-result`. */
-  | { readonly kind: 'confirm'; readonly req: number; readonly form: ConfirmForm };
+  | { readonly kind: 'confirm'; readonly req: number; readonly form: ConfirmForm }
+  /**
+   * ADR 0016: the host no longer needs the answer to `confirm` `req` (its deadline, shutdown):
+   * close the dialog; no `confirm-result` follows (round-8 review, like `prompt-cancel`).
+   */
+  | { readonly kind: 'confirm-cancel'; readonly req: number };
 
 // ---- guard type -------------------------------------------------------------------------
 
