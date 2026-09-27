@@ -5,8 +5,8 @@
  * side builds and is tested without N1's implementation.
  *
  * ┌────────────────────────────────────────────────────────────────────────────────────────┐
- * │ WIRING POINT — `recoveryCore()` below is the ONE place the orchestrator fills when lane │
- * │ N1 merges. Until then it returns `undefined`: the desktop has no recovery phrase (status │
+ * │ WIRING POINT — `recoveryCore()` below is the ONE place lane N1's code is wired (filled at │
+ * │ the merge, 2026-09-27). A host injecting `undefined` has no recovery phrase (status      │
  * │ `unavailable`, every flow refused `payments-unavailable`) and derives nothing.           │
  * │ With N1 (names as the seam's docs give them; adjust to N1's exports):                   │
  * │                                                                                         │
@@ -27,7 +27,13 @@
  * Tests inject fakes through `HostOptions.recoveryCore` (`__tests__/support/fake-recovery.ts`).
  */
 import type { MintUrl } from '@sovit/core';
-import type { wallet as walletMod } from '@sovit/core';
+import { wallet as walletMod } from '@sovit/core';
+
+/** The mint connections' option that carries the seed (core `CashuMintConnections`). */
+export type SeedConnectionsOption = Pick<
+  NonNullable<ConstructorParameters<typeof walletMod.CashuMintConnections>[0]>,
+  'seed'
+>;
 
 export interface RecoveryCore {
   /** Generate, index, decode and seed phrases (core `wallet/seed.ts`, a locked file). */
@@ -37,14 +43,18 @@ export interface RecoveryCore {
    * take `{ request, seed }`). Spread into the money plane's one constructor call; every wallet
    * over those connections then derives from the seed and draws counters from `seed.counters`.
    */
-  seedOption(seed: walletMod.SeedMaterial): object;
+  seedOption(seed: walletMod.SeedMaterial): SeedConnectionsOption;
   /** A wallet's seeded view (`CashuWallet.seeded`); `undefined` over unseeded connections. */
   seeded(wallet: walletMod.CashuWallet): walletMod.SeededWallet | undefined;
 }
 
-/** WIRING POINT (see the box above): lane N1's implementation, or `undefined` before it. */
+/** WIRING POINT (see the box above): lane N1's implementation, filled at the merge (2026-09-27). */
 export function recoveryCore(): RecoveryCore | undefined {
-  return undefined;
+  return {
+    phrases: walletMod.recoveryPhrases, // core wallet/seed.ts (locked)
+    seedOption: (seed) => ({ seed }), // CashuMintConnections({ request, seed })
+    seeded: (w) => w.seeded, // CashuWallet.seeded
+  };
 }
 
 /** Keyset ids the counters file may hold: v1 (`00` + 14 hex) and v2 (`01` + 64 hex). */

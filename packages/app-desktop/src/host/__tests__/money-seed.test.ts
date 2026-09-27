@@ -35,6 +35,7 @@ async function open(o: { core: FakeRecoveryCore; create?: boolean }) {
   const opening = MoneyPlane.open({
     signer,
     journalDir: null,
+    tailDir: null, // in memory: not about tail authorisations (merge of P2 and N2)
     pool: new nostr.FakeRelayPool(),
     relays: () => [{ url: RELAY, read: true, write: true }],
     defaultMints: () => [MINT],
