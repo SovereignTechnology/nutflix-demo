@@ -11,8 +11,14 @@
  * Durability: each payout's locked set is appended to `<dataDir>/wallet/payouts.jsonl` (0600,
  * fsynced) as soon as the mint returns it, BEFORE it is published; one not yet published (every
  * relay refused, or a crash) is published again on the next run. The proofs in it are locked to
- * the owner, so the file is safe at rest. Residual (same as security review F31): a crash between
- * the mint's swap and that append loses the payout — NUT-13 deterministic outputs are the fix.
+ * the owner, so the file is safe at rest. Residual (ADR 0016 related finding 2): a crash between
+ * the mint's swap and that append loses the payout. The sealed wallet file's journal (ADR 0014)
+ * holds the swap's outputs — the locked set (`send`) and the change — before the request goes out,
+ * and the startup settle (`recoverPending`) restores them from the mint (NUT-09), but only to
+ * account for them: the change is kept, the restored locked set is never handed to
+ * `payouts.jsonl`, so it is never published to the owner. NUT-13 would NOT fix this: it derives
+ * no NUT-10/P2PK secrets, so it recovers the change, not the payout. The fix is to hand a
+ * recovered payout set to `payouts.jsonl` from that settle.
  *
  * A payout is irreversible and goes to a key typed into a config file, so none leaves before the
  * owner's own kind 10019 (signed by `owner.pubkey`, fetched from the payout relays) confirms that

@@ -5,15 +5,43 @@
 export type { Wallet, WalletHistoryEntry, WalletChangeEvent } from '../contracts/wallet.js';
 export {
   PENDING_SETTLE_AFTER_S,
+  RESTORE_BATCH,
+  RESTORE_EMPTY_BATCHES,
+  RESTORE_MAX_BATCHES,
+  RESTORE_MAX_KEYSETS,
   Spender,
   WalletError,
   fromCashu,
   toCashu,
   type MintConnections,
+  type RestoreDetail,
+  type Seeding,
   type SpendContext,
   type WalletErrorCode,
   type WalletKey,
 } from './spend.js';
+// ADR 0016: the phrase, the seed and the counters. `DurableCounterSource` is exported as a TYPE
+// only: `CashuMintConnections` keeps one live source per counters store, and a second one built
+// beside it would hand out the same counters (reach it as `connections.seeding.counters`).
+export {
+  COUNTER_LEASE,
+  COUNTER_LIMIT,
+  COUNTER_PROBE_SPAN,
+  CounterStateError,
+  RECOVERY_WORDS,
+  RecoveryPhraseError,
+  RecoverySeedError,
+  entropyFromBytes,
+  entropyFromHex,
+  entropyToHex,
+  isCounterState,
+  recoveryPhrases,
+  wipeEntropy,
+  type CounterProbe,
+  type CounterRange,
+  type DurableCounterSource,
+  type UnpublishedRange,
+} from './seed.js';
 export {
   MemoryProofStore,
   PENDING_KINDS,
@@ -76,6 +104,8 @@ export {
   memoryWalletKey,
   signerWalletKey,
   type CashuWalletOptions,
+  type CoreSeededWallet,
+  type RestoreOptions,
 } from './wallet.js';
 export {
   RECOVERY_D_PREFIX,
