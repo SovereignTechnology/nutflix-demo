@@ -21,8 +21,9 @@
  *   src/renderer/prompt/prompt.css → dist/prompt/prompt.css
  *   src/preload/prompt-preload.ts  → dist/prompt-preload.cjs   CJS, only itself + src/ipc
  * The build fails if the renderer bundle pulled in `@sovit/core` runtime code
- * (nostr-tools, cashu-ts), Electron or a Node builtin, or if the preload bundle contains
- * anything but src/preload + src/ipc.
+ * (nostr-tools, cashu-ts), Electron or a Node builtin, if the preload bundle contains
+ * anything but src/preload + src/ipc, or if the prompt page contains anything but its own
+ * directory and the npm files `packaging/prompt-npm.ts` allows.
  *
  * Usage (from packages/app-desktop): `node scripts/bundle.ts [--out <dir>]` — requires `tsc -b`
  * and `@sovit/ui`'s `build:css` first (the root `npm run build` does both). `--out` (default
@@ -34,7 +35,11 @@ import { createRequire } from 'node:module';
 import { dirname, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { PROMPT_NPM, isPromptNpmInput } from '../packaging/prompt-npm.ts';
+
 const pkg = dirname(dirname(fileURLToPath(import.meta.url)));
+/** The repo root: npm workspaces install into its node_modules (or into this package's). */
+const repo = resolve(pkg, '..', '..');
 const outFlag = process.argv.indexOf('--out');
 const outArg = outFlag === -1 ? undefined : process.argv[outFlag + 1];
 const dist = outArg === undefined ? join(pkg, 'dist') : resolve(outArg);
@@ -104,16 +109,11 @@ async function bundlePreload(): Promise<void> {
 }
 
 /**
- * ADR 0016: the only npm code the prompt page may bundle — the BIP-39 library whose English list
- * it shows words from and whose `validateMnemonic` checks a typed phrase, and the two audited
- * packages that library is built on (wherever npm placed them).
- */
-const PROMPT_NPM =
-  /[\\/]node_modules[\\/](?:@scure[\\/]bip39|@scure[\\/]base|@noble[\\/]hashes)[\\/]/;
-
-/**
  * ADR 0013: the prompt page may contain nothing but itself (no UI kit, no core, no ipc code) —
- * and, since ADR 0016, `PROMPT_NPM`.
+ * and, since ADR 0016, the files of `PROMPT_NPM` (the BIP-39 library and the two audited
+ * packages it is built on), installed under this package's or the repo's node_modules with
+ * nothing but those packages on the way (round 8: `isPromptNpmInput`, not a name anywhere in
+ * the path).
  */
 async function bundlePrompt(): Promise<void> {
   const r = await build({
@@ -133,10 +133,10 @@ async function bundlePrompt(): Promise<void> {
   });
   const own = join(pkg, 'src', 'renderer', 'prompt') + sep;
   const inputs = inputsOf(r.metafile);
-  const bad = inputs.filter((p) => !p.startsWith(own) && !PROMPT_NPM.test(p));
+  const bad = inputs.filter((p) => !p.startsWith(own) && !isPromptNpmInput(p, [pkg, repo]));
   if (bad.length > 0)
     fail(
-      `prompt bundle may only contain src/renderer/prompt and @scure/bip39:\n  ${bad.join('\n  ')}`,
+      `prompt bundle may only contain src/renderer/prompt and ${PROMPT_NPM.join(', ')}:\n  ${bad.join('\n  ')}`,
     );
   // One wordlist only: the English one the host's phrases index into.
   const lists = inputs.filter((p) => /[\\/]@scure[\\/]bip39[\\/]wordlists[\\/]/.test(p));

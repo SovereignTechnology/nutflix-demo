@@ -60,6 +60,7 @@ import {
   PROMPT_FILES,
   RENDERER_FILES,
 } from './identity.ts';
+import { PROMPT_NPM_IMPORTS } from './prompt-npm.ts';
 
 export const PKG_DIR = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 export const REPO_ROOT = resolve(PKG_DIR, '..', '..');
@@ -384,12 +385,14 @@ export function bundleInputDirs(pkg: string, root: string, bundled: readonly str
 
 /**
  * Lane R6-reconcile (the round-5 verifier): the bundle's own configuration shapes its output as
- * much as its sources — the script (entry points, format, target, what it copies and refuses) and
- * the tsconfigs its esbuild builds name (JSX, `paths`, the target they inherit), package-relative.
- * Pinned against the script by a test.
+ * much as its sources — the script (entry points, format, target, what it copies and refuses),
+ * the modules it imports (round 8: the prompt page's npm allow-list) and the tsconfigs its
+ * esbuild builds name (JSX, `paths`, the target they inherit), package-relative. Pinned against
+ * the script by a test.
  */
 export const BUNDLE_CONFIG = [
   'scripts/bundle.ts',
+  'packaging/prompt-npm.ts',
   'tsconfig.renderer.json',
   'tsconfig.preload.json',
 ] as const;
@@ -402,6 +405,36 @@ export function bundleConfigFiles(pkg: string, root: string): string[] {
     ...BUNDLE_CONFIG.map((f) => join(pkg, f)),
     ...BUNDLE_CONFIG_ROOT.map((f) => join(root, f)),
   ];
+}
+
+/**
+ * Round 8 (the final panel): the npm code scripts/bundle.ts inlines into the prompt page — its
+ * install directories, repo-relative, read from the lockfile: `PROMPT_NPM_IMPORTS` as npm
+ * resolves them from this package, then their dependencies, transitively, as each resolves them
+ * (`node_modules/@scure/bip39`, and wherever npm put `@noble/hashes` and `@scure/base` for it).
+ * Refuses one the lockfile does not list: the rule could not be checked. Pinned against the real
+ * prompt bundle's inputs by a test.
+ */
+export function promptNpmDirs(lock: Lockfile, workspace: string): string[] {
+  const seen = new Set<string>();
+  const visit = (from: string, name: string, optional: boolean): void => {
+    const at = resolveFrom(lock, from, name);
+    if (at === undefined) {
+      if (optional) return;
+      fail(
+        `${name} (bundled into the prompt page) is not in the lockfile: cannot tell whether the bundle is current`,
+      );
+    }
+    if (seen.has(at)) return;
+    seen.add(at);
+    const e = lock.packages[at];
+    for (const d of Object.keys(e?.dependencies ?? {})) visit(at, d, false);
+    for (const d of Object.keys(e?.optionalDependencies ?? {})) visit(at, d, true);
+    for (const d of Object.keys(e?.peerDependencies ?? {}))
+      visit(at, d, e?.peerDependenciesMeta?.[d]?.optional === true);
+  };
+  for (const name of PROMPT_NPM_IMPORTS) visit(workspace, name, false);
+  return [...seen].sort();
 }
 
 /**
@@ -509,6 +542,8 @@ export interface CurrentBuildOptions {
   /** Repo-relative workspace directories (`builtFromWorkspaces`). */
   readonly shipped: readonly string[];
   readonly bundled: readonly string[];
+  /** Repo-relative install directories of the prompt page's npm code (`promptNpmDirs`). */
+  readonly npm: readonly string[];
 }
 
 /**
@@ -520,9 +555,12 @@ export interface CurrentBuildOptions {
  *      as the package's newest src CSS;
  *   3. scripts/bundle.ts's output that the stage copies: each file at least as new as the newest
  *      file the bundle reads (`bundleInputDirs`: BUNDLE_SOURCES and the bundled packages' dist/
- *      and src/; tests and stories excluded) and the bundle's own configuration
- *      (`bundleConfigFiles`: the script, its tsconfigs and what they extend; lane R6-reconcile).
- *      A configuration file that is missing is refused: the rule could not be checked.
+ *      and src/; tests and stories excluded), the bundle's own configuration
+ *      (`bundleConfigFiles`: the script, its tsconfigs and what they extend; lane R6-reconcile),
+ *      and the npm code it inlines into the prompt page (`promptNpmDirs`: every installed file
+ *      of those packages and each package directory itself, whose mtime moves when npm adds or
+ *      removes an entry in it; round 8). A configuration file or one of those packages that is
+ *      missing is refused: the rule could not be checked.
  *
  * (2) and (3) compare mtimes: `npm run build` rewrites every one of those files each run, so a
  * refusal clears after it. The remedy is `npm run build` (for outputs deleted by hand,
@@ -577,6 +615,23 @@ export function assertCurrentBuild(o: CurrentBuildOptions): void {
       fail(`${rel(path)} is not a regular file: cannot tell whether the bundle is current`);
     if (newest === undefined || st.mtimeMs > newest.mtimeMs) newest = { path, mtimeMs: st.mtimeMs };
   }
+  // Round 8: an npm install rewrites a package's files (install-time mtimes), so a bump or a
+  // reinstall after the build is newer than the prompt bundle that inlined the old code.
+  for (const d of o.npm) {
+    const dir = join(o.root, d);
+    let st: ReturnType<typeof lstatSync>;
+    try {
+      st = lstatSync(dir);
+    } catch {
+      fail(`${d} is in the lockfile but not installed: cannot tell whether the bundle is current`);
+    }
+    if (!st.isDirectory())
+      fail(`${d} is not a directory: cannot tell whether the bundle is current`);
+    if (newest === undefined || st.mtimeMs > newest.mtimeMs)
+      newest = { path: dir, mtimeMs: st.mtimeMs };
+    const n = newestInput(dir);
+    if (n !== undefined && n.mtimeMs > newest.mtimeMs) newest = n;
+  }
   if (newest === undefined) return;
   for (const f of [
     ...RENDERER_FILES.map((n) => `renderer/${n}`),
@@ -610,7 +665,12 @@ export async function stageApp(o: StageOptions): Promise<StageReport> {
     arch: o.arch,
   });
   // Before `out` is touched: a refused stage leaves the previous one in place.
-  assertCurrentBuild({ pkg, root, ...builtFromWorkspaces(lock, workspace, packages) });
+  assertCurrentBuild({
+    pkg,
+    root,
+    ...builtFromWorkspaces(lock, workspace, packages),
+    npm: promptNpmDirs(lock, workspace),
+  });
 
   assertReplaceable(out);
   rmSync(out, { recursive: true, force: true });
