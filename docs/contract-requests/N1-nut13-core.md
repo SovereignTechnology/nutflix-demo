@@ -1,7 +1,8 @@
 # Contract requests — lane N1-nut13-core (issue #3, ADR 0016, against the frozen `packages/core/src/wallet/recovery-api.ts`)
 
 No item blocks the lane: each is worked around in core as described. Lane N2 (desktop) builds
-against the same seam and should read items 1, 3, 4 and 5.
+against the same seam and should read items 1, 3, 4, 5 and 7. Item 7 (added after the independent
+review, 2026-09-27) also asks Cameron for a decision.
 
 ## 1. `RecoveryPhrases` has no way back from stored entropy
 
@@ -65,7 +66,20 @@ and one `CounterStore` OBJECT per identity per process (see 4).
   `close()` resolved.
 - `DurableCounterSource` is exported as a type only; reach it as `connections.seeding.counters`.
 
-**Proposal.** Say so in the seam's `SeedMaterial` comment.
+- (Independent review 2026-09-27, finding 3.) The counters file is BOUND to its phrase: core writes
+  a `published` entry `ff<32 hex>` → 0 (a keyed BLAKE2b tag of the seed, libsodium). A file bound to
+  another phrase reads as no state (every keyset probed from 0) and is taken over by the first save;
+  a closed source never writes over a file another phrase took over. A `CounterStore` object whose
+  live source belongs to another phrase is refused: `new CashuMintConnections({ seed })` throws
+  `invalid-argument` ("…in use by a wallet of another recovery phrase: close it first"). So a
+  rotation (D5) must close the old wallet before building the new connections, or use a new
+  counters file.
+- Probing is per operation: the counter source asks only the mint an operation runs at, one batch
+  (finding 2). Nothing registers probes at wallet load any more.
+
+**Proposal.** Say so in the seam's `SeedMaterial` comment, and keep one counters file per phrase
+(for example `counters-<pubkey>-<device id>.json`, the relay copy's random id) — core's binding
+then never has to take a file over.
 
 ## 5. `MintConnections.seeding` must be forwarded by a wrapper (not a seam type — for N2)
 
@@ -82,3 +96,48 @@ The three specs and `tests/13-tests.md` are vendored from `cashubtc/nuts@8bde3c0
 2026-09-26) with their rows in `docs/vendor/MANIFEST.txt`. The script rewrites the manifest from
 its own list, so its next run would drop those rows (the files would stay). **Proposal:** add
 `07 09 13` to its NUT loop and fetch `tests/13-tests.md` as `NUT-13-tests.md`.
+
+## 7. Restores need a "not finished" outcome, a resume cursor, and a decision on the bound (independent review 2026-09-27)
+
+**Need.** The review found (high) that a restore stopped by the batch cap (ADR 0016 §5: 200 batches
+of 100 per keyset) read as complete: `RestoreOutcome` has no "partial". A viewer who streams a lot
+passes 20 000 counters on a keyset quickly (the reviewer measured about 1.1 counters per seeded
+send, two sends per PAY, a PAY every 4 blocks: roughly 17 000 counters per hour of 5 Mbit/s video
+with the default window). Past that, a restore from the words stopped short and said `restored` or
+`nothing`.
+
+**What core does now (no seam edit).**
+
+- **This device's own phrase** is scanned at least to its counters file's `next` for each keyset,
+  whatever the gaps or the cap; the cap and the three-empty-batches rule apply only past it. That is
+  ADR 0016's first loss case (the relays dropped the 7375 events), fixed without any decision.
+- **The startup restore** scans all of `[published, next)` newest first, with no cap (the range is
+  this device's own file, not a mint's answer).
+- **Any other scan the cap stops** is reported: `CashuWallet.seeded.restoreFromSeed` returns
+  `RestoreDetail` (a `RestoreReport` plus `resume?: Record<keysetId, counter>`), and takes
+  `{ resume: Map<MintUrl, Record<keysetId, counter>> }` as a fourth argument to continue where it
+  stopped. `CashuWallet.seeded` is typed `CoreSeededWallet` (extends `SeededWallet`). With nothing
+  restored, an unfinished scan is never reported `nothing`: `refused` when only the cap stopped it
+  (ADR 0016 treats hitting the cap as a hostile mint), `unreachable` when a keyset or batch could
+  not be asked.
+
+**Proposal (seam).** Add `'partial'` to `RestoreOutcome` and `resume?: Readonly<Record<string,
+number>>` to `RestoreReport`, and an optional `resume` to `SeededWallet.restoreFromSeed`. N2 should
+offer "continue restoring" when `resume` is present, keeping the cursor in the host (the renderer
+only names the action).
+
+**Decision for Cameron.** A hostile mint and an honest long history look the same to a scan from
+counter 0 (both keep returning signed outputs; a hostile mint can sign anything under its own keys,
+DLEQ included, and call it spent). So no rule can bound the first without bounding the second; the
+reviewer's "stop after N batches with nothing verified and unspent" would stop an honest heavy
+history too (its old batches are all spent). What each option costs:
+
+1. **Keep 200 batches per call, resumable (what core does now).** A heavy user's restore from the
+   words is many calls, each one explicit.
+2. **Raise the per-call cap** (for example 2 000 batches, 200 000 counters: about 10 hours of heavy
+   streaming). This makes a hostile mint's slow restore ten times slower too.
+3. **Checkpoints in the relay copy.** After a reissue (D5), every held proof sits at or above a
+   known counter. A `from` per keyset in the relay copy (kind 30078, NIP-44 to self, D2) would let a
+   restore start there instead of at 0, so its length is the history since the last reissue. This
+   needs a `RecoveryRelayCopy` change and a periodic, fee-paying reissue.
+

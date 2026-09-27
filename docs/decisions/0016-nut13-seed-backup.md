@@ -459,18 +459,41 @@ what the real-mint lane measured (details: `docs/lanes/N1-nut13-core.md`,
 - **§4, without a journal** (a store without `pending`; none in production) the guard falls back to
   the code/message ("already signed").
 - **§3, probe.** Every keyset the counters file does not know is probed before its first
-  derivation, not only when the file is missing (a keyset rotation too): NUT-09 batches of 100
-  from the cursor until one comes back empty. Cost: one request per keyset per device, which shows
-  the mint the next 100 unsigned outputs of this device.
-- **§3, one source per store.** `CashuMintConnections` keeps one live counter source per
-  `CounterStore` object, and a stored lease never moves back (the store is re-read before each
-  write). The shell keeps one `CounterStore` object per identity.
+  derivation, not only when the file is missing (a keyset rotation too): ONE NUT-09 batch of 100
+  from the cursor, at the mint the operation runs at and nowhere else, counting only signatures
+  whose DLEQ verifies (at a NUT-12 mint); the cursor moves by at most 100. A seed that signed
+  further meets a collision, and the guard moves past it. Cost: one request per keyset per device,
+  which shows that mint the next 100 unsigned outputs of this device. (Independent review
+  2026-09-27, finding 2: the first build asked every loaded mint, up to 200 batches, and took the
+  furthest answer, so a mint announcing another mint's keyset id could push the cursor ~20 000
+  ahead and break restores at the real mint.)
+- **§3/§4, what may move the counters.** Only signatures a mint proves: the probe (one batch), the
+  collision guard's skip-ahead (multi-batch at a NUT-12 mint, one batch without NUT-12), and a
+  restore of this device's own phrase (DLEQ-verified signatures only).
+- **§3, one source per store, one phrase per file.** `CashuMintConnections` keeps one live counter
+  source per `CounterStore` object, and a stored lease never moves back (the store is re-read before
+  each write; a lease another writer took moves the cursor past it). The counters file carries its
+  phrase's binding (a `published` entry `ff…`: keyed BLAKE2b of the seed, libsodium); a file another
+  phrase wrote reads as no state, so a rotated phrase (D5) starts at its own counter 0 (finding 3).
+  The shell keeps one `CounterStore` object per identity, and should keep one file per phrase.
+- **§3, startup restore.** `[published, next)` is scanned whole and newest first (the range is this
+  device's file, so no cap is needed). A keyset whose range no mint finished keeps its watermark
+  until a later startup restore finishes it (per keyset: one dead mint holds back only its own).
 - **§2, wrappers.** A `MintConnections` wrapper must forward `seeding`; core refuses to operate on a
   seeded cashu-ts wallet whose context lost it (the desktop's money plane wraps its connections).
 - **§5 step 4.** At a mint without NUT-12 everything unspent is swapped before it counts (one
   history line); dust the input fee would eat is left.
 - **§5 step 5.** PENDING proofs are left out (the store has no "marked" state); a later restore
   adds them if the melt failed. Contract request `docs/contract-requests/N1-nut13-core.md` item 2.
+- **§5 step 3, the batch cap (open for Cameron).** This device's own phrase is scanned at least to
+  its counters file's `next`, whatever the gaps or the cap. Any other scan the 200-batch cap stops
+  is reported, with where to resume (`RestoreDetail.resume`, never outcome `nothing`), because a
+  hostile mint and an honest long history look the same from counter 0. Whether to keep the cap per
+  call, raise it, or add checkpoints to the relay copy is contract request item 7 (independent
+  review 2026-09-27, finding 1: a heavy viewer passes 20 000 counters in about an hour).
+- **§4, journal entries.** A journaled operation records whether its outputs were seeded
+  (`PendingOp.seeded`). Only those need NUT-07 to count as executed; an unseeded entry is decided on
+  its signatures alone, as in ADR 0014 (finding 4).
 - **Wiped entropy** (16 zero bytes, phrase "abandon … about") is refused before it is shown or
   turned into a seed.
 - **Related findings.** 2: the payout comment now names the real gap. 4: NUT-07, NUT-09, NUT-13 and
