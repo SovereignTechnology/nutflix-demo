@@ -359,3 +359,102 @@ Adversarial notes and sharp edges (none needed a code change):
 14. D2: prompts queued behind an open phrase window can time out to their safe answer.
 15. D3: a typed mint sees restore requests of every scanned phrase. The phrase log rule still
     passes Title Case / UPPER CASE words and words separated by `(` or non-ASCII punctuation.
+
+## Round 7 (2026-09-27)
+
+The lane's independent verifier read the fix round at `51db26a` and raised three low findings.
+Each was verified on `51db26a` first. The fixes and their tests are in `1c3f875`. The failing
+runs quoted below were taken on `51db26a` code with this round's tests. The orchestrator
+decided the approach for each: per-mint completion recorded in the envelope (R7-1), percent
+escapes with hex letters and every other form the verifier listed, with canaries (R7-2), and an
+explicit timeout with a stated reason, or a faster test (R7-3).
+
+| # | Sev | Finding (verifier's anchor) | Verified | Fix (file:line at `1c3f875`) | Test |
+| --- | --- | --- | --- | --- | --- |
+| R7-1 | Low | The IR1 fix made a paying loop reachable. A plan the dialog cannot show (an http dev mint, over 100 000 inputs) keeps `complete` false, so every “Finish backup” planned every balance again and swapped, and charged, the mints already moved (`service.ts:520`) | Reproduced with the verifier's scenario (https mint-a 1 000 at fee 2, `http://127.0.0.1:3399` 500, three setups confirmed): `confirms = 3`, `reissued = [mint-a, mint-a, mint-a]`, fees `[2, 2, 2]`, `reissueFailed = 1` each time (a probe, since removed). After the fix, the same probe gives `confirms = 1`, `reissued = [mint-a]` and fees `[2, 0, 0]`. The five new service tests fail on `51db26a`'s `service.ts` | The envelope records `reissuedMints`: distinct https mint URLs, at most `MAX_REISSUED_MINTS` = 64 (`files.ts:50`, `:91`, parsed exact-key at `:140-145`). A file without the field is still read, as `[]`. The service writes each mint as soon as it moved (`service.ts:451-455`, `:596`). A retry skips the recorded mints without asking the mint for a plan (`:533`). It asks no more mints than the envelope can still record (`:559`). A new phrase, a rotation included, starts empty (`:364`). The completion write keeps the record (`...cur`). The file cap went from 16 to 64 KiB so 64 URLs of the longest kind fit | `recovery-service` “fix round 7” (5): the verifier's http scenario, run three times, and the envelope on disk as the record; a failed mint retried alone; more than 32 mints; the 64-mint room; rotation. `recovery-files` “reissuedMints …” |
+| R7-2 | Low | The IR3 phrase rule caught only digit-only escapes (`%20`). `%2C`, `%2F`, `%3A`, `%5B` carry a hex letter that broke the run. `Word1=` keys and indentation over 12 characters passed too (`log.ts:59`) | Reproduced: 12 new canary forms and the property failed on the old rule. Two more new forms, lower-case escapes (read as mangled words such as `cwinner`) and one-letter upper-case keys, were already caught | A separator is 1–12 units (`log.ts:73-85`): a whole white-space run of up to 256 characters; one ASCII digit or punctuation character; a percent escape (`%` and two hex digits) or a lone `%`; or a key a phrase word cannot be (1–16 letters before a digit or `=`, not 3–8 lower-case letters). A word or key may start after a letter only when that letter ends a percent escape (`seedPhrase%3Dlegal…`). The parse stays unique: a white-space run is maximal, `%` is an escape exactly when two hex digits follow, a key ends where its letters end and is never word-shaped, and a word never ends in an escape. Residual 15's Title Case gap stays. Double-encoded escapes are residual 17 | `log`: 14 new forms (URL-encoded comma list, JSON array and JSON object, `%2F`, `%3A%20`, `%2c`, a form body `seedPhrase%3D…`, `Word1=`, `seedWord1=`, `recoveryword1=`, `W0=`, pretty-printed at 20, 14 (tabs) and 104 characters of indent), 4 more property formats, 7 hostile timing inputs |
+| R7-3 | Low | The IR10 test timed out at the 5 s default in full app-desktop runs (5 238 ms, 6 789 ms) (`recovery-relay-copy.test.ts:286`) | Measured alone on this box (load 13): IR10 3.9 s, and the older “at most 64 copies” test 2.7 s. Per event, a `LocalSigner` sign (sign plus re-verify) costs about 32 ms, a verify about 11 ms and a NIP-44 decrypt about 13 ms. With `--testTimeout=1500` standing in for a loaded box, both tests time out on `51db26a` and pass after | Both real-crypto cap tests get an explicit `{ timeout: 30_000 }` (`recovery-relay-copy.test.ts:28`). The comment states why: about 130 real signatures and 200 verifications, the exercised cost, so no fakes. Nothing else changed in the tests. | the two tests themselves |
+
+### Mutation checks (applied to this round's code, named suite run, file restored from a saved copy)
+
+| # | Mutation (file) | Result |
+| --- | --- | --- |
+| M7a | a retry plans recorded mints again: `if (done.includes(mint))` → `if (false)` (`service.ts`) | KILLED: recovery-service fix round 7: the http scenario, the failed mint, more than 32 mints |
+| M7b | the per-mint record never written (`service.ts`) | KILLED: the same three and the 64-mint room |
+| M7c | no room check: asks beyond what the envelope can record (`service.ts`) | KILLED: “never asks more mints than the envelope can record” |
+| M7d | a new phrase inherits the replaced phrase's record (`service.ts`) | KILLED: “a rotation starts a new record” |
+| M7e | the completion write drops the record (`...env` for `...cur`) (`service.ts`) | KILLED: the failed mint retried alone, the rotation |
+| M7f | an envelope from before the field refused (`files.ts`) | KILLED: recovery-files “reissuedMints …” |
+| M7g | the file cap back to 16 KiB (`files.ts`) | KILLED: recovery-files “reissuedMints …” (64 longest URLs) |
+| M7h | duplicate mints accepted (`files.ts`) | KILLED: recovery-files “reissuedMints …” |
+| M7i | no bound on the list (`files.ts`) | KILLED: recovery-files “reissuedMints …” |
+| M7j | no percent-escape unit (`%` back to a plain separator character) (`log.ts`) | KILLED: log, 6 escape forms and the property |
+| M7k | no start after an escape's hex letter (`log.ts`) | KILLED: log “a form body whose key ends in an escape letter” |
+| M7l | white space back to one character per unit (`log.ts`) | KILLED: log, the three pretty-printed forms and the property |
+| M7m | keys back to 1–2 letters (`log.ts`) | KILLED: log `Word1=`, `seedWord1=`, `recoveryword1=`, the property |
+| M7n | keys may be word-shaped (the exclusion dropped) (`log.ts`) | SURVIVED, as designed. The exclusion only keeps the split unique: a word-shaped key is read as a word, which redacts the same span. Without it the ambiguity is bounded, because a failing attempt has fewer than 8 words. Three ambiguous 4 KiB inputs took 0.05–0.68 ms either way |
+
+14 mutations: 13 killed. The survivor guards the parse's uniqueness, not what is redacted.
+
+### Differential review and sharp edges of this round (`51db26a..1c3f875`)
+
+Risk: HIGH `service.ts` (which mints are asked and moved, and so which fees are paid). MEDIUM
+`files.ts` (a new field in the phrase file that must never be refused wrongly: a refused file
+is kept, and the phrase then covers nothing) and `log.ts` (every log line). LOW the tests and
+the fake. No validation was removed. The envelope parse gained one exact-key shape. The old
+shape still parses, as “nothing recorded”, which plans every mint as before.
+
+Blast radius: `parseEnvelope` has 2 callers (`readEnvelope`, `writeEnvelope`). Envelopes are
+read by `seedFor`, `status`, `setupNow`, `showNow` and `restoreNow`, and only
+`finishReissue`/`reissueAll` use the new field. `redact()` covers every host line, forwarded
+worker line and upload error. It is broader again. The constant-message test still passes over
+every host and worker message. A fuzz of 3 000 random repeating 4 KiB inputs over the separator
+alphabet (escapes, lone `%`, long runs, keys) took 8.2 ms at worst. That fuzz was a probe and
+was removed.
+
+- **S1 (sharp edge): a record write that fails after a successful swap** is logged (`a reissued
+  mint could not be recorded`) and not counted as failed. The balance is under the phrase
+  either way. A later retry may move that one mint once more, which is one extra fee (residual
+  18).
+- **S2: the record is keyed by the wallet's own mint string.** `balances()` keys and
+  `plan.mint` are compared equal before a plan is used, so the recorded string is the one the
+  next `balances()` returns.
+- **S3: the mint list sits beside the sealed phrase.** It is not secret: the wallet journal
+  holds the same URLs. It is never published, because the relay copy carries `sealed` only. It
+  is never logged: the log line counts `covered` mints.
+- **S4: the 64-mint room.** A mint beyond it is never asked and is counted failed. It is never
+  moved twice. With 32 plans per question, that is two dialogs' worth.
+- **S5: the unit-based separator** lets words 12 white-space runs apart (up to 256 characters
+  each) read as a phrase. That is more over-redaction of padded text, which is accepted. The
+  constant messages hold.
+
+### Residuals added by this round
+
+16. **A balance that can never be asked keeps “Finish backup” showing:** an http dev mint, or a
+    mint beyond the 64-mint record. Rotation (“Replace phrase”) stays out of reach while it
+    does. Each click now asks nothing and costs nothing, but Settings does not say why. A
+    “cannot be covered from this app” state needs a status-wire change.
+17. **The phrase log rule** does not catch double-encoded escapes (`%252C`), white-space runs
+    over 256 characters, or keys over 16 letters. Residual 15's Title Case / UPPER CASE gap
+    stands.
+18. S1: a record write that fails after a swap can make a later retry move that mint once more.
+
+### Gates (round 7)
+
+- `npx tsc -b --force` clean. `npm run build` OK.
+- eslint and prettier `--check` clean on the 8 changed ts files.
+- `npm run check:locked` OK. `npm run lint:electron` OK (253 files, 0 violations). No
+  dependency change, so `check:native` was not needed.
+- Touched suites, run alone: `recovery-service` 34/34, `recovery-files` + `recovery-save-undo`
+  + `recovery-host` 17/17, `recovery-relay-copy` 11/11 (also with `--testTimeout=1500`),
+  `log` 64/64.
+- The whole suite once with `--maxWorkers=2`, at load 15–18, took 829 s: 3499 passed, 43
+  skipped, 2 failed.
+  - The 2 failures are the known viewer-payer “I2-paygate rate-limited” base failures, owned by
+    lane R6.
+  - Two files, `stage.test` and `packaged-worker.integration`, refused to stage. The
+    `tsc -b --force` gate had made ui's `dist` newer than the renderer bundle, and the stage's
+    own freshness guard refuses that. Their 22 tests account for the extra skips.
+  - After `npm run build`, run alone: `packaged-worker` 2/2; `stage` 19/20, the known R6
+    failure (`QUIT_FLUSH_MS`); `viewer-payer` the same 2 known failures.
+- No test timed out. No timeout was raised except R7-3's stated one.
