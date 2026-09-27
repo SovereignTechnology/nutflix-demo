@@ -870,14 +870,18 @@ describe('AutoTopUp — review F3: a reservation in flight when the host died', 
 
   it('end to end: a melt that never answered, then a restart — the next top-up that no longer fits is refused', async () => {
     let hang = true;
+    let hung = false;
     const s = await setup({
       fund: 80_000,
       amountSats: 10_000,
       belowSats: 60_000,
       wrap: (w) =>
         Object.assign(Object.create(w) as Wallet, {
-          melt: (q: Parameters<Wallet['melt']>[0]) =>
-            hang ? new Promise<never>(() => undefined) : w.melt(q),
+          melt: (q: Parameters<Wallet['melt']>[0]) => {
+            if (!hang) return w.melt(q);
+            hung = true;
+            return new Promise<never>(() => undefined);
+          },
         }),
     });
     for (let i = 0; i < 4; i++) {
@@ -887,7 +891,13 @@ describe('AutoTopUp — review F3: a reservation in flight when the host died', 
       else
         await vi.waitFor(() => {
           expect(s.ledger.snapshot().entries).toHaveLength(4);
-        });
+          // Lane R6-reconcile: and the melt itself in flight. Waiting for the reservation alone
+          // raced the run's seal and `attach` (they come between the reservation and the melt):
+          // under load (the whole suite at load average ~20 on 8 cores) the restart below read
+          // the ledger before the open top-up was written, and the check read 'cap' where this
+          // test's premise — the host died DURING the melt — says 'unresolved'.
+          expect(hung).toBe(true);
+        }, 10_000); // (waitFor's default 1 s is the same race under load)
       later(s);
     }
     hang = false;
