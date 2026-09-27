@@ -13,6 +13,12 @@ amendments to ADRs 0015 and 0018. Lane record: `docs/lanes/P1-owed-seeder.md`.
 | MEDIUM   | 4     | 3                 | 1 (R1, cross-lane: the viewer lane owns it) |
 | LOW      | 6     | 5                 | 1 (R4) |
 
+**Independent review, 2026-09-27** (last section): one HIGH (the terms went out only in reply to
+a block request, so ADR 0015's viewer got silence) and one LOW (a failed OWED report failed open),
+both fixed in `6abd292` with ten more mutation checks (M31–M40); three INFO items (one wording fix,
+two notes). It also turned up R10, a pre-existing gap outside this lane: a stored core the
+`Seeder` has not opened is served with no upload gate.
+
 - **Overall risk:** MEDIUM. A new message a seeder sends every returning viewer, a new meaning on
   PRICE, and a change to the upload gate that every block passes through.
 - **Recommendation:** CONDITIONAL. The seeder side is complete and tested, including at two real
@@ -315,3 +321,204 @@ directory.
   - the gateway's real-mint swarm lane (three seeders, a double-spend, a network drop, all now
     sending PRICE always and OWED on reconnect) is green at `:3399` and `:3397`;
   - core's real-mint integration is green at `:3399`.
+
+## Independent review (2026-09-27)
+
+An independent reviewer examined `54f49bb..dcc49dc` and reported one HIGH, one LOW and three
+INFO findings. Each was verified before anything changed. The fixes are in `6abd292`; this
+section and the lane record were updated after it. Method, as above: `differential-review` and
+`sharp-edges` on the new diff (`dcc49dc..6abd292`), plus mutation checks M31–M40.
+
+| # | Severity | Finding | Outcome |
+|---|----------|---------|---------|
+| IR1 | HIGH | PRICE `{ free: true }` only in reply to a block request | fixed |
+| IR2 | LOW | a failed OWED report is logged and the session carries on | fixed |
+| IR3 | INFO | merge gate: this branch alone breaks desktop image reads | not a defect of P1; gate updated |
+| IR4 | INFO | rule 3 reads "carryIn 0", but the engine chains the carry | fixed (wording) |
+| IR5 | INFO | `gateway/src/upstream/settle.ts` edited (viewer code) | no change; noted for P2 |
+
+### IR1 — the terms went out only in reply to a block request (HIGH, fixed)
+
+`seeder/src/seeder.ts:179` (at `dcc49dc`).
+
+- **Scenario (reproduced).** ADR 0015's amendment: a viewer's image read asks a peer for blocks
+  only after that peer's `PRICE { free: true }`; no probe. At `dcc49dc` the only paths that sent a
+  PRICE were `beforeBlock` (inside Hypercore's `upload` event), the OWED report (priced only) and
+  price changes. A viewer that opened a free core and asked for nothing received no PRICE, so
+  every image showed the placeholder. Getting round that meant asking for a block first, which on
+  a sold core counts one unpaid block per seeder: the failure the amendment removed.
+- **Reproduced by** `owed.integration.test.ts` "a viewer that opens a core and asks for NOTHING
+  receives its terms…" (real streams, pay/1 open on both ends, the viewer opens a free and a sold
+  core and asks for nothing). With the source files of `6abd292` reverted to `dcc49dc` it fails
+  (no PRICE within 3 s), and so do the six other new tests (7 of 22 in the two files).
+- **Fix.** A core's terms go out unprompted as soon as the peer has the core open on a session
+  with pay/1 attached. `beforeBlock` stays the fail-closed backstop.
+  - `SessionRegistry.attachUploadGate` also listens to Hypercore's `peer-add` (both ends of the
+    core's replication channel open) and calls the new `onPeerAdd` hook with the session on the
+    SAME stream (`sessionOf`: looked up, never admitted; a second connection from the same Noise
+    key is another session). The hook runs inside Hypercore's channel-open handler, so the
+    registry catches and logs whatever it throws: an exception there would reach Protomux.
+  - `Seeder.attachPayProtocol` tells the terms of every core already paired on that stream (the
+    peer opened it before pay/1 was attached, so its `peer-add` found nothing to say them on).
+  - `Seeder.onCoreOpened` tells them to every session a newly gated core is already paired on
+    (Corestore can pair a core, for example on a remote's discovery-key request, before the
+    `Seeder` opens its own session of it; that `peer-add` came before the gate).
+  - `setFreeCore` (on a change) and `setCorePolicy` (unless `announce: false`) tell every session
+    the core is paired on now. A core that turns sold is announced at once, so an image read
+    stops asking before its next request is counted.
+  - Those three passes go through `tellTerms`, which never throws (a failure is logged, and the
+    core's next block to that peer says the terms first or is not sent).
+- **Contract.** Rule 1 now says it: the terms as soon as the peer has the core open, unprompted,
+  and in any case before its first block (`contracts/pay-protocol.ts`, `version.ts`, ADR 0015's
+  as-built note).
+- **Tests.**
+  - `owed-terms.test.ts` "rule 1, unprompted" (4 tests): peer-add for a free, a sold and an
+    untermed core; said once; a second stream of the same Noise key; an unadmitted stream is not
+    admitted; a peer-add whose PRICE throws is contained and cuts nothing, and the next block
+    fails closed; the attach pass for the cores paired on this stream only; free ⇄ sold
+    re-announced at once to paired peers only, unchanged terms not repeated, and `announce:
+    false` left to the next block.
+  - `owed.integration.test.ts` (real streams): nothing asked, both kinds; a core paired before
+    pay/1 was attached and a core paired before the `Seeder` opened it.
+  - Nothing-asked cases on every other composition: the gateway's seeder
+    (`gateway/.../terms-before-blocks`), the desktop `PeerNode` over a hyperdht testnet and the
+    dev fixtures over the loopback hub (`app-desktop/.../terms-before-blocks`).
+- **A test changed with the behaviour.** `seeder-runtime.integration.test.ts` (the daemon over
+  hyperswarm) added its PRICE listener after `connect`, which only worked while PRICEs waited for
+  a request: the video's PRICE now arrives during `connect`. The listener is now hooked when the
+  channel is created, with a comment citing why. Its assertions are unchanged (PRICE before the
+  first download of each core, once each, both kinds).
+
+### IR2 — a failed OWED report failed open (LOW, fixed)
+
+`seeder/src/payment/pay-bridge.ts:57` (at `dcc49dc`).
+
+- **Scenario.** `announceOwed` marks the session reported, then sends each core's PRICE and OWED.
+  If one throws on core k (a local fault, such as a policy the codec refuses), cores k..n are
+  never reported and the bridge only logged `open hook failed`. Under the order rule the viewer
+  reads "a block arrived and no OWED" as nothing owed, asks its full window, and is cut for
+  `window-exceeded`: a persisted ban. The bridge test pinned it (`cutReason` null after a
+  throwing `onOpen`).
+- **Fix.** A throwing `onOpen` cuts the session (`local`, no ban) in the same tick, like a
+  throwing `beforeBlock`. Nothing is forgiven: the next connection reports every core again.
+- **Tests.** The bridge test now asserts the cut (`local`, the stream destroyed in the same tick,
+  no ban on either key), with a comment citing this finding; the junk-`outstanding` half of that
+  test is unchanged. A new seeder-level test: `sendOwed` throws on the second core, the session is
+  cut `local`, nobody is banned, and the next connection reports both cores.
+
+### IR3 — merge gate (INFO; not a P1 defect; gate restated)
+
+- **Re-run on `6abd292` alone:** `images-over-pear.integration` 3 failing and
+  `images-paid-core.integration` 4 failing, 7 in all (was 6).
+- **With the one-line R1 guard** in `seeder-credit.ts`'s `price` listener (`if (p.free === true)
+  return;`), applied, built, run and reverted (nothing of it committed): 9 of the 10 pass. The
+  one left is `images-paid-core` "the reviewer's probe…", and only its non-vacuity check
+  `expect(sent).toBeGreaterThan(0)` ("the probe did reach a seeder"). That line encodes the
+  interim one-block probe. With IR1 fixed, the fixture seeders say the video core is sold before
+  anything is asked, so the read is refused with `sent` 0: the amendment's intended outcome ("no
+  probe, nothing counted"). Everything else in that test holds (refused, nobody banned, nothing
+  paid, the viewer's count ≥ what was sent). The test is the viewer's (P2's paths); its
+  replacement check would be "a seeder's priced PRICE was received and `sent` is 0".
+- **So:** P1 still merges only together with P2. P2's "ask only after `{ free: true }`" now gets
+  that PRICE from every seeder this repository builds, with nothing asked (the nothing-asked
+  tests above).
+
+### IR4 — rule 3's carry wording (INFO, fixed)
+
+`RealPaymentEngine.verify` requires `carryIn === cs.carry`; the bind resets the carry to 0 for
+the new channel, and every accepted PAY of the core moves it. Rule 3 said "`carryIn` 0 for that
+core", which reads as "every owed PAY carries 0". Reworded in the contract and in ADR 0018's
+as-built note: an owed range is paid inside this connection's carry chain for the core, so it
+carries 0 only when it is the core's first PAY on this connection, else the last accepted PAY's
+`carryOut`; any other `carryIn` is refused as `malformed`. No code change; the existing engine
+test (`owed.test.ts`, "a stale carry is refused") already covers the seeder side.
+
+### IR5 — `settle.ts` (INFO, no change)
+
+The one-line `sendOwed` pass-through the interface forces. No behaviour. P2 owns the file.
+
+### Differential review of `dcc49dc..6abd292`
+
+- **Blast radius.** `attachUploadGate` runs once per gated core; the new `peer-add` listener runs
+  once per (core, connection) pairing, not per block. `pairedSessions` walks `core.peers` (one
+  entry per connection the core is paired on) and runs only at pay/1 attach (once per
+  connection, over the open cores), at a core's open, and on `setFreeCore` / `setCorePolicy`.
+- **New untrusted input:** none. `peer-add` carries Hypercore's own `Peer`; what a remote controls
+  is only whether and when it opens a core, which it could already do.
+- **Cost a remote can cause.** One PRICE per core it opens per connection (deduplicated per
+  session). A remote opening many cores gets many PRICEs; connections are rate-limited and cores
+  are the seeder's own. The same PRICEs used to follow its first request of each core.
+- **Identity.** `sessionOf` never admits (M34), so a stream that bypassed admission gets nothing
+  said on it (it has no pay/1 anyway), and a core paired on an older connection of the same Noise
+  key is never attributed to the newer session (M33).
+- **Hypercore's handler.** The listener is the only new code that runs inside Hypercore's
+  replication state machine (`onopen`, under a Protomux cork). It cannot throw into it (M32): a
+  throwing listener there would destroy the connection. The cork also means a PRICE written from
+  `peer-add` leaves in the same batch as the seeder's sync for that core.
+- **Logs.** Two new lines, `peer-add hook threw` and `terms not said unprompted — the next block
+  says them first`, each with only the error object from our own code; no keys, pubkeys or
+  ranges. `check:locked` OK (no locked file changed in `6abd292`).
+
+### Sharp edges of the new surface
+
+- `SessionRegistryOptions.onPeerAdd` is optional and contained: forgetting it changes nothing
+  that is enforced (the backstop still runs); throwing from it cannot break replication.
+- `SessionRegistry.sessionOf` / `pairedSessions` are public and read-only; neither admits.
+- `setCorePolicy(…, { announce: false })` now also skips the unprompted re-announcement. It stays
+  a composition's own choice of when to say a price change; the next block still says the terms
+  first (tested). No production caller passes it.
+
+### New residuals
+
+- **R8 — a request in flight when a core turns sold.** The eager re-announcement cannot overtake
+  a request already on the wire: that block goes out after the priced PRICE (the backstop), and is
+  counted. At most the requests in flight at that moment.
+- **R9 — mark then open, not open then mark.** The desktop worker opens a profile core and marks
+  it free after the open resolves (`worker/host.ts` `ownProfile`, the image read). A peer paired
+  in between would be told the core's default price first and `free` after. The worker's seeder
+  has no default price, so such a peer is told nothing and then `free`; the daemon and the gateway
+  serve no free cores in production. Worth closing in the worker (for example, set the mark by key
+  before the open) when P2 reworks that path.
+- **R10 — pre-existing, found while fixing, not introduced by this lane.** A core in the seeder's
+  storage that the `Seeder` has not opened in this process is served by Corestore's
+  discovery-key path with no upload gate: nothing counted, no window, no PRICE. Probe (temporary,
+  deleted): a `Seeder` restarted on the same data directory, its `blobs` core not reopened, served
+  all 6 blocks of a video to a viewer under a 2-block window: 0 counted, no cut, no PRICE. The
+  daemon opens its configured cores at start and the gateway its `blobs` core, so the exposure is
+  any other core in storage until something opens it (replicas opened by key, other names, the
+  desktop worker's cores after a restart). `BlobStore` and its Corestore wiring are unchanged
+  here (`git diff 54f49bb` touches neither). It needs its own lane: for example, refuse the
+  discovery-key attach for cores the `BlobStore` has not opened, or open and gate on it.
+- **R5 extended — free, then no terms.** A core that stops being free while it has no price at all
+  gets no PRICE, so a peer told `free` is not told otherwise, and later blocks are counted without
+  terms. The worker unmarks a core only after closing it.
+
+### Mutation checks M31–M40
+
+Script: the lane's scratch directory (`mutate-review.py`). Each mutation was applied to the
+committed `6abd292`, the named tests were run, and the file was restored with `git checkout`. The
+tree was clean afterwards.
+
+| # | Broken guard | Caught by |
+|---|--------------|-----------|
+| M31 | registry: no `peer-add` listener (terms only in reply to a request) | owed-terms (3), owed.integration (1) |
+| M32 | registry: a throwing `peer-add` hook reaches Hypercore | owed-terms |
+| M33 | registry: `sessionOf` by Noise key alone (no stream identity) | owed-terms |
+| M34 | registry: `sessionOf` admits an unknown stream | owed-terms |
+| M35 | seeder: no pass at pay/1 attach | owed-terms, owed.integration |
+| M36 | seeder: no pass when the `Seeder` opens an already-paired core | owed.integration |
+| M37 | seeder: `setFreeCore` does not re-announce | owed-terms |
+| M38 | seeder: `setCorePolicy` does not re-announce | owed-terms |
+| M39 | seeder: unprompted terms ignore `free` (always priced) | owed-terms, owed.integration |
+| M40 | bridge: a failed OWED report does not cut (fails open) | owed-terms (2) |
+
+### Gates re-run on `6abd292`
+
+- `tsc -b --force`, `npm run build`, eslint, prettier, `check:locked`, `lint:electron`: clean.
+- Touched packages (seeder, gateway, core pay-protocol and payment): 582 passed, 0 failed.
+- Whole suite: 10 failing tests. 3 are the known R6 base failures, 7 are the R1 merge gate (IR3),
+  and one timing failure (`keyfile`) is green alone. Two packaging files failed as whole files on
+  a stale renderer bundle (after the forced `tsc -b`), and pass after `npm run build` (the stage
+  file down to its known R6 case).
+- Real mints: `owed.integration` and the gateway's real-mint swarm lane are green at Nutshell
+  (`:3399`, `:3398`) and cdk-mintd (`:3397`).
