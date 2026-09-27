@@ -390,6 +390,54 @@ describe('the seeder daemon runtime over hyperswarm', () => {
     expect(text).not.toContain('"secret"');
   });
 
+  // Contracts v6 amendment (Cameron 2026-09-26), on the daemon's own composition: its pay/1
+  // wiring (`runtime/pay-wiring.ts`) attaches before any block, so every core's terms precede its
+  // first block — priced for the video, `{ free: true }` for a core it serves outside payment —
+  // and every ACK says what is still counted on the core.
+  it("announces each core's terms before its first block over the swarm — priced for its video, { free: true } for a core it serves outside payment — and every ACK carries outstanding", async () => {
+    const mint = new mocks.TestMint({ url: MINT, seed: new Uint8Array(32).fill(0x57) });
+    const pool = new nostr.FakeRelayPool();
+    const { dataDir, creds } = await setup();
+    const d = await daemon(dataDir, creds, mint, pool, new Map());
+    const v = await viewer(mint);
+    // A core served free (a creator's profile core, ADR 0015), opened before the daemon starts.
+    const profile = await d.seeder.openCore('profile');
+    const image = await profile.blobs.put(new Uint8Array(BLOCK * 3).fill(7));
+    expect(d.seeder.setFreeCore(profile.keyHex, true)).toBe(true);
+    const { core, vcore } = await connect(d, v, 4);
+    const vfree = await v.seeder.blobs.openCoreByKey(Buffer.from(profile.keyHex, 'hex'));
+    const name = (c: string): string => (c === core ? 'paid' : c === profile.keyHex ? 'free' : '?');
+    const seen: string[] = [];
+    v.channel()!.on('price', (p) =>
+      seen.push(`price:${name(p.core)}:${p.free === true ? 'free' : String(p.satsPerBlock)}`),
+    );
+    for (const [vc, n] of [
+      [vcore, 'paid'],
+      [vfree, 'free'],
+    ] as const)
+      vc.core.on('download', (i: number) => seen.push(`download:${n}:${String(i)}`));
+    for (let i = image.blockOffset; i < image.blockOffset + image.blockLength; i++)
+      expect(await vfree.core.get(i, { wait: true, timeout: 5000 })).not.toBeNull();
+    for (let i = 0; i < 4; i++)
+      expect(await vcore.core.get(i, { wait: true, timeout: 5000 })).not.toBeNull();
+    for (const n of ['paid', 'free']) {
+      const price = seen.findIndex((e) => e.startsWith(`price:${n}:`));
+      expect(price, seen.join(' ')).toBeGreaterThanOrEqual(0);
+      expect(seen.findIndex((e) => e.startsWith(`download:${n}:`))).toBeGreaterThan(price);
+      expect(seen.filter((e) => e.startsWith(`price:${n}:`))).toHaveLength(1);
+    }
+    expect(seen).toContain('price:paid:2');
+    expect(seen).toContain('price:free:free');
+    // The free core was never counted; the video's four blocks are, until paid.
+    expect(d.rt.engine.window(v.pubkey)).toMatchObject({ uploaded: 4, paid: 0 });
+    await payRange(v, vcore, core, 0, 1);
+    await payRange(v, vcore, core, 2, 3);
+    expect(v.acks.map((a) => [a.fromBlock, a.toBlock, a.ok, a.outstanding])).toEqual([
+      [0, 1, true, 2],
+      [2, 3, true, 0],
+    ]);
+  });
+
   it('the pending-PAY cap: with the queue full the daemon stops serving (a local cut, no ban) and serves again once a flush drains it', async () => {
     const mint = new mocks.TestMint({ url: MINT, seed: new Uint8Array(32).fill(0x53) });
     const pool = new nostr.FakeRelayPool();

@@ -46,6 +46,13 @@ export const PAY_PROTOCOL_VERSION = 1 as const;
  *    `MAX_OWED_BLOCKS`; what is past the caps is left out, and a range crossing the block cap is
  *    cut short. What is left out is still counted: `ACK.outstanding` includes it. Nothing owed:
  *    no `OWED`. Once per connection; later blocks are reported by `ACK.outstanding` only.
+ *    **Order:** the seeder handles the HELLO that opens the connection — binds the pubkey and
+ *    writes every `OWED` of the report — before it handles any frame that follows that HELLO on
+ *    the stream, and when its own HELLO goes out last, the report follows it directly. So a viewer
+ *    that asks for no block before its channel is `open` receives the whole report before the
+ *    first block it asked for: once any block it asked for after `open` arrives, silence means
+ *    nothing is owed. Blocks it asks for earlier are counted under the provisional identity and
+ *    merged into the pubkey's count when the HELLO binds — a merge past the window is a cut.
  * 3. **Owed blocks are payable at the core's terms.** Before a sold core's `OWED` the seeder sends
  *    that core's priced `PRICE` (unless it already did on this connection). An owed range is then
  *    an ordinary `PAY` on this connection: verified at the terms this connection was told for its

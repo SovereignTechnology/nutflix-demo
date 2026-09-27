@@ -191,8 +191,14 @@ async function rig(windowBlocks: number, real?: MintUrl) {
    * block is asked for), both HELLOs sent. `before` runs once the channels exist, before the
    * HELLOs — where a test hooks the events it records.
    */
+  /**
+   * `seederHelloLast`: the viewer's HELLO goes out first and reaches the seeder before the
+   * seeder's own (a seeder whose HELLO signing is slow — the desktop asks its host) — so the
+   * seeder's channel opens when ITS HELLO is sent, and the report must follow it directly.
+   */
   const connect = async (
     before: (c: { seederChan: payProtocol.PayChannel; viewerChan: payProtocol.PayChannel }) => void,
+    o: { readonly seederHelloLast?: boolean } = {},
   ) => {
     const sa = seeder.replicate(true);
     const sb = viewerNode.replicate(false);
@@ -210,24 +216,38 @@ async function rig(windowBlocks: number, real?: MintUrl) {
     viewerChan.attach(viewerMux);
     seeder.attachPayProtocol(session, seederChan);
     before({ seederChan, viewerChan });
-    seederChan.sendHello(
-      await payProtocol.buildHello(seederSigner, payProtocol.bindingFromMux(seederMux)!, {
+    const seederHello = await payProtocol.buildHello(
+      seederSigner,
+      payProtocol.bindingFromMux(seederMux)!,
+      {
         acceptedMints: [m.mint],
         satsPerBlock: policy.satsPerBlock,
         split: policy.split,
         p2pk: m.seederP2pk,
         windowBlocks,
-      }),
+      },
     );
-    viewerChan.sendHello(
-      await payProtocol.buildHello(viewerSigner, payProtocol.bindingFromMux(viewerMux)!, {
+    const viewerHello = await payProtocol.buildHello(
+      viewerSigner,
+      payProtocol.bindingFromMux(viewerMux)!,
+      {
         acceptedMints: [m.mint],
         satsPerBlock: 0 as Sats,
         split: policy.split,
         p2pk: VIEWER_P2PK,
         windowBlocks: 0,
-      }),
+      },
     );
+    if (o.seederHelloLast === true) {
+      viewerChan.sendHello(viewerHello);
+      await settle(60);
+      expect(seederChan.peer?.pubkey).toBe(viewerPubkey); // received, verified…
+      expect(seederChan.state).toBe('idle'); // …but not open: our HELLO is not out yet
+      seederChan.sendHello(seederHello);
+    } else {
+      seederChan.sendHello(seederHello);
+      viewerChan.sendHello(viewerHello);
+    }
     await settle(80);
     expect(seederChan.state).toBe('open');
     expect(viewerChan.state).toBe('open');
@@ -353,6 +373,46 @@ describe('contracts v6 amendment on a real replication stream', () => {
   it('blocks a dropped connection left unpaid come back as OWED on the next connection (new Noise key, same HELLO pubkey), after the PRICE; paying them there clears them and playback continues', async () => {
     await dropThenPayOwed();
   });
+
+  // The contract's order rule (rule 2): a viewer that asks nothing before `open` has the whole
+  // report before the first block it asks for — so "a block arrived and no OWED" means nothing is
+  // owed. Asked for at the very moment the viewer's channel opens, for both HELLO orders.
+  for (const seederHelloLast of [false, true])
+    it(`the whole OWED report arrives before the first block the viewer asks for once open (${seederHelloLast ? "the seeder's HELLO goes out last" : "the seeder's HELLO first"})`, async () => {
+      const r = await rig(8);
+      const data = new Uint8Array(BLOCK * 8).map((_, i) => (i * 17 + 3) % 256);
+      const put = await r.seeder.putBytes(data, { mime: 'video/mp4' });
+      if (!put.ok) throw new Error('put failed');
+      const core = put.entry.coreKey;
+      r.seeder.setCorePolicy(core, r.policy);
+      const c1 = await r.connect(() => undefined);
+      const vcore = await r.viewerNode.blobs.openCoreByKey(Buffer.from(core, 'hex'));
+      for (let i = 0; i < 3; i++)
+        expect(await vcore.core.get(i, { wait: true, timeout: 3000 })).not.toBeNull();
+      await settle(30);
+      await c1.drop();
+
+      const seen: string[] = [];
+      vcore.core.on('download', (index: number) => seen.push(`download:${String(index)}`));
+      let asked: Promise<unknown> = Promise.resolve();
+      const c2 = await r.connect(
+        ({ viewerChan }) => {
+          viewerChan.on('owed', (m) => seen.push(`owed:${JSON.stringify(m.ranges)}`));
+          viewerChan.on('price', () => seen.push('price'));
+          // The first request goes out in the same tick as the viewer's `open`.
+          viewerChan.on('open', () => {
+            asked = vcore.core.get(5, { wait: true, timeout: 3000 });
+          });
+        },
+        { seederHelloLast },
+      );
+      expect(await asked).not.toBeNull();
+      await settle(30);
+      expect(seen[0], seen.join(' ')).toBe('price');
+      expect(seen[1]).toBe('owed:[[0,2]]');
+      expect(seen.indexOf('download:5')).toBeGreaterThan(1);
+      expect(c2.session.cutReason).toBeNull();
+    });
 });
 
 /**
