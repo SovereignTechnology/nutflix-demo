@@ -362,14 +362,45 @@ export const BUNDLE_SOURCES = ['src/renderer', 'src/preload', 'src/ipc', 'static
  * this package's BUNDLE_SOURCES, and each bundled workspace's dist/ and src/. The bundle reads a
  * bundled workspace through its package exports, i.e. its BUILD: `@sovit/ui` resolves to
  * dist/*.js and the copied stylesheet is dist/ui.css (cross-lane review, round 5: a bundle made
- * from an old ui/dist, with ui rebuilt afterwards, staged the old renderer). src/ reaches the
- * bundle only through dist/ (rules 1 and 2 hold dist/ to it) and stays as a second, stricter
- * check. Pinned against the real renderer bundle's inputs by a test.
+ * from an old ui/dist, with ui rebuilt afterwards, staged the old renderer). Pinned against the
+ * real renderer bundle's inputs by a test.
+ *
+ * What watching a workspace's src/ adds (lane R6-reconcile: the round-5 verifier asked for the
+ * old "second, stricter check" claim to be stated exactly or tested; both are done). src/ reaches
+ * the bundle only through dist/, and an edit there is already refused by rule 1 (tsc would
+ * rebuild) or rule 2 (a stylesheet older than its source), so for a real edit it refuses the same
+ * stale build a second time — a belt for rule 1, whose dry run trusts its `.tsbuildinfo`. On its
+ * own it refuses only a bundle older than a src/ file whose content cannot have changed what the
+ * bundle reads: a source only touched (a checkout rewriting it unchanged; rule 1 calls that
+ * current), or a file that is neither a tsc input nor a stylesheet. Those refusals are false
+ * alarms, cleared by `npm run build`. A test pins that it fires on its own (a touched source).
  */
 export function bundleInputDirs(pkg: string, root: string, bundled: readonly string[]): string[] {
   return [
     ...BUNDLE_SOURCES.map((d) => join(pkg, d)),
     ...bundled.flatMap((w) => [join(root, w, 'dist'), join(root, w, 'src')]),
+  ];
+}
+
+/**
+ * Lane R6-reconcile (the round-5 verifier): the bundle's own configuration shapes its output as
+ * much as its sources — the script (entry points, format, target, what it copies and refuses) and
+ * the tsconfigs its esbuild builds name (JSX, `paths`, the target they inherit), package-relative.
+ * Pinned against the script by a test.
+ */
+export const BUNDLE_CONFIG = [
+  'scripts/bundle.ts',
+  'tsconfig.renderer.json',
+  'tsconfig.preload.json',
+] as const;
+/** What those tsconfigs extend, repo-relative (pinned against their `extends` by the same test). */
+export const BUNDLE_CONFIG_ROOT = ['tsconfig.base.json'] as const;
+
+/** The files of BUNDLE_CONFIG and BUNDLE_CONFIG_ROOT, absolute. */
+export function bundleConfigFiles(pkg: string, root: string): string[] {
+  return [
+    ...BUNDLE_CONFIG.map((f) => join(pkg, f)),
+    ...BUNDLE_CONFIG_ROOT.map((f) => join(root, f)),
   ];
 }
 
@@ -489,7 +520,9 @@ export interface CurrentBuildOptions {
  *      as the package's newest src CSS;
  *   3. scripts/bundle.ts's output that the stage copies: each file at least as new as the newest
  *      file the bundle reads (`bundleInputDirs`: BUNDLE_SOURCES and the bundled packages' dist/
- *      and src/; tests and stories excluded).
+ *      and src/; tests and stories excluded) and the bundle's own configuration
+ *      (`bundleConfigFiles`: the script, its tsconfigs and what they extend; lane R6-reconcile).
+ *      A configuration file that is missing is refused: the rule could not be checked.
  *
  * (2) and (3) compare mtimes: `npm run build` rewrites every one of those files each run, so a
  * refusal clears after it. The remedy is `npm run build` (for outputs deleted by hand,
@@ -532,6 +565,16 @@ export function assertCurrentBuild(o: CurrentBuildOptions): void {
   for (const dir of bundleInputDirs(o.pkg, o.root, o.bundled)) {
     const n = newestInput(dir);
     if (n !== undefined && (newest === undefined || n.mtimeMs > newest.mtimeMs)) newest = n;
+  }
+  for (const path of bundleConfigFiles(o.pkg, o.root)) {
+    let st: ReturnType<typeof lstatSync>;
+    try {
+      st = lstatSync(path);
+    } catch {
+      fail(`${rel(path)} is missing: cannot tell whether the bundle is current`);
+    }
+    if (!st.isFile()) fail(`${rel(path)} is not a regular file: cannot tell whether the bundle is current`);
+    if (newest === undefined || st.mtimeMs > newest.mtimeMs) newest = { path, mtimeMs: st.mtimeMs };
   }
   if (newest === undefined) return;
   for (const f of [

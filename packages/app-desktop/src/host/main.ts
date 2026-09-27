@@ -7,7 +7,7 @@
  * and talks to it with `postMessage(HostIn)` / `'message'` (`HostOut`). Logs are JSON lines on
  * stderr, already redacted. The worker is spawned with `bare-sidecar` (D2 amended).
  */
-import { createHost } from './host.js';
+import { QUIT_FLUSH_MS, createHost } from './host.js';
 import type { Host } from './host.js';
 import { HostArgsError, parseHostArgs } from './flags.js';
 import { createLogger } from './log.js';
@@ -15,12 +15,9 @@ import type { Logger } from './log.js';
 import { spawnBareSidecar } from './worker/sidecar.js';
 import type { SpawnWorker } from './worker/supervisor.js';
 
-/**
- * Fix round 4: how long an app quit waits, at most, for the open play sessions' tails to be paid
- * (the worker drains each session for up to its `CLOSE_DRAIN_MS`, 5 s, in parallel) before the
- * worker is stopped. Main waits a little longer for this process to exit.
- */
-export const QUIT_FLUSH_MS = 7000;
+// Lane R6-reconcile: this entry module exports `runHost` (and types) only — the packaged host
+// bundle is pinned to exactly that (packaging `stage.test.ts`), so constants live in `host.ts`
+// (`QUIT_FLUSH_MS`).
 
 /** Electron's `process.parentPort` in a utility process, structurally. */
 export interface ParentPortLike {

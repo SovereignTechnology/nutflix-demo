@@ -17,6 +17,8 @@ import type Hypercore from 'hypercore';
 import { silentLogger, toHex } from '@sovit/seeder';
 import { describe, expect, it, vi } from 'vitest';
 
+import { PAY_GIVE_UP_MS, PAY_RETRY_BASE_MS, PAY_RETRY_MAX_MS } from '@sovit/gateway/upstream';
+
 import { fromWireError, wireError } from '../../ipc/errors.js';
 import type { PaidEvent } from '../pay/viewer-payer.js';
 import { PAY_RETRY_LATER_MAX_MS, PAY_RETRY_LATER_MS, ViewerPayer } from '../pay/viewer-payer.js';
@@ -396,9 +398,14 @@ describe('ViewerPayer', () => {
   });
 });
 
+// Lane R6-reconcile: both tests below fake `performance` beside the timers. UpstreamPayer's
+// streaks and backoffs now read a monotonic clock (`performance.now()` by default, the round-5
+// verifier), no longer `Date.now()`; with only the timers faked, that clock stood still while the
+// fake timers ran. The retry these tests pin is UpstreamPayer's one mechanism now (`rate-limited`
+// is deferred there), not a timer of ViewerPayer's own.
 describe('ViewerPayer: a PAY the host refuses for now (ADR 0012 amendment, lane I2-paygate)', () => {
   it('a melt at the mint (rate-limited): the blocks stay owed, nothing reaches the seeder, the session stays up; the payer asks again on a backoff — never in a loop — and pays once the host accepts', async () => {
-    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'performance'] });
     try {
       const engine = new mocks.MockPaymentEngine();
       let melting = true;
@@ -464,8 +471,16 @@ describe('ViewerPayer: a PAY the host refuses for now (ADR 0012 amendment, lane 
     }
   });
 
-  it('only rate-limited brings the payer back by itself; the first ask waits PAY_RETRY_LATER_MS, and close() cancels it', async () => {
-    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+  // Lane R6-reconcile: this test was "only rate-limited brings the payer back by itself". That
+  // premise went with fix round 5, which retries EVERY transient failure by itself (its own
+  // backoff, PAY_RETRY_BASE_MS doubling), and gives it up after PAY_GIVE_UP_MS — which would have
+  // written a 300 s melt off after 30 s. Reconciled: `rate-limited` is deferred (its own cadence
+  // from PAY_RETRY_LATER_MS, never given up) and anything else is transient. What the old test
+  // protected still holds and is asserted: the first ask after `rate-limited` waits exactly
+  // PAY_RETRY_LATER_MS, the asks are spaced (never a loop), nothing reaches the seeder, the owed
+  // block stays owed, and close() cancels.
+  it('rate-limited is deferred: asked again after PAY_RETRY_LATER_MS, then on its doubling cadence, never given up; any other failure is transient: retried sooner, given up after PAY_GIVE_UP_MS; close() cancels', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'performance'] });
     try {
       const make = (code: 'rate-limited' | 'no-balance') => {
         let asked = 0;
@@ -487,33 +502,91 @@ describe('ViewerPayer: a PAY the host refuses for now (ADR 0012 amendment, lane 
         proto.hello();
         credit.tryAcquire(toHex(core.key), 0);
         core.emit('download', 0, 65_536, { remotePublicKey: peerKey });
-        return { payer, asked: () => asked };
+        return { payer, proto, asked: () => asked };
       };
       const limited = make('rate-limited');
       const broke = make('no-balance');
       await settle();
       const [l0, b0] = [limited.asked(), broke.asked()];
-      expect(l0).toBe(b0); // the same triggers so far
-      // The tail timer (2 s after the download) asks each once more; the rate-limited one's
-      // backoff (PAY_RETRY_LATER_MS) comes due at the same moment.
-      await vi.advanceTimersByTimeAsync(PAY_RETRY_LATER_MS - 1);
+      expect([l0, b0]).toEqual([1, 1]); // the download's own ask, refused
+      // The transient failure comes back after PAY_RETRY_BASE_MS; the deferred one waits longer.
+      await vi.advanceTimersByTimeAsync(PAY_RETRY_BASE_MS);
       await settle();
-      expect([limited.asked(), broke.asked()]).toEqual([l0, b0]);
+      expect([limited.asked(), broke.asked()]).toEqual([l0, b0 + 1]);
+      await vi.advanceTimersByTimeAsync(PAY_RETRY_LATER_MS - PAY_RETRY_BASE_MS - 1);
+      await settle();
+      expect(limited.asked()).toBe(l0); // (the 2 s tail timer is due at the same moment)
       await vi.advanceTimersByTimeAsync(1);
       await settle();
-      const [l1, b1] = [limited.asked(), broke.asked()];
-      expect(b1).toBe(b0 + 1);
-      expect(l1).toBe(l0 + 2);
+      const l1 = limited.asked();
+      expect(l1).toBe(l0 + 1); // exactly one ask at PAY_RETRY_LATER_MS
+      // A minute on: the transient one is given up (settled as unpaid, asked no more); the
+      // deferred one is still owed and asked on its cadence (2, 4, 8, 16, then every 30 s).
       await vi.advanceTimersByTimeAsync(60_000);
       await settle();
-      expect(broke.asked()).toBe(b1); // no-balance: the next trigger decides, as before
-      expect(limited.asked()).toBeGreaterThan(l1);
+      expect(broke.payer.stats()).toMatchObject({ unpayableBlocks: 1, owed: 0 });
+      expect(limited.payer.stats()).toMatchObject({ unpayableBlocks: 0, owed: 1 });
+      expect(limited.asked() - l1).toBeGreaterThanOrEqual(3);
+      expect(limited.asked() - l1).toBeLessThanOrEqual(5);
+      // The transient one was asked on its own backoff (≤ 4 s apart) until PAY_GIVE_UP_MS, no more.
+      expect(broke.asked()).toBeLessThanOrEqual(
+        b0 + 5 + Math.ceil(PAY_GIVE_UP_MS / PAY_RETRY_MAX_MS),
+      );
+      const b1 = broke.asked();
+      await vi.advanceTimersByTimeAsync(60_000);
+      await settle();
+      expect(broke.asked()).toBe(b1);
+      expect(limited.asked()).toBeGreaterThan(l1 + 3);
+      // Neither ever reached the seeder.
+      expect(limited.proto.sent).toEqual([]);
+      expect(broke.proto.sent).toEqual([]);
       limited.payer.close();
       const closed = limited.asked();
       await vi.advanceTimersByTimeAsync(10 * PAY_RETRY_LATER_MAX_MS);
       await settle();
       expect(limited.asked()).toBe(closed);
       broke.payer.close();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // Lane R6-reconcile: close() used to clear ViewerPayer's own timer; the retry is UpstreamPayer's
+  // now, and a PAY refused after close() must arm none.
+  it('a PAY refused for now AFTER close() arms no retry (the host answered late)', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'performance'] });
+    try {
+      let asked = 0;
+      let refuse: (e: Error) => void = () => undefined;
+      const credit = new CreditPool(2);
+      const payer = new ViewerPayer({
+        pay: () => {
+          asked++;
+          return new Promise<PayMessage>((_resolve, reject) => {
+            refuse = reject;
+          });
+        },
+        ownMints: [mocks.MINTS.a],
+        credit,
+        logger: silentLogger,
+        policyFor: () => policy,
+      });
+      const core = fakeCore(1);
+      payer.attachCore(core);
+      const proto = new FakeProto();
+      payer.attachPeer(NOISE, proto);
+      proto.hello();
+      credit.tryAcquire(toHex(core.key), 0);
+      core.emit('download', 0, 65_536, { remotePublicKey: peerKey });
+      await settle();
+      expect(asked).toBe(1); // being built by the host
+      payer.close();
+      refuse(fromWireError(wireError('rate-limited', 'a melt is in progress at this mint')));
+      await settle();
+      await vi.advanceTimersByTimeAsync(10 * PAY_RETRY_LATER_MAX_MS);
+      await settle();
+      expect(asked).toBe(1);
+      expect(proto.sent).toEqual([]);
     } finally {
       vi.useRealTimers();
     }

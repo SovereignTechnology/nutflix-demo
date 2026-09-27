@@ -9,7 +9,8 @@ Accepted for Stage 3 (issue #6, security review F21). Cameron's decisions, 2026-
 - Electron Forge plus Pear makers.
 - Targets: Windows `.exe`, macOS `.dmg`, Linux `.deb`, Linux AppImage, and a `pear://` address.
 - Fuses: `RunAsNode`, `EnableNodeOptionsEnvironmentVariable` and `EnableNodeCliInspectArguments`
-  off; `EnableEmbeddedAsarIntegrityValidation` and `OnlyLoadAppFromAsar` on.
+  off; `EnableEmbeddedAsarIntegrityValidation` and `OnlyLoadAppFromAsar` on. On 2026-09-26
+  Cameron added a sixth: `GrantFileProtocolExtraPrivileges` off (§4; open question 8).
 - Every release is signed with the SovTech ngit Nostr key through Bunker46, as a Nostr-signed
   manifest of sha256 sums. The nsec is never written anywhere.
 - Gatekeeper and SmartScreen warnings are accepted for now.
@@ -175,14 +176,19 @@ path) is still dropped.
 
 ### 4. Fuses
 
-- `packaging/fuses.ts` holds exactly the five settings. Every other fuse keeps Electron's
-  default.
+- `packaging/fuses.ts` holds exactly six settings: the five of the decision, and
+  `GrantFileProtocolExtraPrivileges` **off** (Cameron, 2026-09-26, answering open question 8).
+  The app never loads `file://` (it serves everything over its own `app:` scheme), so taking
+  `file:` pages' extra privileges away is defence in depth only; Electron's security guidance
+  recommends it. Every other fuse keeps Electron's default, `EnableCookieEncryption` (off)
+  included: the 2026-09-26 decision named only the `file:` fuse.
 - They are flipped with `@electron/fuses` 2.1.3 (Electron org, zero dependencies, SLSA
   provenance) in Forge's `packageAfterCopy` hook. That is before packager renames and signs
   the binary, following the same rule as `@electron-forge/plugin-fuses`. That plugin is not
   used: 7.11.2 pins `@electron/fuses` ^1.
-- They are **read back from every packaged binary** in `postPackage`, together with a layout
-  check (`layout.ts`):
+- They are **read back from every packaged binary** in `postPackage` — all six: a binary that
+  still grants `file://` its privileges fails the build like one with `RunAsNode` on — together
+  with a layout check (`layout.ts`):
   - main, the host, both preloads, and every file of the app window and the prompt window are
     packed (derived from the staging step's file lists, so a file added there is checked too);
   - the worker and the runtime are unpacked, and the worker's three files (boot module,
@@ -519,13 +525,12 @@ lane's allowlist. Enabling it takes one `include:` line, proposed in `docs/lanes
 7. Confirm the pinned AppImage runtime digests, for example with
    `gh release view 20251108 -R AppImage/type2-runtime` or by checking the `.sig` files. They
    were read from GitHub's release listing. A wrong pin fails closed.
-8. `GrantFileProtocolExtraPrivileges` (the app uses no `file://`) and `EnableCookieEncryption`
-   keep their defaults because only five fuses were asked for. Flip them too? (Chromium's
-   remote-debugging switches are now refused in packaged builds, §4.) The cross-lane review
-   (round 4) read the packaged binary back with `@electron/fuses read`: the five chosen fuses
-   are as intended, `GrantFileProtocolExtraPrivileges` is Enabled and `EnableCookieEncryption`
-   Disabled. The app serves everything over its own `app:` scheme, and Electron's security
-   guidance recommends turning the `file:` privilege fuse off. Left unchanged until you answer.
+8. **Answered 2026-09-26:** `GrantFileProtocolExtraPrivileges` is turned off as well (§4). The
+   decision did not name `EnableCookieEncryption`, which keeps its default. (The question was
+   whether to flip the two fuses left at their defaults because only five were asked for. The
+   cross-lane review, round 4, had read the packaged binary back with `@electron/fuses read`:
+   the five chosen fuses as intended, `GrantFileProtocolExtraPrivileges` Enabled,
+   `EnableCookieEncryption` Disabled.)
 9. **The makers.** The decision said "Electron Forge plus Pear makers". This lane uses Forge's
    Squirrel and deb makers plus two in-repo makers (AppImage, dmg) instead, because Holepunch's
    AppImage maker adds `--no-sandbox` on Ubuntu ≥ 24 (main refuses it, D4) and pulls
@@ -544,9 +549,3 @@ lane's allowlist. Enabling it takes one `include:` line, proposed in `docs/lanes
     feature names is specific to each Chromium version and cannot be checked here without
     launching Electron. Refuse named features (which list?), refuse the switches outright, or
     leave them?
-
-## Amendment 2026-09-26 — a sixth fuse (Cameron)
-
-`GrantFileProtocolExtraPrivileges` is turned **off** as well (Cameron, 2026-09-26): the app never
-loads `file://`, so the privileges are defence-in-depth only. The build's fuse read-back checks
-all six.

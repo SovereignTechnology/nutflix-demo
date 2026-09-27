@@ -485,7 +485,8 @@ app.on('window-all-closed', () => {
   app.quit();
 });
 // Fix round 4: the host pays the open play sessions' tails before its worker goes (SIGTERM →
-// `Host.shutdown`, `QUIT_FLUSH_MS`); main lets it, up to `QUIT_GRACE_MS`, before quitting.
+// `Host.shutdown`, `QUIT_FLUSH_MS` in host/host.ts); main lets it, up to `QUIT_GRACE_MS`, before
+// quitting.
 const QUIT_GRACE_MS = 9000;
 let quitReady = false;
 app.on('before-quit', (e) => {

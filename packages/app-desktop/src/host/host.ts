@@ -94,6 +94,15 @@ export interface HostOptions {
   >;
 }
 
+/**
+ * Fix round 4: how long an app quit waits, at most, for the open play sessions' tails to be paid
+ * (the worker drains each session for up to its `CLOSE_DRAIN_MS`, 5 s, in parallel) before the
+ * worker is stopped (`Host.shutdown`, run by the entry `main.ts` on SIGTERM). Main waits a little
+ * longer for this process to exit (`QUIT_GRACE_MS`, main.ts). Here, not in the entry module, whose
+ * exports the packaged bundle pins to `runHost` (lane R6-reconcile).
+ */
+export const QUIT_FLUSH_MS = 7000;
+
 export class Host {
   readonly adapter: DesktopNetworkAdapter;
   readonly worker: WorkerSupervisor;

@@ -23,6 +23,7 @@ import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { dirname, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import ts from 'typescript';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 import {
@@ -36,6 +37,8 @@ import {
 import { runtimeClosure, type Lockfile } from '../closure.ts';
 import { NOT_SHIPPED } from '../identity.ts';
 import {
+  BUNDLE_CONFIG,
+  BUNDLE_CONFIG_ROOT,
   BUNDLE_SOURCES,
   PKG_DIR,
   REPO_ROOT,
@@ -371,6 +374,38 @@ describe('the build the stage copies must be current (cross-lane review, round 4
       ).toBe(true);
     // The fifth copy is @sovit/ui's stylesheet: a bundled workspace, checked as one.
     expect(script).toMatch(/require\.resolve\('@sovit\/ui\/ui\.css'\)/);
+  });
+
+  // Lane R6-reconcile (the round-5 verifier): the freshness rule watches the bundle's own
+  // configuration too. Every tsconfig the script's builds name is watched, and so is every file
+  // those configs extend, followed to the end of the chain.
+  it("BUNDLE_CONFIG covers scripts/bundle.ts, every tsconfig it names and everything they extend", () => {
+    const script = readFileSync(join(PKG_DIR, 'scripts', 'bundle.ts'), 'utf8');
+    const named = [...new Set([...script.matchAll(/tsconfig:\s*'([^']+)'/g)].map((m) => m[1] ?? ''))];
+    expect(named.sort()).toEqual(['tsconfig.preload.json', 'tsconfig.renderer.json']);
+    const watched = new Set([
+      ...BUNDLE_CONFIG.map((f) => join(PKG_DIR, f)),
+      ...BUNDLE_CONFIG_ROOT.map((f) => join(REPO_ROOT, f)),
+    ]);
+    expect(watched.has(join(PKG_DIR, 'scripts', 'bundle.ts'))).toBe(true);
+    const chain: string[] = [];
+    for (let next of named.map((f) => join(PKG_DIR, f))) {
+      for (;;) {
+        chain.push(next);
+        const read = ts.readConfigFile(next, (f) => ts.sys.readFile(f));
+        expect(read.error).toBeUndefined();
+        const ext = (read.config as { extends?: unknown }).extends;
+        if (ext === undefined) break;
+        expect(typeof ext).toBe('string'); // one parent, a relative path
+        next = resolve(dirname(next), ext as string);
+      }
+    }
+    for (const f of chain) expect(watched.has(f), relative(REPO_ROOT, f)).toBe(true);
+    expect(chain).toContain(join(REPO_ROOT, 'tsconfig.base.json'));
+    // Nothing watched that the bundle does not read.
+    expect([...watched].sort()).toEqual(
+      [...new Set([join(PKG_DIR, 'scripts', 'bundle.ts'), ...chain])].sort(),
+    );
   });
 
   // Cross-lane review round 5: the freshness rule watched ui's src/, but the bundle reads ui's

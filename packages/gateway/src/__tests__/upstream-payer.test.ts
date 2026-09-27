@@ -14,12 +14,17 @@ import type { CoreKeyHex, PayMessage, PricePolicy, Sats } from '@sovit/core';
 import { Seeder, nodeCrypto, nodeFs, toHex } from '@sovit/seeder';
 
 import {
+  MAX_CLOCK_STEP_MS,
   MAX_PAY_FAILURES,
   PAY_GIVE_UP_MS,
   PAY_RETRY_BASE_MS,
+  PAY_RETRY_LATER_MAX_MS,
+  PAY_RETRY_LATER_MS,
   PAY_RETRY_MAX_MS,
   UpstreamPayer,
   manifestPolicyResolver,
+  monotonicClock,
+  payFailureClass,
 } from '../upstream/payer.js';
 import type { UpstreamPayerOptions } from '../upstream/payer.js';
 import { FakePayProtocol, helloFrom } from './fake-pay-protocol.js';
@@ -954,5 +959,332 @@ describe('UpstreamPayer — transient failures back off in time; two sessions of
     await settle();
     expect(sent(g.protocol)).toEqual([[CORE_A, 4, 4]]);
     off();
+  });
+});
+
+// Lane R6-reconcile: one retry mechanism for lane I2-paygate's "rate-limited" and fix round 5's
+// transient failures; the round-5 verifier's two payer items (a final give-up ends the streak; a
+// monotonic clock).
+describe('UpstreamPayer — deferred refusals, streaks and the clock (lane R6-reconcile)', () => {
+  function rig6(
+    fail: (range: { core: CoreKeyHex; fromBlock: number; toBlock: number }) => Error | null,
+    opts: Partial<UpstreamPayerOptions> & { readonly batch?: number } = {},
+  ) {
+    const engine = new mocks.MockPaymentEngine({ mode: 'honest' });
+    const calls: [CoreKeyHex, number, number][] = [];
+    const unpayable: [CoreKeyHex, number, number][] = [];
+    const log = capturedLogger();
+    const perCore = new Map<CoreKeyHex, PricePolicy>([
+      [CORE_A, basePolicy(MANIFEST_PRICE)],
+      [CORE_B, basePolicy(MANIFEST_PRICE)],
+    ]);
+    const payer = new UpstreamPayer({
+      engine: {
+        pay: (range, seeder, policy, o) => {
+          calls.push([range.core, range.fromBlock, range.toBlock]);
+          const err = fail(range);
+          return err === null ? engine.pay(range, seeder, policy, o) : Promise.reject(err);
+        },
+        spent: () => engine.spent(),
+      },
+      logger: log.logger,
+      payEveryBlocks: 1,
+      tailMs: 0,
+      seederBatch: () => ({ batch: opts.batch ?? 4, atCap: true }),
+      ownMints: [MINT_A, MINT_B],
+      policyFor: manifestPolicyResolver(() => perCore),
+      onUnpayable: (_noise, r) => {
+        unpayable.push([r.core, r.fromBlock, r.toBlock]);
+      },
+      ...opts,
+    });
+    const protocol = new FakePayProtocol({ autoAck: true });
+    payer.attachPeer(NOISE, protocol);
+    protocol.remoteHello(hello());
+    const sent = (): [CoreKeyHex, number, number][] =>
+      protocol.sentPays.map((m) => [m.range.core, m.range.fromBlock, m.range.toBlock]);
+    return { payer, protocol, calls, unpayable, sent, log };
+  }
+  const limited = (): Error =>
+    Object.assign(new Error('rate-limited: a melt is in progress at this mint'), {
+      code: 'rate-limited',
+    });
+
+  it('classifies outcomes: session-closed and forbidden final, rate-limited deferred, anything else transient', () => {
+    expect(payFailureClass('session-closed')).toBe('final');
+    expect(payFailureClass('forbidden')).toBe('final');
+    expect(payFailureClass('rate-limited')).toBe('deferred');
+    for (const c of ['no-balance', 'backend-down', 'internal', 'error', 'rate-limitedx'])
+      expect(payFailureClass(c)).toBe('transient');
+  });
+
+  it('a 5-minute "rate-limited" (a melt at the mint) is never given up: asked on its own cadence, then paid once the host accepts', async () => {
+    vi.useFakeTimers();
+    try {
+      let melting = true;
+      const r = rig6(() => (melting ? limited() : null));
+      r.payer.onDownload(CORE_A, 0, NOISE); // at the cap: paid at once — and refused
+      await vi.advanceTimersByTimeAsync(0);
+      expect(r.calls).toHaveLength(1);
+      await vi.advanceTimersByTimeAsync(PAY_RETRY_LATER_MS - 1);
+      expect(r.calls).toHaveLength(1); // not the transient cadence (PAY_RETRY_BASE_MS)
+      await vi.advanceTimersByTimeAsync(1);
+      expect(r.calls).toHaveLength(2);
+      // A burst of flushes (a close drain polls every 25 ms) asks nothing inside the backoff.
+      for (let i = 0; i < 20; i++) {
+        await r.payer.flush();
+        await vi.advanceTimersByTimeAsync(25);
+      }
+      expect(r.calls).toHaveLength(2);
+      await vi.advanceTimersByTimeAsync(300_000);
+      // 2, 4, 8, 16 s, then every 30 s: about 13 asks in 5 minutes, and never given up.
+      expect(r.calls.length).toBeGreaterThanOrEqual(10);
+      expect(r.calls.length).toBeLessThanOrEqual(Math.ceil(300_000 / PAY_RETRY_LATER_MAX_MS) + 6);
+      expect(r.unpayable).toEqual([]);
+      expect(r.sent()).toEqual([]);
+      melting = false;
+      await vi.advanceTimersByTimeAsync(PAY_RETRY_LATER_MAX_MS);
+      expect(r.sent()).toEqual([[CORE_A, 0, 0]]);
+      expect(r.payer.stats()).toMatchObject({ pays: 1, unpayableBlocks: 0 });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('a deferred refusal ends a transient streak: its time never counts toward giving up', async () => {
+    vi.useFakeTimers();
+    try {
+      let mode: 'transient' | 'limited' | 'ok' = 'transient';
+      const r = rig6(() =>
+        mode === 'transient'
+          ? new Error('no-balance: not enough sats at this mint')
+          : mode === 'limited'
+            ? limited()
+            : null,
+      );
+      r.payer.onDownload(CORE_A, 0, NOISE);
+      await vi.advanceTimersByTimeAsync(PAY_GIVE_UP_MS - PAY_RETRY_MAX_MS - 100); // a long streak
+      expect(r.calls.length).toBeGreaterThanOrEqual(MAX_PAY_FAILURES);
+      expect(r.unpayable).toEqual([]);
+      mode = 'limited'; // a melt at the mint: two minutes of "not now"
+      await vi.advanceTimersByTimeAsync(120_000);
+      expect(r.unpayable).toEqual([]);
+      mode = 'transient'; // the melt is over; the mint blips once more
+      const before = r.calls.length;
+      await vi.advanceTimersByTimeAsync(PAY_RETRY_LATER_MAX_MS);
+      expect(r.calls.length).toBeGreaterThan(before);
+      // A fresh transient streak: not written off at once (the old streak's age plus the melt's
+      // would have been far past PAY_GIVE_UP_MS).
+      expect(r.unpayable).toEqual([]);
+      mode = 'ok';
+      await vi.advanceTimersByTimeAsync(PAY_RETRY_MAX_MS + 10);
+      expect(r.sent()).toEqual([[CORE_A, 0, 0]]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // The round-5 verifier's sequence: a streak of transient failures on session A's range, then A
+  // closes (its range given up with a final code); 40 s later session B's range of the same core
+  // fails once, transiently. Round 5 kept the old streak (n ≥ 3, first failure 40 s ago), so B's
+  // range was written off at that first failure.
+  it("a range given up with a final code ends the core's streak: a later transient failure starts afresh and is paid once it clears", async () => {
+    vi.useFakeTimers();
+    try {
+      let aClosed = false;
+      let bDown = false;
+      const r = rig6((range) => {
+        if (range.toBlock < 5)
+          return aClosed
+            ? new Error('session-closed: no play session covers these blocks')
+            : new Error('backend-down: the host is busy');
+        return bDown ? new Error('backend-down: the host is busy') : null;
+      });
+      r.payer.onDownload(CORE_A, 0, NOISE); // session A
+      await vi.advanceTimersByTimeAsync(2 * PAY_RETRY_MAX_MS); // 0, 250, 750, 1750, 3750, 7750 ms
+      expect(r.calls.length).toBeGreaterThanOrEqual(MAX_PAY_FAILURES);
+      aClosed = true;
+      await vi.advanceTimersByTimeAsync(PAY_RETRY_MAX_MS);
+      expect(r.unpayable).toEqual([[CORE_A, 0, 0]]);
+      await vi.advanceTimersByTimeAsync(40_000);
+      bDown = true;
+      r.payer.onDownload(CORE_A, 5, NOISE); // session B, a mint blip
+      await vi.advanceTimersByTimeAsync(0);
+      expect(r.unpayable).toEqual([[CORE_A, 0, 0]]); // B's range NOT written off
+      bDown = false;
+      await vi.advanceTimersByTimeAsync(PAY_RETRY_BASE_MS);
+      expect(r.sent()).toEqual([[CORE_A, 5, 5]]);
+      expect(r.unpayable).toEqual([[CORE_A, 0, 0]]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("the final code also frees the core's next run from the old backoff: tried in the same pass", async () => {
+    let closed = false;
+    const r = rig6(
+      (range) =>
+        range.toBlock < 5
+          ? new Error(closed ? 'forbidden: outside the video' : 'backend-down: busy')
+          : null,
+      { batch: 8, clock: () => 0 },
+    );
+    r.payer.onDownload(CORE_A, 0, NOISE);
+    await settle();
+    expect(r.calls).toEqual([[CORE_A, 0, 0]]); // refused: a backoff that (clock 0) never ends
+    closed = true;
+    r.payer.onDownload(CORE_A, 6, NOISE);
+    // The clock stands still, so only a retry TIMER could end the backoff; wait for it to fire
+    // (PAY_RETRY_BASE_MS, real time), when block 0 is given up for good and block 6 is paid in the
+    // same pass — not held back by the streak block 0 left behind.
+    await until(() => r.sent().length === 1, 2_000);
+    expect(r.unpayable).toEqual([[CORE_A, 0, 0]]);
+    expect(r.sent()).toEqual([[CORE_A, 6, 6]]);
+  });
+
+  it('streaks read the injected monotonic clock, never Date.now(): a wall-clock step writes nothing off; a step of the clock itself does', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+    try {
+      let mono = 0;
+      const r = rig6(() => new Error('no-balance: not enough sats at this mint'), {
+        clock: () => mono,
+      });
+      r.payer.onDownload(CORE_A, 0, NOISE);
+      await vi.advanceTimersByTimeAsync(0);
+      // Three more tries on the backoff, the monotonic clock moving with the timers.
+      for (const d of [PAY_RETRY_BASE_MS, 2 * PAY_RETRY_BASE_MS, 4 * PAY_RETRY_BASE_MS]) {
+        mono += d;
+        await vi.advanceTimersByTimeAsync(d);
+      }
+      expect(r.calls).toHaveLength(MAX_PAY_FAILURES + 1);
+      // The wall clock jumps a day ahead (NTP, a resume from suspend): nothing is written off.
+      vi.setSystemTime(Date.now() + 24 * 60 * 60_000);
+      mono += 8 * PAY_RETRY_BASE_MS;
+      await vi.advanceTimersByTimeAsync(8 * PAY_RETRY_BASE_MS);
+      expect(r.calls).toHaveLength(MAX_PAY_FAILURES + 2);
+      expect(r.unpayable).toEqual([]);
+      // …and a step back of the wall clock holds no retry back.
+      vi.setSystemTime(Date.now() - 48 * 60 * 60_000);
+      mono += PAY_RETRY_MAX_MS;
+      await vi.advanceTimersByTimeAsync(PAY_RETRY_MAX_MS);
+      expect(r.calls).toHaveLength(MAX_PAY_FAILURES + 3);
+      expect(r.unpayable).toEqual([]);
+      // The monotonic clock itself past PAY_GIVE_UP_MS: the next failure gives the range up.
+      mono += PAY_GIVE_UP_MS;
+      await vi.advanceTimersByTimeAsync(PAY_RETRY_MAX_MS);
+      expect(r.unpayable).toEqual([[CORE_A, 0, 0]]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('a clock that stands still cannot stall a retry: the retry timer ends the backoff', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      let down = true;
+      const r = rig6(() => (down ? new Error('backend-down: the host is busy') : null), {
+        clock: () => 1_000,
+      });
+      r.payer.onDownload(CORE_A, 0, NOISE);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(r.calls).toHaveLength(1);
+      down = false;
+      await vi.advanceTimersByTimeAsync(PAY_RETRY_BASE_MS - 1);
+      expect(r.calls).toHaveLength(1);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(r.sent()).toEqual([[CORE_A, 0, 0]]);
+      // …and a frozen clock never gives up either (its streak never ages): fail-safe.
+      const f = rig6(() => new Error('internal: boom'), { clock: () => 5 });
+      f.payer.onDownload(CORE_B, 0, NOISE);
+      await vi.advanceTimersByTimeAsync(3 * PAY_GIVE_UP_MS);
+      expect(f.unpayable).toEqual([]);
+      expect(f.calls.length).toBeGreaterThan(MAX_PAY_FAILURES);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('dispose(): a PAY that fails after it arms no retry, and nothing more is built', async () => {
+    vi.useFakeTimers();
+    try {
+      let refuse: (e: Error) => void = () => undefined;
+      const engine = new mocks.MockPaymentEngine({ mode: 'honest' });
+      let calls = 0;
+      const perCore = new Map<CoreKeyHex, PricePolicy>([[CORE_A, basePolicy(MANIFEST_PRICE)]]);
+      const payer = new UpstreamPayer({
+        engine: {
+          pay: () => {
+            calls++;
+            return new Promise<PayMessage>((_resolve, reject) => {
+              refuse = reject;
+            });
+          },
+          spent: () => engine.spent(),
+        },
+        logger: capturedLogger().logger,
+        payEveryBlocks: 1,
+        tailMs: 0,
+        ownMints: [MINT_A, MINT_B],
+        policyFor: manifestPolicyResolver(() => perCore),
+      });
+      const protocol = new FakePayProtocol({ autoAck: true });
+      payer.attachPeer(NOISE, protocol);
+      protocol.remoteHello(hello());
+      payer.onDownload(CORE_A, 0, NOISE);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(calls).toBe(1);
+      payer.dispose();
+      refuse(new Error('backend-down: the host is busy'));
+      await vi.advanceTimersByTimeAsync(10 * PAY_RETRY_LATER_MAX_MS);
+      payer.onDownload(CORE_A, 1, NOISE);
+      await payer.flush();
+      expect(calls).toBe(1);
+      expect(protocol.sentPays).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  describe('monotonicClock', () => {
+    it('is performance.now() where the runtime has it (called on performance)', () => {
+      const perf = {
+        t: 42,
+        now(this: { t: number }): number {
+          return this.t;
+        },
+      };
+      const c = monotonicClock({ performance: perf, dateNow: () => 1e12 });
+      expect(c()).toBe(42);
+      perf.t = 50;
+      expect(c()).toBe(50);
+      // The runtime's own: Node has performance.
+      const real = monotonicClock();
+      expect(Math.abs(real() - performance.now())).toBeLessThan(1_000);
+    });
+
+    it('without performance (Bare): Date.now() made steady — never backwards, a step forward counts at most MAX_CLOCK_STEP_MS, NaN counts nothing', () => {
+      let wall = 1_000_000;
+      const c = monotonicClock({ performance: undefined, dateNow: () => wall });
+      expect(c()).toBe(0);
+      wall += 250;
+      expect(c()).toBe(250);
+      wall -= 60 * 60_000; // an hour back
+      expect(c()).toBe(250);
+      wall += 1_000; // time goes on from there
+      expect(c()).toBe(1_250);
+      wall += 24 * 60 * 60_000; // a day ahead (a resume from suspend)
+      expect(c()).toBe(1_250 + MAX_CLOCK_STEP_MS);
+      wall = Number.NaN;
+      expect(c()).toBe(1_250 + MAX_CLOCK_STEP_MS);
+      wall = 5_000;
+      expect(c()).toBe(1_250 + MAX_CLOCK_STEP_MS);
+      wall += 100;
+      expect(c()).toBe(1_350 + MAX_CLOCK_STEP_MS);
+      // MAX_CLOCK_STEP_MS is past the longest wait between two reads during a transient streak.
+      expect(MAX_CLOCK_STEP_MS).toBeGreaterThan(PAY_RETRY_MAX_MS);
+      // A performance object without a now() function is not a clock.
+      const d = monotonicClock({ performance: { now: 'x' }, dateNow: () => 7 });
+      expect(d()).toBe(0);
+    });
   });
 });

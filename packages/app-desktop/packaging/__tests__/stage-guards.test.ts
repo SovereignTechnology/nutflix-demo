@@ -34,7 +34,14 @@ import ts from 'typescript';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import { NOT_SHIPPED, PRELOAD_FILES, PROMPT_FILES, RENDERER_FILES } from '../identity.ts';
-import { BUNDLE_SOURCES, StageError, stageApp, testDoubleStub } from '../stage.ts';
+import {
+  BUNDLE_CONFIG,
+  BUNDLE_CONFIG_ROOT,
+  BUNDLE_SOURCES,
+  StageError,
+  stageApp,
+  testDoubleStub,
+} from '../stage.ts';
 
 let root = '';
 beforeEach(() => {
@@ -126,6 +133,10 @@ function fixture(f: Fixture = {}): { pkg: string; root: string } {
   };
   for (const [p, c] of Object.entries(src))
     if (!(f.omit ?? []).includes(p)) put(join(pkg, 'src', p), c);
+  // The bundle's own configuration (lane R6-reconcile): the script and its tsconfigs, and the
+  // repo's base config they extend — written before the outputs, like the sources.
+  for (const c of BUNDLE_CONFIG) put(join(pkg, c), '// bundle config\n');
+  for (const c of BUNDLE_CONFIG_ROOT) put(join(root, c), '{}\n');
   // The bundle outputs are written AFTER the sources, as `npm run build` leaves them (round 4:
   // staging refuses a bundle output older than the bundles' sources).
   for (const n of RENDERER_FILES) put(join(pkg, 'dist', 'renderer', n), n);
@@ -432,6 +443,69 @@ describe(
         expect(existsSync(join(out, 'package.json'))).toBe(true);
       },
     );
+
+    // Lane R6-reconcile (the round-5 verifier): the bundle's own configuration is an input too —
+    // a changed target, JSX setting or entry point changes the output as much as a source does.
+    it.each([
+      ...BUNDLE_CONFIG.map((f) => ['packages/app', f] as const),
+      ...BUNDLE_CONFIG_ROOT.map((f) => ['', f] as const),
+    ])(
+      "a bundle output older than the bundle's own configuration (%s/%s) is refused; rebundled, it stages",
+      async (under, file) => {
+        const { pkg, root: repoRoot } = fixture();
+        const out = join(root, 'out-bundle-config');
+        await restage(pkg, repoRoot, out);
+        const path = join(repoRoot, under, file);
+        touch(path, 60);
+        const named = (under === '' ? file : `${under}/${file}`).replace(/\./g, '\\.');
+        await expect(restage(pkg, repoRoot, out)).rejects.toThrow(
+          new RegExp(`dist/\\S+ is older than ${named}: run \`npm run build\``),
+        );
+        for (const f of [
+          ...RENDERER_FILES.map((n) => join('renderer', n)),
+          ...PROMPT_FILES.map((n) => join('prompt', n)),
+          ...PRELOAD_FILES,
+        ])
+          touch(join(pkg, 'dist', f), 61);
+        await expect(restage(pkg, repoRoot, out)).resolves.toBeDefined();
+      },
+    );
+
+    it("the bundle's configuration missing (renamed, never written) is refused: the rule could not be checked", async () => {
+      const { pkg, root: repoRoot } = fixture();
+      rmSync(join(pkg, 'tsconfig.renderer.json'));
+      await expect(restage(pkg, repoRoot, join(root, 'out-nobundlecfg'))).rejects.toThrow(
+        /packages\/app\/tsconfig\.renderer\.json is missing: cannot tell whether the bundle is current/,
+      );
+      const r2 = fixture();
+      rmSync(join(r2.root, 'tsconfig.base.json'));
+      mkdirSync(join(r2.root, 'tsconfig.base.json'));
+      await expect(restage(r2.pkg, r2.root, join(root, 'out-dircfg'))).rejects.toThrow(
+        /tsconfig\.base\.json is not a regular file: cannot tell whether the bundle is current/,
+      );
+    });
+
+    // Lane R6-reconcile (the round-5 verifier: "src/ stays as a second check" was untested). A
+    // ui source only touched — content as built, so tsc's dry run calls the build current (rule
+    // 1) and no stylesheet changed (rule 2) — still refuses a bundle older than it: the src/
+    // watch fires on its own (`bundleInputDirs`, which states exactly what it adds).
+    it("watching @sovit/ui's src/ refuses on its own: a ui source touched after the bundle (tsc calls it current)", async () => {
+      const { pkg, root: repoRoot } = fixture({ ui: true });
+      const out = join(root, 'out-ui-src');
+      const ui = join(repoRoot, 'packages', 'ui');
+      await restage(pkg, repoRoot, out);
+      touch(join(ui, 'src', 'index.ts'), 60); // unchanged content: "would update timestamps"
+      await expect(restage(pkg, repoRoot, out)).rejects.toThrow(
+        /dist\/\S+ is older than packages\/ui\/src\/index\.ts: run `npm run build`/,
+      );
+      for (const f of [
+        ...RENDERER_FILES.map((n) => join('renderer', n)),
+        ...PROMPT_FILES.map((n) => join('prompt', n)),
+        ...PRELOAD_FILES,
+      ])
+        touch(join(pkg, 'dist', f), 61);
+      await expect(restage(pkg, repoRoot, out)).resolves.toBeDefined();
+    });
 
     it('@sovit/ui (bundled into the renderer): its tsc build, its stylesheet, then the bundles', async () => {
       const { pkg, root: repoRoot } = fixture({ ui: true });
