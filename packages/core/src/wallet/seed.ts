@@ -406,6 +406,12 @@ interface Loaded {
   readonly published: Map<string, number>;
   /** Keysets whose counters the store knew, or a probe settled, in this process. */
   readonly safe: Set<string>;
+  /**
+   * Keysets whose stored `[published, next)` was not empty at load (an earlier process's outputs,
+   * maybe never published) and that no startup restore has scanned since (`markScanned`): their
+   * watermark does not move. Held from the load, so it fails closed (fix round 7).
+   */
+  readonly unscanned: Set<string>;
   /** `published` moved since the last save. */
   dirty: boolean;
 }
@@ -560,21 +566,37 @@ export class DurableCounterSource {
 
   /**
    * Every output handed out so far is published (the caller checked: no operation running,
-   * nothing journaled, the store's outbox empty) — except under the keysets in `hold`, whose
-   * earlier range a startup restore has not finished (required: forgetting it must not silently
-   * move a held keyset). Kept in memory; written with the next lease
-   * or by `flush` — a stale watermark only restores more at startup.
+   * nothing journaled, the store's outbox empty) — except under the keysets in `hold` (required,
+   * an empty set to add none) and under every keyset whose earlier range was not empty when the
+   * counters file was loaded and no startup restore has scanned since (`markScanned`). That second
+   * hold is this source's own, from its first load: an operation finishing before the startup
+   * restore ran, or in another wallet object over the same source, cannot mark an earlier
+   * process's range published (independent verifier, fix round 7: the hold used to start empty in
+   * the wallet). Kept in memory; written with the next lease or by `flush` — a stale watermark
+   * only restores more at startup.
    */
   markPublished(hold: ReadonlySet<string>): Promise<void> {
     return this.serial(async () => {
       const s = await this.load();
       for (const [k, c] of s.cursor) {
-        if (hold.has(k)) continue;
+        if (hold.has(k) || s.unscanned.has(k)) continue;
         if ((s.published.get(k) ?? 0) < c) {
           s.published.set(k, c);
           s.dirty = true;
         }
       }
+    });
+  }
+
+  /**
+   * A startup restore scanned the whole `[published, next)` range (as `unpublished` gave it) of
+   * `keysetIds` and added what it found: their watermark may move again. Only the startup restore
+   * (`CashuWallet.restoreUnpublished`) calls this. A keyset not held is ignored.
+   */
+  markScanned(keysetIds: Iterable<string>): Promise<void> {
+    return this.serial(async () => {
+      const s = await this.load();
+      for (const k of keysetIds) s.unscanned.delete(k);
     });
   }
 
@@ -638,7 +660,16 @@ export class DurableCounterSource {
           const next = leased.get(k);
           if (next !== undefined) published.set(k, Math.min(v, next));
         }
-        return { cursor, leased, published, safe: new Set(leased.keys()), dirty: false };
+        const unscanned = new Set<string>();
+        for (const [k, next] of leased) if ((published.get(k) ?? 0) < next) unscanned.add(k);
+        return {
+          cursor,
+          leased,
+          published,
+          safe: new Set(leased.keys()),
+          unscanned,
+          dirty: false,
+        };
       });
       this.state = p;
       p.catch(() => {

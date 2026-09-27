@@ -699,6 +699,35 @@ describe('DurableCounterSource: the published watermark (ADR 0016 §3)', () => {
     expect(store.state?.published).toEqual({ [KS_B]: 4 });
   });
 
+  it('a keyset whose stored [published, next) is not empty is held from load until a startup restore scanned it (fix round 7)', async () => {
+    // The verifier's finding: the hold started empty, so an operation finishing before the
+    // startup restore marked an earlier process's range published. It is held from the load now.
+    const store = new MemoryCounterStore({
+      v: 1,
+      next: { [KS_A]: 10, [KS_B]: 5 },
+      published: { [KS_A]: 3, [KS_B]: 5 },
+    });
+    const src = new DurableCounterSource(store);
+    await src.reserve(KS_A, 2);
+    await src.reserve(KS_B, 2);
+    await src.markPublished(new Set());
+    await src.flush();
+    expect(store.state?.published).toEqual({ [KS_A]: 3, [KS_B]: 7 });
+    // The hold outlives the source: a successor over the same file holds the range again.
+    src.close();
+    const next = new DurableCounterSource(store);
+    await next.reserve(KS_A, 1);
+    await next.markPublished(new Set());
+    await next.flush();
+    expect(store.state?.published[KS_A]).toBe(3);
+    // Released per keyset once scanned: 10 + 2 was leased to 44 and the successor handed out 44,
+    // so A moves to 45; B's unused lease [7, 39) is a range too, not scanned, so it stays held.
+    await next.markScanned([KS_A]);
+    await next.markPublished(new Set());
+    await next.flush();
+    expect(store.state?.published).toEqual({ [KS_A]: 45, [KS_B]: 7 });
+  });
+
   it('flush works after close (the wallet closes the source first, then writes the watermark)', async () => {
     const store = new MemoryCounterStore({ v: 1, next: { [KS_A]: 0 }, published: {} });
     const src = new DurableCounterSource(store);
