@@ -11,7 +11,8 @@
  * the real `entry.js` installs its handlers, a real `bareDleqThread()` thread starts and answers
  * DLEQ checks (then parks), an uncaught exception is thrown, and the process must exit 1 within a
  * few seconds. Before the fix it was still running 25 s later and had to be SIGKILLed. Skipped
- * when `dist/` lacks the modules (`npm run build` first, as CI does).
+ * when `dist/` lacks the modules (`npm run build` first, as CI does) — unless
+ * `NUTFLIX_REQUIRE_BUILT=1`, when a missing build FAILS it (round-8 review, below).
  */
 import { randomBytes } from 'node:crypto';
 import { existsSync } from 'node:fs';
@@ -33,6 +34,15 @@ const built =
   existsSync(join(DIST, 'pay', 'dleq-thread-entry.mjs')) &&
   existsSync(join(DIST, 'pay', 'dleq-thread.js')) &&
   existsSync(join(DIST, 'adapters', 'bare.js'));
+/**
+ * Round-8 review (test integrity): with `NUTFLIX_REQUIRE_BUILT=1` a `dist/` without the built
+ * modules FAILS this file instead of skipping it, so the only real-Bare check of the `Bare.exit` fix can never pass by being skipped.
+ * A gate that builds first sets it (`NUTFLIX_REQUIRE_BUILT=1 npx vitest run` after `npm run
+ * build`); a plain `vitest run` without a build still skips, as before.
+ */
+const REQUIRE_BUILT = process.env['NUTFLIX_REQUIRE_BUILT'] === '1';
+/** Why the file cannot run (the assertion's message under `NUTFLIX_REQUIRE_BUILT=1`). */
+const NOT_BUILT = 'dist/worker lacks the built worker modules: run `npm run build` first';
 const MINT = 'https://mint.bare-exit.test' as MintUrl;
 /** How long the process may take to exit after the throw (it takes milliseconds when it works). */
 const EXIT_WITHIN_MS = 5000;
@@ -86,10 +96,11 @@ afterAll(async () => {
 });
 
 describe('the Bare worker exits with a DLEQ thread parked (fix round 4)', () => {
-  it.skipIf(!built)(
+  it.skipIf(!built && !REQUIRE_BUILT)(
     'an uncaught exception after the thread answered exits 1 within a few seconds',
     { timeout: 90_000 },
     async () => {
+      expect(built, NOT_BUILT).toBe(true);
       const sc = new Sidecar(join(work, 'boot.mjs'), []);
       let stdout = '';
       let stderr = '';

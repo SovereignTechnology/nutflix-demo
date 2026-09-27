@@ -32,6 +32,12 @@ import {
   upload,
 } from './provider.mjs';
 
+// Round-8 review (test integrity): the stated reason. The seam returns the REAL engine over real
+// ecash (`provider.mts`): the property run against the mock's model and the reconnect-and-pay
+// tests mint and DLEQ-verify real proofs through in-process TestMints in pure JS (~30 ms per proof,
+// see cheating-modes.test.ts). Alone the file takes under a second (measured 2026-09-27: 0.5 s for
+// the reconnect test); under the whole suite's load real curve work runs many times slower, so it
+// keeps the budget engine.test.ts gives the same seam. No run count or assertion depends on it.
 vi.setConfig({ testTimeout: 120_000 });
 
 const CORE_C = 'c4'.repeat(32) as CoreKeyHex;
