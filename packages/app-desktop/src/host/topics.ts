@@ -81,6 +81,9 @@ export class TopicRegistry {
       case 'signer.status':
         sub.off = a.onSignerStatus(emit);
         break;
+      case 'recovery.progress':
+        sub.off = a.onRecoveryProgress(emit);
+        break;
     }
     if (subs === undefined) {
       subs = new Map();

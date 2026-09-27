@@ -54,7 +54,14 @@ import { MAX_IMAGE_BYTES, NostrKind, manifest, nostr } from '@sovit/core';
 
 import { toHex } from '../ipc/codec.js';
 import { IpcError } from '../ipc/errors.js';
-import type { FfmpegStatus, ImageMime, NfMediaImgUrl, UploadId } from '../ipc/protocol.js';
+import type {
+  FfmpegStatus,
+  ImageMime,
+  NfMediaImgUrl,
+  RecoveryProgressWire,
+  RecoveryStatusWire,
+  UploadId,
+} from '../ipc/protocol.js';
 import { IMAGE_MIMES } from '../ipc/protocol.js';
 import { rehydrate } from '../ipc/wiremap.js';
 import type {
@@ -70,6 +77,7 @@ import type { FixtureCatalog } from './catalog/fixture-catalog.js';
 import { fail, hostError } from './errors.js';
 import type { IdentityProvider } from './identity.js';
 import type { DesktopSigner } from './signer/desktop-signer.js';
+import type { RecoveryService } from './recovery/service.js';
 import { QuoteHandles } from './quote-handles.js';
 import type { ImageService } from './images/images.js';
 import { sniffImage } from './images/images.js';
@@ -100,6 +108,8 @@ export interface DesktopAdapterOptions {
   readonly identity: IdentityProvider;
   /** ADR 0013: the connect / unlock / lock / sign-out flow (absent with --dev-mocks or an injected signer). */
   readonly signerFlow?: DesktopSigner;
+  /** ADR 0016: the recovery phrase (present with the signer flow only). */
+  readonly recovery?: RecoveryService;
   readonly wallet: WalletProvider;
   /**
    * Stage 3 (ADR 0012): the money plane of the unlocked signer, read at each play (ADR 0013: it
@@ -282,6 +292,26 @@ export class DesktopNetworkAdapter implements NetworkAdapter {
     if (this.o.signerFlow === undefined)
       fail('forbidden', 'the signer cannot be changed in this mode (--dev-mocks)');
     return this.o.signerFlow;
+  }
+
+  /** ADR 0016: the recovery phrase's flows; refused where the signer is fixed. */
+  recovery(): RecoveryService {
+    if (this.o.recovery === undefined)
+      fail('forbidden', 'the recovery phrase is not available in this mode (--dev-mocks)');
+    return this.o.recovery;
+  }
+
+  /** ADR 0016: the status — `unavailable` where there is no recovery phrase at all. */
+  recoveryStatus(): Promise<RecoveryStatusWire> {
+    return (
+      this.o.recovery?.status() ??
+      Promise.resolve({ state: 'unavailable', reissuePending: false, relayCopy: false })
+    );
+  }
+
+  /** `recovery.progress` topic (ADR 0016). */
+  onRecoveryProgress(cb: (p: RecoveryProgressWire) => void): Unsubscribe {
+    return this.o.recovery?.onProgress(cb) ?? ((): void => undefined);
   }
 
   me(): Promise<NostrPubkey | null> {

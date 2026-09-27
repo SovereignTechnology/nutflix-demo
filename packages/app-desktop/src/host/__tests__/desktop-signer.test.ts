@@ -172,6 +172,11 @@ function localScript(
       case 'remove-key':
       case 'bunker-auth':
       case 'top-up-first': // issue #2: the auto top-up's question, never part of this flow
+      // ADR 0016: the recovery phrase's questions, never part of this flow either.
+      case 'recovery-show':
+      case 'recovery-confirm':
+      case 'recovery-restore':
+      case 'recovery-reauth':
         return null;
     }
   };

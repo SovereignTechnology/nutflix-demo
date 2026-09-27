@@ -44,6 +44,18 @@ const IPV6_RE =
   /\[[0-9a-fA-F:]{2,39}(?:%\w+)?\]|(?<![\w:.])(?=[0-9a-fA-F:]*:[0-9a-fA-F:]*:)[0-9a-fA-F:]{3,39}(?:%\w+)?(?![\w:])/g;
 // eslint-disable-next-line no-control-regex -- stripping control characters is the point
 const CONTROL_RE = /[\u0000-\u001f\u007f]/g;
+/**
+ * ADR 0016 (related finding 3): a word phrase — 8 or more consecutive lower-case words of 3 to 8
+ * letters (every BIP-39 English word is one), separated by spaces or punctuation, optionally
+ * numbered ("1. abandon 2. ability …"). Over-matches ordinary prose on purpose: a recovery
+ * phrase must never reach a log whole, and part of one is still a guessing head start.
+ */
+const PHRASE_SEP = String.raw`(?:[\s,;:.|/_-]+(?:\d{1,2}[.):]?[\s,;:.|/_-]*)?)`;
+const PHRASE_WORD = '[a-z]{3,8}';
+const PHRASE_RE = new RegExp(
+  String.raw`(?<![A-Za-z])${PHRASE_WORD}(?:${PHRASE_SEP}${PHRASE_WORD}){7,}(?![A-Za-z])`,
+  'g',
+);
 
 const LOOPBACK_HOST = /^(?:127\.0\.0\.1|\[::1\]|localhost)(?::\d{1,5})?$/i;
 const IP_HOST = /^(?:[\d.]+|\[[0-9a-fA-F:.%\w]*\])(?::\d{1,5})?$/;
@@ -51,12 +63,17 @@ const IP_HOST = /^(?:[\d.]+|\[[0-9a-fA-F:.%\w]*\])(?::\d{1,5})?$/;
 /**
  * Removes everything that could be secret or peer-identifying from a string, keeping enough to
  * debug by: URLs keep only `scheme://host[:port]` (IP-literal hosts other than loopback become
- * `<ip>`), and file paths, bech32 keys/invoices/tokens, e-mail addresses, hex and base64 runs
- * and IP addresses become placeholders. Bounded: only the first few KiB are ever looked at.
- * Over-redaction (a clock time read as an IPv6 address) is accepted; under-redaction is not.
+ * `<ip>`), and file paths, bech32 keys/invoices/tokens, e-mail addresses, hex and base64 runs,
+ * IP addresses and word phrases (a recovery phrase, ADR 0016) become placeholders. Bounded: only
+ * the first few KiB are ever looked at. Over-redaction (a clock time read as an IPv6 address, a
+ * long sentence read as a phrase) is accepted; under-redaction is not.
  */
 export function redact(input: string): string {
-  let s = input.slice(0, 8 * MAX_LOG_STRING).replace(CONTROL_RE, ' ');
+  // Phrases first: before the path and token rules can split one into pieces that pass.
+  let s = input
+    .slice(0, 8 * MAX_LOG_STRING)
+    .replace(CONTROL_RE, ' ')
+    .replace(PHRASE_RE, '<redacted>');
   s = s.replace(URL_RE, (_all, scheme: string, host: string) => {
     const h =
       host === '' ? '<host>' : LOOPBACK_HOST.test(host) || !IP_HOST.test(host) ? host : '<ip>';

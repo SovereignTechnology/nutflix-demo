@@ -350,6 +350,16 @@ export class DesktopSigner implements IdentityProvider {
     });
   }
 
+  /**
+   * ADR 0016: close the money plane and open it again for the same signer (the worker restarts
+   * around it), with `beforeOpen` run in between — while no plane holds the wallet — so a
+   * recovery phrase saved there is what the new plane derives from. No status change is
+   * announced (the identity did not change). Refused while a signer flow runs.
+   */
+  reopenMoney(beforeOpen?: () => Promise<void>): Promise<void> {
+    return this.exclusive(() => this.swapPlane(false, false, beforeOpen));
+  }
+
   /** Host shutdown: wipe the key, close the money plane and any NIP-46 session. */
   async close(): Promise<void> {
     this.closed = true;
@@ -622,11 +632,32 @@ export class DesktopSigner implements IdentityProvider {
 
   /** Swap the money plane for the current signer (worker stopped around it), then announce. */
   private async changed(interactive: boolean, generated: boolean): Promise<void> {
+    await this.swapPlane(interactive, generated);
+    this.emit();
+  }
+
+  /**
+   * Close the money plane, run `between` (ADR 0016: no plane holds the wallet then), open one
+   * for the current signer. A failure of `between` is rethrown once the plane is open again.
+   */
+  private async swapPlane(
+    interactive: boolean,
+    generated: boolean,
+    between?: () => Promise<void>,
+  ): Promise<void> {
+    const failed: { hit: boolean; e?: unknown } = { hit: false };
     await this.o.swap(async () => {
       const old = this.plane;
       this.plane = undefined;
       this.planeError = null;
       old?.close();
+      if (between !== undefined)
+        try {
+          await between();
+        } catch (e) {
+          failed.hit = true;
+          failed.e = e;
+        }
       const s = this.signer();
       if (s === undefined || this.closed) return;
       try {
@@ -661,7 +692,7 @@ export class DesktopSigner implements IdentityProvider {
         this.log.warn('the wallet could not be created', { reason: this.planeError });
       }
     });
-    this.emit();
+    if (failed.hit) throw failed.e;
   }
 
   private emit(): void {

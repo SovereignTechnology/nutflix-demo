@@ -195,6 +195,10 @@ export const VALID: Samples = {
   'desktop.signer.unlock': [[]],
   'desktop.signer.lock': [[]],
   'desktop.signer.signOut': [[]],
+  'desktop.wallet.recovery.status': [[]],
+  'desktop.wallet.recovery.setup': [[]],
+  'desktop.wallet.recovery.show': [[]],
+  'desktop.wallet.recovery.restore': [[]],
 };
 
 /** Hand-picked invalid argument lists per method (on top of the generic mutations). */
@@ -320,4 +324,19 @@ export const INVALID: Partial<Record<Method, readonly unknown[][]>> = {
     [{}],
   ],
   'desktop.signer.signOut': [[true]],
+  // ADR 0016: the renderer names an action only — never words, indices, a phrase, a mint or a fee.
+  'desktop.wallet.recovery.status': [[{}], [true]],
+  'desktop.wallet.recovery.setup': [
+    [{ words: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11] }],
+    [[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]],
+    ['abandon ability able about above absent absorb abstract absurd abuse access accident'],
+    [{ skipReissue: true }],
+  ],
+  'desktop.wallet.recovery.show': [[{ again: true }], ['now']],
+  'desktop.wallet.recovery.restore': [
+    ['abandon ability able about above absent absorb abstract absurd abuse access accident'],
+    [[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]],
+    [{ mints: [MINT] }],
+    [MINT],
+  ],
 };

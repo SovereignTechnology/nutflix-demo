@@ -1,7 +1,7 @@
 /**
  * The host's side of main's trusted prompt window and OS-keychain store (ADR 0013): `HostOut`
  * `prompt` / `prompt-cancel` / `keychain` out, `HostIn` `prompt-answer` / `keychain-result` in,
- * matched by request id.
+ * matched by request id. ADR 0016 adds main's native dialog: `confirm` out, `confirm-result` in.
  *
  * An answer must fit the question: the wrong kind, an unlock method or flow the question did not
  * offer, or a keychain value nobody asked for is treated as a cancel and any secret in it is wiped.
@@ -10,7 +10,13 @@
 import { signer as signerMod } from '@sovit/core';
 
 import { promptAnswerFits } from '../../ipc/guards.js';
-import type { HostOut, KeychainSlot, PromptAnswer, PromptForm } from '../../ipc/protocol.js';
+import type {
+  ConfirmForm,
+  HostOut,
+  KeychainSlot,
+  PromptAnswer,
+  PromptForm,
+} from '../../ipc/protocol.js';
 
 import type { Timers } from '../worker/supervisor.js';
 
@@ -18,6 +24,8 @@ import type { Timers } from '../worker/supervisor.js';
 export const PROMPT_TIMEOUT_MS = 5 * 60_000;
 /** How long a keychain operation may take (safeStorage can wait on the OS keyring's own prompt). */
 export const KEYCHAIN_TIMEOUT_MS = 60_000;
+/** ADR 0016: how long main's native dialog may stay unanswered before it counts as "no". */
+export const CONFIRM_TIMEOUT_MS = 5 * 60_000;
 
 const realTimers: Timers = {
   setTimeout: (fn, ms) => setTimeout(fn, ms),
@@ -31,6 +39,7 @@ export interface MainBridgeOptions {
   readonly timers?: Timers;
   readonly promptTimeoutMs?: number;
   readonly keychainTimeoutMs?: number;
+  readonly confirmTimeoutMs?: number;
 }
 
 export interface KeychainResult {
@@ -42,6 +51,10 @@ export interface KeychainResult {
 interface PendingPrompt {
   readonly form: PromptForm;
   readonly resolve: (a: PromptAnswer | null) => void;
+  readonly timer: unknown;
+}
+interface PendingConfirm {
+  readonly resolve: (ok: boolean) => void;
   readonly timer: unknown;
 }
 interface PendingKeychain {
@@ -62,6 +75,7 @@ export class MainBridge {
   private next = 1;
   private readonly prompts = new Map<number, PendingPrompt>();
   private readonly keychainReqs = new Map<number, PendingKeychain>();
+  private readonly confirms = new Map<number, PendingConfirm>();
   private closed = false;
 
   constructor(o: MainBridgeOptions) {
@@ -88,6 +102,31 @@ export class MainBridge {
       this.prompts.set(req, { form, resolve, timer });
       this.o.post({ kind: 'prompt', req, form });
     });
+  }
+
+  /**
+   * ADR 0016: ask in main's native dialog (Cancel the default). `true` only for the confirm
+   * button; a timeout, a host shutdown or a dialog that could not open is `false`.
+   */
+  confirm(form: ConfirmForm): Promise<boolean> {
+    if (this.closed) return Promise.resolve(false);
+    const req = this.id();
+    return new Promise((resolve) => {
+      const timer = this.timers.setTimeout(() => {
+        if (this.confirms.delete(req)) resolve(false);
+      }, this.o.confirmTimeoutMs ?? CONFIRM_TIMEOUT_MS);
+      this.confirms.set(req, { resolve, timer });
+      this.o.post({ kind: 'confirm', req, form });
+    });
+  }
+
+  /** `HostIn` `confirm-result`: answers only a question still waiting. */
+  onConfirmResult(req: number, ok: boolean): void {
+    const c = this.confirms.get(req);
+    if (c === undefined) return;
+    this.confirms.delete(req);
+    this.timers.clearTimeout(c.timer);
+    c.resolve(ok);
   }
 
   /** Main's keychain store. Never rejects: a failure is `{ ok: false }`. */
@@ -163,5 +202,10 @@ export class MainBridge {
       k.resolve({ ok: false, value: null });
     }
     this.keychainReqs.clear();
+    for (const [, c] of this.confirms) {
+      this.timers.clearTimeout(c.timer);
+      c.resolve(false);
+    }
+    this.confirms.clear();
   }
 }
