@@ -413,8 +413,7 @@ export class DurableCounterSource {
       if (minNext <= (s.cursor.get(keysetId) ?? 0)) return;
       if (minNext > (s.leased.get(keysetId) ?? 0)) {
         const leased = new Map(s.leased).set(keysetId, minNext);
-        await this.save(s, leased);
-        s.leased.set(keysetId, minNext);
+        for (const [k, v] of await this.save(s, leased)) s.leased.set(k, v);
       }
       s.cursor.set(keysetId, minNext);
     });
@@ -465,7 +464,7 @@ export class DurableCounterSource {
     return this.serial(async () => {
       if (this.state === null) return;
       const s = await this.load();
-      if (s.dirty) await this.save(s, s.leased);
+      if (s.dirty) for (const [k, v] of await this.save(s, s.leased)) s.leased.set(k, v);
     });
   }
 
@@ -528,17 +527,30 @@ export class DurableCounterSource {
     if (end > COUNTER_LIMIT) throw new CounterStateError('exhausted');
     if (end > (s.leased.get(keysetId) ?? 0)) {
       const leased = new Map(s.leased).set(keysetId, Math.min(end + this.lease, COUNTER_LIMIT));
-      await this.save(s, leased);
-      for (const [k, v] of leased) s.leased.set(k, v);
+      for (const [k, v] of await this.save(s, leased)) s.leased.set(k, v);
     }
     s.cursor.set(keysetId, end);
   }
 
-  private async save(s: Loaded, leased: ReadonlyMap<string, number>): Promise<void> {
+  /**
+   * Write `leased` (and the watermark). A stored lease is never moved back: the store is re-read
+   * and each keyset keeps the higher of the two — a source closed for a reopened wallet may still
+   * flush after its successor leased further (`CashuMintConnections` keeps ONE live source per
+   * store; this covers the one that was closed). Returns what was written.
+   */
+  private async save(
+    s: Loaded,
+    leased: ReadonlyMap<string, number>,
+  ): Promise<ReadonlyMap<string, number>> {
+    const next = new Map(leased);
+    const onDisk = await this.store.load();
+    if (onDisk !== null && isCounterState(onDisk))
+      for (const [k, v] of Object.entries(onDisk.next)) if (v > (next.get(k) ?? 0)) next.set(k, v);
     const published: Record<string, number> = {};
-    for (const [k, v] of s.published) published[k] = Math.min(v, leased.get(k) ?? 0);
-    await this.store.save({ v: 1, next: Object.fromEntries(leased), published });
+    for (const [k, v] of s.published) published[k] = Math.min(v, next.get(k) ?? 0);
+    await this.store.save({ v: 1, next: Object.fromEntries(next), published });
     s.dirty = false;
+    return next;
   }
 }
 

@@ -131,8 +131,10 @@ describe('ADR 0016 §3: counters never repeat', () => {
     await fund(a, mint, 7);
     await a.wallet.send(sats(2), { p2pk: TO, mint: MINT_A });
     const lease = counters.state?.next[mint.keysetId] ?? 0;
-    // Crash: `a` is dropped without close. A new process over the same files.
-    const b = device({ mints: [mint], seed, counters, store });
+    // Crash: `a` is dropped without close. A new process loads the counters file as it is on disk
+    // (a new store object: nothing of `a`'s memory survives).
+    const onDisk = new MemoryCounterStore(counters.state);
+    const b = device({ mints: [mint], seed, counters: onDisk, store });
     await fund(b, mint, 3);
     const later = (await secrets(store)).map((s) => counterOf(seed, mint.keysetId, s));
     expect(Math.max(...later)).toBeGreaterThanOrEqual(lease);
@@ -142,12 +144,42 @@ describe('ADR 0016 §3: counters never repeat', () => {
     const c = device({
       mints: [mint],
       seed: await recoveryPhrases.toSeed(entropy),
-      counters,
+      counters: new MemoryCounterStore(onDisk.state),
       store,
     });
     await fund(c, mint, 1);
     expect(c.net.codes).not.toContain(10002);
     expect(new Set(await secrets(store)).size).toBe((await secrets(store)).length);
+  });
+
+  it('connections built twice over one counters store share ONE counter source; a closed one is replaced', async () => {
+    const mint = mintA();
+    const entropy = recoveryPhrases.generate();
+    const seed = await recoveryPhrases.toSeed(entropy);
+    const counters = new MemoryCounterStore(null);
+    const store = new MemoryProofStore();
+    // A reconnect: two connections from the same SeedMaterial, both used.
+    const a = device({ mints: [mint], seed, counters, store });
+    const b = device({ mints: [mint], seed, counters, store });
+    expect(a.conns.seeding!.counters).toBe(b.conns.seeding!.counters);
+    await Promise.all([fund(a, mint, 7), fund(b, mint, 7), fund(a, mint, 3)]);
+    expect([...a.net.codes, ...b.net.codes]).not.toContain(10002);
+    const all = await secrets(store);
+    expect(new Set(all).size).toBe(all.length);
+    // Closed, then reopened from the same words over the same store: a fresh, open source that
+    // starts past everything the closed one handed out.
+    await a.wallet.close();
+    expect(b.conns.seeding!.counters.closed).toBe(true);
+    const c = device({
+      mints: [mint],
+      seed: await recoveryPhrases.toSeed(entropy),
+      counters,
+      store,
+    });
+    expect(c.conns.seeding!.counters).not.toBe(a.conns.seeding!.counters);
+    expect(c.conns.seeding!.counters.closed).toBe(false);
+    await fund(c, mint, 1);
+    expect(c.net.codes).not.toContain(10002);
   });
 
   it('a lost counters file: the probe skips what this seed already signed', async () => {

@@ -540,6 +540,20 @@ describe('DurableCounterSource: the published watermark (ADR 0016 §3)', () => {
     expect(store.state?.published).toEqual({ [KS_A]: 3 });
   });
 
+  it('a closed source flushing late never moves a stored lease back (its successor leased further)', async () => {
+    const store = new MemoryCounterStore({ v: 1, next: { [KS_A]: 0 }, published: {} });
+    const old = new DurableCounterSource(store);
+    await old.reserve(KS_A, 5);
+    await old.markPublished();
+    old.close();
+    const successor = new DurableCounterSource(store);
+    expect((await successor.reserve(KS_A, 100)).start).toBe(5 + COUNTER_LEASE);
+    const leased = store.state?.next[KS_A] ?? 0;
+    await old.flush(); // the old one's watermark reaches the file…
+    expect(store.state?.published[KS_A]).toBe(5);
+    expect(store.state?.next[KS_A]).toBe(leased); // …without its older lease
+  });
+
   it('a stored watermark above next is clamped (it can never skip a counter still leased)', async () => {
     const store = new MemoryCounterStore({ v: 1, next: { [KS_A]: 10 }, published: { [KS_A]: 50 } });
     const src = new DurableCounterSource(store);

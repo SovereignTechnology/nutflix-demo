@@ -238,13 +238,15 @@ describe('restoreFromSeed (ADR 0016 §5)', () => {
     ]);
   });
 
-  it('a hostile mint that signs everything is held to the batch cap per keyset', async () => {
+  it('a hostile mint that signs something in every batch is held to the batch cap per keyset', async () => {
     const mint = mintAt(MINT_A);
-    mint.hostileRestore();
+    // One signature per request is enough to keep a scan from ever seeing an empty batch.
+    mint.hostileRestore({ perRequest: 1 });
     const phrase = await newSeed();
-    const c = device({ mints: [mint], seed: await newSeed(), restoreLimits: { maxBatches: 4 } });
-    await c.wallet.seeded!.restoreFromSeed(phrase, [MINT_A]);
-    expect(c.net.restores()).toBe(4);
+    const c = device({ mints: [mint], seed: await newSeed(), restoreLimits: { maxBatches: 5 } });
+    const [r] = await c.wallet.seeded!.restoreFromSeed(phrase, [MINT_A]);
+    expect(c.net.restores()).toBe(5);
+    expect(r).toEqual({ mint: MINT_A, outcome: 'restored', restoredSats: 5 });
   });
 
   it('mints that cannot restore (no NUT-09) or cannot be reached are reported; the others restore', async () => {
@@ -412,8 +414,13 @@ describe('ADR 0016 §3: the startup restore of [published, next)', () => {
     const durable = new MemoryProofStore();
     await hold(durable, MINT_A, await live.proofs(MINT_A));
     await a.wallet.send(sats(5), { p2pk: TO, mint: MINT_A }); // its change never reached `durable`
-    // Crash; the next start over what was durable.
-    const b = device({ mints: [mint], seed: phrase, counters, store: durable });
+    // Crash; the next start over what was durable (a new process: the counters file as on disk).
+    const b = device({
+      mints: [mint],
+      seed: phrase,
+      counters: new MemoryCounterStore(counters.state),
+      store: durable,
+    });
     expect(await b.wallet.balance(MINT_A)).toBe(64); // stale: that proof is spent
     expect(await b.wallet.restoreUnpublished()).toEqual([
       { mint: MINT_A, outcome: 'restored', restoredSats: 59 },

@@ -19,19 +19,25 @@ export {
   type WalletErrorCode,
   type WalletKey,
 } from './spend.js';
+// ADR 0016: the phrase, the seed and the counters. `DurableCounterSource` is exported as a TYPE
+// only: `CashuMintConnections` keeps one live source per counters store, and a second one built
+// beside it would hand out the same counters (reach it as `connections.seeding.counters`).
 export {
   COUNTER_LEASE,
   COUNTER_LIMIT,
   CounterStateError,
-  DurableCounterSource,
   RECOVERY_WORDS,
   RecoveryPhraseError,
   RecoverySeedError,
+  entropyFromBytes,
+  entropyFromHex,
+  entropyToHex,
   isCounterState,
   recoveryPhrases,
   wipeEntropy,
   type CounterProbe,
   type CounterRange,
+  type DurableCounterSource,
   type UnpublishedRange,
 } from './seed.js';
 export {

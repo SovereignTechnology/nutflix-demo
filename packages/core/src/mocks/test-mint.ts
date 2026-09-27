@@ -179,8 +179,8 @@ export class TestMint {
   private readonly keySeed: Uint8Array | undefined;
   private readonly keysetVersion: 0 | 1;
   private readonly nut12: boolean;
-  /** `/v1/restore` signs every output it is asked about (`hostileRestore`). */
-  private signOnRestore = false;
+  /** `/v1/restore` signs up to this many unsigned outputs per request (`hostileRestore`). */
+  private signOnRestore = 0;
   private readonly inputFeePpk: number;
   private readonly feeReserve: number;
   private readonly nut20: boolean;
@@ -276,9 +276,13 @@ export class TestMint {
     return this.addKeyset();
   }
 
-  /** `/v1/restore` signs every output it is asked about, as a hostile mint could. */
-  hostileRestore(on = true): void {
-    this.signOnRestore = on;
+  /**
+   * `/v1/restore` signs outputs it is asked about and never signed, as a hostile mint could: up to
+   * `perRequest` per request (default: all of them). One per request is enough to keep a scan
+   * going forever. `false` turns it off.
+   */
+  hostileRestore(on: boolean | { readonly perRequest: number } = true): void {
+    this.signOnRestore = on === false ? 0 : on === true ? Number.MAX_SAFE_INTEGER : on.perRequest;
   }
 
   private keysOf(id: string): TestKeyset | undefined {
@@ -635,9 +639,11 @@ export class TestMint {
     if (!Array.isArray(outputs)) throw new MintOperationError(11002, 'outputs must be a list');
     const outs: SerializedBlindedMessage[] = [];
     const signatures: SerializedBlindedSignature[] = [];
+    let signed = 0;
     for (const o of outputs as SerializedBlindedMessage[]) {
       let sig = this.promises.get(o.B_);
-      if (sig === undefined && this.signOnRestore && o.id === this.keysetId) {
+      if (sig === undefined && signed < this.signOnRestore && o.id === this.keysetId) {
+        signed++;
         // A hostile mint: signs (a 1-sat output) whatever it is asked about under its active
         // keyset (an inactive one no longer signs).
         const one = { ...o, amount: 1 as unknown as Amount };

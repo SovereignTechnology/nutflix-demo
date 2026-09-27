@@ -47,6 +47,7 @@ import {
 } from './spend.js';
 import { fetchRawHttp } from './fetch-http.js';
 import type {
+  CounterStore,
   RecoverySeed,
   ReissuePlan,
   ReissueResult,
@@ -69,6 +70,21 @@ import { cashuRequestFn } from './transport.js';
  * `fetch` (`fetch-http.ts`). `fetch` is looked up per request, so building this loads nothing.
  */
 const DEFAULT_REQUEST: RequestFn = cashuRequestFn(fetchRawHttp());
+
+/**
+ * ONE live counter source per counters store (ADR 0016 §3): two sources over one store would each
+ * keep their own cursor and hand out the same counters. Connections built twice from the same
+ * `SeedMaterial` (a reconnect) share it; one whose wallet was closed is replaced by a fresh source,
+ * which starts from what is on disk — past every counter the closed one handed out (each lease is
+ * written before its counters are). Reopen only after the old wallet's `close()` resolved.
+ */
+const SOURCES = new WeakMap<CounterStore, DurableCounterSource>();
+
+function counterSourceFor(store: CounterStore): DurableCounterSource {
+  let src = SOURCES.get(store);
+  if (src === undefined || src.closed) SOURCES.set(store, (src = new DurableCounterSource(store)));
+  return src;
+}
 
 /**
  * One loaded cashu-ts `Wallet` per mint, created on first use. `request` overrides the HTTP
@@ -103,10 +119,7 @@ export class CashuMintConnections implements MintConnections {
     } = {},
   ) {
     if (opts.seed !== undefined)
-      this.seeding = {
-        seed: opts.seed.seed,
-        counters: new DurableCounterSource(opts.seed.counters),
-      };
+      this.seeding = { seed: opts.seed.seed, counters: counterSourceFor(opts.seed.counters) };
   }
 
   wallet(mint: MintUrl): Promise<CashuTsWallet> {
