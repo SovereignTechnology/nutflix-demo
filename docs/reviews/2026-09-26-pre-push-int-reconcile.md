@@ -289,3 +289,62 @@ Changed, each with a comment citing why (none deleted, none weakened):
   least 1.6 W).
 - **RR-8: the fuse was not seen on a real packaged binary here** (no `npm run package`, no
   Electron e2e: lane rule); the flip and read-back run for real on a synthetic binary.
+
+## Round 7
+
+Fix round 7, from the independent verifier of this lane (2026-09-27). One item.
+
+| # | Severity | Where | Finding | Outcome |
+|---|---|---|---|---|
+| R7-1 (R6-3's test) | LOW (test integrity) | `host/topup/auto-topup.ts:578`, `host/__tests__/auto-topup.test.ts` (the start-by table) | R6-3 was recorded as fixed with no test or mutation. Scenario (the verifier's): with `const reservedAt = this.clock();` moved back after `await this.o.ledger.reserve(...)`, exactly the wip bug, every test in `host/__tests__/` still passed (491; the only 2 failures were `money.test.ts` 5 s timeouts under load). A later refactor could measure the start-by from after the reservation's disk write again, and on a slow write `TOP_UP_MELT_RETURNED_BY_MS` would no longer bound the melt from the entry's `at` | **fixed** `522edd0`: a third case in the start-by table. `ledger.reserve` is wrapped so that the injected monotonic clock advances 1 ms inside the call, after the ledger stamps its entry (the write's time), and the seal advances it by exactly `TOP_UP_MELT_START_BY_MS`. Counted from the stamp, that is 1 ms past the start-by: `'failed'`, nothing melts, the reservation settles failed and is not counted. The table gained a `reserveMs` column; the two older cases pass 0 and are otherwise unchanged. Mutation MS3 |
+
+Verified first: the code at `auto-topup.ts:578` reads `this.clock()` just before `reserve` is
+called, so the fix is in place and fails safe; what was missing was a test that fails without it.
+
+### Mutation check
+
+| # | Mutation | Killed by |
+|---|---|---|
+| MS3 | the start-by read after `ledger.reserve` resolves (the wip's order) | 1: the new case, "after a reservation whose write took 1 ms …": `expected 'done' to be 'failed'` (the melt ran). The other two cases pass (they give the write no time) |
+
+The mutation was applied alone by exact string replacement. The original file was restored from a
+copy, and `git diff --quiet` on it confirmed the restore. The three cases pass on the real code
+(3/3). Totals for the lane are now 29 mutations: 28 killed, 1 equivalent (P8b).
+
+### Gates (round 7)
+
+- `npx tsc -b --force`: clean (exit 0). Afterwards `npm run build` brought `dist/renderer` up to
+  date, because `--force` rewrites ui's `dist/` and the stage guard then refuses the older bundle
+  (the same step as the earlier rounds).
+- Touched package, `npx vitest run --project app-desktop --maxWorkers=2` (run before that
+  rebuild, load 5-10): 93 files, 1734 tests, 1709 passed, 24 skipped, 1 failed, plus 2 suites
+  that failed to load:
+  - `packaging/__tests__/stage.test.ts` and `host/__tests__/packaged-worker.integration.test.ts`
+    failed on "dist/renderer/index.html is older than packages/ui/dist/…". That was the stale
+    build left by `tsc --force`. After `npm run build` they pass alone (23/23).
+  - auto-topup "a corrupt ledger (an unknown version) fails CLOSED" timed out at 5.48 s. This
+    lane did not touch that test. The whole file passes alone (96/96) and the test passed in the
+    whole-suite run below. No timeout was raised.
+- **Whole suite**, `npx vitest run --maxWorkers=2` after the rebuild (load 11-20 on 8 cores): 213
+  files, 209 passed, 1 failed, 3 skipped; 3356 tests, 3334 passed, 1 failed, 21 skipped; 823.98 s.
+  Every app-desktop and gateway test passed. The one failure is not this lane's:
+  - The test: `seeder/src/__tests__/one-peer-router.test.ts` "the probe option: a probed peer is
+    asked ONE block …" (348 ms, not a timeout).
+  - How often it fails when run alone: 2 of 5 runs of the whole file, and 4 of 4 with a `-t` filter
+    on that test. Each time it is `expected +0 to be 1` at line 479,
+    `expect(peer.getMaxInflight()).toBe(peer.inflight + 1)`.
+  - Why this lane cannot have caused it: `git diff 54f49bb..HEAD` is empty for `packages/seeder`,
+    `packages/core`, every `package.json` and `package-lock.json`, and seeder does not import
+    gateway or app-desktop (only a comment in `cli/config-file.ts` names gateway). So this run
+    executed the base's seeder code.
+  - Likely cause (not verified): the router's `cap()` also subtracts `peer.dataProcessing` while
+    probing, so a message still being processed right after the connection gives 0.
+  - Not fixed here, since `packages/seeder/` is outside this lane's allowlist. Reported to the
+    orchestrator.
+- `eslint` and `prettier --check` on the changed test file: clean. `prettier --check` on the two
+  changed docs: clean.
+- `npm run check:locked`: OK. `npm run lint:electron`: OK (237 files, 3 window constructors, 3
+  webPreferences objects, 0 violations). No Electron e2e (lane rule).
+
+Contracts, locked paths, `docs/status.md` and `docs/security-review.md`: untouched. Nothing
+outward.

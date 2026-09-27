@@ -15,6 +15,9 @@ Branch `stage-3/int-reconcile`, off `54f49bb` (the base for the next fan-out). D
   exposed at load ~20).
 - then this report and the review record `docs/reviews/2026-09-26-pre-push-int-reconcile.md`
   (findings with file:line and scenario, sharp edges, the attacker model, 28 mutation checks).
+- `522edd0` test(money), fix round 7: the start-by pinned to the reservation's stamp (R6-3 had
+  no test; the verifier's mutant passed every host test). Then the review record's "Round 7"
+  section and this report's updates.
 
 No contract request: nothing needed from `packages/core/src/contracts/`. Nothing changed under
 the contracts, the locked paths, `docs/status.md` or `docs/security-review.md`. Nothing outward:
@@ -110,7 +113,8 @@ no push, MR, issue edit, relay or bunker contact.
   the PAY/melt gate's wait come between the reservation and the melt request. Now:
   - a melt starts within `TOP_UP_MELT_START_BY_MS` = 5 min of its reservation, or never (the
     entry settles `failed`, nothing moved, a log line with no mint or quote). The start-by is read
-    as the ledger stamps the entry, not after the write (resumed work);
+    as the ledger stamps the entry, not after the write (resumed work; pinned since round 7 by a
+    reservation whose write takes 1 ms: mutation MS3);
   - after a restart the guard counts from the later of the reservation plus
     `TOP_UP_MELT_RETURNED_BY_MS` (the start-by, 5 min, + the gate's wait,
     `WORKER_HOST_REQUEST_TIMEOUT_MS`, 5 min, + the melt request, `MELT_REQUEST_TIMEOUT_MS`, 5 min:
@@ -144,7 +148,7 @@ no push, MR, issue edit, relay or bunker contact.
 
 ## Tests
 
-New: 27 test declarations (33 cases) across eight files, and a third case in round 5's "kept
+New: 27 test declarations (34 cases) across eight files, and a third case in round 5's "kept
 past the lapse" table — the review record lists each. In short:
 
 - payer (`upstream-payer.test.ts`, 12 / 14 cases): the classification; a 5-minute
@@ -157,7 +161,8 @@ past the lapse" table — the review record lists each. In short:
 - auto top-up (`auto-topup.test.ts`, 7 / 8 cases, and the table's third case): the journal that
   cannot be read; the source that cannot be read past the lapse; one bound across the finishing
   and the run, across two mints, and the question's time across mints; the start-by at and past
-  its edge; a restart long after the reservation.
+  its edge, and past it by a reservation's 1 ms write (round 7); a restart long after the
+  reservation.
 - whole host (`topup-host.test.ts`, 1): a play at two trusted mints waits one bound in all.
 - host entry (`main.test.ts`, 1): exports `runHost` only; `QUIT_FLUSH_MS > CLOSE_DRAIN_MS`.
 - packaging (`fuses`, `stage-guards`, `stage`: 5 / 8 cases): the read-back refuses a binary with
@@ -185,7 +190,7 @@ violations); `check:native` not needed (no dependency changed). No Electron e2e 
 
 ## Mutation checks
 
-28 mutations, each applied alone and restored (scripted, tree checked clean): 27 killed, 1
+29 mutations, each applied alone and restored (scripted, tree checked clean): 28 killed, 1
 equivalent (P8b: the check at the top of `payPending` is covered by the loop's). P8 (`armRetry`
 ignoring `dispose()`) survived its first run and is killed since `dadd56f`. Highlights: a
 deferred refusal counting toward the give-up (P1) or classified transient (P2); the streak kept
@@ -193,11 +198,33 @@ after a final code (P3, the verifier's sequence); `Date.now()` for the give-up (
 guard removed (P7); `ViewerPayer.close()` not disposing (V1); the verifier's **ME** (a phase or a
 mint with a bound of its own: ME, ME2, and ME3 for the question's time across mints) and **MF**
 (`meltPending`'s failed read taken as "nothing journaled"); the lapse releasing on a failed source
-read (MG); no start-by or a strict one (MS, MS2); round 5's restart bound or no host start (MR,
+read (MG); no start-by, a strict one, or one read after the reservation's write (MS, MS2, MS3,
+the last from fix round 7); round 5's restart bound or no host start (MR,
 MR2); the adapter's per-mint loop (MA); the sixth fuse dropped (F1); the bundle configuration or
 ui `src/` not watched (S1-S4); `QUIT_FLUSH_MS` exported from the entry (H1). The verifier's own
 ME and MF definitions are not in the repo; these are this lane's, named after them and stated
 exactly in the table.
+
+## Fix round 7
+
+The lane's independent verifier found that R6-3 (the melt's start-by read before
+`ledger.reserve`, not after its write) was recorded as fixed with nothing to pin it. With the
+read moved back after the write, every host test still passed. `522edd0` adds a third case to the
+start-by table:
+- the reservation's write takes 1 ms on the monotonic clock, and the seal takes exactly
+  `TOP_UP_MELT_START_BY_MS`;
+- counted from the stamp, that is 1 ms past the start-by, so nothing melts;
+- the mutant (the read after the write) lets it melt and fails the case (MS3).
+
+Gates, with detail in the review record's "Round 7":
+- `tsc -b --force` clean.
+- `app-desktop` tests pass. Its only failures in the loaded run were the stale build after
+  `--force` (they pass after `npm run build`) and a 5 s timeout in an untouched auto top-up test
+  (the file passes alone, 96/96).
+- The whole suite: 3334 passed, 1 failed, 21 skipped. The failure is a `seeder` router test
+  that also fails alone about half the time. The lane's diff does not touch seeder, core or any
+  dependency, and seeder is outside this lane's allowlist, so it is reported, not fixed.
+- `eslint`/`prettier` clean, `check:locked` OK, `lint:electron` OK.
 
 ## Residuals
 
@@ -217,7 +244,7 @@ exactly in the table.
 
 ## Proposed `docs/status.md` row
 
-| Reconcile and small fixes on the integration base (lane R6-reconcile: the three base failures, the round-5 verifier's payer and money-plane items, the sixth fuse) | `stage-3/int-reconcile` (on `54f49bb`) | **done** — The staged host bundle exports `runHost` only again (`QUIT_FLUSH_MS` moved to `host.ts`). One retry mechanism for a refused PAY: `UpstreamPayer` classifies failures as final (`session-closed`, `forbidden`: given up, the core's streak ended), deferred (`rate-limited`: 2 s doubling to 30 s, never given up — a melt may take 300 s) or transient (round 5); `ViewerPayer`'s own timer is gone and `close()` cancels the payer's. The payer's time is monotonic and injectable (`performance.now()`, a steady `Date.now()` on Bare), and a bad clock stands still. Auto top-up: one 15 s bound for the whole play, every mint included (the adapter asked once per mint); a kept quote goes only on answers (a failed journal or source read keeps it; past the lapse the source must answer); a melt starts within 5 min of its reservation or never, and after a restart the release guard counts from the later of reservation + 15 min and the host's start. Packaging: `GrantFileProtocolExtraPrivileges` off and read back (ADR 0017 §4); the freshness rule watches `scripts/bundle.ts` and its tsconfigs. 34 new test cases, 28 mutations (27 killed, 1 equivalent). Open: a source gone for good holds its target back again (R5-R1); `rate-limited` is never given up; Bare's clock is a steady wall clock (RR-1) |
+| Reconcile and small fixes on the integration base (lane R6-reconcile: the three base failures, the round-5 verifier's payer and money-plane items, the sixth fuse) | `stage-3/int-reconcile` (on `54f49bb`) | **done** — The staged host bundle exports `runHost` only again (`QUIT_FLUSH_MS` moved to `host.ts`). One retry mechanism for a refused PAY: `UpstreamPayer` classifies failures as final (`session-closed`, `forbidden`: given up, the core's streak ended), deferred (`rate-limited`: 2 s doubling to 30 s, never given up — a melt may take 300 s) or transient (round 5); `ViewerPayer`'s own timer is gone and `close()` cancels the payer's. The payer's time is monotonic and injectable (`performance.now()`, a steady `Date.now()` on Bare), and a bad clock stands still. Auto top-up: one 15 s bound for the whole play, every mint included (the adapter asked once per mint); a kept quote goes only on answers (a failed journal or source read keeps it; past the lapse the source must answer); a melt starts within 5 min of its reservation or never, and after a restart the release guard counts from the later of reservation + 15 min and the host's start. Packaging: `GrantFileProtocolExtraPrivileges` off and read back (ADR 0017 §4); the freshness rule watches `scripts/bundle.ts` and its tsconfigs. 35 new test cases, 29 mutations (28 killed, 1 equivalent). Open: a source gone for good holds its target back again (R5-R1); `rate-limited` is never given up; Bare's clock is a steady wall clock (RR-1) |
 
 ## Proposed `docs/security-review.md` text
 
