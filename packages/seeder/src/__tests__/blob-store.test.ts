@@ -296,6 +296,46 @@ describe('BlobStore (Corestore + Hyperblobs + CAS index + disk cap)', () => {
     expect(store2.coreByKey(hex)?.name).toBe('mine');
     await expect(store2.closeCoreByKey(hex)).rejects.toThrow(/opened by name/);
     expect(byName.core.closed).toBe(false);
+    // The other order: the name open first, a key open while it is under way.
+    await store2.close();
+    const seen3: string[] = [];
+    const store3 = new BlobStore({
+      storageDir: path.join(dir, 'store'),
+      blockSize: BLOCK,
+      ...adapters,
+      index: index2,
+      diskCap: new DiskCap(10 * BLOCK, 0),
+      logger: capturedLogger().logger,
+      onCoreOpened: (c) => {
+        seen3.push(c.name);
+      },
+    });
+    store = store3;
+    await store3.ready();
+    // The key open is started first but held at its `ready()` until the name open has finished.
+    const real = store3.store.get.bind(store3.store);
+    let release: () => void = () => undefined;
+    const gate = new Promise<void>((done) => {
+      release = done;
+    });
+    (store3.store as unknown as { get: unknown }).get = (o: { key?: Uint8Array }) => {
+      const c = real(o) as unknown as { ready: () => Promise<void> };
+      if (o.key === undefined) return c;
+      const ready = c.ready.bind(c);
+      c.ready = async () => {
+        await gate;
+        await ready();
+      };
+      return c;
+    };
+    const keyed = store3.openCoreByKey(key);
+    const n = await store3.openCore('mine');
+    release();
+    const k = await keyed;
+    expect(k).toBe(n); // the key open yields to the named session
+    expect(seen3).toEqual(['mine']);
+    expect(store3.coreByKey(hex)?.name).toBe('mine');
+    (store3.store as unknown as { get: unknown }).get = real;
   });
 
   it('an open that fails closes its session, and a retry opens afresh', async () => {

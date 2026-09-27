@@ -195,7 +195,11 @@ export class UnpaidRecord {
     this.dirty = true;
   }
 
-  /** Blocks `from..to` of `core` from `seeder` were paid, or refused for good: forget them. */
+  /**
+   * Blocks `from..to` of `core` from `seeder` were acknowledged, or refused for good: forget them
+   * (written in the next batch). Blocks a PAY is being SENT for go through `removeNow` instead
+   * (lane W8b-p2p): written out before the send, or a crash after it brings them back.
+   */
   remove(seeder: string, core: string, from: number, to: number): void {
     this.take(seeder, core, from, to);
   }

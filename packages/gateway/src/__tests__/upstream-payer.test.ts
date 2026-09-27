@@ -1747,6 +1747,37 @@ describe('UpstreamPayer — owed blocks from before (ADR 0018 amendment)', () =>
     }
   });
 
+  // The pass goes on with the core after a failure: when one retry timer brings both kinds back at
+  // once (their backoffs end together), the owed range — lower in the core, tried first — fails
+  // again, and this connection's block must still be tried in that same pass. Ending the pass
+  // there (as before the streaks were split) left it for the next owed retry, which failed first
+  // again: this connection's blocks starved behind an owed range retried for ever.
+  it('one retry pass with both kinds due: the owed range fails again, this connection’s block is still paid in that pass', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'performance'] });
+    try {
+      let freshBroke = true;
+      const r = owedRig({
+        payEveryBlocks: 1,
+        failOwed: () => 'no-balance',
+        failFresh: () => (freshBroke ? 'mint-error' : null),
+      });
+      r.protocol.remoteHello(hello());
+      r.protocol.remotePrice(priced);
+      r.payer.onDownload(CORE_A, 5, NOISE); // fails: backs off PAY_RETRY_BASE_MS
+      expect(r.payer.addOwed(NOISE, CORE_A, [1])).toBe(1); // fails too, same backoff
+      await vi.advanceTimersByTimeAsync(0);
+      expect(r.protocol.sentPays).toEqual([]);
+      freshBroke = false;
+      // ONE timer ends both backoffs; nothing else happens (no block, no ACK, no flush).
+      await vi.advanceTimersByTimeAsync(PAY_RETRY_BASE_MS);
+      expect(r.protocol.sentPays.map((p) => p.range.fromBlock)).toEqual([5]);
+      expect(r.payer.holds(NOISE, CORE_A, 1)).toBe(true); // still owed, backing off
+      expect(r.given).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('an owed range the seeder no longer prices on this connection is dropped from this connection only (scope connection); a final refusal drops it for good', async () => {
     const r = owedRig({ failOwed: () => null });
     const unacked = new FakePayProtocol({ autoAck: false });
