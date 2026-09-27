@@ -1,8 +1,8 @@
 /**
- * Electron fuses (security review F21; Cameron, 2026-09-24). Exactly five are set; every other
- * fuse keeps Electron's default. They are flipped on the packaged binary after the app is copied
- * in (before any signing, which would otherwise be invalidated) and READ BACK from every
- * packaged binary before a build counts: a mismatch fails the build.
+ * Electron fuses (security review F21; Cameron, 2026-09-24, and the sixth 2026-09-26). Exactly six
+ * are set; every other fuse keeps Electron's default. They are flipped on the packaged binary
+ * after the app is copied in (before any signing, which would otherwise be invalidated) and READ
+ * BACK from every packaged binary before a build counts: a mismatch fails the build.
  *
  *   RunAsNode off                              `ELECTRON_RUN_AS_NODE=1 nutflix …` is not a Node shell
  *   EnableNodeOptionsEnvironmentVariable off   `NODE_OPTIONS` / `NODE_EXTRA_CA_CERTS` are ignored
@@ -10,6 +10,8 @@
  *   EnableEmbeddedAsarIntegrityValidation on   app.asar's header hash is checked (macOS, Windows;
  *                                              Electron has no Linux support — ADR 0017)
  *   OnlyLoadAppFromAsar on                     no `resources/app/` folder or loose `default_app`
+ *   GrantFileProtocolExtraPrivileges off       `file://` pages get no extra privileges (the app
+ *                                              never loads `file://`: defence in depth, 2026-09-26)
  *
  * None of these can be done at runtime: they act before main's first line runs.
  */
@@ -30,11 +32,12 @@ export const FUSES = {
   EnableNodeCliInspectArguments: false,
   EnableEmbeddedAsarIntegrityValidation: true,
   OnlyLoadAppFromAsar: true,
+  GrantFileProtocolExtraPrivileges: false,
 } as const satisfies Partial<Record<keyof typeof FuseV1Options, boolean>>;
 
 type FuseName = keyof typeof FUSES;
 
-/** The `flipFuses` config: the five settings above, nothing else. */
+/** The `flipFuses` config: the six settings above, nothing else. */
 export function fuseConfig(resetAdHocDarwinSignature: boolean): FuseV1Config {
   const cfg: FuseV1Config = { version: FuseVersion.V1, resetAdHocDarwinSignature };
   for (const [name, on] of Object.entries(FUSES) as [FuseName, boolean][])
@@ -96,7 +99,7 @@ export function packagedBinary(
   return join(outputDir, platform === 'win32' ? `${executableName}.exe` : executableName);
 }
 
-/** Forge `packageAfterCopy`: flip the five fuses (ad-hoc re-sign only for unsigned arm64 macOS). */
+/** Forge `packageAfterCopy`: flip the six fuses (ad-hoc re-sign only for unsigned arm64 macOS). */
 export async function flipAppFuses(
   buildPath: string,
   platform: TargetPlatform,

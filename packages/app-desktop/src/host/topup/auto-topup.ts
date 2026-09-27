@@ -46,21 +46,23 @@
  * retry, the next trigger, a new wallet after a lock/unlock or a signer swap, the next start —
  * finishes it first (`resolveOpen`): minted exactly once when the target says PAID (core's
  * journaled `pollQuote`), released only while the quote is still UNPAID and either the melt is
- * settled as not paid (no journal entry left, the source mint's own quote state UNPAID) or, whatever
- * the source says short of PAID, a day has passed since the invoice expired (round 5: a source
- * gone for good). Never within `TOP_UP_RELEASE_AFTER_MS` of its melt returning (round 5, R4-R2).
- * No new top-up runs into a target with one open (`unresolved`). When the journal settles the melt
- * as paid, its history line is found by the anchor the record keeps and reads "top-up"; the entry
- * says `done`. Every run waits for the money plane's startup settle first (what a crash cut off at
- * the target is restored before its balance is read).
+ * settled as not paid (the journal ANSWERS that nothing is left, the source mint's own quote state
+ * UNPAID) or a day has passed since the invoice expired and the source mint ANSWERS short of PAID
+ * (round 5; lane R6-reconcile: UNPAID or PENDING — a read that fails, at the journal or at the
+ * source, releases nothing). Never within `TOP_UP_RELEASE_AFTER_MS` of its melt returning (round
+ * 5, R4-R2). No new top-up runs into a target with one open (`unresolved`). When the journal
+ * settles the melt as paid, its history line is found by the anchor the record keeps and reads
+ * "top-up"; the entry says `done`. Every run waits for the money plane's startup settle first
+ * (what a crash cut off at the target is restored before its balance is read).
  *
  * History (NIP-60 kind 7376): minting at the target already writes `in … "top-up"` and the melt
  * writes `out … "melt to Lightning"` at the source — nothing more is written (no double entry).
  * Core's melt takes no memo (contracts `Wallet.melt`; docs/contract-requests/S3-topup.md), so the
  * host shows that melt as "top-up" (`relabel`), by the history id the ledger recorded.
  *
- * A play at zero balance waits for its top-up at most `PLAY_TOP_UP_WAIT_MS` in all, the time the
- * first-funding question is open aside (`checkForPlay`); a slower one finishes in the background.
+ * A play at zero balance waits for its top-up at most `PLAY_TOP_UP_WAIT_MS` in all — every mint it
+ * tries together, the time the first-funding question is open aside (`checkForPlay`, lane
+ * R6-reconcile); a slower one finishes in the background.
  *
  * Logs carry outcome codes and numbers only — never a mint URL, a quote, an invoice or a proof.
  */
@@ -78,7 +80,7 @@ import type {
 } from '@sovit/core';
 import { AUTO_TOP_UP_MAX_SATS, wallet as walletMod } from '@sovit/core';
 
-import { MELT_REQUEST_TIMEOUT_MS } from '../../ipc/deadlines.js';
+import { MELT_REQUEST_TIMEOUT_MS, WORKER_HOST_REQUEST_TIMEOUT_MS } from '../../ipc/deadlines.js';
 import type { Logger } from '../log.js';
 import { GateRefusal } from '../pay-melt-gate.js';
 import { autoTopUpDue } from '../settings/settings.js';
@@ -105,7 +107,8 @@ export const TOP_UP_RESOLVE_EVERY_MS = 30_000;
 /**
  * A play at zero balance waits at most this long for its top-up in all — open top-ups finishing,
  * the money plane's startup settle, the run's own finishing of them, the quotes, the melt (up to
- * 300 s) and the target's polls — from the moment the play asks (round 5). The time the
+ * 300 s) and the target's polls — from the moment the play asks (round 5), for every mint it tries
+ * together (lane R6-reconcile: one bound for the whole play, not one per mint). The time the
  * first-funding question is open does not count: the user answers it in main's window, bounded by
  * its own deadline. A fast Lightning top-up takes seconds. Past it the play fails `no-balance` and
  * the top-up finishes in the background.
@@ -116,17 +119,46 @@ export const PLAY_TOP_UP_WAIT_MS = 15_000;
  * melt request the transport gave up on may still reach the source mint, and the mint marks its
  * quote PENDING only once it takes it. The age core waits before it settles a journaled melt it
  * cannot find (`PENDING_SETTLE_AFTER_S`). Minting a quote the target says PAID never waits.
- * Without the melt's own time (a restart), the latest it can have returned is used: the
- * reservation plus `MELT_REQUEST_TIMEOUT_MS`.
+ * Without the melt's own time (a restart) it counts from the latest the melt can have returned:
+ * see `TOP_UP_MELT_RETURNED_BY_MS`.
  */
 export const TOP_UP_RELEASE_AFTER_MS = walletMod.PENDING_SETTLE_AFTER_S * 1000;
 /**
+ * Lane R6-reconcile (the round-5 verifier): a top-up's melt starts within this long of its
+ * reservation, or not at all (the entry settles `failed`: nothing moved). Between the two the run
+ * reads the source's history and balance, SEALS the record through the signer (a NIP-46 bunker may
+ * ask its user), writes it and looks at the settings once more. Five minutes, like main's prompt
+ * window: a bunker's approval fits, and a restart can bound the melt without the seal's own time.
+ */
+export const TOP_UP_MELT_START_BY_MS = 5 * 60_000;
+/**
+ * Lane R6-reconcile (the round-5 verifier): how long after its reservation a top-up's melt request
+ * can have returned, as far as the host bounds it — what the release guard counts from when the
+ * melt's own time is not known (an entry of an earlier run of the host). Round 5 counted the melt
+ * request alone (`MELT_REQUEST_TIMEOUT_MS`), but two waits come before it: the seal (a NIP-46
+ * bunker may ask its user), now bounded by the melt's start-by (`TOP_UP_MELT_START_BY_MS`), and
+ * the PAY/melt gate's wait for the PAY in flight at the source, at most its `meltWaitMs` (the
+ * worker's deadline, `WORKER_HOST_REQUEST_TIMEOUT_MS`). So: start-by + gate + melt request, 15
+ * minutes. Still NOT in it, because they have no fixed bound: core's own turn at the source (a
+ * redeem, a NUT-07 check or the journal's settle loop there first) and its round trips before the
+ * request (the mint's load, the quote's lookup, the journal settle). The release guard therefore
+ * counts from the LATER of this bound and the start of this run of the host: a melt request never
+ * outlives the host process that sent it (the startup settle only reads a journaled melt, it never
+ * sends one again), and a host starts only after the one before it exited (main respawns it on
+ * its exit alone, under the single-instance lock). The guard's own `TOP_UP_RELEASE_AFTER_MS` then
+ * covers a request still on its way to the mint when that process died.
+ */
+export const TOP_UP_MELT_RETURNED_BY_MS =
+  TOP_UP_MELT_START_BY_MS + WORKER_HOST_REQUEST_TIMEOUT_MS + MELT_REQUEST_TIMEOUT_MS;
+/**
  * An open top-up whose target still says UNPAID this long after its invoice expired is released
- * even when the source cannot say the melt did not pay — journaled there, PENDING, or the mint
- * gone for good (round 5): an expired invoice can no longer be paid. The margin covers clocks that
- * disagree and a target that reads its stored UNPAID while its own Lightning backend cannot be
- * asked. A source that says PAID keeps it (the target owes it), and so does a quote without an
- * expiry (0). An expiry before the reservation counts from the reservation.
+ * even when the source cannot say the melt did not pay — journaled here, or PENDING there (round
+ * 5): an expired invoice can no longer be paid. The margin covers clocks that disagree and a
+ * target that reads its stored UNPAID while its own Lightning backend cannot be asked. A source
+ * that says PAID keeps it (the target owes it), and so does a quote without an expiry (0). An
+ * expiry before the reservation counts from the reservation. Lane R6-reconcile (the round-5
+ * verifier): the source must ANSWER — UNPAID or PENDING. A source that cannot be read (down for a
+ * moment, or gone for good) keeps it: a read that failed says nothing, and the melt may have paid.
  */
 export const TOP_UP_EXPIRED_RELEASE_AFTER_MS = 24 * 60 * 60_000;
 /** How much of the source mint's history is compared around the melt. */
@@ -240,7 +272,11 @@ export interface TopUpVault {
   /** Seal `plain` to the identity (NIP-44 to self through its signer), and open it again. */
   seal(plain: string): Promise<string>;
   unseal(sealed: string): Promise<string>;
-  /** Whether the wallet's journal still holds a melt of `quoteId` at `mint` (outcome unknown). */
+  /**
+   * Whether the wallet's journal still holds a melt of `quoteId` at `mint` (outcome unknown). Read
+   * as three states: yes, no, or not known (it rejects) — only an affirmative "no" lets a kept
+   * quote go (lane R6-reconcile pins it).
+   */
   meltPending(mint: MintUrl, quoteId: string): Promise<boolean>;
   /** The mint's own state of its melt quote `quoteId` (NUT-05, read only). */
   meltState(mint: MintUrl, quoteId: string): Promise<MeltQuote['state']>;
@@ -269,6 +305,12 @@ export interface AutoTopUpOptions {
   readonly log: Logger;
   /** Wall-clock milliseconds. */
   readonly now?: () => number;
+  /**
+   * Lane R6-reconcile: a monotonic clock in ms (default `performance.now`) — a play's bound, the
+   * first-funding question's time, a melt's start-by. Wall time (`now`) stays for what is
+   * persisted or compared with a mint (the ledger, the release guard, an invoice's expiry).
+   */
+  readonly clock?: () => number;
   readonly sleep?: (ms: number) => Promise<void>;
   readonly pollAttempts?: number;
   readonly pollIntervalMs?: number;
@@ -301,7 +343,14 @@ export class AutoTopUp {
   private readonly o: AutoTopUpOptions;
   private readonly log: Logger;
   private readonly now: () => number;
+  private readonly clock: () => number;
   private readonly sleep: (ms: number) => Promise<void>;
+  /**
+   * When this AutoTopUp was made — once per run of the host (wall clock, like the ledger's `at`):
+   * a melt of an earlier run was sent, if at all, before this (lane R6-reconcile; see
+   * `TOP_UP_MELT_RETURNED_BY_MS`).
+   */
+  private readonly startedAt: number;
   private flight: Flight | null = null;
   /** No attempt before this (min interval, failure backoff). */
   private notBefore = 0;
@@ -337,6 +386,8 @@ export class AutoTopUp {
     this.o = o;
     this.log = o.log.child('topup');
     this.now = o.now ?? Date.now;
+    this.clock = o.clock ?? ((): number => performance.now());
+    this.startedAt = this.now();
     this.sleep =
       o.sleep ??
       ((ms) =>
@@ -364,7 +415,7 @@ export class AutoTopUp {
       const now = this.now();
       if (now < this.notBefore || (this.declined.get(mint) ?? 0) > now)
         return Promise.resolve('backoff');
-      const question = new QuestionClock();
+      const question = new QuestionClock(this.clock);
       const done = this.run(mint, question)
         .catch((): TopUpOutcome => 'failed')
         .then((out) => {
@@ -383,22 +434,37 @@ export class AutoTopUp {
   }
 
   /**
-   * A play about to open at zero balance (round 4, info): the identity's open top-ups are finished
-   * first (one may hold the sats this play needs), then `check`. Both together are waited for at
-   * most `playWaitMs` from now (round 5: the run's wait for the startup settle and its own
-   * finishing of open top-ups count too), the time the run's first-funding question is open aside
+   * A play about to open at zero balance at every mint of `mints` (round 4, info): the identity's
+   * open top-ups are finished first (one may hold the sats this play needs), then `check` for each
+   * mint in turn until one is due — its outcome decides (done, declined, capped, failed: no second
+   * mint is tried, and asked about, for the same play); `not-due` when none is. All of it together
+   * is waited for at most `playWaitMs` from now (round 5: the run's wait for the startup settle and
+   * its own finishing of open top-ups count too; lane R6-reconcile: one bound for the whole play,
+   * every mint included, not one per mint), the time a run's first-funding question is open aside
    * (the user's own, bounded by the prompt's deadline). `in-flight`: still running (the play fails
    * `no-balance` and may be retried; the top-up goes on). Never rejects.
    */
-  async checkForPlay(mint: MintUrl): Promise<TopUpOutcome | 'in-flight'> {
+  async checkForPlay(mints: readonly MintUrl[]): Promise<TopUpOutcome | 'in-flight'> {
     const waitMs = this.o.playWaitMs ?? PLAY_TOP_UP_WAIT_MS;
-    const started = performance.now();
-    if ((await within(this.resolveSoon(), waitMs)) === 'late') return 'in-flight';
-    const done = this.check(mint, 0 as Sats);
-    const f = this.flight;
-    if (f?.target !== mint) return done;
-    const out = await within(done, waitMs - (performance.now() - started), f.question);
-    return out === 'late' ? 'in-flight' : out;
+    const started = this.clock();
+    /** Time a first-funding question was open during this play: not counted. */
+    let aside = 0;
+    const left = (): number => waitMs - (this.clock() - started - aside);
+    if ((await within(this.resolveSoon(), left(), this.clock)) === 'late') return 'in-flight';
+    for (const mint of mints) {
+      const done = this.check(mint, 0 as Sats);
+      const f = this.flight;
+      let out: TopUpOutcome | 'late';
+      if (f?.target !== mint) out = await done;
+      else {
+        const asked = f.question.spentMs();
+        out = await within(done, left(), this.clock, f.question);
+        aside += f.question.spentMs() - asked;
+      }
+      if (out === 'late') return 'in-flight';
+      if (out !== 'not-due') return out;
+    }
+    return 'not-due';
   }
 
   /**
@@ -507,6 +573,9 @@ export class AutoTopUp {
     // taken the target off the list, or signed out meanwhile.
     if (!(await this.stillWanted(w, target, from, amount))) return 'not-due';
     if (!this.o.ledger.fits(reserved)) return 'cap';
+    // Read as the ledger stamps the entry (`at`, at the call), not after its write: the melt's
+    // start-by counts from no later than the time a restart counts from.
+    const reservedAt = this.clock();
     const entry = await this.o.ledger.reserve({ amount, sats: reserved, target, from });
 
     const before = await this.historyBefore(w, from, amount, reserved);
@@ -534,6 +603,14 @@ export class AutoTopUp {
     if (!(await this.stillWanted(w, target, from, amount))) {
       await this.close(w, entry, { state: 'failed' }); // nothing moved
       return 'not-due';
+    }
+    // Lane R6-reconcile: the melt starts within its start-by of the reservation or not at all, so
+    // a restart can bound when it returned (`TOP_UP_MELT_RETURNED_BY_MS`) — a seal that waited on
+    // a bunker for longer moves nothing. `!(… <= …)`: a clock that is not a number refuses too.
+    if (!(this.clock() - reservedAt <= TOP_UP_MELT_START_BY_MS)) {
+      await this.close(w, entry, { state: 'failed' }); // nothing moved
+      this.log.warn('auto top-up melt not started: too long since its reservation');
+      return 'failed';
     }
     this.meltInFlight = before;
     let paid: { paid: boolean; change: Sats };
@@ -671,8 +748,9 @@ export class AutoTopUp {
    * says PAID (`pollQuote` mints it — journaled by core, so a lost answer is restored, never minted
    * twice), or released while the quote is still UNPAID once the melt is settled as not paid, or
    * (round 5) once the invoice has been expired for `TOP_UP_EXPIRED_RELEASE_AFTER_MS` and the source
-   * does not say PAID — never within `TOP_UP_RELEASE_AFTER_MS` of the melt returning. Anything
-   * else — a target that cannot be asked, a melt still pending, a record that does not open —
+   * answers short of PAID (lane R6-reconcile: an answer, never a failed read) — never within
+   * `TOP_UP_RELEASE_AFTER_MS` of the melt returning. Anything else — a target or source that cannot
+   * be asked, a journal that cannot be read, a melt still pending, a record that does not open —
    * leaves it open for the next time. Never rejects.
    */
   private async resolveOpen(w: Wallet, v: TopUpVault): Promise<void> {
@@ -700,23 +778,32 @@ export class AutoTopUp {
         // UNPAID. A melt that paid (`done`) will reach the target: keep polling it.
         if (r.state !== 'UNPAID' || e.state === 'done') continue;
         // Round 5 (R4-R2): a melt request the transport gave up on may still reach the source.
+        // Lane R6-reconcile: without the melt's own time (an earlier run of the host), from the
+        // later of the latest it can have returned and this host's start.
         const now = this.now();
-        const returned = this.meltReturned.get(e.id) ?? e.at + MELT_REQUEST_TIMEOUT_MS;
-        if (now < returned + TOP_UP_RELEASE_AFTER_MS) continue;
+        const returned =
+          this.meltReturned.get(e.id) ??
+          Math.max(e.at + TOP_UP_MELT_RETURNED_BY_MS, this.startedAt);
+        if (!(now >= returned + TOP_UP_RELEASE_AFTER_MS)) continue;
         // Round 5: the target still says UNPAID a day after the invoice expired — it can no
-        // longer be paid, whatever the source says short of PAID (a source gone for good).
+        // longer be paid, whatever the source answers short of PAID.
         const lapsed =
           open.quote.expiry > 0 &&
           now >= Math.max(open.quote.expiry * 1000, e.at) + TOP_UP_EXPIRED_RELEASE_AFTER_MS;
         const { mint, quoteId } = open.melt;
+        // Three states: true, false, or null — the journal could not be read (lane R6-reconcile
+        // pins that null is never read as false).
         const pending = await orNull(() => v.meltPending(mint, quoteId));
         if (pending === true && !lapsed) continue;
+        // null when the source could not be read: no answer at all (lane R6-reconcile).
         const source = await orNull(() => v.meltState(mint, quoteId));
         // Otherwise released only when the melt can no longer pay it: nothing journaled at the
         // source, and the source mint's own quote UNPAID (PAID and PENDING are not; UNPAID after
-        // the target read UNPAID means the melt never paid before it either).
+        // the target read UNPAID means the melt never paid before it either) — or, lapsed, when
+        // the source ANSWERS short of PAID (a read that failed keeps it: the melt may have paid).
         const unpaid = pending === false && source === 'UNPAID';
-        if (!unpaid && !(lapsed && source !== 'PAID')) continue;
+        const answered = source === 'UNPAID' || source === 'PENDING';
+        if (!unpaid && !(lapsed && answered)) continue;
         // Still counted (the melt reached the mint; its inputs may have been lost there).
         await this.close(w, e.id, { state: e.state === 'failed' ? 'failed' : 'unknown' });
         this.log.info(
@@ -868,13 +955,15 @@ class QuestionClock {
   private spent = 0;
   private readonly waiting: (() => void)[] = [];
 
+  constructor(private readonly clock: () => number) {}
+
   open(): void {
-    this.openedAt ??= performance.now();
+    this.openedAt ??= this.clock();
   }
 
   close(): void {
     if (this.openedAt === null) return;
-    this.spent += performance.now() - this.openedAt;
+    this.spent += this.clock() - this.openedAt;
     this.openedAt = null;
     for (const wake of this.waiting.splice(0)) wake();
   }
@@ -886,7 +975,7 @@ class QuestionClock {
 
   /** Milliseconds it has been open so far, the question open now included. */
   spentMs(): number {
-    return this.spent + (this.openedAt === null ? 0 : performance.now() - this.openedAt);
+    return this.spent + (this.openedAt === null ? 0 : this.clock() - this.openedAt);
   }
 
   /** Resolves once no question is open (at once when none is). */
@@ -899,14 +988,19 @@ class QuestionClock {
 }
 
 /**
- * `p`, or `'late'` once `ms` have passed without it settling — the time `question` is open aside
- * (round 5). Unref'd timers, cleared once either wins.
+ * `p`, or `'late'` once `ms` have passed on `clock` without it settling — the time `question` is
+ * open aside (round 5). Unref'd timers, cleared once either wins.
  */
-async function within<T>(p: Promise<T>, ms: number, question?: QuestionClock): Promise<T | 'late'> {
-  const started = performance.now();
+async function within<T>(
+  p: Promise<T>,
+  ms: number,
+  clock: () => number,
+  question?: QuestionClock,
+): Promise<T | 'late'> {
+  const started = clock();
   const asked = question?.spentMs() ?? 0;
   /** The time waited so far, the question's aside. */
-  const waited = (): number => performance.now() - started - ((question?.spentMs() ?? 0) - asked);
+  const waited = (): number => clock() - started - ((question?.spentMs() ?? 0) - asked);
   const settled = p.then((value) => ({ value }));
   for (;;) {
     if (question?.isOpen() === true) {

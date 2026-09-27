@@ -1,5 +1,6 @@
 /**
- * Issue #6 / security review F21: exactly five fuses, flipped on the packaged binary and read
+ * Issue #6 / security review F21: exactly six fuses (five chosen 2026-09-24, the sixth —
+ * GrantFileProtocolExtraPrivileges off — 2026-09-26), flipped on the packaged binary and read
  * back. The flip and the read-back run for real against a synthetic "binary" that carries
  * Electron's fuse sentinel and a 9-fuse wire (the layout @electron/fuses scans for), so no
  * Electron download is needed.
@@ -53,17 +54,19 @@ afterEach(() => {
 });
 
 describe('FUSES', () => {
-  it('is exactly the five settings Cameron chose (2026-09-24)', () => {
+  // Lane R6-reconcile: the sixth fuse (Cameron, 2026-09-26; ADR 0017 §4) joins the five.
+  it('is exactly the six settings Cameron chose (five 2026-09-24, GrantFileProtocolExtraPrivileges off 2026-09-26)', () => {
     expect(FUSES).toEqual({
       RunAsNode: false,
       EnableNodeOptionsEnvironmentVariable: false,
       EnableNodeCliInspectArguments: false,
       EnableEmbeddedAsarIntegrityValidation: true,
       OnlyLoadAppFromAsar: true,
+      GrantFileProtocolExtraPrivileges: false,
     });
   });
 
-  it('fuseConfig sets those five by wire index and nothing else', () => {
+  it('fuseConfig sets those six by wire index and nothing else', () => {
     const cfg = fuseConfig(false) as unknown as Record<string, unknown>;
     expect(cfg).toEqual({
       version: FuseVersion.V1,
@@ -73,6 +76,7 @@ describe('FUSES', () => {
       [FuseV1Options.EnableNodeCliInspectArguments]: false,
       [FuseV1Options.EnableEmbeddedAsarIntegrityValidation]: true,
       [FuseV1Options.OnlyLoadAppFromAsar]: true,
+      [FuseV1Options.GrantFileProtocolExtraPrivileges]: false,
     });
   });
 });
@@ -85,6 +89,7 @@ describe('fuseMismatches', () => {
     [FuseV1Options.EnableNodeCliInspectArguments]: FuseState.DISABLE,
     [FuseV1Options.EnableEmbeddedAsarIntegrityValidation]: FuseState.ENABLE,
     [FuseV1Options.OnlyLoadAppFromAsar]: FuseState.ENABLE,
+    [FuseV1Options.GrantFileProtocolExtraPrivileges]: FuseState.DISABLE,
   };
 
   it('accepts the right wire (other fuses are not its business)', () => {
@@ -109,7 +114,7 @@ describe('fuseMismatches', () => {
 });
 
 describe('flip + read-back on a (synthetic) binary', () => {
-  it('flipAppFuses writes exactly the five; assertAppFuses then passes; the untouched wire fails', async () => {
+  it('flipAppFuses writes exactly the six; assertAppFuses then passes; the untouched wire fails', async () => {
     // packager's layout while `packageAfterCopy` runs: <app>/electron next to resources/app.
     const buildPath = join(root, 'Nutflix-linux-x64', 'resources', 'app');
     mkdirSync(buildPath, { recursive: true });
@@ -125,14 +130,33 @@ describe('flip + read-back on a (synthetic) binary', () => {
     await flipAppFuses(buildPath, 'linux', 'x64', false);
     await expect(assertAppFuses(bin)).resolves.toBeUndefined();
     const wire = (await getCurrentFuseWire(bin)) as unknown as Record<number, FuseState>;
-    // The two fuses nobody asked about keep Electron's defaults.
+    // The sixth fuse (2026-09-26) is off, where Electron's default has it on…
+    expect(wire[FuseV1Options.GrantFileProtocolExtraPrivileges]).toBe(FuseState.DISABLE);
+    // …and the fuses nobody asked about keep Electron's defaults.
     expect(wire[FuseV1Options.EnableCookieEncryption]).toBe(FuseState.DISABLE);
-    expect(wire[FuseV1Options.GrantFileProtocolExtraPrivileges]).toBe(FuseState.ENABLE);
-    // Only the wire bytes changed.
+    expect(wire[FuseV1Options.LoadBrowserProcessSpecificV8Snapshot]).toBe(FuseState.DISABLE);
+    expect(wire[FuseV1Options.WasmTrapHandlers]).toBe(FuseState.ENABLE);
+    // Only the wire bytes changed: one per fuse set (each differs from the default here).
     const before = fakeBinary();
     const after = readFileSync(bin);
     const diff = [...after].flatMap((b, i) => (b === before[i] ? [] : [i]));
-    expect(diff.length).toBe(5);
+    expect(diff.length).toBe(6);
+  });
+
+  it('the read-back refuses a binary that still grants file:// its extra privileges (the other five right)', async () => {
+    const bin = join(root, 'five-only');
+    const b = fakeBinary();
+    // Flip the five by hand, leave GrantFileProtocolExtraPrivileges at Electron's default (on).
+    const at = b.indexOf(Buffer.from(SENTINEL)) + SENTINEL.length + 2;
+    b[at + FuseV1Options.RunAsNode] = FuseState.DISABLE;
+    b[at + FuseV1Options.EnableNodeOptionsEnvironmentVariable] = FuseState.DISABLE;
+    b[at + FuseV1Options.EnableNodeCliInspectArguments] = FuseState.DISABLE;
+    b[at + FuseV1Options.EnableEmbeddedAsarIntegrityValidation] = FuseState.ENABLE;
+    b[at + FuseV1Options.OnlyLoadAppFromAsar] = FuseState.ENABLE;
+    writeFileSync(bin, b);
+    await expect(assertAppFuses(bin)).rejects.toThrow(
+      /^fuses wrong on .*:\n {2}GrantFileProtocolExtraPrivileges: expected off, binary has on$/,
+    );
   });
 });
 

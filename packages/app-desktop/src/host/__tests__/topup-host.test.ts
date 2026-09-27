@@ -557,6 +557,44 @@ describe('cross-lane review round 4 through the whole host', () => {
     expect((await invoke(w.r, 'play', [w.trusted.id])).ok).toBe(true);
     expect(w.lightning.paid).toHaveLength(1);
   }, 30_000);
+
+  // Lane R6-reconcile (the round-5 verifier): the adapter asked `checkForPlay` once PER MINT, each
+  // with a whole `playWaitMs` of its own, so a video at two trusted mints could wait twice the
+  // bound. One call for the play now: here the first mint's run takes 60 % of the bound and ends
+  // not due (the settings changed meanwhile), and the second mint's run gets only the rest.
+  it('a video at two trusted mints waits one playWaitMs in all, not one per mint', async () => {
+    const W = 3_000;
+    const t = holding();
+    // A clock that passes the minute between attempts at every read (the second mint's run is
+    // not spaced out behind the first's).
+    const w = await world({ wrap: t.wrap, tickMs: 61_000, hooks: { playWaitMs: W } });
+    r = w.r;
+    t.hold(
+      (mint, path) => (mint === TARGET || mint === SECOND) && path === 'POST /v1/mint/quote/bolt11',
+    );
+    const reply = invoke(w.r, 'play', [w.both.id]);
+    const first = await t.next(); // the first mint's run, at its quote
+    const since = performance.now();
+    await new Promise((resolve) => setTimeout(resolve, 0.6 * W));
+    await w.r.host.adapter.updateSettings({
+      autoTopUp: { belowSats: 1_000 as Sats, fromMint: SOURCE, amountSats: 2_500 as Sats },
+    });
+    first.release(); // that run is no longer the one the settings want: it ends not due
+    const second = await t.next(); // the second mint's run, at its quote: held
+    const res = await reply;
+    const took = performance.now() - since;
+    expect(!res.ok && res.error.code).toBe('no-balance');
+    expect(!res.ok && res.error.message).toMatch(/a top-up is on its way/);
+    // Not 0.6 W, then a whole bound for the second mint (≥ 1.6 W: timers are never early); the
+    // margin is for a loaded box's late timers.
+    expect(took).toBeLessThan(1.4 * W);
+    expect(w.asked.map((f) => (f as { target?: MintUrl }).target)).toEqual([TARGET, SECOND]);
+    // The second mint's top-up finishes in the background.
+    t.hold(null);
+    second.release();
+    await w.r.host.adapter.topUpInFlight();
+    expect(await balance(w.r, SECOND)).toBe(2_500);
+  }, 30_000);
 });
 
 // Fix round 4 (cross-lane review, HIGH): the host revoked a session before the worker heard

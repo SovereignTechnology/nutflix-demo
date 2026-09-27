@@ -297,6 +297,50 @@ block to a `pay/1` peer, with no switch.
     that does not unseal (R4-R1). Each holds back auto top-ups into its target for that identity;
     manual top-ups are unaffected.
 
+- Addendum 2026-09-27 (lane R6-reconcile, the verifier of fix round 5): **one retry mechanism
+  for a refused PAY; a kept quote goes only on answers; the play's bound is the play's.**
+  - **A PAY refused "for now" is retried by the shared payer, never given up** (replaces the
+    viewer payer's own timer of the 2026-09-25 amendment). Lane I2 gave the worker's
+    `ViewerPayer` a timer for the host's `rate-limited:`; fix round 5 then gave the shared
+    `UpstreamPayer` a per-core failure streak with its own timer and a give-up after
+    `MAX_PAY_FAILURES` over `PAY_GIVE_UP_MS` (30 s). Together, I2's timer no longer brought a
+    retry (the round-5 backoff held it back) and a 300 s melt was written off after 30 s. Now
+    `UpstreamPayer` classifies every failed PAY by its outcome code: `session-closed` and
+    `forbidden` give their range up at once (and end the core's streak, so a later failure of
+    another session's blocks starts afresh); `rate-limited` is **deferred** — asked again after
+    `PAY_RETRY_LATER_MS` = 2 s, doubling up to `PAY_RETRY_LATER_MAX_MS` = 30 s, by its own retry
+    timer, and never counted toward giving up; everything else is **transient**, as round 5. A
+    failure of the other kind starts a new streak. The viewer payer's timer is gone;
+    `ViewerPayer.close()` cancels the payer's (`UpstreamPayer.dispose()` also stops a PAY that
+    fails after it from arming one).
+  - **The payer's time is monotonic**: streaks, backoffs and the give-up read an injectable
+    clock, by default `performance.now()`; the desktop worker runs on Bare, which has none, so
+    there it is `Date.now()` made steady (never backwards, a step forward counts at most 8 s per
+    read). A retry timer that fires makes the backoffs due by then retryable whatever the clock
+    says, and a reading that is not a finite number, goes back or throws counts as the last good
+    one — a bad clock stands still, gives nothing up and cannot loop.
+  - **A kept quote goes only on answers.** The journal's `meltPending` is three states: only an
+    answered "nothing journaled" counts, a read that fails keeps the quote. Past the lapse, the
+    source mint must ANSWER short of PAID (UNPAID, or its payment stuck PENDING): round 5 also
+    released when the source could not be read at all, but a failed read says nothing and the
+    melt may have paid. A source gone for good therefore holds its target back again, with no
+    in-app clear (R5-R1).
+  - **The restart bound covers what comes before the melt request.** A melt now starts within
+    `TOP_UP_MELT_START_BY_MS` = 5 min of its reservation or not at all (the entry settles
+    `failed`: nothing moved) — between the two the run seals the record through the signer, and
+    a NIP-46 bunker may ask its user. After a restart the release guard counts from the later of
+    the reservation plus `TOP_UP_MELT_RETURNED_BY_MS` (start-by + the PAY/melt gate's wait,
+    `WORKER_HOST_REQUEST_TIMEOUT_MS`, + the melt request, `MELT_REQUEST_TIMEOUT_MS`: 15 min) and
+    this run of the host's start: core's own turn at the source and its round trips before the
+    request have no fixed bound, but a melt request never outlives the host process that sent it,
+    and a host starts only after the one before it exited.
+  - **One bound for the whole play**: `checkForPlay` takes all of the video's mints, and
+    `PLAY_TOP_UP_WAIT_MS` = 15 s covers the open top-ups' finishing and every mint's run together
+    (the adapter asked once per mint, each with its own 15 s). The questions' time stays aside.
+    The play's bound, the question's time and the melt's start-by are on a monotonic clock
+    (`clock`, default `performance.now()`); the ledger, the release guard and an invoice's expiry
+    stay on the wall clock they are compared with.
+
 ## Consequences
 
 - With a signer, the desktop pays and is paid for real: tested end to end — the worker (real
