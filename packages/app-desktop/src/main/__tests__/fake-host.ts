@@ -215,7 +215,9 @@ export class FakeHost {
       }
       case 'prompt-answer':
       case 'keychain-result':
-        // ADR 0013: main's prompt window / keychain answering the host; this fake asks nothing.
+      case 'confirm-result':
+        // ADR 0013 / 0016: main's prompt window, keychain or native confirm answering the host;
+        // this fake asks nothing.
         return;
     }
   }
@@ -266,7 +268,8 @@ export class FakeHost {
         };
       }
       case 'signer.status':
-        // ADR 0013: the fake adapter's signer never changes.
+      case 'recovery.progress':
+        // ADR 0013 / 0016: the fake adapter's signer never changes and it runs no restore.
         return () => undefined;
     }
   }
