@@ -223,7 +223,14 @@ function isCounter(x: unknown): x is number {
   return typeof x === 'number' && Number.isSafeInteger(x) && x >= 0 && x <= MAX_COUNTER;
 }
 
-function counterMap(x: unknown): Record<string, number> | null {
+/**
+ * Core's phrase binding (`seed.ts` `counterBinding`; its contract request 4): a `published` entry
+ * `ff` + 32 hex → 0, with no `next` entry. It names which phrase the file belongs to — no secret
+ * (it can only confirm a guessed phrase) — and core writes it with every save.
+ */
+const BINDING_ENTRY = /^ff[0-9a-f]{32}$/;
+
+function counterMap(x: unknown, binding = false): Record<string, number> | null {
   if (typeof x !== 'object' || x === null || Array.isArray(x)) return null;
   const proto: unknown = Object.getPrototypeOf(x);
   if (proto !== Object.prototype && proto !== null) return null;
@@ -231,24 +238,34 @@ function counterMap(x: unknown): Record<string, number> | null {
   if (entries.length > MAX_KEYSETS) return null;
   const out: Record<string, number> = {};
   for (const [k, v] of entries) {
-    if (!KEYSET_ID.test(k) || !isCounter(v)) return null;
+    if (!(KEYSET_ID.test(k) || (binding && BINDING_ENTRY.test(k))) || !isCounter(v)) return null;
     out[k] = v;
   }
   return out;
 }
 
 /**
- * Exactly a `CounterState` — every keyset id hex (v1 or v2), every counter an integer in
- * `[0, 2^31]`, every `published` watermark at or below its keyset's `next` — or `null`.
+ * Exactly a `CounterState` as core writes it — every keyset id hex (v1 or v2), every counter an
+ * integer in `[0, 2^31]`, every `published` watermark at or below its keyset's `next`, and at most
+ * one phrase binding (`published` only, → 0) — or `null`.
+ *
+ * Integration fix 2: the binding was refused (not a keyset id, no `next`), so once core wrote it
+ * the desktop saved no lease: every seeded operation — a reissue, a top-up, a send's change —
+ * failed before it reached the mint, and the counters file stayed without the binding.
  */
 export function parseCounterState(raw: unknown): walletMod.CounterState | null {
   if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return null;
   const o = raw as Record<string, unknown>;
   if (Object.keys(o).sort().join(',') !== 'next,published,v' || o['v'] !== 1) return null;
   const next = counterMap(o['next']);
-  const published = counterMap(o['published']);
+  const published = counterMap(o['published'], true);
   if (next === null || published === null) return null;
+  let bindings = 0;
   for (const [k, p] of Object.entries(published)) {
+    if (BINDING_ENTRY.test(k)) {
+      if (p !== 0 || ++bindings > 1) return null;
+      continue;
+    }
     const n = next[k];
     if (n === undefined || p > n) return null;
   }

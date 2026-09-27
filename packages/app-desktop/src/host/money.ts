@@ -223,6 +223,7 @@ export class MoneyPlane {
   private readonly closeKey: () => void;
   private readonly closeJournal: () => void;
   private readonly closeSeed: () => void;
+  private readonly closeCounters: () => void;
   private closed = false;
 
   private constructor(
@@ -266,6 +267,9 @@ export class MoneyPlane {
     this.closeSeed = () => {
       o.seed?.material.seed.wipe();
     };
+    this.closeCounters = () => {
+      parts.conns.seeding?.counters.close();
+    };
     this.now = o.now ?? ((): UnixSeconds => Math.floor(Date.now() / 1000) as UnixSeconds);
     this.viewer = new payment.RealPaymentEngine({
       config: {
@@ -291,8 +295,21 @@ export class MoneyPlane {
     });
   }
 
-  /** Open the user's NIP-60 wallet with `signer` and publish their kind 10019. */
+  /**
+   * Open the user's NIP-60 wallet with `signer` and publish their kind 10019. A plane that does
+   * not open wipes the seed it was given, whatever failed (integration fix 2: before, a signer or
+   * NIP-60 failure — `no-wallet`, unreachable relays — left that to the caller).
+   */
   static async open(o: MoneyPlaneOptions): Promise<MoneyPlane> {
+    try {
+      return await MoneyPlane.openWith(o);
+    } catch (err) {
+      o.seed?.material.seed.wipe();
+      throw err;
+    }
+  }
+
+  private static async openWith(o: MoneyPlaneOptions): Promise<MoneyPlane> {
     const relays = nip60Relays(o.pool, o.relays);
     const pubkey = await o.signer.getPublicKey();
     const nip60 = await walletMod.openNip60Wallet({
@@ -536,6 +553,16 @@ export class MoneyPlane {
     // at its turn and writes nothing (its blocks stay off the budget on disk: respected, never paid).
     this.tails.close();
     this.settles.stop();
+    // ADR 0016, integration fix 2 (core's contract request 4): the wallet's NUT-13 counter source
+    // is closed now — every later reservation or advance is refused, so this plane's source never
+    // writes the counters file again. Left open, an operation still running or queued at a mint
+    // (the journal's settle moving the counters past a collision, a PAY behind another) could
+    // save a lease after a rotation had given that file to the new phrase: core lets an OPEN
+    // source take over a file another phrase wrote. Not `CashuWallet.close()`, whose watermark
+    // flush lands whenever the running operations end — after a quit's writes, or in the middle
+    // of the next plane's counters-file rotation; without it the watermark only lags (a larger
+    // startup range for `restoreUnpublished`), as before.
+    this.closeCounters();
     this.closeKey();
     this.closeJournal();
     // The seam's contract: core refuses to derive from a wiped seed (never from zeros).

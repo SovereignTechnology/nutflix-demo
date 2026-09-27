@@ -56,7 +56,10 @@ export interface RigOptions {
   readonly pool?: nostr.FakeRelayPool;
   /** Issue #2: the auto top-up's clock and target polling. */
   readonly topUp?: HostOptions['topUp'];
-  /** ADR 0016: a fake of lane N1's NUT-13 code (`support/fake-recovery.ts`). */
+  /**
+   * ADR 0016: lane N1's NUT-13 code — default core's real one (`recoveryCore()`); the recovery
+   * suites pass a pass-through spy of it (`support/real-recovery.ts`).
+   */
   readonly recoveryCore?: HostOptions['recoveryCore'];
 }
 
