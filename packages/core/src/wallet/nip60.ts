@@ -42,7 +42,7 @@ import type {
 } from '../contracts/index.js';
 import { NostrKind } from '../contracts/index.js';
 import { verifyIncoming } from '../nostr/event.js';
-import type { PendingOp, ProofStore, WalletTx } from './store.js';
+import { checkBegin, type PendingOp, type ProofStore, type WalletTx } from './store.js';
 
 /** The two relay operations this store needs (the host's relay pool implements them). */
 export interface Nip60Relays {
@@ -445,6 +445,8 @@ export class Nip60ProofStore implements ProofStore {
     },
   ): Promise<void> {
     const run = this.chain.then(async () => {
+      // A begin whose id is still journaled is refused before anything changes (`WalletTx.begin`).
+      checkBegin(this.ops, tx);
       const ops = new Map(this.ops);
       for (const id of tx.settle ?? []) ops.delete(id);
       if (tx.begin !== undefined) ops.set(tx.begin.id, cloneOp(tx.begin));

@@ -43,6 +43,7 @@ import {
   type MintConnections,
   type RestoreDetail,
   type Seeding,
+  type SendBound,
   type WalletKey,
 } from './spend.js';
 import { fetchRawHttp } from './fetch-http.js';
@@ -248,6 +249,17 @@ export interface CashuWalletOptions {
   readonly now?: () => UnixSeconds;
   /** Tests: tighter NUT-13 restore bounds (`SpendContext.restoreLimits`; can only tighten). */
   readonly restoreLimits?: { readonly maxBatches?: number; readonly maxKeysets?: number };
+  /**
+   * The shell's per-mint gate around the operations that hold a mint's turn for many round trips
+   * (lane W8a): each NUT-13 restore — `seeded.restoreFromSeed` and `restoreUnpublished`, one call
+   * per mint — each reissue and its plan, and each mint's journal settle in `recoverPending` run
+   * as `holdMint(mint, run)`. The desktop passes its PAY/melt gate: a PAY build at that mint is
+   * then refused at once, as during a melt, instead of queueing behind a scan and being built after
+   * the worker gave up on it. Default: `run()` at once. A hook that rejects without running `run`
+   * refuses that one call: a restore or settle then reports that mint unreachable, a reissue or
+   * plan rejects.
+   */
+  readonly holdMint?: <T>(mint: MintUrl, run: () => Promise<T>) => Promise<T>;
 }
 
 export class CashuWallet implements Wallet {
@@ -285,9 +297,15 @@ export class CashuWallet implements Wallet {
 
   // ---- NUT-13 (ADR 0016) ----------------------------------------------------------------
 
+  /** `run` inside the shell's per-mint gate (`CashuWalletOptions.holdMint`), or at once. */
+  private hold<T>(mint: MintUrl, run: () => Promise<T>): Promise<T> {
+    const h = this.o.holdMint;
+    return h === undefined ? run() : h(mint, run);
+  }
+
   private async reissuePlan(mint: MintUrl): Promise<ReissuePlan> {
     try {
-      return await this.spender.reissuePlan(mint);
+      return await this.hold(mint, () => this.spender.reissuePlan(mint));
     } finally {
       await this.afterOperation(mint);
     }
@@ -295,7 +313,7 @@ export class CashuWallet implements Wallet {
 
   private async reissue(plan: ReissuePlan): Promise<ReissueResult> {
     try {
-      return await this.spender.reissue(plan);
+      return await this.hold(plan.mint, () => this.spender.reissue(plan));
     } finally {
       await this.afterOperation(plan.mint);
     }
@@ -309,17 +327,33 @@ export class CashuWallet implements Wallet {
   ): Promise<readonly RestoreDetail[]> {
     const reports: RestoreDetail[] = [];
     for (const mint of [...new Set(mints)]) {
+      const scan = { ran: false };
       try {
         reports.push(
-          await this.spender.restoreFromSeed(
-            seed,
-            mint,
-            (keysetsDone, keysets) => {
-              onProgress?.({ mint, keysetsDone, keysets });
-            },
-            opts?.resume?.get(mint),
-          ),
+          await this.hold(mint, () => {
+            scan.ran = true;
+            return this.spender.restoreFromSeed(
+              seed,
+              mint,
+              (keysetsDone, keysets) => {
+                onProgress?.({ mint, keysetsDone, keysets });
+              },
+              opts?.resume?.get(mint),
+            );
+          }),
         );
+      } catch (e) {
+        // The shell's gate refused this mint before the scan began (`holdMint`): nothing was
+        // asked there — unreachable for now, where a continuation would have started. Anything
+        // the scan itself throws (a wiped seed, a malformed resume) is not a mint's outcome.
+        if (scan.ran) throw e;
+        const at = opts?.resume?.get(mint);
+        reports.push({
+          mint,
+          outcome: 'unreachable',
+          restoredSats: 0 as Sats,
+          ...(at === undefined ? {} : { resume: { ...at } }),
+        });
       } finally {
         await this.afterOperation(mint);
       }
@@ -351,9 +385,11 @@ export class CashuWallet implements Wallet {
     const reports: RestoreDetail[] = [];
     for (const mint of await this.mints()) {
       try {
-        const r = await this.spender.restoreUnpublished(mint, ranges, (done) => {
-          for (const k of done) scanned.add(k);
-        });
+        const r = await this.hold(mint, () =>
+          this.spender.restoreUnpublished(mint, ranges, (done) => {
+            for (const k of done) scanned.add(k);
+          }),
+        );
         if (r.outcome !== 'nothing') reports.push(r);
       } catch {
         reports.push({ mint, outcome: 'unreachable', restoredSats: 0 as Sats });
@@ -393,18 +429,33 @@ export class CashuWallet implements Wallet {
    * Close the wallet (ADR 0016 §2): the counter source refuses every reservation, every running
    * or queued operation finishes (new ones are refused), the `published` watermark is written, and
    * only then is the seed wiped — cashu-ts holds it by reference. Idempotent.
+   *
+   * `flush` (lane W8a) is asked once the operations ended, just before that write: `false` skips
+   * it. A shell that has moved on — the next wallet over the same counters file, a rotated phrase,
+   * a quit — answers `false`, so this late write can never land after it (a stale watermark only
+   * restores more at the next start). Default: write.
    */
-  async close(): Promise<void> {
+  async close(opts: { readonly flush?: () => boolean } = {}): Promise<void> {
     const s = this.o.mints.seeding;
     s?.counters.close();
     await this.spender.close();
     if (s === undefined) return;
-    try {
-      await s.counters.flush();
-    } catch {
-      // a stale watermark only restores more at the next start
-    }
+    if (opts.flush?.() !== false)
+      try {
+        await s.counters.flush();
+      } catch {
+        // a stale watermark only restores more at the next start
+      }
     s.seed.wipe();
+  }
+
+  /**
+   * Get `mint` ready for a deadline-bound send (lane W8a; `Spender.prepare`): its wallet loaded
+   * and, with a recovery phrase, its active keyset probed if the counters file does not know it —
+   * so neither round trip falls inside the bound. Spends nothing.
+   */
+  prepare(mint: MintUrl): Promise<void> {
+    return this.spender.prepare(mint);
   }
 
   /** Emit the balance and move the watermark after an operation (neither may throw). */
@@ -518,6 +569,8 @@ export class CashuWallet implements Wallet {
       readonly mint: MintUrl;
       readonly tags?: readonly (readonly string[])[];
       readonly memo?: string;
+      /** A deadline-bound send, e.g. a PAY build (`SendBound`, lane W8a). */
+      readonly bound?: SendBound;
     },
   ): Promise<LockedProofSet> {
     // A failed send may still move the balance (its inputs held while the mint's answer is
@@ -573,7 +626,7 @@ export class CashuWallet implements Wallet {
       let counted = false;
       try {
         before = await pendingAt(mint);
-        const r = await this.spender.recover(mint);
+        const r = await this.hold(mint, () => this.spender.recover(mint));
         recovered += r.recovered;
         const after = await pendingAt(mint);
         left += after;
