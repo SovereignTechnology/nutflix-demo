@@ -105,11 +105,14 @@ export class FakeSeededWallet implements walletMod.SeededWallet {
   /** Phrases whose restore throws. */
   readonly failRestore = new Set<string>();
   readonly reissued: walletMod.ReissuePlan[] = [];
+  /** Every mint `reissuePlan` was asked about, in order. */
+  readonly planned: MintUrl[] = [];
   readonly restoreCalls: RestoreCall[] = [];
   /** Balances the plan reads (set by the test to mirror the wallet). */
   readonly balances = new Map<MintUrl, number>();
 
   reissuePlan(mint: MintUrl): Promise<walletMod.ReissuePlan> {
+    this.planned.push(mint);
     const p = this.plans.get(mint);
     if (p === undefined) return Promise.reject(new Error('unreachable: no answer'));
     return Promise.resolve({

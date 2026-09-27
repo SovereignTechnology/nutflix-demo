@@ -22,10 +22,16 @@ import type {
   PromptForm,
   RecoveryProgressWire,
 } from '../../ipc/protocol.js';
+import { MAX_REISSUE_PLANS } from '../../ipc/protocol.js';
 import { memoryLogger } from '../log.js';
 import type { MoneyPlane } from '../money.js';
 import { entropyHex } from '../recovery/core.js';
-import { readEnvelope, recoveryPath } from '../recovery/files.js';
+import {
+  MAX_REISSUED_MINTS,
+  readEnvelope,
+  recoveryPath,
+  writeEnvelope,
+} from '../recovery/files.js';
 import type { PlaneSeed } from '../recovery/service.js';
 import { CONFIRM_ATTEMPTS, RecoveryService, reasonOf } from '../recovery/service.js';
 import { MainBridge } from '../signer/main-bridge.js';
@@ -964,6 +970,166 @@ describe('independent review fixes', () => {
       // Distinct https mints typed: TYPED and MINT_A (the http one dropped, the case twin merged).
       typedMints: 2,
     });
+    expectNoPhrase(w, [r]);
+  });
+});
+
+/**
+ * Fix round 7 (the lane verifier's finding on the IR1 fix): a reissue that did not finish is
+ * retried by "Finish backup", and that retry must plan ONLY the mints not yet reissued under the
+ * phrase — the envelope records each mint as it moves — so a mint that can never be asked (an
+ * http dev mint) or one that failed this time never makes the covered mints move, and pay their
+ * fee, again.
+ */
+describe('fix round 7: a retry never moves a covered mint again', () => {
+  const HTTP = 'http://127.0.0.1:3399' as MintUrl;
+  const fund = (w: World, mint: MintUrl, amount: number, feeSats: number): void => {
+    w.balances.set(mint, amount);
+    w.core.wallet.balances.set(mint, amount);
+    w.core.wallet.plans.set(mint, { inputs: 2, feeSats });
+  };
+
+  it('an http plan the dialog cannot show: "Finish backup" again and again asks nothing and moves nothing; the record is the envelope on disk', async () => {
+    const w = await world();
+    w.core.phrases.queue.push(ENTROPY_1);
+    fund(w, MINT_A, 1_000, 2);
+    fund(w, HTTP, 500, 1);
+    userWhoWritesItDown(w);
+    w.confirm = () => true;
+    const path = recoveryPath(w.dir, w.pubkey);
+
+    const r1 = await w.svc.setup();
+    expect(r1).toMatchObject({ reissuedSats: 998, feeSats: 2, reissueFailed: 1 });
+    expect(await readEnvelope(path)).toMatchObject({ reissued: false, reissuedMints: [MINT_A] });
+
+    // The verifier's probe ran setup three times: mint-a was swapped (and charged) each time.
+    w.asked.length = 0;
+    const r2 = await w.svc.setup();
+    const r3 = await w.svc.setup();
+    for (const r of [r2, r3])
+      expect(r).toEqual({
+        status: { state: 'covered', reissuePending: true, relayCopy: true },
+        reissuedSats: 0,
+        feeSats: 0,
+        reissueFailed: 1,
+      });
+    expect(w.asked).toEqual([]);
+    expect(w.confirms).toEqual([
+      { kind: 'recovery-reissue', plans: [{ mint: MINT_A, amount: 1_000, inputs: 2, feeSats: 2 }] },
+    ]);
+    expect(w.core.wallet.reissued.map((p) => p.mint)).toEqual([MINT_A]);
+    // mint-a is not even planned again (no mint round trip for it); the http one is, each time.
+    expect(w.core.wallet.planned).toEqual([MINT_A, HTTP, HTTP, HTTP]);
+    expect(await readEnvelope(path)).toMatchObject({ reissued: false, reissuedMints: [MINT_A] });
+
+    // The envelope on disk is the record (it survives a restart): without the entry, mint-a is
+    // planned and asked again.
+    const env = await readEnvelope(path);
+    if (env === null) throw new Error('no envelope');
+    await writeEnvelope(w.dir, path, { ...env, reissuedMints: [] });
+    await w.svc.setup();
+    expect(w.confirms).toHaveLength(2);
+    expect(w.core.wallet.planned.slice(4)).toEqual([MINT_A, HTTP]);
+    expectNoPhrase(w, [r1, r2, r3]);
+  });
+
+  it('a mint whose reissue failed is retried alone: the one that moved is neither asked nor charged again', async () => {
+    const w = await world();
+    fund(w, MINT_A, 1_000, 2);
+    fund(w, MINT_B, 700, 1);
+    w.core.wallet.failReissue.add(MINT_B);
+    userWhoWritesItDown(w);
+    w.confirm = () => true;
+    const r1 = await w.svc.setup();
+    expect(r1).toMatchObject({ reissuedSats: 998, feeSats: 2, reissueFailed: 1 });
+    expect(r1.status.reissuePending).toBe(true);
+
+    w.core.wallet.failReissue.clear();
+    const r2 = await w.svc.setup();
+    expect(w.confirms[1]).toEqual({
+      kind: 'recovery-reissue',
+      plans: [{ mint: MINT_B, amount: 700, inputs: 2, feeSats: 1 }],
+    });
+    expect(w.core.wallet.reissued.map((p) => p.mint)).toEqual([MINT_A, MINT_B]);
+    expect(r2).toMatchObject({ reissuedSats: 699, feeSats: 1, reissueFailed: 0 });
+    expect(r2.status.reissuePending).toBe(false);
+    expect(await readEnvelope(recoveryPath(w.dir, w.pubkey))).toMatchObject({
+      reissued: true,
+      reissuedMints: [MINT_A, MINT_B],
+    });
+    expectNoPhrase(w, [r1, r2]);
+  });
+
+  it(`more than ${String(MAX_REISSUE_PLANS)} mints: the next "Finish backup" asks only the rest, never the first ${String(MAX_REISSUE_PLANS)} again`, async () => {
+    const w = await world();
+    const mints = Array.from(
+      { length: MAX_REISSUE_PLANS + 1 },
+      (_, i) => `https://m${String(i)}.recovery.test` as MintUrl,
+    );
+    for (const m of mints) fund(w, m, 100, 1);
+    userWhoWritesItDown(w);
+    w.confirm = () => true;
+    const r1 = await w.svc.setup();
+    expect(r1.reissueFailed).toBe(1);
+    expect(r1.status.reissuePending).toBe(true);
+    const r2 = await w.svc.setup();
+    const second = w.confirms[1];
+    expect(second?.kind === 'recovery-reissue' && second.plans.map((p) => p.mint)).toEqual([
+      mints[MAX_REISSUE_PLANS],
+    ]);
+    expect(r2).toMatchObject({ reissuedSats: 99, feeSats: 1, reissueFailed: 0 });
+    expect(r2.status.reissuePending).toBe(false);
+    expect(w.core.wallet.reissued.map((p) => p.mint)).toEqual(mints);
+  });
+
+  it(`never asks more mints than the envelope can record (${String(MAX_REISSUED_MINTS)}): a mint moved but not recorded would be moved again`, async () => {
+    const w = await world();
+    fund(w, MINT_A, 100, 1);
+    fund(w, MINT_B, 200, 1);
+    userWhoWritesItDown(w);
+    w.confirm = () => false; // the first dialog declined: the reissue stays pending
+    await w.svc.setup();
+    const path = recoveryPath(w.dir, w.pubkey);
+    const env = await readEnvelope(path);
+    if (env === null) throw new Error('no envelope');
+    // Room for one more mint.
+    const others = Array.from(
+      { length: MAX_REISSUED_MINTS - 1 },
+      (_, i) => `https://done${String(i)}.recovery.test` as MintUrl,
+    );
+    await writeEnvelope(w.dir, path, { ...env, reissuedMints: others });
+    w.confirm = () => true;
+    const r = await w.svc.setup();
+    expect(w.confirms[1]).toEqual({
+      kind: 'recovery-reissue',
+      plans: [{ mint: MINT_A, amount: 100, inputs: 2, feeSats: 1 }],
+    });
+    expect(r).toMatchObject({ reissuedSats: 99, reissueFailed: 1 });
+    expect((await readEnvelope(path))?.reissuedMints).toEqual([...others, MINT_A]);
+    expect(w.log.lines.some((l) => l.msg.includes('could not be recorded'))).toBe(false);
+    // Full now: nothing more is asked, nothing moves.
+    await w.svc.setup();
+    expect(w.confirms).toHaveLength(2);
+    expect(w.core.wallet.reissued.map((p) => p.mint)).toEqual([MINT_A]);
+  });
+
+  it('a rotation starts a new record: every mint is moved again, under the NEW phrase', async () => {
+    const w = await world();
+    w.core.phrases.queue.push(ENTROPY_1, ENTROPY_2);
+    fund(w, MINT_A, 100, 1);
+    userWhoWritesItDown(w);
+    w.confirm = () => true;
+    await w.svc.setup();
+    const path = recoveryPath(w.dir, w.pubkey);
+    const first = await readEnvelope(path);
+    expect(first).toMatchObject({ reissued: true, reissuedMints: [MINT_A] });
+    const r = await w.svc.setup(); // rotation
+    const second = await readEnvelope(path);
+    expect(second?.device).not.toBe(first?.device);
+    expect(second).toMatchObject({ reissued: true, reissuedMints: [MINT_A] });
+    expect(w.confirms.filter((f) => f.kind === 'recovery-reissue')).toHaveLength(2);
+    expect(w.core.wallet.reissued.map((p) => p.mint)).toEqual([MINT_A, MINT_A]);
+    expect(r.status).toEqual({ state: 'covered', reissuePending: false, relayCopy: true });
     expectNoPhrase(w, [r]);
   });
 });

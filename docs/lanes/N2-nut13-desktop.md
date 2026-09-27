@@ -28,7 +28,9 @@ lockfile or `package.json` change; nothing outside the allowlist; `packaging/` r
 - `<userData>/wallet/recovery-<pubkey>.sealed`: a JSON envelope whose only secret field, `sealed`,
   is the phrase's `RecoveryRelayCopy` (`{ v, entropy (32 hex), created }`) NIP-44-encrypted to
   self through the signer. The other fields hold no secret — the random device id, when, and
-  `confirmed` / `reissued` / `relayCopy` / `replaces` — so the status needs no signer round trip.
+  `confirmed` / `reissued` / `relayCopy` / `replaces`, plus `reissuedMints` (the mints already
+  reissued under this phrase, at most 64 distinct https URLs; a file without the field reads as
+  `[]`: fix round 7) — so the status needs no signer round trip.
 - `recovery-<pubkey>.<device>.retired`: a replaced phrase, kept for restores, never derived from.
 - `counters-<pubkey>.json`: core's `CounterStore` (`FileCounterStore`): exact `CounterState`
   (hex keyset ids v1/v2, integer counters ≤ 2^31, `published` ≤ `next`), saves applied in order
@@ -65,7 +67,9 @@ is shown or typed in main's prompt window; the fee is confirmed in main's native
   checked with the dialog's own guard first: one it cannot show (an http dev mint, too many
   inputs) is left out and counted, never sinking the question for the other mints. A declined
   fee dialog counts as a dismissed prompt. A phrase whose reissue did not finish: setup only
-  finishes the reissue. A finished phrase: **rotation**, after re-authentication (for NIP-46 a
+  finishes the reissue, for the mints not yet reissued under it. Each mint is recorded in the
+  envelope as it moves, so a retry never moves or charges a covered mint again (fix round 7). A
+  finished phrase: **rotation**, after re-authentication (for NIP-46 a
   native `recovery-rotate` question worded as a replacement).
 - **show**: re-authentication (the local key's passphrase in the prompt window, checked against
   the key file; a native confirm for NIP-46), then the same indices; an unconfirmed backup can be
@@ -134,11 +138,14 @@ it over the fields; an "Other mints" box takes up to 8 addresses typed with `htt
 ### The logger — `host/log.ts`
 
 ADR 0016 related finding 3: 8 or more consecutive lower-case words of 3–8 letters become
-`<redacted>`, before the other rules can split them. Words may be separated by 1–12 characters
-of white space, digits or ASCII punctuation (quotes, brackets, `&`, `+`, `=`, `%`), or by a one-
-or two-letter key before a digit or `=`. That catches JSON arrays, per-word quotes, numbered
-lists, `%20` and query strings (independent review IR3). `(` and non-ASCII punctuation are not
-separators, so constant prose keeps reading. It over-redacts prose on purpose. Four constant host
+`<redacted>`, before the other rules can split them. Words may be separated by 1–12 units. A
+unit is a whole run of white space (up to 256 characters), one ASCII digit or punctuation
+character (quotes, brackets, `&`, `+`, `=`), a percent escape (`%20`, `%2C`, `%5B`) or a lone
+`%`, or a key a phrase word cannot be (1–16 letters before a digit or `=`, such as `w1=`,
+`Word1=` or `seedWord1=`). That catches JSON arrays, per-word quotes, numbered lists, query
+strings (independent review IR3), URL-encoded lists and JSON, and deeply indented pretty-printed
+JSON (fix round 7). `(` and non-ASCII punctuation are not separators, so constant prose keeps
+reading. It over-redacts prose on purpose. Four constant host
 messages it swallowed were reworded, and a test keeps every constant host/worker message intact.
 A timing test keeps the rule linear on hostile input.
 
@@ -213,6 +220,15 @@ unreadable finished phrase never rotated, IR7 retirement retried, IR8 rotate que
 `prompt-recovery-page.test.ts` (the page normaliser against `isMintUrl`, the box, refusals).
 No test was deleted or weakened; one expectation gained the new `omitted: 0` field.
 
+Fix round 7: `recovery-service.test.ts` “fix round 7” (5 tests: the verifier's http scenario
+run three times, with the envelope on disk as the record; a failed mint retried alone; more
+than 32 mints; the 64-mint room; a rotation starts a new record). `recovery-files.test.ts`
+“reissuedMints …” covers the shape, refusals, the pre-field file and 64 longest URLs fitting.
+`log.test.ts` has 14 new forms, 4 more property formats and 7 hostile timing inputs.
+`recovery-relay-copy.test.ts` gives the two real-crypto cap tests an explicit 30 s budget, with
+the reason in the file. The fake records `planned` mints. One fixture, the files suite's `ENV`,
+gained the new required field, with a comment. No test was deleted or weakened.
+
 Gates (2026-09-27, shared box at load 15–28): `npx tsc -b --force` clean; eslint + prettier
 `--check` clean on the 57 changed ts/tsx/css files; `npm run check:locked` OK; `npm run
 lint:electron` OK (253 files, 0 violations); `check:native` not needed (no dependency change);
@@ -235,6 +251,18 @@ violations); no dependency change (`check:native` not needed). The whole suite o
 owned by lane R6 (stage.test `QUIT_FLUSH_MS`, two viewer-payer "I2-paygate rate-limited"); no
 timeout this run. Opt-in real mints: `topup-real-mint.integration.test.ts` passes against
 Nutshell :3399 → :3398 and cdk-mintd :3397 → :3398.
+
+Gates after fix round 7 (2026-09-27, load 13–18, fixes in `1c3f875`):
+- `npx tsc -b --force` clean. `npm run build` OK.
+- eslint and prettier `--check` clean on the 8 changed ts files.
+- `npm run check:locked` OK. `npm run lint:electron` OK (253 files, 0 violations). No
+  dependency change.
+- The whole suite once with `--maxWorkers=2` (829 s): 3499 passed, 43 skipped, 2 failed. The
+  failures are the two known viewer-payer base failures owned by lane R6.
+- `stage.test` and `packaged-worker.integration` refused to stage: `tsc -b --force` had left the
+  renderer bundle older than ui's `dist`. After `npm run build`, run alone: packaged-worker 2/2,
+  and stage 19/20 with the known R6 `QUIT_FLUSH_MS` failure.
+- No test timed out. The only timeout added is R7-3's stated 30 s budget.
 
 ## Independent review (2026-09-27)
 
@@ -265,6 +293,27 @@ Deferred, with reasons in the record's residuals 11–15: paging the relay query
 retired files, a retry of an older retirement after a further rotation, and a Settings note for
 a discarded phrase.
 
+## Fix round 7 (2026-09-27)
+
+The lane verifier raised three low findings on `51db26a`. The record's “Round 7” section gives,
+for each, the verification, the fix at file:line, the tests and the mutation checks.
+
+- **R7-1:** the IR1 fix made a paying loop reachable. With a plan the dialog cannot show (an
+  http dev mint), every “Finish backup” moved the covered mints again and charged their fee
+  again: the verifier's three setups swapped mint-a three times. The envelope now records
+  `reissuedMints`, written as each mint moves. A retry plans only the others and never asks
+  more than the envelope can still record (64). A rotation starts a new record.
+- **R7-2:** the phrase log rule now takes percent escapes with hex letters (`%2C`, `%2F`,
+  `%3A`, `%5B`), a word right after such an escape, keys a phrase word cannot be (`Word1=`,
+  `seedWord1=`, `recoveryword1=`) and white-space runs taken whole (deep indentation). Each has a
+  canary, and the parse stays unique.
+- **R7-3:** the IR10 test, and the older 64-cap test, sign and verify about 130 real events. They
+  get an explicit 30 s budget with the reason stated. The cost is the crypto they exercise.
+
+Deferred (residuals 16–18): a balance that can never be asked keeps “Finish backup” showing
+(each click is now free); double-encoded escapes and runs over 256 characters pass the log
+rule; a record write that fails after a swap can repeat that mint once.
+
 ## Mutation checks
 
 See `docs/reviews/2026-09-26-pre-push-nut13-desktop.md`: 32 mutations of security-relevant
@@ -274,7 +323,9 @@ file refusals, the seed ownership, the native-dialog exclusivity, the reissue fi
 by a named suite; two survived the first run and got the tests they lacked. The independent
 review round adds 19 (MIR1–MIR11), all killed except MIR4c: the page's `https://` prefix is one
 of three redundant layers, and removing all three is killed. Main and the host, which enforce,
-are killed by MIR4a and MIR4b.
+are killed by MIR4a and MIR4b. Fix round 7 adds 14 (M7a–M7n), all killed except M7n. M7n drops
+the rule that a key is never word-shaped, which only keeps the parse unique: a word-shaped key
+is read as a word, which redacts the same span.
 
 ## Residuals
 
@@ -282,7 +333,10 @@ See the review record's Residuals (10 items, plus 11–15 from the independent r
 an older retirement not retried after a further rotation; one relay page and the 64 caps; a
 discarded phrase silent in Settings; prompts queued behind a 30-minute phrase window; a typed
 mint sees every scanned phrase's restore requests, and Title Case / `(`-separated words pass
-the log rule); the ones that need someone else:
+the log rule; plus 16–18 from fix round 7: a balance that can never be asked keeps “Finish
+backup” showing and rotation out of reach, although each click is now free; double-encoded
+escapes and white-space runs over 256 characters pass the log rule; a record write that fails
+after a swap can repeat that mint once); the ones that need someone else:
 
 - **N1 / orchestrator:** fill `recoveryCore()`; give `seedOption` N1's real option type; confirm
   `CashuWallet.seeded` reads the seed from `options.mints`; `wiped` checked at derivation time;
@@ -293,7 +347,7 @@ the log rule); the ones that need someone else:
 
 ## Proposed row for `docs/status.md`
 
-| Issue #3 — NUT-13 recovery phrase, desktop side (ADR 0016) | `stage-3/nut13-desktop` | DONE (desktop half; lane N1's core wired at merge through `host/recovery/core.ts` `recoveryCore()`): one 12-word phrase per device, sealed in `<userData>/wallet/recovery-<pubkey>.sealed` (NIP-44 to self, 0600/0700, fails loudly and is kept when damaged) and copied to the user's relays (kind 30078, `d` = `nutflix/nut13/<device id>`, read only by an explicit restore); counters file for core (atomic, fsynced, fails loudly); main's prompt window shows the words from its own bundled BIP-39 list (indices on the wire), content protection on, hidden after 2 min or on blur, no copy; confirm three words; the old balance reissued after main's native fee dialog (each mint's plan checked, one it cannot show left out and counted); show again after the passphrase (native confirm for NIP-46, its own question for a rotation); restore from this device's phrases, every relay copy, a typed phrase and typed https mint addresses, with progress and a per-mint report; Settings › Recovery phrase (web: "not covered"); log rule for word phrases (JSON arrays, quoted words, query strings) with a canary. Review `docs/reviews/2026-09-26-pre-push-nut13-desktop.md` (self-review of resumed WIP: 12 findings fixed, 32 mutation checks; independent review: 11 findings addressed, 19 mutation checks); contract request `N2-nut13-desktop.md` (6 items, worked around) |
+| Issue #3 — NUT-13 recovery phrase, desktop side (ADR 0016) | `stage-3/nut13-desktop` | DONE (desktop half; lane N1's core wired at merge through `host/recovery/core.ts` `recoveryCore()`): one 12-word phrase per device, sealed in `<userData>/wallet/recovery-<pubkey>.sealed` (NIP-44 to self, 0600/0700, fails loudly and is kept when damaged) and copied to the user's relays (kind 30078, `d` = `nutflix/nut13/<device id>`, read only by an explicit restore); counters file for core (atomic, fsynced, fails loudly); main's prompt window shows the words from its own bundled BIP-39 list (indices on the wire), content protection on, hidden after 2 min or on blur, no copy; confirm three words; the old balance reissued after main's native fee dialog (each mint's plan checked, one it cannot show left out and counted; each mint recorded as it moves, so a retry never moves or charges a covered mint again); show again after the passphrase (native confirm for NIP-46, its own question for a rotation); restore from this device's phrases, every relay copy, a typed phrase and typed https mint addresses, with progress and a per-mint report; Settings › Recovery phrase (web: "not covered"); log rule for word phrases (JSON arrays, quoted words, query strings, URL-encoded lists and JSON, pretty-printed JSON) with a canary. Review `docs/reviews/2026-09-26-pre-push-nut13-desktop.md` (self-review of resumed WIP: 12 findings fixed, 32 mutation checks; independent review: 11 findings addressed, 19 mutation checks; fix round 7: 3 findings fixed, 14 mutation checks); contract request `N2-nut13-desktop.md` (6 items, worked around) |
 
 ## Proposed text for `docs/security-review.md`
 
@@ -302,13 +356,17 @@ the log rule); the ones that need someone else:
   NIP-44 to self and copied to the user's relays (kind 30078, restore-only read), shown and typed
   only in main's prompt window as word indices (content protection, auto-hide, no copy; checksum
   checked in page, main and host), reissue after a native fee confirm (a declined dialog counts
-  toward the prompt throttle), re-authentication before reveal or rotation, restore mint
-  addresses typed only in the prompt window (https, checked in page, main and host), logger rule
-  for word phrases in prose, JSON and query forms; core half (lane N1) wired at merge. Residuals
+  toward the prompt throttle; each mint recorded as it moves, so a retry never pays a covered
+  mint's fee again), re-authentication before reveal or rotation, restore mint addresses typed
+  only in the prompt window (https, checked in page, main and host), logger rule for word
+  phrases in prose, JSON, query, URL-encoded and pretty-printed forms; core half (lane N1) wired
+  at merge. Residuals
   [Low]: JS strings holding the NIP-44 plaintext cannot be wiped; Linux has no capture block; a
   NIP-46 bunker encrypts the entropy itself and reveal/rotate re-auth is a native confirm there;
   an unreadable phrase leaves new ecash uncovered (shown in Settings only); a new device sets up
-  its own phrase before restoring; upper-case or `(`-separated phrases pass the log rule; a
+  its own phrase before restoring; upper-case, `(`-separated or double-encoded phrases pass the
+  log rule; a balance at a mint the fee dialog cannot show (an http dev mint) keeps “Finish
+  backup” showing and rotation out of reach (each click asks and costs nothing); a
   typed restore mint receives restore requests for every scanned phrase; relay-copy deletion is
   best effort (an older retirement is not retried after a further rotation)`
 - New paragraph under the F31 section: **NUT-13 (2026-09-26, desktop).** The relay copy is

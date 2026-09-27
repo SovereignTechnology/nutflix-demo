@@ -104,6 +104,13 @@ describe('createLogger', () => {
  * however it is separated or numbered, wherever it sits — before the path and token rules could
  * split it into pieces that pass.
  */
+/** `inner` under `depth` levels of objects (a pretty-printer's indentation grows with it). */
+function nested(depth: number, inner: object): object {
+  let o = inner;
+  for (let i = 0; i < depth; i++) o = { n: o };
+  return o;
+}
+
 describe('redact — word phrases (ADR 0016)', () => {
   const phraseOf = (entropy: Uint8Array): string[] =>
     entropyToMnemonic(entropy, wordlist).split(' ');
@@ -134,6 +141,38 @@ describe('redact — word phrases (ADR 0016)', () => {
     ['word keys, a query string', (w) => w.map((x, i) => `word${String(i + 1)}=${x}`).join('&')],
     ['one-letter keys', (w) => w.map((x) => `k=${x}`).join('&')],
     ['a JS array literal', (w) => `[ '${w.join("', '")}' ]`],
+    // Fix round 7 (the lane verifier): percent escapes whose hex digits include a letter, keys a
+    // phrase word cannot be, and indentation deeper than the old 12-character separator.
+    ['URL-encoded, comma-joined', (w) => encodeURIComponent(w.join(','))],
+    ['URL-encoded JSON array', (w) => encodeURIComponent(JSON.stringify(w))],
+    ['URL-encoded JSON object', (w) => encodeURIComponent(JSON.stringify({ words: w }))],
+    ['escaped slashes', (w) => w.join('%2F')],
+    ['escaped colon and space', (w) => w.join('%3A%20')],
+    ['lower-case escapes', (w) => w.join('%2c')],
+    [
+      'a form body whose key ends in an escape letter',
+      (w) => `seedPhrase%3D${encodeURIComponent(w.join(','))}`,
+    ],
+    ['Title Case keys', (w) => w.map((x, i) => `Word${String(i + 1)}=${x}`).join('&')],
+    ['camelCase keys', (w) => w.map((x, i) => `seedWord${String(i + 1)}=${x}`).join('&')],
+    ['long keys', (w) => w.map((x, i) => `recoveryword${String(i + 1)}=${x}`).join('&')],
+    ['upper-case keys', (w) => w.map((x, i) => `W${String(i)}=${x}`).join(';')],
+    [
+      'pretty-printed, nested deep (4 spaces)',
+      (w) => JSON.stringify({ a: { b: { c: { words: w } } } }, null, 4),
+    ],
+    [
+      'pretty-printed, nested deeper (tabs, a 14-character indent)',
+      (w) => JSON.stringify(nested(12, { words: w }), null, '\t'),
+    ],
+    [
+      // From the array on: the opening levels alone would pass MAX_LOG_STRING.
+      'pretty-printed, nested very deep (4 spaces, a 104-character indent)',
+      (w) => {
+        const text = JSON.stringify(nested(24, { words: w }), null, 4);
+        return text.slice(text.indexOf('"words"'));
+      },
+    ],
   ])('%s', (_what, fmt) => {
     const out = redact(`seed ${fmt(VECTOR)} end`);
     expect(out).toContain('<redacted>');
@@ -169,6 +208,11 @@ describe('redact — word phrases (ADR 0016)', () => {
           (w) => w.map((x) => `'${x}'`).join(', '),
           (w) => w.join('%20'),
           (w) => w.map((x, i) => `w${String(i)}=${x}`).join('&'),
+          // Fix round 7.
+          (w) => encodeURIComponent(w.join(',')),
+          (w) => encodeURIComponent(JSON.stringify(w)),
+          (w) => w.map((x, i) => `Word${String(i + 1)}=${x}`).join('&'),
+          (w) => JSON.stringify({ a: { b: { c: { words: w } } } }, null, 4),
         ),
         (entropy, fmt) => {
           const words = phraseOf(entropy);
@@ -191,6 +235,14 @@ describe('redact — word phrases (ADR 0016)', () => {
       `${'ab1=abc '.repeat(7)}x`.repeat(80),
       `${'abc'.padEnd(3)}${' '.repeat(13)}`.repeat(250),
       'a1'.repeat(2000),
+      // Fix round 7: escapes, white-space runs past the unit's bound, long and mixed-case keys.
+      '%2C'.repeat(1400),
+      `${'abc%2C'.repeat(7)}abcdefghijk `.repeat(60),
+      `abc${' '.repeat(300)}`.repeat(14),
+      `${'abc Abcdefghijklmnopq1= '.repeat(7)}X`.repeat(20),
+      'Ab1='.repeat(1000),
+      `${'abc%41%'.repeat(7)}Z`.repeat(80),
+      `${'abc%2Cab1=%2CWord1='.repeat(7)}Q`.repeat(30),
     ];
     for (const h of hostile) {
       const t0 = performance.now();
