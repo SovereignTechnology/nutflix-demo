@@ -57,6 +57,31 @@ export class RangeSet {
     return false;
   }
 
+  /**
+   * The indexes of this set that are not in `other`, as intervals: ascending, disjoint and not
+   * adjacent (the canonical form a `pay/1` `OWED` carries). Neither set changes.
+   */
+  difference(other: RangeSet): readonly (readonly [number, number])[] {
+    const out: (readonly [number, number])[] = [];
+    const b = other.spans;
+    let j = 0;
+    for (const [start, end] of this.spans) {
+      // Skip the spans of `other` that end before this one starts (both lists ascend).
+      for (let span = b[j]; span !== undefined && span[1] < start; span = b[++j]);
+      let s = start;
+      for (let k = j; s <= end; k++) {
+        const span = b[k];
+        if (span === undefined || span[0] > end) {
+          out.push([s, end]);
+          break;
+        }
+        if (span[0] > s) out.push([s, span[0] - 1]);
+        s = Math.max(s, span[1] + 1);
+      }
+    }
+    return out;
+  }
+
   /** Union `other` into this set. */
   merge(other: RangeSet): void {
     for (const [s, e] of other.spans) this.add(s, e);

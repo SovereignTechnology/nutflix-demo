@@ -162,6 +162,12 @@ export const validateWorkerArgs: {
   'profile.putImage': safe(obj({ hex: isImageHex })),
 };
 
+/**
+ * Lane P2-owed-viewer: the most blocks a `play.close` may report unpaid (the worker's record holds
+ * at most 1024 per seeder; the host caps a tail authorisation at the session's remaining budget).
+ */
+const MAX_TAIL_BLOCKS = 1 << 20;
+
 const isUndefined = (x: unknown): x is undefined => x === undefined;
 /** JSON has no `undefined`: a void result arrives as an absent `r`, i.e. `undefined`. */
 const isVoid = isUndefined;
@@ -189,7 +195,9 @@ export const validateWorkerResult: {
   'play.pause': isVoid,
   'play.resume': isVoid,
   'play.prefetch': isVoid,
-  'play.close': isVoid,
+  // Lane P2-owed-viewer: a session's unpaid tail (a seeder's credit is at most 1024 blocks per
+  // seeder; the host caps the authorisation at the session's remaining budget anyway).
+  'play.close': safe(obj({ unpaid: int(0, MAX_TAIL_BLOCKS) })),
   'seeder.status': safe(isSeederStatusWire),
   'seeder.configure': isVoid,
   'seeder.melt': safe(obj({ paid: bool })),
@@ -270,12 +278,29 @@ const isPayBuild = obj({
   policy: isPricePolicy,
   carryIn: int(0, 99),
 });
-const isPayMessage = obj({
-  range: isRange,
-  carryIn: int(0, 99),
-  seederProofs: isLockedSet,
-  creatorProofs: isLockedSet,
+/**
+ * One set of a `PayMessage`: legitimately EMPTY when its share is 0 sats by the split (contracts
+ * v5, `PayMessage`: "still addressed to its recipient") — at 90/10 a PAY of 3 blocks at 2 sats
+ * gives the creator 0. Lane P2-owed-viewer (found building the independent review's 90/10 test):
+ * `isLockedSet` asks for one proof at least, so such a PAY was refused AFTER the host had built it
+ * (its proofs spent, locked to the seeder and the creator) and the payer asked for another.
+ */
+const isPaySet = obj({
+  mint: isMintUrl,
+  unit: literal('sat'),
+  lockedTo: isCashuP2pk,
+  proofs: arrayOf(isProof, MAX_PROOFS, 0),
 });
+/** A PAY carries at least one proof, in one set or the other (a PAY of nothing is malformed). */
+const isPayMessage = safe(
+  (x: unknown): x is HostMethodTable['pay.build'][1] =>
+    obj({
+      range: isRange,
+      carryIn: int(0, 99),
+      seederProofs: isPaySet,
+      creatorProofs: isPaySet,
+    })(x) && x.seederProofs.proofs.length + x.creatorProofs.proofs.length > 0,
+);
 /** A keyset from the host: amount → compressed public key, at most 64 denominations. */
 const isKeys = safe((x: unknown): x is Readonly<Record<string, string>> => {
   if (typeof x !== 'object' || x === null || Array.isArray(x)) return false;

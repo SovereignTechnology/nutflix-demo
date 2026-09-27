@@ -9,10 +9,13 @@
  *      S1, not against S1's credit at the viewer (ADR 0015 serving keeps working; browsing never
  *      erodes paid playback);
  *   2. THE REVIEWER'S PROBE: one `image.fetch` naming the fixture video's core. Before the fix both
- *      fixture seeders ended `{ uploaded: 6, paid: 0, windowBlocks: 5, banned: true }`. Now each
- *      seeder is asked one block at most, announces the core's price before it, and the read stops
- *      (refused): nobody is overrun, nobody bans us, and the viewer counts what they sent as unpaid;
- *   3. a second read of that core is refused at once, asking nothing more of anyone;
+ *      fixture seeders ended `{ uploaded: 6, paid: 0, windowBlocks: 5, banned: true }`. Fix round 4
+ *      asked each seeder one block (a probe) and stopped at its price. ADR 0015 amendment
+ *      (2026-09-26, lane P2-owed-viewer): both say the core's price as soon as the core is open, and
+ *      a seeder is asked for image blocks only after `PRICE { free: true }` — so nobody is asked
+ *      anything, nobody is overrun or bans us, nothing is counted, and the read ends at its
+ *      deadline (the placeholder);
+ *   3. a second read of that core asks nothing of anyone either;
  *   4. the video still plays in full from the same seeders, fully paid, nobody banned;
  *   5. once played, the core is refused as an image, and never marked free on our own seeder.
  */
@@ -21,7 +24,7 @@ import { createHash, randomBytes } from 'node:crypto';
 import type { CoreKeyHex, NostrPubkey, Sha256Hex, VideoManifest } from '@sovit/core';
 import { manifest } from '@sovit/core';
 import type { Logger } from '@sovit/seeder';
-import { createLogger, nodeFs } from '@sovit/seeder';
+import { createLogger, nodeFs, toHex } from '@sovit/seeder';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 
 import type { SessionId } from '../../ipc/protocol.js';
@@ -29,7 +32,7 @@ import type { WorkerEvent } from '../../ipc/worker-protocol.js';
 import { sodiumCrypto } from '../crypto.js';
 import type { DevTestnet, FixtureNet, FixtureSeeder } from '../dev/fixtures-net.js';
 import { startDevTestnet, startFixtureNet, syntheticBytes } from '../dev/fixtures-net.js';
-import { LoopbackPayHub } from '../dev/loopback-pay.js';
+import { LoopbackEnd, LoopbackPayHub } from '../dev/loopback-pay.js';
 import type { ViewerPayer } from '../pay/viewer-payer.js';
 import type { WorkerClient } from './helpers/harness.js';
 import { httpGet, startWorker, tempDir } from './helpers/harness.js';
@@ -50,6 +53,8 @@ describe('fix round 4: an image URL naming a paid core (images over Pear × F33 
   let imageUrl: string;
   let videoCore: CoreKeyHex;
   let videoImage: { url: string; sha256: Sha256Hex; size: number };
+  /** PRICE frames the worker's pay/1 ends received: `[core, free]`. */
+  let readPrices: () => [string, boolean][] = () => [];
 
   const payer = (): ViewerPayer => {
     const p = worker.host.internals.payer;
@@ -103,7 +108,25 @@ describe('fix round 4: an image URL naming a paid core (images over Pear × F33 
     await net.s1.node.flush();
     imageUrl = manifest.encodeHyperUrl({ core: sc.keyHex, blob });
 
-    worker = startWorker({ hub, logLevel: 'error' });
+    // Every PRICE frame the WORKER's ends receive (they are registered under its Noise key; the
+    // spy passes every frame through untouched).
+    const spy = vi.spyOn(LoopbackEnd.prototype, 'receive');
+    teardown.push(() => {
+      spy.mockRestore();
+      return Promise.resolve();
+    });
+    readPrices = () => {
+      const node = worker.host.internals.node;
+      if (node === null) return [];
+      const key = toHex(node.publicKey);
+      return spy.mock.calls.flatMap(([w], i) => {
+        const end = spy.mock.contexts[i] as LoopbackEnd;
+        if (w.t !== 'price' || !end.id.endsWith(`:${key}`)) return [];
+        return [[w.m.core, w.m.free === true] as [string, boolean]];
+      });
+    };
+    // Image reads here end at their deadline when nobody serves the core free: 2.5 s, not 15.
+    worker = startWorker({ hub, logLevel: 'error', imageTimeoutMs: 2500 });
     teardown.push(() => worker.close());
     await worker.call('init', {
       v: 1,
@@ -170,37 +193,41 @@ describe('fix round 4: an image URL naming a paid core (images over Pear × F33 
         expect(w.banned).toBe(false);
         expect(w.outstanding).toBeLessThanOrEqual(w.windowBlocks);
       }
-      // …each was asked one block at most (the probe), announced as sold before it…
-      expect(w?.uploaded ?? 0).toBeLessThanOrEqual(1);
-      expect(w?.paid ?? 0).toBe(0); // …and browsing spends nothing.
+      // …nobody was asked anything (ADR 0015 amendment: no probe — fix round 4 allowed one block
+      // here, and its check that the probe reached a seeder is replaced by the one below)…
       sent += w?.uploaded ?? 0;
+      expect(w?.paid ?? 0).toBe(0); // …and browsing spends nothing.
     }
-    // The read stops as soon as a seeder says the core is sold.
-    expect(outcome).toMatch(/^forbidden/);
-    expect(sent).toBeGreaterThan(0); // the probe did reach a seeder: this is not a vacuous pass
-    // The viewer counts, for good, every block they may count: unpaid, or lost with a request.
+    expect(sent).toBe(0);
+    // No seeder said `free` for it: the read ends at its deadline (fix round 4 stopped it at a
+    // seeder's price, and so a price from a gateway also stopped an honest free image).
+    expect(outcome).toMatch(/^not-found/);
+    // Not a vacuous pass (it replaces fix round 4's "the probe reached a seeder"): the seeders
+    // said the core's price to us, and nobody said `free` for it.
+    expect(readPrices().some(([c, free]) => c === videoCore && !free)).toBe(true);
+    expect(readPrices().some(([c, free]) => c === videoCore && free)).toBe(false);
+    // The viewer counts nothing against either of them.
     const credit = payer().seeders;
-    const lost =
-      credit.stats().unpaid +
-      credit.router.debt(net.s1.noiseKeyHex()) +
-      credit.router.debt(net.s2.noiseKeyHex());
-    expect(lost).toBeGreaterThanOrEqual(sent);
+    expect(credit.stats().unpaid).toBe(0);
+    expect(credit.router.debt(net.s1.noiseKeyHex())).toBe(0);
+    expect(credit.router.debt(net.s2.noiseKeyHex())).toBe(0);
     // Our own seeder never marked the video free, and the replica is gone again.
     const own = worker.host.internals.seeder!;
     expect(own.isFreeCore(videoCore)).toBe(false);
     expect(own.blobs.coreByKey(videoCore)).toBeUndefined();
   }, 60_000);
 
-  it('a second read of that core is refused at once, asking nothing more of anyone', async () => {
+  // Fix round 4 refused a second read at once, from its memory of a seeder's price on the image
+  // path. That memory went with the probe (ADR 0015 amendment, lane P2-owed-viewer): it also
+  // refused an honest free image for good once a gateway that prices it had answered first. A
+  // second read now costs what the first did — nothing at any seeder.
+  it('a second read of that core asks nothing of anyone either', async () => {
     const before = [net.s1, net.s2].map((fx) => counted(fx)?.uploaded ?? 0);
-    const opens = vi.spyOn(worker.host.internals.seeder!.blobs, 'openCoreByKey');
-    const t0 = Date.now();
-    await expect(worker.call('image.fetch', videoImage)).rejects.toThrow(/^forbidden/);
-    expect(Date.now() - t0).toBeLessThan(2000);
+    await expect(worker.call('image.fetch', videoImage)).rejects.toThrow(/^not-found/);
     expect([net.s1, net.s2].map((fx) => counted(fx)?.uploaded ?? 0)).toEqual(before);
-    // Refused before anything is opened: no replica, no topic joined, nothing replicated.
-    expect(opens).not.toHaveBeenCalled();
-    opens.mockRestore();
+    expect(before).toEqual([0, 0]);
+    for (const fx of [net.s1, net.s2]) expect(fx.seeder.bans()).toEqual([]);
+    expect(payer().seeders.stats().unpaid).toBe(0);
   }, 60_000);
 
   it('the video still plays in full from the same seeders afterwards: every block it downloads is paid, nobody is banned', async () => {
@@ -220,8 +247,9 @@ describe('fix round 4: an image URL naming a paid core (images over Pear × F33 
     for (const fx of [net.s1, net.s2]) {
       await fx.seeder.flushNow();
       const w = counted(fx)!;
-      // Everything it served is paid, except the probe block browsing never pays for.
-      expect(w.outstanding).toBeLessThanOrEqual(1);
+      // Everything it served is paid (fix round 4 allowed one probe block unpaid here; with no
+      // probe, nothing is left).
+      expect(w.outstanding).toBe(0);
       expect(w.outstanding).toBeLessThanOrEqual(w.windowBlocks);
       expect(w.banned).toBe(false);
       expect(fx.seeder.bans()).toEqual([]);

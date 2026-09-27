@@ -92,3 +92,45 @@ from seeders that said so.**
 - A viewer's image read asks a peer for blocks only after that peer's `PRICE { free: true }` for
   the core; silence or a price means the peer is never asked. No probe, nothing counted.
   Images held only by older or third-party seeders show the placeholder.
+
+Seeder side as built (2026-09-27, lane P1-owed-seeder): `Seeder` says a core's terms —
+`{ free: true }` (`satsPerBlock` and `effectiveFromBlock` 0) for a core marked with `setFreeCore`,
+else the core's price — **unprompted, as soon as the peer has the core open** on a connection with
+pay/1 attached (Hypercore's `peer-add`; for a core paired before pay/1 was attached, at the attach;
+for a core paired before the `Seeder` opened it, at that open), so a viewer that asks for nothing
+still learns the terms (the independent review of 2026-09-27 found the first build said them only
+in reply to a block request, which left this decision's viewer with silence). The synchronous
+upload hook stays the backstop: before any block is written, the terms go out if they have not
+been said, and a seeder that cannot send them cuts the connection (`local`, no ban) instead of
+sending the block. Said once per connection, and again whenever they change — a free core turned
+sold, or back, reaches every peer that has the core open at once (`setFreeCore`,
+`setCorePolicy`). The option that switched this off (`announceCorePrices`) is gone, so every
+seeder the repository builds (the daemon, the gateway, the desktop worker, the dev fixtures) does
+it; tests on each composition show the reader receives the `PRICE` before the core's first block,
+for both kinds, and with nothing asked at all. `free` covers the blocks served while it holds;
+blocks counted before a core turned free stay counted (they appear in `OWED`, with no priced
+`PRICE`, and are not payable).
+
+Viewer side as built (2026-09-27, lane P2-owed-viewer):
+
+- **Free only.** `SeederCredit.attachImageCore` routes an image read. A seeder is asked for the
+  core's blocks only while it is on an open channel (both HELLOs) and its last word for that core
+  on this connection is `PRICE { free: true }`. It is then asked up to `NO_PAY_INFLIGHT` in
+  flight, from its own cap. Silence, a priced PRICE, no `pay/1`, or no HELLO: never asked.
+- **No debt.** The router's new `free` option keeps a free core's requests out of `used`,
+  `inflight` and `debt`, and out of what a released peer leaves as lost. So a free read that
+  times out or is stopped leaves nothing owed, and never erodes that seeder's paid credit.
+- **Free, then sold.** A core that turns sold is not asked again there. A block of it that still
+  lands afterwards is counted unpaid for good (browsing never pays).
+- **The probe is removed**, with what it needed:
+  - the router's `probe` option, `SeederCredit.probing`, `onImageVerdict` and its per-seeder
+    "priced" memory;
+  - the worker's `imageSold` / `imageFree` sets and its early stop of a read at a seeder's price.
+    That early stop also stopped an honest free image whenever a gateway that prices it answered
+    first; that no longer happens.
+  - The worker still refuses cores it knows are sold: a policy here, a routed core, one our
+    seeder prices.
+- **R9 closed.** The worker marks a replica it opens for an image free, by key, before the open.
+  A peer pairing on it hears `free`, never silence first.
+- **Free for a paid core.** `UpstreamPayer` never reads `{ free: true }` as a 0-sat price. The
+  settler and the payer owe nothing for a core a seeder serves free.

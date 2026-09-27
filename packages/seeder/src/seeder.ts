@@ -10,6 +10,7 @@
  *   BanList (Noise + Nostr, persisted)
  *   Logger (redacting; the only output path)
  */
+import { payment } from '@sovit/core';
 import type {
   BlockRange,
   CoreKeyHex,
@@ -22,6 +23,7 @@ import type {
   UnixSeconds,
 } from '@sovit/core';
 import type { BlobReadStream } from 'hyperblobs';
+import type Hypercore from 'hypercore';
 import type { ReplicationStream, ReplicationStreamOptions } from 'hypercore';
 import type { PeerInfo, SwarmConnection } from 'hyperswarm';
 
@@ -48,7 +50,13 @@ import type { CasEntry } from './store/cas-index.js';
 import { DiskCap } from './store/disk-cap.js';
 
 export interface SeederDeps {
-  readonly engine: PaymentEngineSeeder & { readonly config?: EngineConfigLike };
+  /**
+   * The seeder-side engine. It must also be an `UnpaidLedger` (both engines of `@sovit/core` are):
+   * the seeder reports what a peer still owes in `OWED` and `ACK.outstanding` (contracts v6
+   * amendment) — required, so no seeder can be built that silently leaves them out.
+   */
+  readonly engine: PaymentEngineSeeder &
+    payment.UnpaidLedger & { readonly config?: EngineConfigLike };
   readonly fs: SeederFs;
   readonly crypto: SeederCrypto;
   readonly logger?: Logger;
@@ -105,6 +113,7 @@ export class Seeder {
   readonly swarm: SwarmManager | null;
   readonly scheduler: FlushScheduler;
   private readonly engine: PaymentEngineSeeder;
+  private readonly ledger: payment.UnpaidLedger;
   private readonly listeners = new Set<(e: SeederEvent) => void>();
   private readonly readyListeners = new Set<(session: PeerSession) => void>();
   /**
@@ -114,7 +123,7 @@ export class Seeder {
    */
   private readonly gates = new Map<
     string,
-    { readonly core: object; readonly detach: () => void }
+    { readonly core: Hypercore; readonly detach: () => void }
   >();
   private readonly protocols = new Map<PeerSession, PayProtocol>();
   private readonly unsubs: (() => void)[] = [];
@@ -131,6 +140,14 @@ export class Seeder {
     PeerSession,
     Map<CoreKeyHex, { readonly fromBlock: number; readonly policy: PricePolicy }[]>
   >();
+  /**
+   * Per session × core, the terms this peer was last told on its pay/1 channel (contracts v6
+   * amendment, rule 1): a `PRICE` goes out before a block only when what is served differs from
+   * what was said — once per core, and again when it turns free or sold.
+   */
+  private readonly told = new WeakMap<PeerSession, Map<CoreKeyHex, 'free' | 'priced'>>();
+  /** Sessions whose `OWED` report went out (once per connection, rule 2). */
+  private readonly owedSent = new WeakSet<PeerSession>();
   private started = false;
   private closed = false;
 
@@ -141,6 +158,7 @@ export class Seeder {
   ) {
     this.config = config;
     this.engine = deps.engine;
+    this.ledger = deps.engine;
     this.log = (deps.logger ?? silentLogger).child({ component: 'seeder' });
     this.policyOverride = config.policy;
     this.banList = loaded.banList;
@@ -158,13 +176,16 @@ export class Seeder {
       pricing: (core) => this.pricingFor(core),
       ...(deps.accepting ? { accepting: deps.accepting } : {}),
       isFree: (core) => this.freeCores.has(core),
-      ...(config.announceCorePrices
-        ? {
-            onFirstUpload: (session: PeerSession, core: CoreKeyHex) => {
-              this.announceFirstUpload(session, core);
-            },
-          }
-        : {}),
+      // Contracts v6 amendment, rule 1 — always on: a core's terms precede its blocks.
+      beforeBlock: (session, core, free) => {
+        this.announceTerms(session, core, free);
+      },
+      // …and are said as soon as the peer opens the core, before it asks for anything: ADR 0015's
+      // viewer asks for an image block only after a `PRICE { free: true }` (independent review,
+      // 2026-09-27). The registry contains what this throws; `beforeBlock` stays the backstop.
+      onPeerAdd: (session, core) => {
+        this.announceTerms(session, core, this.freeCores.has(core));
+      },
     });
     this.blobs = new BlobStore({
       storageDir: config.storageDir,
@@ -201,6 +222,13 @@ export class Seeder {
 
   /** Open storage, load the ban list + CAS index, size the disk cap. Does not touch the network. */
   static async create(userConfig: SeederConfig, deps: SeederDeps): Promise<Seeder> {
+    // Checked here, not at the first connection: an engine without the ledger would otherwise
+    // fail inside every session (no OWED report; every PAY cutting its session).
+    const ledger: Partial<payment.UnpaidLedger> = deps.engine;
+    if (typeof ledger.outstandingOn !== 'function' || typeof ledger.unpaid !== 'function')
+      throw new TypeError(
+        'Seeder: the engine must be an UnpaidLedger (outstandingOn, unpaid) — contracts v6 amendment',
+      );
     const config = resolveConfig(userConfig, deps.fs.join.bind(deps.fs), deps.engine.config);
     const log = (deps.logger ?? silentLogger).child({ component: 'seeder' });
     await deps.fs.mkdir(config.dataDir, { recursive: true });
@@ -373,9 +401,20 @@ export class Seeder {
       policy: (core, range) => this.policyForRange(session, core, range),
       scheduler: this.scheduler,
       logger: this.log,
+      // Contracts v6 amendment: every ACK says what this peer still owes on the core (rule 4),
+      // and the open channel gets the OWED report (rules 2–3).
+      outstanding: (core) => this.ledger.outstandingOn(session.accountId(), core),
+      onOpen: () => {
+        this.announceOwed(session, protocol);
+      },
     });
     this.protocols.set(session, protocol);
     session.stream.once('close', () => this.protocols.delete(session));
+    // Cores this peer opened before pay/1 was attached: their `peer-add` found nothing to say the
+    // terms on, so say them now (rule 1, unprompted).
+    for (const [core, g] of this.gates)
+      if (this.sessions.pairedSessions(g.core).includes(session))
+        this.tellTerms(session, core as CoreKeyHex);
     return () => {
       this.protocols.delete(session);
       detach();
@@ -417,38 +456,125 @@ export class Seeder {
     return hit ?? this.policyFor(core);
   }
 
-  /** Tell every live `pay/1` peer that has downloaded `core` its new price, and remember it. */
+  /** Whether `session` has been sold `core`: a counted block sent, or a priced `PRICE` said. */
+  private pricedOn(session: PeerSession, core: CoreKeyHex): boolean {
+    return session.uploadedCores.has(core) || this.told.get(session)?.get(core) === 'priced';
+  }
+
+  private toldOf(session: PeerSession): Map<CoreKeyHex, 'free' | 'priced'> {
+    let m = this.told.get(session);
+    if (m === undefined) {
+      m = new Map();
+      this.told.set(session, m);
+    }
+    return m;
+  }
+
+  private historyOf(
+    session: PeerSession,
+  ): Map<CoreKeyHex, { readonly fromBlock: number; readonly policy: PricePolicy }[]> {
+    let m = this.priceHistory.get(session);
+    if (m === undefined) {
+      m = new Map();
+      this.priceHistory.set(session, m);
+    }
+    return m;
+  }
+
+  /**
+   * Tell every live `pay/1` peer that was sold `core` (sent a counted block, or told its price) its
+   * new price, and remember it. A core served free now gets no priced `PRICE` (its next block says
+   * `free`).
+   */
   private announcePrice(core: CoreKeyHex, prev: PricePolicy, next: PricePolicy): void {
+    if (this.freeCores.has(core)) return;
     for (const [session, protocol] of this.protocols) {
-      if (session.closed || !session.uploadedCores.has(core)) continue;
+      if (session.closed || !this.pricedOn(session, core)) continue;
       const fromBlock = session.nextIndexFor(core);
-      let byCore = this.priceHistory.get(session);
-      if (byCore === undefined) {
-        byCore = new Map();
-        this.priceHistory.set(session, byCore);
-      }
+      const byCore = this.historyOf(session);
       const list = byCore.get(core) ?? [{ fromBlock: 0, policy: prev }];
       list.push({ fromBlock, policy: next });
       byCore.set(core, list);
+      this.toldOf(session).set(core, 'priced');
       protocol.sendPrice({ core, satsPerBlock: next.satsPerBlock, effectiveFromBlock: fromBlock });
     }
   }
 
   /**
-   * `announceCorePrices`: the first block of `core` is about to go to this peer — tell it the
-   * core's price from block 0 (runs before the block is written, so it precedes it on the wire).
+   * Contracts v6 amendment, rule 1: a block of `core` is about to go to this peer (`free`: outside
+   * payment) — unless the peer was already told exactly that on this connection, send the core's
+   * `PRICE` first. Runs inside Hypercore's `upload` event, before the block is written, so the
+   * `PRICE` precedes it on the wire. Priced: from one past the highest block of the core counted on
+   * this connection (0 at first), remembered for the PAYs to come (F9). A core with no price at
+   * all (none of its own, no default) has no terms to announce.
    */
-  private announceFirstUpload(session: PeerSession, core: CoreKeyHex): void {
+  private announceTerms(session: PeerSession, core: CoreKeyHex, free: boolean): void {
     const protocol = this.protocols.get(session);
-    const policy = this.corePolicies.get(core) ?? this.policyOverride;
-    if (protocol === undefined || policy === null) return;
-    let byCore = this.priceHistory.get(session);
-    if (byCore === undefined) {
-      byCore = new Map();
-      this.priceHistory.set(session, byCore);
+    if (protocol === undefined || session.closed) return;
+    const told = this.toldOf(session);
+    const said = told.get(core);
+    // `told` is set only once the PRICE is out: a send that throws is retried on the next block
+    // (the session cuts this one, `PeerSession.onUpload`).
+    if (free) {
+      if (said === 'free') return;
+      protocol.sendPrice({ core, satsPerBlock: 0 as Sats, effectiveFromBlock: 0, free: true });
+      told.set(core, 'free');
+      return;
     }
-    byCore.set(core, [{ fromBlock: 0, policy }]);
-    protocol.sendPrice({ core, satsPerBlock: policy.satsPerBlock, effectiveFromBlock: 0 });
+    if (said === 'priced') return;
+    const policy = this.corePolicies.get(core) ?? this.policyOverride;
+    if (policy === null) return;
+    const fromBlock = session.nextIndexFor(core);
+    protocol.sendPrice({ core, satsPerBlock: policy.satsPerBlock, effectiveFromBlock: fromBlock });
+    const byCore = this.historyOf(session);
+    const list = fromBlock === 0 ? [] : (byCore.get(core) ?? []);
+    list.push({ fromBlock, policy });
+    byCore.set(core, list);
+    told.set(core, 'priced');
+  }
+
+  /**
+   * `announceTerms` at the core's current kind, for a peer that has the core open but asked for
+   * nothing yet (unprompted, rule 1). Never throws: a failure is logged, and the core's next block
+   * to that peer says the terms first or is not sent (`beforeBlock` fails closed).
+   */
+  private tellTerms(session: PeerSession, core: CoreKeyHex): void {
+    try {
+      this.announceTerms(session, core, this.freeCores.has(core));
+    } catch (err) {
+      this.log.error('terms not said unprompted — the next block says them first', {
+        error: err,
+      });
+    }
+  }
+
+  /** `tellTerms` to every live session `core` is paired on now (its kind or price changed). */
+  private tellPaired(core: CoreKeyHex): void {
+    const g = this.gates.get(core);
+    if (g === undefined) return;
+    for (const session of this.sessions.pairedSessions(g.core)) this.tellTerms(session, core);
+  }
+
+  /**
+   * Contracts v6 amendment, rules 2–3: the channel is open (both HELLOs verified, the pubkey bound)
+   * — report, once, every core where this peer's pubkey still owes blocks, oldest first and within
+   * the `OWED` caps, each after that core's priced `PRICE` (the terms an owed range is paid at). A
+   * core served free now, or with no price at all, gets its `OWED` with no `PRICE`: counted, but
+   * not payable here now.
+   */
+  private announceOwed(session: PeerSession, protocol: PayProtocol): void {
+    const peer = session.pubkey;
+    if (peer === null || session.closed || session.cutReason !== null) return;
+    if (this.owedSent.has(session)) return;
+    this.owedSent.add(session);
+    const report = this.ledger.unpaid(peer, payment.OWED_LIMITS);
+    let blocks = 0;
+    for (const { core, ranges } of report) {
+      if (!this.freeCores.has(core)) this.announceTerms(session, core, false);
+      protocol.sendOwed({ core, ranges });
+      for (const [from, to] of ranges) blocks += to - from + 1;
+    }
+    if (report.length > 0) this.log.debug('OWED sent', { cores: report.length, blocks });
   }
 
   /** v5: `policyFor` for the effective window, never throwing (unpriced when none). */
@@ -460,7 +586,9 @@ export class Seeder {
   /**
    * Set (or with `null` clear) the policy for one core. When that changes the core's price, every
    * live `pay/1` peer that downloaded it gets a `PRICE` for the core (v5 `PRICE` names its core),
-   * and blocks it was already sent stay at the old price (F9). `announce: false` skips that.
+   * and blocks it was already sent stay at the old price (F9). A peer that has the core open and
+   * was told it free (or nothing) is told the price now (rule 1, unprompted). `announce: false`
+   * skips both; the core's next block to a peer still says its terms first.
    */
   setCorePolicy(
     core: CoreKeyHex,
@@ -475,8 +603,10 @@ export class Seeder {
       this.freeCores.delete(core);
     }
     const next = this.corePolicies.get(core) ?? this.policyOverride;
-    if (!(opts.announce ?? true) || prev === null || next === null) return;
-    if (prev.satsPerBlock !== next.satsPerBlock) this.announcePrice(core, prev, next);
+    if (!(opts.announce ?? true)) return;
+    if (prev !== null && next !== null && prev.satsPerBlock !== next.satsPerBlock)
+      this.announcePrice(core, prev, next);
+    this.tellPaired(core);
   }
 
   /** Per-core policies currently set (does not include the default). */
@@ -489,15 +619,19 @@ export class Seeder {
    * stop. A free core's blocks are never recorded against a peer's window. Fix round 4: a core
    * with its own price policy is never marked free (`false` is returned and nothing changes), and
    * `setCorePolicy` clears the mark — so a caller that names a paid core by mistake (an image URL
-   * pointing at a video) cannot give that video away.
+   * pointing at a video) cannot give that video away. A change reaches every peer that has the
+   * core open now, unprompted (rule 1): `{ free: true }`, or back to its price.
    */
   setFreeCore(core: CoreKeyHex, free: boolean): boolean {
     if (!free) {
-      this.freeCores.delete(core);
+      if (this.freeCores.delete(core)) this.tellPaired(core);
       return true;
     }
     if (this.corePolicies.has(core)) return false;
-    this.freeCores.add(core);
+    if (!this.freeCores.has(core)) {
+      this.freeCores.add(core);
+      this.tellPaired(core);
+    }
     return true;
   }
 
@@ -518,10 +652,14 @@ export class Seeder {
     this.policyOverride = policy;
     if (!(opts.announce ?? true) || !changed) return;
     const cores = new Set<CoreKeyHex>();
-    for (const session of this.protocols.keys())
-      if (!session.closed)
-        for (const core of session.uploadedCores)
-          if (!this.corePolicies.has(core as CoreKeyHex)) cores.add(core as CoreKeyHex);
+    for (const session of this.protocols.keys()) {
+      if (session.closed) continue;
+      const sold = [
+        ...(session.uploadedCores as ReadonlySet<CoreKeyHex>),
+        ...[...(this.told.get(session) ?? [])].filter(([, t]) => t === 'priced').map(([c]) => c),
+      ];
+      for (const core of sold) if (!this.corePolicies.has(core)) cores.add(core);
+    }
     for (const core of cores) this.announcePrice(core, prev, policy);
   }
 
@@ -592,6 +730,8 @@ export class Seeder {
     if (had?.core !== sc.core) {
       had?.detach();
       this.gates.set(sc.keyHex, { core: sc.core, detach: this.sessions.attachUploadGate(sc.core) });
+      // A peer paired while the core was still opening had its `peer-add` before the gate was here.
+      this.tellPaired(sc.keyHex);
     }
     if (this.started && this.swarm) this.swarm.join(sc.core.discoveryKey);
   }

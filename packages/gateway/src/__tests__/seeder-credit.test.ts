@@ -5,7 +5,7 @@
  */
 import { EventEmitter } from 'node:events';
 
-import { mocks, payment } from '@sovit/core';
+import { MAX_OWED_RANGES, mocks, payment } from '@sovit/core';
 import type { CoreKeyHex, PricePolicy, Sats } from '@sovit/core';
 import type Hypercore from 'hypercore';
 import { silentLogger } from '@sovit/seeder';
@@ -318,102 +318,493 @@ describe('SeederCredit — the budget per seeder (issue #8)', () => {
   });
 });
 
-// Fix round 4 (cross-lane review, HIGH): `image.fetch` read any core a thumbnail URL named —
-// outside the router, unpaid — so every honest seeder of a PAID core it named counted those blocks
-// and banned the viewer at window+1. Image cores are now routed too, in "image" mode:
-//   - a pay/1 seeder is asked only what its bare window can hold beside everything else it may
-//     count (owed, lost, in flight: the router adds those), so it is never overrun;
-//   - one block at a time until it has served one WITHOUT a PRICE for the core first (a seeder
-//     that counts a core's blocks announces its price before the first one): then it serves the
-//     core free, and nothing it serves there is ever counted against its credit (browsing never
-//     erodes playback);
-//   - a seeder that sent a PRICE for it is never asked for it again, and what it delivered after
-//     that PRICE is unpaid for good (browsing never spends sats).
-describe('SeederCredit — image cores (fix round 4)', () => {
+// Fix round 4 (cross-lane review, HIGH) routed image cores so that a thumbnail URL naming a PAID
+// core could not get the viewer banned; its interim probe (one unpaid block per seeder, stop on a
+// PRICE) still left one block per seeder that a restart turned into a ban. ADR 0015 amendment
+// (Cameron 2026-09-26, lane P2-owed-viewer): seeders say "free" per core, and a viewer asks a
+// seeder for an image core's blocks ONLY after that seeder's `PRICE { free: true }` for it, on an
+// open channel. Silence, a price, no pay/1, no HELLO: never asked, nothing counted — no probe. The
+// probe's tests went with the probe; these pin its replacement.
+describe('SeederCredit — image cores: asked only after PRICE { free: true } (ADR 0015 amendment)', () => {
   const IMG = 'd3'.repeat(32) as CoreKeyHex;
+  const free = (core: CoreKeyHex = IMG) =>
+    ({ type: 'PRICE', core, satsPerBlock: 0 as Sats, effectiveFromBlock: 0, free: true }) as const;
+  const priced = (core: CoreKeyHex = IMG) =>
+    ({ type: 'PRICE', core, satsPerBlock: 2 as Sats, effectiveFromBlock: 0 }) as const;
   function imageRig() {
     const r = rig();
     const img = fakeCore(IMG);
-    const verdicts: [string, string][] = [];
     const detach = r.credit.attachImageCore(img);
-    r.credit.onImageVerdict((core, verdict) => verdicts.push([core, verdict]));
     const got = (i: number, from: string): void => {
       img.emit('download', i, 1024, { remotePublicKey: hexBytes(from) });
     };
-    return { ...r, img, got, detach, verdicts };
+    return { ...r, img, got, detach };
   }
 
-  it('a pay/1 seeder: its bare window less what it may already count, asked one block at a time until it serves free; no pay/1 link, no HELLO: nothing', () => {
+  it('never asked without its free word: no pay/1, no HELLO, silence and a priced PRICE all ask nothing', () => {
     const r = imageRig();
-    expect(r.credit.budget(B, IMG)).toBe(NO_PAY_INFLIGHT); // no pay/1 on that connection
+    expect(r.credit.budget(B, IMG)).toBe(0); // no pay/1 on that connection: silent
     const a = r.link(A);
-    expect(r.credit.budget(A, IMG)).toBe(0); // no HELLO: its window is unknown
+    a.proto.remotePrice(free()); // said before the HELLO…
+    expect(r.credit.budget(A, IMG)).toBe(0); // …but nothing is asked before the channel is open
     a.proto.remoteHello(helloFrom(pubkey('a'), { windowBlocks: 4 }));
-    expect(r.credit.budget(A, IMG)).toBe(4);
-    expect(r.credit.probing(A, IMG)).toBe(true);
-    r.download(0, A); // a paid block owed on CORE: it counts at the seeder too
-    expect(r.credit.budget(A, IMG)).toBe(3);
-    // Its first image block came with no PRICE: it serves this core free.
-    r.got(0, A);
-    expect(r.credit.probing(A, IMG)).toBe(false);
-    expect(r.verdicts).toEqual([[IMG, 'free']]);
-    for (let i = 1; i < 40; i++) r.got(i, A);
-    // Honest free image blocks never come off its credit — neither for images nor for playback.
-    expect(r.credit.stats().unpaid).toBe(0);
-    expect(r.credit.budget(A, CORE)).toBe(4 - 1);
-    expect(r.credit.budget(A, IMG)).toBe(3);
-  });
-
-  it('a seeder that PRICEs the core: never asked for it again, and what it delivered after its PRICE is unpaid for good — its playback credit shrinks, it is never overrun', () => {
-    const r = imageRig();
-    const a = r.link(A);
-    a.proto.remoteHello(helloFrom(pubkey('a'), { windowBlocks: 4 }));
-    a.proto.remotePrice({
-      type: 'PRICE',
-      core: IMG,
-      satsPerBlock: 2 as Sats,
-      effectiveFromBlock: 0,
-    });
-    expect(r.credit.budget(A, IMG)).toBe(0);
-    r.got(0, A); // the probe block that was in flight: it counted it
-    expect(r.credit.stats().unpaid).toBe(1);
-    expect(r.credit.budget(A, CORE)).toBe(4 - 1);
-    expect(r.verdicts).toEqual([[IMG, 'priced']]);
-    // Another seeder of it is still probed (it may serve it free).
+    expect(r.credit.budget(A, IMG)).toBe(NO_PAY_INFLIGHT);
     const b = r.link(B);
     b.proto.remoteHello(helloFrom(pubkey('b'), { windowBlocks: 4 }));
-    expect(r.credit.budget(B, IMG)).toBe(4);
-    expect(r.credit.probing(B, IMG)).toBe(true);
-    // A reconnect of A: still never asked for it (what it priced is remembered per seeder).
-    a.detach();
-    const a2 = r.link(A);
-    a2.proto.remoteHello(helloFrom(pubkey('a'), { windowBlocks: 4 }));
-    expect(r.credit.budget(A, IMG)).toBe(0);
+    expect(r.credit.budget(B, IMG)).toBe(0); // open, silent: never asked (no probe)
+    b.proto.remotePrice(priced());
+    expect(r.credit.budget(B, IMG)).toBe(0); // it sells the core: never asked
+    expect(r.credit.servesFree(A, IMG)).toBe(true);
+    expect(r.credit.servesFree(B, IMG)).toBe(false);
   });
 
-  it('a PRICE for a core that is not being read as an image changes nothing (a paid core is the settler’s)', () => {
+  it('a free seeder: nothing it serves of the image counts against it — not its playback budget, not unpaid', () => {
     const r = imageRig();
     const a = r.link(A);
     a.proto.remoteHello(helloFrom(pubkey('a'), { windowBlocks: 4 }));
-    a.proto.remotePrice({
-      type: 'PRICE',
-      core: CORE,
-      satsPerBlock: 2 as Sats,
-      effectiveFromBlock: 0,
-    });
-    expect(r.credit.budget(A, CORE)).toBe(4);
-    expect(r.credit.budget(A, IMG)).toBe(4);
-    expect(r.credit.probing(A, IMG)).toBe(true);
-    expect(r.verdicts).toEqual([]);
+    a.proto.remotePrice(free());
+    r.download(0, A); // a paid block owed on CORE
+    for (let i = 0; i < 40; i++) r.got(i, A);
+    expect(r.credit.stats().unpaid).toBe(0);
+    expect(r.credit.budget(A, CORE)).toBe(4 - 1);
+    expect(r.credit.budget(A, IMG)).toBe(NO_PAY_INFLIGHT); // its own cap, not the window's rest
+  });
+
+  it('free, then priced: never asked again there; an image block that still lands is unpaid for good (browsing never pays)', () => {
+    const r = imageRig();
+    const a = r.link(A);
+    a.proto.remoteHello(helloFrom(pubkey('a'), { windowBlocks: 4 }));
+    a.proto.remotePrice(free());
+    r.got(0, A);
+    a.proto.remotePrice(priced());
+    expect(r.credit.budget(A, IMG)).toBe(0);
+    expect(r.credit.servesFree(A, IMG)).toBe(false);
+    r.got(1, A); // a request that was out when it turned the core sold (it counts that block)
+    expect(r.credit.stats().unpaid).toBe(1);
+    expect(r.credit.budget(A, CORE)).toBe(4 - 1);
+    // And back to free: askable again, and later blocks cost nothing.
+    a.proto.remotePrice(free());
+    expect(r.credit.budget(A, IMG)).toBe(NO_PAY_INFLIGHT);
+    r.got(2, A);
+    expect(r.credit.stats().unpaid).toBe(1);
+  });
+
+  it('the free word is per connection and per core: a reconnect forgets it; a PRICE for another core changes nothing', () => {
+    const r = imageRig();
+    const a = r.link(A);
+    a.proto.remoteHello(helloFrom(pubkey('a'), { windowBlocks: 4 }));
+    a.proto.remotePrice(free(CORE)); // free for another core: not for IMG
+    expect(r.credit.budget(A, IMG)).toBe(0);
+    a.proto.remotePrice(free());
+    expect(r.credit.budget(A, IMG)).toBe(NO_PAY_INFLIGHT);
+    a.proto.remoteClose('remote');
+    expect(r.credit.budget(A, IMG)).toBe(0);
+    // Closed, the word stands for requests released after the close (owed nothing)…
+    expect(r.credit.servesFree(A, IMG)).toBe(true);
+    // …and a new connection starts without it: it must say it again.
+    const again = r.link(A);
+    again.proto.remoteHello(helloFrom(pubkey('a'), { windowBlocks: 4 }));
+    expect(r.credit.servesFree(A, IMG)).toBe(false);
+    expect(r.credit.budget(A, IMG)).toBe(0);
   });
 
   it('the last detach stops treating it as an image core', () => {
     const r = imageRig();
     const a = r.link(A);
     a.proto.remoteHello(helloFrom(pubkey('a'), { windowBlocks: 4 }));
+    expect(r.credit.budget(A, IMG)).toBe(0);
     r.detach();
-    expect(r.credit.probing(A, IMG)).toBe(false);
     expect(r.credit.budget(A, IMG)).toBe(NO_PAY_INFLIGHT);
+  });
+});
+
+// Lane P2-owed-viewer (ADR 0018 amendment 2026-09-26, contracts v6): a seeder reports what it
+// still counts for us (`OWED` once the HELLOs verify, `ACK.outstanding` after every PAY), and the
+// viewer's credit toward it starts from that — never asking beyond its window minus the count.
+describe("SeederCredit — the seeder's report (ADR 0018 amendment)", () => {
+  const owed = (ranges: [number, number][], core: CoreKeyHex = CORE) =>
+    ({ type: 'OWED', core, ranges }) as const;
+  /** A replication peer on the routed core (the router reads its cap). */
+  function peerOn(r: ReturnType<typeof rig>, noise: string) {
+    const peer = Object.assign(new FakeReplicator.Peer(), {
+      remotePublicKey: hexBytes(noise),
+      inflight: 0,
+      dataProcessing: 0,
+      stats: { wireCancel: { tx: 0 } },
+    });
+    r.core.replicator.peers.push(peer);
+    r.core.emit('peer-add', peer);
+    return peer;
+  }
+
+  it('before its report: one block at a time, and what it reported so far counts; the first block completes it', () => {
+    const r = rig();
+    const a = r.link(A);
+    const peer = peerOn(r, A);
+    a.proto.remoteHello(helloFrom(pubkey('a'), { windowBlocks: 4 }));
+    expect(r.credit.reportOf(A)).toEqual({ done: false, claimed: 0, truncated: false });
+    expect(r.credit.budget(A, CORE)).toBe(4);
+    expect(peer.getMaxInflight()).toBe(1); // single, before the report
+    a.proto.remoteOwed(owed([[10, 11]]));
+    expect(r.credit.budget(A, CORE)).toBe(2);
+    expect(peer.getMaxInflight()).toBe(1);
+    r.download(0, A); // a block we asked for after `open`: its report came before it
+    expect(r.credit.reportOf(A)).toEqual({ done: true, claimed: 2, truncated: false });
+    expect(r.credit.budget(A, CORE)).toBe(4 - 2 - 1);
+    expect(peer.getMaxInflight()).toBe(1); // 4 − 2 claimed − 1 owed = 1: pipelining by budget now
+  });
+
+  // Review finding (lane P2-owed-viewer): a gateway session may replicate before its pay/1
+  // attaches, so requests can be in flight then; their replies come BEFORE the seeder's report on
+  // the stream and must not complete it.
+  it('replies to requests in flight when its pay/1 attached do not complete its report; the next block does', () => {
+    const r = rig();
+    const peer = peerOn(r, A);
+    peer.inflight = 2; // asked before pay/1 attached (no budget known: a bounded burst)
+    const a = r.link(A);
+    a.proto.remoteHello(helloFrom(pubkey('a'), { windowBlocks: 4 }));
+    peer.inflight = 0;
+    r.download(0, A);
+    r.download(1, A);
+    expect(r.credit.reportOf(A)?.done).toBe(false);
+    a.proto.remoteOwed(owed([[10, 10]]));
+    r.download(2, A); // asked after open: its report came first
+    expect(r.credit.reportOf(A)).toMatchObject({ done: true, claimed: 1 });
+  });
+
+  // Independent review (lane P2-owed-viewer, LOW): a core nobody pays for is asked before the
+  // channel opens (a bounded burst), so a request can leave after pay/1 attached but before our
+  // HELLO (the gateway's sendHello awaits signing). The seeder answers it before it handles our
+  // HELLO — before its report — and that block completed the report: the OWED behind it was
+  // ignored and a restarted gateway asked the full window of a seeder it still owed, and was
+  // banned. What is in flight when the channel opens is now `early` too.
+  it('a reply to a request made after pay/1 attached but before the channel opened does not complete the report', () => {
+    const r = rig({ policies: new Map([[CORE, { ...tight }]]) });
+    const free = fakeCore(OTHER); // routed, nobody pays for it: asked before the channel opens
+    r.credit.attachCore(free);
+    const a = r.link(A); // pay/1 attached: nothing in flight yet
+    const onFree = Object.assign(new FakeReplicator.Peer(), {
+      remotePublicKey: hexBytes(A),
+      inflight: 0,
+      dataProcessing: 0,
+      stats: { wireCancel: { tx: 0 } },
+    });
+    free.replicator.peers.push(onFree);
+    free.emit('peer-add', onFree);
+    expect(r.credit.budget(A, OTHER)).toBe(NO_PAY_INFLIGHT);
+    onFree.inflight = 1; // asked now: before our HELLO went out
+    a.proto.remoteHello(helloFrom(pubkey('a'), { windowBlocks: 3 })); // the channel opens
+    onFree.inflight = 0;
+    free.emit('download', 0, 1024, { remotePublicKey: hexBytes(A) }); // its reply, before the OWED
+    expect(r.credit.reportOf(A)?.done).toBe(false);
+    a.proto.remoteOwed(owed([[0, 2]])); // it still counts its whole window on the paid core
+    expect(r.credit.reportOf(A)).toMatchObject({ claimed: 3 });
+    expect(r.credit.budget(A, CORE)).toBe(0);
+    // A reply to a request made after the channel opened comes after the report: it completes it.
+    free.emit('download', 1, 1024, { remotePublicKey: hexBytes(A) });
+    expect(r.credit.reportOf(A)).toEqual({ done: true, claimed: 3, truncated: false });
+    expect(r.credit.budget(A, CORE)).toBe(0);
+  });
+
+  it('never asks beyond window minus what it reports: a report of its whole window asks nothing', () => {
+    const r = rig();
+    const a = r.link(A);
+    a.proto.remoteHello(helloFrom(pubkey('a'), { windowBlocks: 4 }));
+    a.proto.remoteOwed(owed([[0, 3]]));
+    expect(r.credit.budget(A, CORE)).toBe(0);
+    r.download(9, A);
+    expect(r.credit.budget(A, CORE)).toBe(0);
+    expect(r.credit.seederBatch(A)).toMatchObject({ atCap: true });
+  });
+
+  it('the report replaces our estimate of everything before this connection (in-process debts, other Noise keys) — lower or higher', () => {
+    const r = rig();
+    const first = r.link(A);
+    first.proto.remoteHello(helloFrom(pubkey('a'), { windowBlocks: 4 }));
+    r.download(0, A);
+    r.download(1, A);
+    r.download(2, A);
+    first.proto.remoteClose('remote'); // three owed at the drop: unpaid for good, in-process
+    const second = r.link(A);
+    second.proto.remoteHello(helloFrom(pubkey('a'), { windowBlocks: 4 }));
+    expect(r.credit.budget(A, CORE)).toBe(1); // before its report: what we know of
+    // It says it counts one of them (it was paid by a PAY in flight at the drop, say).
+    second.proto.remoteOwed(owed([[2, 2]]));
+    expect(r.credit.budget(A, CORE)).toBe(1); // before completion: the larger estimate stands
+    r.download(3, A);
+    expect(r.credit.stats().unpaid).toBe(0);
+    expect(r.credit.budget(A, CORE)).toBe(4 - 1 - 1);
+    // A renamed seeder (new Noise key, same pubkey) whose report says more than we know of.
+    const renamed = r.link(B);
+    renamed.proto.remoteHello(helloFrom(pubkey('a'), { windowBlocks: 4 }));
+    renamed.proto.remoteOwed(owed([[5, 7]]));
+    expect(r.credit.budget(B, CORE)).toBe(1);
+  });
+
+  it('an ACK completes the report and re-bases its core on outstanding, less what is still owed on the link', () => {
+    const r = rig();
+    const a = r.link(A);
+    a.proto.remoteHello(helloFrom(pubkey('a'), { windowBlocks: 6 }));
+    a.proto.remoteOwed(owed([[20, 22]]));
+    r.download(0, A);
+    r.download(1, A);
+    r.download(2, A);
+    expect(r.credit.budget(A, CORE)).toBe(6 - 3 - 3);
+    // Our PAY for 0..1 is accepted; it still counts 2 (owed on the link) + 1 of the old ones.
+    a.settled.protocol.sendPay({ range: { core: CORE, fromBlock: 0, toBlock: 1 } } as never);
+    a.proto.remoteAck({
+      type: 'ACK',
+      core: CORE,
+      fromBlock: 0,
+      toBlock: 1,
+      ok: true,
+      outstanding: 2,
+    });
+    expect(r.credit.reportOf(A)).toMatchObject({ done: true, claimed: 1 });
+    expect(r.credit.budget(A, CORE)).toBe(6 - 1 - 1);
+    // An ACK without `outstanding` (an older seeder) leaves the estimate as it is.
+    r.download(3, A);
+    a.settled.protocol.sendPay({ range: { core: CORE, fromBlock: 2, toBlock: 2 } } as never);
+    a.proto.remoteAck({ type: 'ACK', core: CORE, fromBlock: 2, toBlock: 2, ok: true });
+    expect(r.credit.reportOf(A)).toMatchObject({ claimed: 1 });
+    // A junk outstanding is ignored too.
+    a.settled.protocol.sendPay({ range: { core: CORE, fromBlock: 3, toBlock: 3 } } as never);
+    a.proto.remoteAck({
+      type: 'ACK',
+      core: CORE,
+      fromBlock: 3,
+      toBlock: 3,
+      ok: true,
+      outstanding: -1,
+    });
+    expect(r.credit.reportOf(A)).toMatchObject({ claimed: 1 });
+  });
+
+  it('a report is complete REPORT_WAIT_MS after the channel opened even if nothing was answered', async () => {
+    const pool = new CreditPool(4);
+    const settler = new CreditSettler({ credit: pool, logger: silentLogger, payable: () => true });
+    const credit = new SeederCredit({
+      settler,
+      pool,
+      policyFor: () => tight,
+      logger: silentLogger,
+      reportWaitMs: 30,
+    });
+    const proto = new FakePayProtocol();
+    settler.attachPeer(A, proto);
+    credit.attachPeer(A, proto);
+    proto.remoteHello(helloFrom(pubkey('a'), { windowBlocks: 4 }));
+    proto.remoteOwed(owed([[1, 1]]));
+    expect(credit.reportOf(A)?.done).toBe(false);
+    await new Promise((res) => setTimeout(res, 80));
+    expect(credit.reportOf(A)).toEqual({ done: true, claimed: 1, truncated: false });
+    credit.dispose();
+    // A wait of 0 (or junk) is the default, never "at once": the report is not taken as complete.
+    for (const junk of [0, -5, Number.NaN, Number.POSITIVE_INFINITY]) {
+      const pool2 = new CreditPool(4);
+      const settler2 = new CreditSettler({
+        credit: pool2,
+        logger: silentLogger,
+        payable: () => true,
+      });
+      const credit2 = new SeederCredit({
+        settler: settler2,
+        pool: pool2,
+        policyFor: () => tight,
+        logger: silentLogger,
+        reportWaitMs: junk,
+      });
+      const p2 = new FakePayProtocol();
+      settler2.attachPeer(A, p2);
+      credit2.attachPeer(A, p2);
+      p2.remoteHello(helloFrom(pubkey('a'), { windowBlocks: 4 }));
+      await new Promise((res) => setTimeout(res, 20));
+      expect(credit2.reportOf(A)?.done, String(junk)).toBe(false);
+      credit2.dispose();
+    }
+  });
+
+  it('a report at the caps (or malformed) may be short: nothing more is asked on that connection', () => {
+    const r = rig();
+    const a = r.link(A);
+    a.proto.remoteHello(helloFrom(pubkey('a'), { windowBlocks: 8 }));
+    const ranges = Array.from({ length: MAX_OWED_RANGES }, (_, i): [number, number] => [
+      2 * i,
+      2 * i,
+    ]);
+    a.proto.remoteOwed(owed(ranges, OTHER));
+    expect(r.credit.reportOf(A)).toMatchObject({ truncated: true });
+    expect(r.credit.budget(A, CORE)).toBe(0);
+    r.download(0, A);
+    expect(r.credit.budget(A, CORE)).toBe(0);
+    // Malformed (a loopback end does not run the codec): the same.
+    const b = r.link(B);
+    b.proto.remoteHello(helloFrom(pubkey('b'), { windowBlocks: 8 }));
+    b.proto.remoteOwed({ type: 'OWED', core: CORE, ranges: [[3, 1]] });
+    expect(r.credit.reportOf(B)).toMatchObject({ truncated: true, claimed: 0 });
+    expect(r.credit.budget(B, CORE)).toBe(0);
+    // Its report complete (a block asked after open), it still asks nothing: the claim it could
+    // not make is taken as its whole window, not as nothing (mutation M13).
+    r.download(3, B);
+    expect(r.credit.reportOf(B)).toMatchObject({ done: true, truncated: true });
+    expect(r.credit.budget(B, CORE)).toBe(0);
+  });
+
+  it('one OWED per core per connection: a second for the same core, or any after the report, is ignored', () => {
+    const r = rig();
+    const a = r.link(A);
+    a.proto.remoteHello(helloFrom(pubkey('a'), { windowBlocks: 8 }));
+    a.proto.remoteOwed(owed([[0, 1]]));
+    a.proto.remoteOwed(owed([[0, 5]]));
+    expect(r.credit.reportOf(A)).toMatchObject({ claimed: 2 });
+    r.download(9, A);
+    a.proto.remoteOwed(owed([[0, 0]], OTHER));
+    expect(r.credit.reportOf(A)).toMatchObject({ claimed: 2 });
+  });
+
+  it('a closed connection keeps what it reported counted; the next one starts from it until its own report', () => {
+    const r = rig();
+    const a = r.link(A);
+    a.proto.remoteHello(helloFrom(pubkey('a'), { windowBlocks: 4 }));
+    a.proto.remoteOwed(owed([[0, 1]]));
+    r.download(5, A);
+    a.proto.remoteClose('remote'); // block 5 owed at the drop, 2 reported
+    expect(r.credit.stats().unpaid).toBe(3);
+    const b = r.link(A);
+    b.proto.remoteHello(helloFrom(pubkey('a'), { windowBlocks: 4 }));
+    expect(r.credit.budget(A, CORE)).toBe(1);
+    b.proto.remoteOwed(owed([[0, 1]])); // block 5 was paid meanwhile, say
+    r.download(6, A);
+    expect(r.credit.budget(A, CORE)).toBe(4 - 2 - 1);
+  });
+
+  it("only an OPEN channel's HELLO counts: a peer seen before our own HELLO went out is asked nothing", () => {
+    const r = rig();
+    const proto = new FakePayProtocol();
+    proto.peer = helloFrom(pubkey('a'), { windowBlocks: 4 }); // verified, our HELLO not sent yet
+    proto.state = 'hello-sent';
+    r.settler.attachPeer(A, proto);
+    r.credit.attachPeer(A, proto);
+    expect(r.credit.budget(A, CORE)).toBe(0);
+    proto.remoteHello(helloFrom(pubkey('a'), { windowBlocks: 4 }));
+    expect(r.credit.budget(A, CORE)).toBe(4);
+  });
+
+  it('seederReach: per pubkey, what it may count now and its bare window', () => {
+    const r = rig();
+    const a = r.link(A);
+    a.proto.remoteHello(helloFrom(pubkey('a'), { windowBlocks: 4 }));
+    a.proto.remoteOwed(owed([[0, 1]]));
+    r.download(5, A);
+    expect(r.credit.seederReach()).toEqual([{ pubkey: pubkey('a'), reach: 3, window: 4 }]);
+    a.proto.remoteClose('remote');
+    expect(r.credit.seederReach()).toEqual([{ pubkey: pubkey('a'), reach: 3, window: 4 }]);
+  });
+});
+
+// Lane P2-owed-viewer: the desktop's durable ledger. After a crash, a seeder the last run may have
+// brought to its whole window is asked NOTHING until its report is in (not even one block, which
+// would overrun it); the word is written before anything is asked that could bring it there.
+describe('SeederCredit — the durable ledger (lane P2-owed-viewer)', () => {
+  class Ledger {
+    readonly before = new Set<string>();
+    readonly now = new Set<string>();
+    writes = 0;
+    failing = false;
+    fullBefore(pk: string): boolean {
+      return this.before.has(pk);
+    }
+    full(pk: string): boolean {
+      return this.now.has(pk);
+    }
+    markFull(pk: string): boolean {
+      if (this.failing) return false;
+      this.writes++;
+      this.now.add(pk);
+      return true;
+    }
+  }
+  function ledgerRig(ledger: Ledger) {
+    const pool = new CreditPool(4);
+    const settler = new CreditSettler({
+      credit: pool,
+      logger: silentLogger,
+      payable: (c) => c === CORE,
+    });
+    const credit = new SeederCredit({
+      settler,
+      pool,
+      policyFor: () => tight,
+      logger: silentLogger,
+      ledger,
+    });
+    const core = fakeCore(CORE);
+    settler.attachCore(core);
+    credit.attachCore(core);
+    const link = (noise: string) => {
+      const proto = new FakePayProtocol();
+      settler.attachPeer(noise, proto);
+      credit.attachPeer(noise, proto);
+      return proto;
+    };
+    const download = (i: number, from: string): void => {
+      pool.tryAcquire(CORE, i);
+      core.emit('download', i, 1024, { remotePublicKey: hexBytes(from) });
+    };
+    return { credit, link, download };
+  }
+
+  it('an earlier run left it possibly at its window: nothing is asked until its report; then its report rules', () => {
+    const ledger = new Ledger();
+    ledger.before.add(pubkey('a'));
+    ledger.now.add(pubkey('a'));
+    const r = ledgerRig(ledger);
+    const a = r.link(A);
+    a.remoteHello(helloFrom(pubkey('a'), { windowBlocks: 4 }));
+    expect(r.credit.budget(A, CORE)).toBe(0);
+    a.remoteOwed({ type: 'OWED', core: CORE, ranges: [[0, 0]] });
+    expect(r.credit.budget(A, CORE)).toBe(0); // the report is not complete yet
+    // Its ACK for an owed PAY completes it (the block itself never came on this connection).
+    a.remoteAck({ type: 'ACK', core: CORE, fromBlock: 0, toBlock: 0, ok: true, outstanding: 0 });
+    expect(r.credit.budget(A, CORE)).toBe(4);
+  });
+
+  it('write-ahead: `full` is made durable before a budget that could reach the bare window; once, not per read', () => {
+    const ledger = new Ledger();
+    const r = ledgerRig(ledger);
+    const a = r.link(A);
+    a.remoteHello(helloFrom(pubkey('a'), { windowBlocks: 4 }));
+    expect(ledger.writes).toBe(0);
+    expect(r.credit.budget(A, CORE)).toBe(4);
+    expect(ledger.full(pubkey('a'))).toBe(true);
+    for (let i = 0; i < 5; i++) r.credit.budget(A, CORE);
+    expect(ledger.writes).toBe(1);
+    // Written in THIS run: it is not an earlier run's word (the budget stays whole).
+    expect(r.credit.budget(A, CORE)).toBe(4);
+  });
+
+  it('a ledger that cannot be written holds the credit one short of the bare window', () => {
+    const ledger = new Ledger();
+    ledger.failing = true;
+    const r = ledgerRig(ledger);
+    const a = r.link(A);
+    a.remoteHello(helloFrom(pubkey('a'), { windowBlocks: 4 }));
+    expect(r.credit.budget(A, CORE)).toBe(3);
+    r.download(0, A);
+    expect(r.credit.budget(A, CORE)).toBe(2);
+  });
+
+  it('a ledger that throws: the earlier-run word is taken as full (asks nothing before the report)', () => {
+    const ledger = new Ledger();
+    ledger.fullBefore = () => {
+      throw new Error('disk');
+    };
+    const r = ledgerRig(ledger);
+    const a = r.link(A);
+    a.remoteHello(helloFrom(pubkey('a'), { windowBlocks: 4 }));
+    expect(r.credit.budget(A, CORE)).toBe(0);
+    r.download(1, A); // its report is in (say the one block was asked of it earlier)
+    expect(r.credit.budget(A, CORE)).toBeGreaterThan(0);
   });
 });
 
@@ -461,6 +852,40 @@ describe('CreditSettler — what settled without a payment (issue #8)', () => {
     expect(r.settler.owedOn(CORE, { fromBlock: 4, toBlock: 9 })).toBe(2);
     b.proto.remoteClose('remote'); // a link gone: nothing it was owed counts any more
     expect(r.settler.owedOn(CORE, { fromBlock: 4, toBlock: 9 })).toBe(1);
+  });
+});
+
+// Lane P2-owed-viewer (ADR 0015 amendment): a block from a seeder that serves its core free is owed
+// nothing — the settler settles it on arrival; a predicate that throws owes it (the safe side).
+describe('CreditSettler — servesFree (ADR 0015 amendment)', () => {
+  it('a block from a free-serving seeder settles on arrival, owed nothing; others are owed; a throwing predicate owes', () => {
+    let free = (n: string): boolean => n === A;
+    const pool = new CreditPool(8);
+    const settler = new CreditSettler({
+      credit: pool,
+      logger: silentLogger,
+      payable: () => true,
+      servesFree: (n) => free(n),
+    });
+    const core = fakeCore(CORE);
+    settler.attachCore(core);
+    settler.attachPeer(A, new FakePayProtocol());
+    settler.attachPeer(B, new FakePayProtocol());
+    const got = (i: number, from: string): void => {
+      pool.tryAcquire(CORE, i);
+      core.emit('download', i, 1024, { remotePublicKey: hexBytes(from) });
+    };
+    got(0, A);
+    expect(settler.owedBy(A)).toBe(0);
+    expect(pool.holds(CORE, 0)).toBe(false);
+    got(1, B);
+    expect(settler.owedBy(B)).toBe(1);
+    free = () => {
+      throw new Error('credit gone');
+    };
+    got(2, A);
+    expect(settler.owedBy(A)).toBe(1);
+    expect(pool.holds(CORE, 2)).toBe(true);
   });
 });
 

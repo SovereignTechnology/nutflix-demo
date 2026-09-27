@@ -5,10 +5,12 @@
  *   viewer   every PAY is built by the host (`pay.build`) for the play session whose blocks it
  *            covers — the host checks the session, the range, the manifest terms and the
  *            session's budget. Two sessions of one core (a rendition switch, two windows) each
- *            pay their own blocks (fix round 5);
+ *            pay their own blocks (fix round 5). A tail a seeder reports owed (lane
+ *            P2-owed-viewer) is paid under the id of the session it was recorded for: the host
+ *            checks that session while it is open, and its persisted tail authorisation after;
  *   HELLO    signed by the host over this connection's `pay/1` challenge (`pay.hello`); the price
  *            it states is a ceiling (the highest price among the cores we serve) and each core's
- *            own price follows as `PRICE` on its first block (`announceCorePrices`);
+ *            own price follows as `PRICE` on its first block (always, contracts v6 amendment);
  *   seeder   `RealPaymentEngine` runs HERE (its upload accounting is synchronous), with every
  *            money step asked of the host: keysets, redeem (swap into the NIP-60 wallet), NUT-07
  *            checks, nutzaps. Accepted-but-unflushed PAYs are kept in `<storage>/payments/
@@ -267,6 +269,13 @@ export function realProviders(o: RealProviderOptions): RealProviders {
     seederEngine: engine,
     accepting: () => engine.pendingCount() < (o.maxPendingPays ?? WORKER_MAX_PENDING_PAYS),
     pay: async (range, seeder, policy: PricePolicy, opts) => {
+      // The carry of this channel's chain for the core (the payer always passes it). Without it
+      // the host would split with a guess, and a seeder holding another carry refuses the PAY
+      // `malformed` after the proofs were spent (independent review, lane P2-owed-viewer, HIGH):
+      // refused here, before the host is asked.
+      const carryIn = opts?.carryIn;
+      if (carryIn === undefined)
+        throw new Error('internal: a PAY without the carry of its chain is never built');
       const sids = o.sidsFor(range);
       if (sids.length === 0) throw new Error('session-closed: no play session covers these blocks');
       // Fix round 5: a session's refusal ('forbidden', 'session-closed') is not the last word
@@ -280,7 +289,7 @@ export function realProviders(o: RealProviderOptions): RealProviders {
             range,
             seeder,
             policy,
-            carryIn: opts?.carryIn ?? 0,
+            carryIn,
           });
         } catch (err) {
           const code = (err as { code?: unknown } | null)?.code;
@@ -290,6 +299,10 @@ export function realProviders(o: RealProviderOptions): RealProviders {
       }
       throw refusal;
     },
+    // Lane P2-owed-viewer: the recorded session's id — never another session's (the host pays a
+    // tail only under its own authorisation, like any PAY).
+    payOwed: (sid, range, seeder, policy, carryIn) =>
+      request('pay.build', { sid: sid as SessionId, range, seeder, policy, carryIn }),
     viewerMints: payments.mints,
     payWiring: {
       protocol: () =>

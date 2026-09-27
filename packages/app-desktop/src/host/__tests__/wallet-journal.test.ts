@@ -128,6 +128,7 @@ describe('the money plane over the sealed journal', () => {
         log: memoryLogger('warn'),
         mintRequest: () => request,
         journalDir: join(dir, WALLET_DIR),
+        tailDir: null, // in memory: not about tail authorisations
         ...(create ? { createWallet: true } : {}),
         now: () => t++ as UnixSeconds,
       });
@@ -213,6 +214,7 @@ describe('the money plane over the sealed journal', () => {
       log: memoryLogger('warn'),
       mintRequest: () => request,
       journalDir: join(dir, WALLET_DIR),
+      tailDir: null, // in memory: not about tail authorisations
       createWallet: true,
       now: () => clock.t as UnixSeconds,
       settleTimer: (fn, ms) => {
@@ -270,6 +272,7 @@ describe('the money plane over the sealed journal', () => {
       log: memoryLogger('warn'),
       mintRequest: () => net.wrap(mint.request),
       journalDir: join(dir, WALLET_DIR),
+      tailDir: null, // in memory: not about tail authorisations
       createWallet: true,
       settleTimer: () => {
         const t = { live: true };
@@ -345,6 +348,7 @@ describe('the host says why payments are off', () => {
     await MoneyPlane.open({
       signer: s,
       journalDir: null, // only publishes the wallet event; the host opens the journal below
+      tailDir: null, // in memory: not about tail authorisations
       pool,
       relays: () => [{ url: RELAY, read: true, write: true }],
       defaultMints: () => [MINT],

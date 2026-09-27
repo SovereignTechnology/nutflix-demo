@@ -150,6 +150,7 @@ async function world(
     mintRequest,
     createWallet: true,
     journalDir: null, // in memory: this only creates the NIP-60 wallet (merge of issues #2 and #8)
+    tailDir: null, // in memory: not about tail authorisations
   });
   first.close();
 
@@ -557,6 +558,44 @@ describe('cross-lane review round 4 through the whole host', () => {
     expect((await invoke(w.r, 'play', [w.trusted.id])).ok).toBe(true);
     expect(w.lightning.paid).toHaveLength(1);
   }, 30_000);
+
+  // Lane R6-reconcile (the round-5 verifier): the adapter asked `checkForPlay` once PER MINT, each
+  // with a whole `playWaitMs` of its own, so a video at two trusted mints could wait twice the
+  // bound. One call for the play now: here the first mint's run takes 60 % of the bound and ends
+  // not due (the settings changed meanwhile), and the second mint's run gets only the rest.
+  it('a video at two trusted mints waits one playWaitMs in all, not one per mint', async () => {
+    const W = 3_000;
+    const t = holding();
+    // A clock that passes the minute between attempts at every read (the second mint's run is
+    // not spaced out behind the first's).
+    const w = await world({ wrap: t.wrap, tickMs: 61_000, hooks: { playWaitMs: W } });
+    r = w.r;
+    t.hold(
+      (mint, path) => (mint === TARGET || mint === SECOND) && path === 'POST /v1/mint/quote/bolt11',
+    );
+    const reply = invoke(w.r, 'play', [w.both.id]);
+    const first = await t.next(); // the first mint's run, at its quote
+    const since = performance.now();
+    await new Promise((resolve) => setTimeout(resolve, 0.6 * W));
+    await w.r.host.adapter.updateSettings({
+      autoTopUp: { belowSats: 1_000 as Sats, fromMint: SOURCE, amountSats: 2_500 as Sats },
+    });
+    first.release(); // that run is no longer the one the settings want: it ends not due
+    const second = await t.next(); // the second mint's run, at its quote: held
+    const res = await reply;
+    const took = performance.now() - since;
+    expect(!res.ok && res.error.code).toBe('no-balance');
+    expect(!res.ok && res.error.message).toMatch(/a top-up is on its way/);
+    // Not 0.6 W, then a whole bound for the second mint (≥ 1.6 W: timers are never early); the
+    // margin is for a loaded box's late timers.
+    expect(took).toBeLessThan(1.4 * W);
+    expect(w.asked.map((f) => (f as { target?: MintUrl }).target)).toEqual([TARGET, SECOND]);
+    // The second mint's top-up finishes in the background.
+    t.hold(null);
+    second.release();
+    await w.r.host.adapter.topUpInFlight();
+    expect(await balance(w.r, SECOND)).toBe(2_500);
+  }, 30_000);
 });
 
 // Fix round 4 (cross-lane review, HIGH): the host revoked a session before the worker heard
@@ -597,7 +636,8 @@ describe('closing a session: the tail PAY the worker builds meanwhile is authori
           // The worker pays the session's tail BEFORE it answers play.close.
           'play.close': async (_a, fw) => {
             outcomes.push(await tailPay(fw));
-            return undefined;
+            // Lane P2-owed-viewer: play.close answers the unpaid tail (none left here).
+            return { unpaid: 0 };
           },
         },
       },
@@ -609,5 +649,67 @@ describe('closing a session: the tail PAY the worker builds meanwhile is authori
     expect(outcomes).toEqual(['paid']);
     // Once play.close answered, nothing more is paid for that session.
     expect(await tailPay(w.r.worker() as never)).toBe('session-closed');
+  }, 30_000);
+
+  // Lane P2-owed-viewer (ADR 0018 amendment): the host keeps a tail authorisation for what the
+  // worker reports still unpaid at play.close — or, when the worker is gone, for all the session
+  // had left — so a seeder that reports those blocks later is paid under it.
+  it('play.close reporting an unpaid tail leaves a tail authorisation on the money plane; a worker gone leaves one too; none for 0', async () => {
+    let unpaid = 2;
+    const w = await world({
+      tickMs: 61_000,
+      worker: { handlers: { 'play.close': () => Promise.resolve({ unpaid }) } },
+    });
+    r = w.r;
+    const payTail = (
+      sid: SessionId,
+      open: {
+        rendition: { hyper: { core: CoreKeyHex; blob: HyperblobId } };
+        policy: VideoManifest['price'];
+      },
+    ) =>
+      (w.r.worker() as unknown as { request(m: 'pay.build', a: never): Promise<unknown> })
+        .request('pay.build', {
+          sid,
+          range: {
+            core: open.rendition.hyper.core,
+            fromBlock: open.rendition.hyper.blob.blockOffset,
+            toBlock: open.rendition.hyper.blob.blockOffset,
+          },
+          seeder: { pubkey: SEEDER, p2pk: SEEDER_P2PK, mint: TARGET },
+          policy: open.policy,
+          carryIn: 0,
+        } as never)
+        .then(
+          () => 'paid',
+          (e: unknown) => (e as { code?: string }).code ?? 'error',
+        );
+    interface Open {
+      readonly sid: SessionId;
+      readonly rendition: {
+        readonly hyper: { readonly core: CoreKeyHex; readonly blob: HyperblobId };
+      };
+      readonly policy: VideoManifest['price'];
+    }
+    const opened = (): Open => w.r.worker().calls('play.open').at(-1) as Open;
+    expect((await invoke(w.r, 'play', [w.trusted.id])).ok).toBe(true);
+    const a = opened();
+    await w.r.host.adapter.sessions.all()[0]!.closeAsync();
+    // Two blocks reported unpaid: two may be paid under the closed session's id, not three.
+    expect(await payTail(a.sid, a)).toBe('paid');
+    expect(await payTail(a.sid, a)).toBe('paid');
+    expect(await payTail(a.sid, a)).toBe('forbidden');
+    // Nothing left unpaid: no tail — the session is simply closed.
+    unpaid = 0;
+    expect((await invoke(w.r, 'play', [w.trusted.id])).ok).toBe(true);
+    const b = opened();
+    await w.r.host.adapter.sessions.all()[0]!.closeAsync();
+    expect(await payTail(b.sid, b)).toBe('session-closed');
+    // The worker gone (its sessions dropped, nothing said): all the session had left.
+    expect((await invoke(w.r, 'play', [w.trusted.id])).ok).toBe(true);
+    const c = opened();
+    w.r.host.adapter.onWorkerDown();
+    await w.r.host.adapter.flushTails();
+    expect(await payTail(c.sid, c)).toBe('paid');
   }, 30_000);
 });

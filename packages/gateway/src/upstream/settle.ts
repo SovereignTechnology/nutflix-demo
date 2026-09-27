@@ -13,6 +13,12 @@
  * Issue #8: a unit settled WITHOUT a payment (a rejected PAY, a peer gone with blocks owed) frees
  * the pool, but the seeder still counts those blocks against its window. `onChange` reports them
  * per peer (`unpaid`), and `SeederCredit` keeps them off that seeder's credit for good.
+ *
+ * Lane P2-owed-viewer (ADR 0015 / 0018 amendments): a block from a peer that serves its core free
+ * (`servesFree`: its `PRICE { free: true }` on the current connection) is owed nothing and settles
+ * on arrival; `onAck` hands each ACK on, AFTER it was applied here — `SeederCredit` re-bases its
+ * estimate on `ACK.outstanding` less what is still owed on that link (`owedByOn`), which must no
+ * longer include the blocks that ACK settled.
  */
 import type {
   AckMessage,
@@ -34,6 +40,12 @@ export interface CreditSettlerOptions {
   readonly logger: Logger;
   /** `false` for a core nobody pays for (its blocks settle on arrival). */
   readonly payable: (core: CoreKeyHex) => boolean;
+  /**
+   * Lane P2-owed-viewer: `true` when the peer `noiseHex` serves `core` outside payment (its
+   * `PRICE { free: true }` on the current connection) — its blocks of `core` settle on arrival,
+   * owed nothing. A throw counts as `false` (owed: the safe side).
+   */
+  readonly servesFree?: (noiseHex: string, core: CoreKeyHex) => boolean;
 }
 
 interface Link {
@@ -51,6 +63,9 @@ interface Link {
  */
 export type SettleListener = (noiseHex: string, unpaid: number) => void;
 
+/** An ACK from `noiseHex`, handed on once the settler applied it (matched or not). */
+export type AckListener = (noiseHex: string, ack: AckMessage) => void;
+
 export interface CreditSettlerStats {
   readonly acksRejected: number;
   readonly unmatchedAcks: number;
@@ -63,6 +78,7 @@ export class CreditSettler {
   private readonly log: Logger;
   private readonly links = new Map<string, Link>();
   private readonly listeners = new Set<SettleListener>();
+  private readonly ackListeners = new Set<AckListener>();
   private acksRejected = 0;
   private unmatchedAcks = 0;
 
@@ -84,6 +100,13 @@ export class CreditSettler {
     let n = 0;
     for (const s of l.owed.values()) n += s.size;
     return n;
+  }
+
+  /** Blocks of `core` downloaded from `noiseHex` on its live `pay/1` link and not settled yet. */
+  owedByOn(noiseHex: string, core: string): number {
+    const l = this.links.get(noiseHex);
+    if (l === undefined || l.closed) return 0;
+    return l.owed.get(core)?.size ?? 0;
   }
 
   /**
@@ -119,6 +142,15 @@ export class CreditSettler {
   onChange(cb: SettleListener): () => void {
     this.listeners.add(cb);
     return () => this.listeners.delete(cb);
+  }
+
+  /**
+   * Called with every ACK on a live link, after it was applied here (its blocks settled): what is
+   * still owed on that link (`owedByOn`) no longer counts them. Returns an unsubscribe.
+   */
+  onAck(cb: AckListener): () => void {
+    this.ackListeners.add(cb);
+    return () => this.ackListeners.delete(cb);
   }
 
   /** Whether a downloaded block is waiting for its ACK (a reader settles a block it never owed). */
@@ -162,6 +194,9 @@ export class CreditSettler {
       sendPrice: (p) => {
         protocol.sendPrice(p);
       },
+      sendOwed: (o) => {
+        protocol.sendOwed(o);
+      },
       cut: (reason) => {
         protocol.cut(reason);
       },
@@ -169,7 +204,7 @@ export class CreditSettler {
         protocol.on(event, cb),
     };
     const offAck = protocol.on('ack', (ack) => {
-      this.onAck(link, ack);
+      this.handleAck(link, ack);
     });
     const offClose = protocol.on('close', () => {
       this.release(link);
@@ -189,8 +224,14 @@ export class CreditSettler {
   attachCore(core: Hypercore): () => void {
     const keyHex = toHex(core.key);
     const onDownload = (index: number, _bytes: number, peer: ReplicationPeer): void => {
-      const link = this.links.get(toHex(peer.remotePublicKey));
-      if (link === undefined || link.closed || !this.o.payable(keyHex as CoreKeyHex)) {
+      const noiseHex = toHex(peer.remotePublicKey);
+      const link = this.links.get(noiseHex);
+      if (
+        link === undefined ||
+        link.closed ||
+        !this.o.payable(keyHex as CoreKeyHex) ||
+        this.freeFrom(noiseHex, keyHex as CoreKeyHex)
+      ) {
         this.o.credit.settle(keyHex, index);
         return;
       }
@@ -227,7 +268,30 @@ export class CreditSettler {
     return n;
   }
 
-  private onAck(link: Link, ack: AckMessage): void {
+  /** The `servesFree` option; a throw is `false` (owed: the safe side). */
+  private freeFrom(noiseHex: string, core: CoreKeyHex): boolean {
+    const f = this.o.servesFree;
+    if (f === undefined) return false;
+    try {
+      return f(noiseHex, core);
+    } catch {
+      return false;
+    }
+  }
+
+  private handleAck(link: Link, ack: AckMessage): void {
+    this.applyAck(link, ack);
+    if (link.closed) return;
+    for (const cb of [...this.ackListeners]) {
+      try {
+        cb(link.noiseHex, ack);
+      } catch {
+        // a listener's failure is its own
+      }
+    }
+  }
+
+  private applyAck(link: Link, ack: AckMessage): void {
     const i = link.sent.findIndex(
       (m) =>
         m.range.core === ack.core &&

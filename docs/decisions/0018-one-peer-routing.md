@@ -159,3 +159,102 @@ from zero, overruns that seeder and is banned. Cameron's answers:
 Implemented on `stage-3/owed-seeder` (seeder side: codec, engine, announcements) and
 `stage-3/owed-viewer` (viewer side: credit, payer, the worker's record, the host's tail
 authorisations).
+
+### Seeder side as built (2026-09-27, lane P1-owed-seeder)
+
+The normative text is in `packages/core/src/contracts/pay-protocol.ts`; the choices it fixes:
+
+- **When and what.** The report goes out when the seeder's channel opens and the viewer's pubkey
+  binds (a banned pubkey is cut instead). It names what the engine counts unpaid for that pubkey:
+  earlier connections under any Noise key, and this one's blocks sent before the HELLO (merged by
+  the bind). Cores in first-counted order, ranges ascending, the whole report capped at 256
+  ranges / 1024 blocks (`MAX_OWED_RANGES` / `MAX_OWED_BLOCKS`); what the caps leave out is still
+  in `ACK.outstanding`.
+- **Order.** The seeder handles the opening HELLO — bind and the whole report — before any frame
+  after it on the stream, and when its own HELLO goes out last the report follows it directly. A
+  viewer that asks nothing before its channel is `open` therefore has the whole report before the
+  first block it asks for, so "a block arrived, no `OWED`" means nothing is owed. Tested on real
+  streams for both HELLO orders.
+- **Terms.** Before a sold core's `OWED` the seeder sends its priced `PRICE`; owed ranges are
+  verified at the terms this connection was told (the core's current policy), inside this
+  connection's carry chain for the core: it restarts at 0 on the new channel and moves with every
+  accepted PAY of the core, so an owed range carries 0 only if it is the core's first PAY here. The seeder keeps no per-block record of the price a block was delivered at, so
+  a price change between two connections moves the owed blocks to the new price — the viewer,
+  which pays only at the terms it recorded, then leaves them unpaid (a residual, below). An `OWED`
+  with no priced `PRICE` (a core served free since, or with no terms) is counted and not payable.
+- **In memory.** The engine's counts live for the seeder process; a restarted seeder counts
+  nothing old and reports nothing.
+- **Residuals.** A report past the caps (heavily fragmented debts) is short until the first
+  `ACK.outstanding`. Owed blocks are priced at the current terms, not the delivery-time terms.
+  `OWED` has no end marker; the order rule above is what tells a viewer the report is complete.
+
+### Viewer side as built (2026-09-27, lane P2-owed-viewer)
+
+- **Credit from the report** (`SeederCredit`, shared by the desktop worker and the gateway).
+  - Per connection, a seeder's report is complete once anything it sent in answer to a frame we
+    sent after our HELLO arrives: a block we asked for after `open`, or an ACK. Replies to
+    requests made before the channel opened do not count: those in flight when its `pay/1`
+    attached (a gateway session may replicate before `pay/1` attaches), and, counted again when
+    the channel opens, those asked since on a core nobody pays for (independent review: such a
+    reply could land before the OWED and complete the report without it). Otherwise the report is
+    complete `REPORT_WAIT_MS` (10 s) after the channel opened, which bounds a report that never
+    arrives.
+  - Before the report, `old` is what this process knows of: blocks left unpaid on earlier
+    connections, and requests lost with them. It is the report so far instead, if that is
+    larger. The seeder is asked ONE block at a time (the router's new `single` option).
+  - At the report, what the seeder says it counts replaces our estimate of everything before this
+    connection: requests remembered as lost (`OnePeerRouter.forgive`), blocks settled unpaid,
+    what other Noise keys of its pubkey left, and the ledger's word for an earlier run.
+  - After the report, `old` is what it reported, plus what this connection left unpaid since.
+    Each ACK of a core re-bases that core to `outstanding` less the blocks of it still owed on the
+    link. That is an upper bound: blocks in flight count twice.
+  - A report that hit the contract's caps, or a malformed one, may be short. Nothing more is asked
+    of that seeder on that connection.
+- **The durable ledger** (desktop only). After a crash, the worker's record keeps, per seeder
+  pubkey, whether that seeder may count its whole window against us. The word is written
+  synchronously before anything is asked that could bring the seeder there, and cleared at a
+  flush once it is below. A seeder with that word is asked nothing before its report: not even
+  the one block, which would overrun a seeder left exactly at its window. Liveness is bounded by
+  `REPORT_WAIT_MS`. The word outlives the record's 7-day age-out, and the record's seeder bound
+  drops seeders holding only blocks first (independent review): the seeder keeps counting what we
+  forget.
+- **Paying the old tail** (desktop only).
+  - The worker's `UnpaidRecord` holds, per seeder pubkey and core, the blocks received and not
+    paid, each with its session's id, blob range and manifest policy. It is rewritten atomically
+    in batches (1 s) and at close.
+  - A block leaves the record when a PAY is built for it. So a seeder that takes a PAY and drops
+    before its ACK is never paid twice for reporting the same blocks again, just as a refused PAY
+    is never re-sent.
+  - On `OWED`, only the reported blocks the record also holds are handed to the payer
+    (`UpstreamPayer.addOwed`), and only after the core's priced PRICE on this connection. They
+    are paid at once, apart from this connection's blocks and on its carry chain, at the recorded
+    terms: the asked price may only lower them. They are paid under the recorded session's id.
+    Owed and fresh PAYs of a core share that one chain, and the worker hands the host the carry
+    of every PAY; a PAY without one is refused before the host is asked (independent review: the
+    fresh path dropped it, and a PAY split with 0 against another carry is refused `malformed`
+    after its proofs were spent). A PAY whose creator share is 0 sats carries an empty creator set
+    (contracts v5), which the worker's guard now admits.
+  - An owed range with no mint shared on this connection is dropped from this connection only
+    and stays in the record for a later one. A range the host refuses for good leaves it.
+  - The host checks that id as an open session. If the session is closed, it checks its tail
+    authorisation: the same core, blob range and terms, and a block budget taken off on disk
+    before the PAY is built.
+- **Tail authorisations** (`host/tails.ts`).
+  - `play.close` answers `{ unpaid }`, the session's blocks still in the record. The host keeps
+    `min(unpaid, what the session had left, MAX_TAIL_BLOCKS = 1024)` for 7 days, per identity, in
+    `<userData>/tails/<pubkey>.json` (private file).
+  - When the worker could not say (it was gone, a quit past its bound, a sign-out with sessions
+    open), the host keeps the session's remaining budget, with the same cap.
+  - The quit waits for these writes, including those the signer flow's plane starts as it closes;
+    and a new plane for an identity opens only after the closed plane's writes landed.
+  - An expired tail is refused `forbidden`. The worker drops those blocks from its record:
+    respected, never paid.
+- **The gateway** gets the credit-from-report part, including the one-block rule before the
+  report. It pays no old tail: it has no durable record of what it received and no host to
+  authorise a closed session's tail. What its previous run left unpaid stays counted at the
+  seeder, and the gateway stays under it, until that seeder forgets it (its own restart).
+- **Residuals** (lane record): a report delayed past `REPORT_WAIT_MS` for a seeder left at its
+  window. A full-app crash leaves no tail authorisation, since the task creates them at close or
+  quit, so that tail is respected and not paid. A compromised worker keeps its closed sessions'
+  capped budgets as spending authority for 7 days. The gateway has no durable ledger, so it keeps
+  the one-block risk after its own crash at a seeder's cap.

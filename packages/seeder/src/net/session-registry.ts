@@ -33,12 +33,21 @@ export interface SessionRegistryOptions {
    * unpriced (`{ satsPerBlock: 0 }` → the configured window).
    */
   readonly pricing?: (core: CoreKeyHex) => UploadPricing;
-  /** Forwarded to every session (`PeerSessionOptions.onFirstUpload`). */
-  readonly onFirstUpload?: (session: PeerSession, core: CoreKeyHex) => void;
+  /** Forwarded to every session (`PeerSessionOptions.beforeBlock`). */
+  readonly beforeBlock?: (session: PeerSession, core: CoreKeyHex, free: boolean) => void;
   /** Forwarded to every session (`PeerSessionOptions.accepting`: the pending-PAY cap). */
   readonly accepting?: () => boolean;
   /** Forwarded to every session (`PeerSessionOptions.isFree`: ADR 0015 free cores). */
   readonly isFree?: (core: CoreKeyHex) => boolean;
+  /**
+   * A remote opened a gated core on an admitted session's stream (Hypercore's `peer-add`: both
+   * ends of the core's replication channel are open), before it has asked for any block. Where the
+   * seeder says the core's terms unprompted (contracts v6 amendment, rule 1; ADR 0015's viewer asks
+   * a peer for an image block only after its `PRICE { free: true }`). Runs inside Hypercore's
+   * channel-open handler: what it throws is caught and logged here, never let into Hypercore (the
+   * seeder's `beforeBlock` still says the terms before the first block, and fails closed).
+   */
+  readonly onPeerAdd?: (session: PeerSession, core: CoreKeyHex) => void;
 }
 
 export class SessionRegistry {
@@ -52,9 +61,10 @@ export class SessionRegistry {
   private readonly log: Logger;
   private readonly now: (() => number) | undefined;
   private readonly pricing: ((core: CoreKeyHex) => UploadPricing) | undefined;
-  private readonly onFirstUpload: SessionRegistryOptions['onFirstUpload'];
+  private readonly beforeBlock: SessionRegistryOptions['beforeBlock'];
   private readonly accepting: SessionRegistryOptions['accepting'];
   private readonly isFree: SessionRegistryOptions['isFree'];
+  private readonly onPeerAdd: SessionRegistryOptions['onPeerAdd'];
 
   constructor(opts: SessionRegistryOptions) {
     this.engine = opts.engine;
@@ -62,9 +72,10 @@ export class SessionRegistry {
     this.rateLimiter = opts.rateLimiter;
     this.log = opts.logger;
     this.now = opts.now;
-    this.onFirstUpload = opts.onFirstUpload;
+    this.beforeBlock = opts.beforeBlock;
     this.accepting = opts.accepting;
     this.isFree = opts.isFree;
+    this.onPeerAdd = opts.onPeerAdd;
     this.pricing = opts.pricing;
   }
 
@@ -128,7 +139,7 @@ export class SessionRegistry {
       peerInfo,
       ...(this.now ? { now: this.now } : {}),
       ...(this.pricing ? { pricing: this.pricing } : {}),
-      ...(this.onFirstUpload ? { onFirstUpload: this.onFirstUpload } : {}),
+      ...(this.beforeBlock ? { beforeBlock: this.beforeBlock } : {}),
       ...(this.accepting ? { accepting: this.accepting } : {}),
       ...(this.isFree ? { isFree: this.isFree } : {}),
       onClose: (s) => {
@@ -164,7 +175,10 @@ export class SessionRegistry {
 
   /**
    * Attach the synchronous upload gate to a core. Every `upload` event resolves the peer's
-   * session by Noise key and forwards to `session.onUpload()`. Returns a detach function.
+   * session by Noise key and forwards to `session.onUpload()`. Every `peer-add` (the remote opened
+   * the core) goes to `onPeerAdd` with the session of that stream — looked up, never admitted
+   * (a stream that was not admitted carries no `pay/1` to say anything on). Returns a detach
+   * function.
    */
   attachUploadGate(core: Hypercore): () => void {
     const coreKeyHex = toHex(core.key);
@@ -173,10 +187,49 @@ export class SessionRegistry {
       if (session === null) return;
       session.onUpload(coreKeyHex, index, byteLength);
     };
+    const onPeer = (peer: ReplicationPeer): void => {
+      const session = this.sessionOf(peer);
+      if (session === null) return;
+      this.peerAdded(session, coreKeyHex as CoreKeyHex);
+    };
     core.on('upload', handler);
+    core.on('peer-add', onPeer);
     return () => {
       core.off('upload', handler);
+      core.off('peer-add', onPeer);
     };
+  }
+
+  /**
+   * The live, admitted session a replication peer belongs to: the one on the SAME stream (a second
+   * connection from the same Noise key is another session, and a core paired on the old one is not
+   * the new one's). `null` when none — never admits.
+   */
+  sessionOf(peer: ReplicationPeer): PeerSession | null {
+    const found = this.byNoise.get(toHex(peer.remotePublicKey));
+    if (found !== undefined && !found.closed && found.stream === peer.stream) return found;
+    for (const s of this.live) if (!s.closed && s.stream === peer.stream) return s;
+    return null;
+  }
+
+  /** The live sessions on whose streams `core` is paired now (`core.peers`), each once. */
+  pairedSessions(core: Hypercore): readonly PeerSession[] {
+    const out = new Set<PeerSession>();
+    for (const peer of core.peers) {
+      const s = this.sessionOf(peer);
+      if (s !== null) out.add(s);
+    }
+    return [...out];
+  }
+
+  /** `onPeerAdd`, contained: nothing it throws reaches Hypercore's channel-open handler. */
+  private peerAdded(session: PeerSession, core: CoreKeyHex): void {
+    if (this.onPeerAdd === undefined) return;
+    try {
+      this.onPeerAdd(session, core);
+    } catch (err) {
+      this.log.error('peer-add hook threw', { error: err });
+    }
   }
 
   /** Cut every session bound to (or provisionally accounted as) `pubkey`. */

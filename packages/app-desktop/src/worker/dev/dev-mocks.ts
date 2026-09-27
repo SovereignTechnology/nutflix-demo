@@ -130,7 +130,12 @@ export function devMockProviders(o: DevMockOptions): DevMockProviders {
   return {
     engine,
     seederEngine: engine,
-    pay: (range, seeder, policy) => engine.pay(range, seeder, policy),
+    // The carry of the channel's chain, as the payer passes it (the mock's own running carry
+    // outlives a channel; the seeder's restarts at 0 on each).
+    pay: (range, seeder, policy, opts) => engine.pay(range, seeder, policy, opts),
+    // A dev identity is new every run (nothing is recorded for it): mid-run tails only.
+    payOwed: (_sid, range, seeder, policy, carryIn) =>
+      engine.pay(range, seeder, policy, { carryIn }),
     viewerMints: engine.config.acceptedMints,
     payWiring: {
       protocol: (link) => o.hub.endpoint(link),

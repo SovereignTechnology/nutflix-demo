@@ -55,5 +55,19 @@
  *       `Wallet.inputFeePpk` (mint fees shown in the price). And issue #2 (auto top-ups
  *       execute): `Settings.autoTopUp.amountSats?`, `AUTO_TOP_UP_MAX_SATS` (10 000) and
  *       `AUTO_TOP_UP_MAX_SATS_PER_DAY` (50 000, rolling 24 h).
+ *       Amended 2026-09-26 (Stage 3, no bump; Cameron, amendments to ADRs 0015 and 0018),
+ *       additive on pay/1: `PriceMessage.free?` (a seeder serves that core outside payment:
+ *       `satsPerBlock` and `effectiveFromBlock` 0); `OwedMessage` (tag 5, seeder → viewer: the
+ *       unpaid blocks of one core it still counts for the viewer's HELLO pubkey, canonical ranges
+ *       bounded by `MAX_OWED_RANGES` 256 / `MAX_OWED_BLOCKS` 1024); `AckMessage.outstanding?`
+ *       (after the PAY, the blocks of that core still counted); `PayProtocolEvents.owed` and
+ *       `PayProtocol.sendOwed`. Normative for every seeder this repository builds: a core's
+ *       `PRICE` (priced, or `free`) as soon as a peer has the core open on a pay/1 connection,
+ *       unprompted, and in any case before its first block to that peer; `OWED` once both HELLOs
+ *       verify (with the core's priced `PRICE` first); `outstanding` in every ACK
+ *       (`pay-protocol.ts`). `PAY_PROTOCOL_VERSION` stays 1: a priced `PRICE` is byte-for-byte the
+ *       v5 frame (its flags byte is written only with `free`), while an older build's codec
+ *       refuses `OWED`, a `free` PRICE and an ACK carrying `outstanding`, and closes pay/1 (no
+ *       deployed base yet).
  */
 export const CONTRACTS_VERSION = 6 as const;

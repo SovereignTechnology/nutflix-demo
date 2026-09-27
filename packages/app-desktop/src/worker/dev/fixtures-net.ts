@@ -171,16 +171,15 @@ export async function createFixtureSeeder(o: FixtureSeederOptions): Promise<Fixt
       diskCapBytes: 4 * 1024 ** 3,
       swarm: null,
       policy: o.policy,
-      // Like every seeder this repository builds (fix round 4): a core's PRICE precedes its first
-      // counted block, so a viewer reading an image learns the core is sold before our window
-      // would cut it.
-      announceCorePrices: true,
+      // Like every seeder this repository builds (contracts v6 amendment, always on in `Seeder`):
+      // a core's PRICE (priced, or `free`) precedes its first block, a returning viewer gets OWED,
+      // and every ACK carries `outstanding`.
     },
     { engine, fs: o.fs, crypto: o.crypto, logger },
   );
   const credit = new CreditPool(DEFAULT_WINDOW_BLOCKS);
   const payer = new ViewerPayer({
-    pay: (range, s, policy) => engine.pay(range, s, policy),
+    pay: (range, s, policy, opts) => engine.pay(range, s, policy, opts),
     ownMints: engine.config.acceptedMints,
     credit,
     logger,

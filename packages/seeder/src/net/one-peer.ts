@@ -28,8 +28,13 @@
  *      hypercore's own cap; anything else that is not a finite number ≥ 1 asks nothing.
  *   3. `refresh()` re-runs hypercore's scheduler (`updateAll()`) after a budget grew (an ACK, a
  *      HELLO), and while a request is stalled a ticker runs `updatePeer()` so a failover can fire.
- *   4. (fix round 4) with the `probe` option, a peer being probed on a core — a seeder not yet
- *      known to serve an image core free — is asked one block of it at a time.
+ *   4. (lane P2-owed-viewer, ADR 0018 amendment) with the `single` option, a peer whose count is
+ *      not known yet — its `pay/1` report is not in — is asked one block at a time on the cores
+ *      it counts.
+ *   5. (lane P2-owed-viewer, ADR 0015 amendment) with the `free` option, a peer that serves a core
+ *      outside payment (its `PRICE { free: true }`) is capped on that core by the budget alone:
+ *      what it may count on its other cores does not hold that core back, and nothing asked of it
+ *      there — in flight, cancelled or lost with a peer — is ever counted in `used` or `debt`.
  *
  * A request has STALLED when it is at least `stallMs` old AND its peer has delivered no block on
  * that core for `stallMs` (measured from the later of the request and the peer's last block): a
@@ -123,11 +128,21 @@ export interface OnePeerRouterOptions {
   /** A request was taken from a stalled peer (`remote`) and given to another one. */
   readonly onFailover?: (remote: string, core: string) => void;
   /**
-   * Fix round 4: `true` = ask `remote` at most ONE block of `core` at a time (a seeder not yet
-   * known to serve an image core free — `SeederCredit.probing`), within its credit as always. A
-   * throw counts as `true` (the narrower cap).
+   * Lane P2-owed-viewer (ADR 0018 amendment): `true` = ask `remote` at most ONE block at a time on
+   * the cores it counts (every routed core it does not serve `free`), within its credit as always
+   * — its `pay/1` report of what it still counts for us is not in yet (`SeederCredit`). A throw
+   * counts as `true` (the narrower cap).
    */
-  readonly probe?: (remote: string, core: string) => boolean;
+  readonly single?: (remote: string) => boolean;
+  /**
+   * Lane P2-owed-viewer (ADR 0015 amendment): `true` = `remote` serves `core` outside payment (its
+   * `PRICE { free: true }` on the current connection), so it counts nothing it sends of it. Its
+   * cap on `core` is `budget` less what it has in flight THERE (not `used`), and none of its
+   * requests on `core` — in flight, being verified, cancelled after sending, or lost when its peer
+   * goes — is counted in `used`, `inflight` or `debt`. Read live: a core that turns sold counts
+   * again from then on, all of it (the safe side). A throw counts as `false` (counted).
+   */
+  readonly free?: (remote: string, core: string) => boolean;
 }
 
 export interface OnePeerRouterStats {
@@ -460,6 +475,8 @@ export class OnePeerRouter {
   private readonly stalled = new Set<string>();
   /** Replication peer → when it last delivered a block on its core (the stall rule). */
   private readonly delivered = new WeakMap<object, number>();
+  /** Replication peer → the routed core it replicates (hex; the `free` option asks per core). */
+  private readonly coreOf = new WeakMap<object, string>();
   private failovers = 0;
   private raced = 0;
   private ticker: ReturnType<typeof setInterval> | null = null;
@@ -514,18 +531,48 @@ export class OnePeerRouter {
     });
   }
 
-  /** What `remote` may have outstanding toward us beyond the blocks it delivered (see header). */
+  /**
+   * What `remote` may have outstanding toward us beyond the blocks it delivered (see header) — on
+   * the cores it counts (not those it serves `free`).
+   */
   used(remote: string): number {
     let n = this.lost.get(remote) ?? 0;
-    for (const p of this.byRemote.get(remote) ?? []) n += load(p);
+    for (const p of this.byRemote.get(remote) ?? []) if (this.counted(remote, p)) n += load(p);
     return n;
   }
 
-  /** Requests in flight to `remote` and blocks from it being verified, on the routed cores. */
+  /**
+   * Requests in flight to `remote` and blocks from it being verified, on the routed cores it
+   * counts (not those it serves `free`).
+   */
   inflight(remote: string): number {
     let n = 0;
-    for (const p of this.byRemote.get(remote) ?? []) n += p.inflight + p.dataProcessing;
+    for (const p of this.byRemote.get(remote) ?? [])
+      if (this.counted(remote, p)) n += p.inflight + p.dataProcessing;
     return n;
+  }
+
+  /**
+   * Requests `remote` may have answered that nothing will ever pay, remembered from replication
+   * peers now gone (the part of `debt` that outlives them).
+   */
+  lostOf(remote: string): number {
+    return this.lost.get(remote) ?? 0;
+  }
+
+  /**
+   * Lane P2-owed-viewer (ADR 0018 amendment): drop `n` of the requests remembered as lost to
+   * `remote` (at most all of them). Its `SeederCredit` calls it when `remote`'s `pay/1` report
+   * came in: the seeder then said itself what it still counts from before this connection, which
+   * replaces this estimate of it. Lost requests of the current connection are the caller's to keep
+   * (it passes only what it remembered when the connection began).
+   */
+  forgive(remote: string, n: number): void {
+    const had = this.lost.get(remote);
+    if (had === undefined || !Number.isSafeInteger(n) || n <= 0) return;
+    const left = had - Math.min(had, n);
+    if (left > 0) this.lost.set(remote, left);
+    else this.lost.delete(remote);
   }
 
   /**
@@ -554,10 +601,14 @@ export class OnePeerRouter {
     return this.stalled.has(remote);
   }
 
-  /** The part of `used` that never comes back: cancelled after sending, or lost with a channel. */
+  /**
+   * The part of `used` that never comes back: cancelled after sending, or lost with a channel (on
+   * the cores `remote` counts: a request of a `free` core is owed nothing, whatever became of it).
+   */
   debt(remote: string): number {
     let n = this.lost.get(remote) ?? 0;
-    for (const p of this.byRemote.get(remote) ?? []) n += p.stats.wireCancel.tx;
+    for (const p of this.byRemote.get(remote) ?? [])
+      if (this.counted(remote, p)) n += p.stats.wireCancel.tx;
     return n;
   }
 
@@ -700,6 +751,7 @@ export class OnePeerRouter {
     if (route.peers.has(peer)) return;
     const remote = toHex(peer.remotePublicKey);
     route.peers.set(peer, remote);
+    this.coreOf.set(peer, route.keyHex);
     let set = this.byRemote.get(remote);
     if (set === undefined) {
       set = new Set();
@@ -724,8 +776,9 @@ export class OnePeerRouter {
     // Requests in flight when the channel closed, blocks mid-verify and cancelled requests: the
     // peer may have sent every one of them and none of them will be paid, so they stay counted
     // against its window for good. (A block mid-verify that still lands is then counted twice,
-    // which errs on the safe side.)
-    this.remember(remote, load(peer));
+    // which errs on the safe side.) Not on a core it serves `free`: it counted none of them — a
+    // free read that timed out or was stopped leaves no debt (lane P2-owed-viewer).
+    if (!this.isFree(remote, route.keyHex)) this.remember(remote, load(peer));
     const set = this.byRemote.get(remote);
     set?.delete(peer);
     if (set?.size === 0) this.byRemote.delete(remote);
@@ -756,22 +809,46 @@ export class OnePeerRouter {
     if (budget === UNCAPPED) return base;
     const credit =
       typeof budget === 'number' && Number.isFinite(budget) && budget >= 1 ? Math.floor(budget) : 0;
+    if (this.isFree(remote, route.keyHex)) {
+      // Served outside payment: only what is in flight on THIS core holds it back (lane
+      // P2-owed-viewer) — never what the peer may count on the cores it sells.
+      let free = Math.max(0, credit - peer.inflight - peer.dataProcessing);
+      if (this.stalled.has(remote))
+        free = Math.min(free, Math.max(0, 1 - peer.inflight - peer.dataProcessing));
+      return Math.min(base, peer.inflight + free);
+    }
     let free = Math.max(0, credit - this.used(remote));
-    if (this.stalled.has(remote)) free = Math.min(free, Math.max(0, 1 - this.inflight(remote)));
-    if (this.probing(remote, route.keyHex))
-      free = Math.min(free, Math.max(0, 1 - peer.inflight - peer.dataProcessing));
+    if (this.stalled.has(remote) || this.isSingle(remote))
+      free = Math.min(free, Math.max(0, 1 - this.inflight(remote)));
     return Math.min(base, peer.inflight + free);
   }
 
-  /** The `probe` option (fix round 4); a throw is a probe. */
-  private probing(remote: string, core: string): boolean {
-    const probe = this.o.probe;
-    if (probe === undefined) return false;
+  /** The `single` option (lane P2-owed-viewer); a throw is `true` (the narrower cap). */
+  private isSingle(remote: string): boolean {
+    const single = this.o.single;
+    if (single === undefined) return false;
     try {
-      return probe(remote, core);
+      return single(remote);
     } catch {
       return true;
     }
+  }
+
+  /** The `free` option (lane P2-owed-viewer); a throw is `false` (counted: the safe side). */
+  private isFree(remote: string, core: string): boolean {
+    const free = this.o.free;
+    if (free === undefined) return false;
+    try {
+      return free(remote, core);
+    } catch {
+      return false;
+    }
+  }
+
+  /** Whether `p` (a peer of `remote`) replicates a core `remote` counts (not one it serves free). */
+  private counted(remote: string, p: object): boolean {
+    const core = this.coreOf.get(p);
+    return core === undefined || !this.isFree(remote, core);
   }
 
   /**

@@ -165,6 +165,7 @@ describe('the money plane’s default mint transport sends each request once (fi
       defaultMints: () => [url],
       log: memoryLogger('warn'),
       journalDir: join(dir, WALLET_DIR),
+      tailDir: null, // in memory: not about tail authorisations
       createWallet: true,
       // no mintRequest: the host's own default
     });
@@ -205,6 +206,7 @@ describe('the money plane’s default mint transport sends each request once (fi
       defaultMints: () => [url],
       log: memoryLogger('warn'),
       journalDir: join(dir, WALLET_DIR),
+      tailDir: null, // in memory: not about tail authorisations
       createWallet: true,
       mintRequest: () => undefined,
     });

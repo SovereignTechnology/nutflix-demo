@@ -84,6 +84,7 @@ async function rig(
   const plane = await MoneyPlane.open({
     signer,
     journalDir: null, // in memory: these tests are not about the journal
+    tailDir: null, // in memory: not about tail authorisations
     pool,
     relays: () => [{ url: RELAY, read: true, write: true }],
     defaultMints: () => [MINT],
@@ -141,6 +142,7 @@ describe('MoneyPlane: the NIP-60 wallet', () => {
     const again = await MoneyPlane.open({
       signer: a.signer,
       journalDir: null, // in memory: these tests are not about the journal
+      tailDir: null, // in memory: not about tail authorisations
       pool,
       relays: () => [{ url: RELAY, read: true, write: true }],
       defaultMints: () => [MINT],
@@ -157,6 +159,7 @@ describe('MoneyPlane: the NIP-60 wallet', () => {
       MoneyPlane.open({
         signer: other,
         journalDir: null, // in memory: these tests are not about the journal
+        tailDir: null, // in memory: not about tail authorisations
         pool,
         relays: () => [{ url: RELAY, read: true, write: true }],
         defaultMints: () => [MINT],
@@ -235,7 +238,7 @@ describe('MoneyPlane: pay.build is authorised', () => {
       await h['pay.build']!(build({ range: { core: CORE, fromBlock: 10, toBlock: 11 } }));
     expect(await refused(build())).toBe('forbidden');
     // Revoked: nothing more for this session.
-    plane.revokeSession(SID);
+    void plane.revokeSession(SID);
     expect(await refused(build())).toBe('session-closed');
   });
 
@@ -640,7 +643,7 @@ describe('MoneyPlane: PAY builds and melts never overlap at a mint (ADR 0012 ame
       h['pay.build']!(build({ range: { core: CORE, fromBlock: 12, toBlock: 13 } })),
     );
     await settleIo();
-    plane.revokeSession(SID); // play.close while the PAY waits
+    void plane.revokeSession(SID); // play.close while the PAY waits
     held.release();
     await settleIo();
     await settleIo();

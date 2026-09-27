@@ -14,18 +14,24 @@ import type { CoreKeyHex, PayMessage, PricePolicy, Sats } from '@sovit/core';
 import { Seeder, nodeCrypto, nodeFs, toHex } from '@sovit/seeder';
 
 import {
+  MAX_CLOCK_STEP_MS,
   MAX_PAY_FAILURES,
   PAY_GIVE_UP_MS,
   PAY_RETRY_BASE_MS,
+  PAY_RETRY_LATER_MAX_MS,
+  PAY_RETRY_LATER_MS,
   PAY_RETRY_MAX_MS,
   UpstreamPayer,
   manifestPolicyResolver,
+  monotonicClock,
+  payFailureClass,
 } from '../upstream/payer.js';
 import type { UpstreamPayerOptions } from '../upstream/payer.js';
 import { FakePayProtocol, helloFrom } from './fake-pay-protocol.js';
 import {
   BLOCK,
   CREATOR_P2PK,
+  GW_PUBKEY,
   MINT_A,
   MINT_B,
   basePolicy,
@@ -390,12 +396,12 @@ describe('UpstreamPayer (integration): gateway pulls from a real upstream seeder
     for (const c of closers.splice(0).reverse()) await c();
   });
 
-  async function upstream() {
+  async function upstream(windowBlocks = 100) {
     const t = await tmpDir('nutflix-l3-upstream-');
     const engine = new mocks.MockPaymentEngine({
       mode: 'honest',
       config: {
-        windowBlocks: 100,
+        windowBlocks,
         acceptedMints: [MINT_A, MINT_B],
         ownP2pk: UP_P2PK,
         ownPubkey: UP_PUBKEY,
@@ -510,6 +516,91 @@ describe('UpstreamPayer (integration): gateway pulls from a real upstream seeder
     expect(forwarded.every((m) => m.seederProofs.lockedTo === UP_P2PK)).toBe(true);
     // And the blob is now served by the gateway as its own (Blossom index is the seeder's).
     expect(r.gateway.seeder.blobs.coreByKey(coreKey)).toBeDefined();
+  });
+
+  // Lane P2-owed-viewer (ADR 0018 amendment): the gateway has no durable record and no host to
+  // authorise an old tail, so it pays none — but it must stay under what the upstream seeder says
+  // it still counts for it, or a restarted gateway is banned for its previous run's tail.
+  it('the gateway stays under what the upstream reports it still counts (OWED, ACK.outstanding), pays none of that old tail, and is never banned', async () => {
+    const BLOCKS = 9;
+    const WIN = 6;
+    const up = await upstream(WIN);
+    const data = fixtureBytes(BLOCKS, 23);
+    const put = await up.seeder.putBytes(data, { mime: 'video/mp4' });
+    if (!put.ok) throw new Error(put.error.code);
+    const coreKey = put.entry.coreKey;
+    // What an earlier run of the gateway left unpaid there: two blocks (past this blob).
+    up.engine.recordUpload(GW_PUBKEY, { core: coreKey, fromBlock: 50, toBlock: 51 }, basePolicy(3));
+    expect(up.engine.window(GW_PUBKEY)).toMatchObject({ outstanding: 2 });
+
+    const r = await rig({ windowBlocks: 100, raw: { upstream: { payEveryBlocks: 2 } } });
+    const gwStream = r.gateway.seeder.replicate(true);
+    const upStream = up.seeder.replicate(false);
+    gwStream.on('error', () => undefined);
+    upStream.on('error', () => undefined);
+    gwStream.pipe(upStream).pipe(gwStream);
+    const upProto = new FakePayProtocol();
+    await until(() => r.protocols.length === 1);
+    const gwProto = r.protocols[0]!;
+    const upSession = await (async () => {
+      await until(() => up.seeder.sessionInfos().length === 1);
+      return up.seeder.session(up.seeder.sessionInfos()[0]!.noiseKeyHex)!;
+    })();
+    up.seeder.attachPayProtocol(upSession, upProto);
+    // Bridge the two fakes: PAY up; ACK, PRICE and OWED down.
+    const origSendPay = gwProto.sendPay.bind(gwProto);
+    gwProto.sendPay = (msg) => {
+      origSendPay(msg);
+      upProto.remotePay(msg);
+    };
+    upProto.sendAck = (ack) => {
+      gwProto.remoteAck({ type: 'ACK', ...ack });
+    };
+    upProto.sendPrice = (price) => {
+      gwProto.remotePrice({ type: 'PRICE', ...price });
+    };
+    upProto.sendOwed = (owed) => {
+      gwProto.remoteOwed({ type: 'OWED', ...owed });
+    };
+    r.gateway.setUpstreamPolicy(coreKey, basePolicy(3));
+    const sc = await r.gateway.openUpstreamCore(coreKey);
+    // Both HELLOs: the upstream binds the gateway's pubkey and reports what it still counts.
+    gwProto.remoteHello(
+      helloFrom(UP_PUBKEY, {
+        acceptedMints: [MINT_A, MINT_B],
+        satsPerBlock: 3 as Sats,
+        p2pk: UP_P2PK,
+        windowBlocks: WIN,
+      }),
+    );
+    upProto.remoteHello(helloFrom(GW_PUBKEY, { acceptedMints: [MINT_A], windowBlocks: 0 }));
+    let worst = 0;
+    const sample = setInterval(() => {
+      worst = Math.max(worst, up.engine.window(GW_PUBKEY)?.outstanding ?? 0);
+    }, 1);
+    try {
+      const got = await sc.blobs.get(put.entry.blob, { wait: true, timeout: 15_000 });
+      expect(Buffer.from(got!).equals(Buffer.from(data))).toBe(true);
+      await r.gateway.payer.flush();
+      await until(() => up.engine.window(GW_PUBKEY)?.outstanding === 2, 10_000);
+    } finally {
+      clearInterval(sample);
+    }
+    const upNoise = toHex(upStream.noiseStream.publicKey!);
+    expect(r.gateway.seeders.reportOf(upNoise)).toMatchObject({ done: true, truncated: false });
+    // It paid this blob, and none of the old tail (no record, no host: it cannot know it got them).
+    const covered = gwProto.sentPays.flatMap((p) =>
+      Array.from(
+        { length: p.range.toBlock - p.range.fromBlock + 1 },
+        (_, i) => p.range.fromBlock + i,
+      ),
+    );
+    expect([...covered].sort((a, b) => a - b)).toEqual([...Array(BLOCKS).keys()]);
+    expect(r.gateway.payer.stats()).toMatchObject({ owedAccepted: 0, owedPaid: 0 });
+    // Never beyond window minus the reported count: never banned, never past the window.
+    expect(worst).toBeLessThanOrEqual(WIN);
+    expect(up.engine.window(GW_PUBKEY)).toMatchObject({ outstanding: 2, banned: false });
+    expect(up.engine.bans()).toEqual([]);
   });
 
   it('pays each core under its MANIFEST policy (creator P2PK from the manifest); a core without one is not paid (F2)', async () => {
@@ -954,5 +1045,595 @@ describe('UpstreamPayer — transient failures back off in time; two sessions of
     await settle();
     expect(sent(g.protocol)).toEqual([[CORE_A, 4, 4]]);
     off();
+  });
+});
+
+// Lane R6-reconcile: one retry mechanism for lane I2-paygate's "rate-limited" and fix round 5's
+// transient failures; the round-5 verifier's two payer items (a final give-up ends the streak; a
+// monotonic clock).
+describe('UpstreamPayer — deferred refusals, streaks and the clock (lane R6-reconcile)', () => {
+  function rig6(
+    fail: (range: { core: CoreKeyHex; fromBlock: number; toBlock: number }) => Error | null,
+    opts: Partial<UpstreamPayerOptions> & { readonly batch?: number } = {},
+  ) {
+    const engine = new mocks.MockPaymentEngine({ mode: 'honest' });
+    const calls: [CoreKeyHex, number, number][] = [];
+    const unpayable: [CoreKeyHex, number, number][] = [];
+    const log = capturedLogger();
+    const perCore = new Map<CoreKeyHex, PricePolicy>([
+      [CORE_A, basePolicy(MANIFEST_PRICE)],
+      [CORE_B, basePolicy(MANIFEST_PRICE)],
+    ]);
+    const payer = new UpstreamPayer({
+      engine: {
+        pay: (range, seeder, policy, o) => {
+          calls.push([range.core, range.fromBlock, range.toBlock]);
+          const err = fail(range);
+          return err === null ? engine.pay(range, seeder, policy, o) : Promise.reject(err);
+        },
+        spent: () => engine.spent(),
+      },
+      logger: log.logger,
+      payEveryBlocks: 1,
+      tailMs: 0,
+      seederBatch: () => ({ batch: opts.batch ?? 4, atCap: true }),
+      ownMints: [MINT_A, MINT_B],
+      policyFor: manifestPolicyResolver(() => perCore),
+      onUnpayable: (_noise, r) => {
+        unpayable.push([r.core, r.fromBlock, r.toBlock]);
+      },
+      ...opts,
+    });
+    const protocol = new FakePayProtocol({ autoAck: true });
+    payer.attachPeer(NOISE, protocol);
+    protocol.remoteHello(hello());
+    const sent = (): [CoreKeyHex, number, number][] =>
+      protocol.sentPays.map((m) => [m.range.core, m.range.fromBlock, m.range.toBlock]);
+    return { payer, protocol, calls, unpayable, sent, log };
+  }
+  const limited = (): Error =>
+    Object.assign(new Error('rate-limited: a melt is in progress at this mint'), {
+      code: 'rate-limited',
+    });
+
+  it('classifies outcomes: session-closed and forbidden final, rate-limited deferred, anything else transient', () => {
+    expect(payFailureClass('session-closed')).toBe('final');
+    expect(payFailureClass('forbidden')).toBe('final');
+    expect(payFailureClass('rate-limited')).toBe('deferred');
+    for (const c of ['no-balance', 'backend-down', 'internal', 'error', 'rate-limitedx'])
+      expect(payFailureClass(c)).toBe('transient');
+  });
+
+  it('a 5-minute "rate-limited" (a melt at the mint) is never given up: asked on its own cadence, then paid once the host accepts', async () => {
+    vi.useFakeTimers();
+    try {
+      let melting = true;
+      const r = rig6(() => (melting ? limited() : null));
+      r.payer.onDownload(CORE_A, 0, NOISE); // at the cap: paid at once — and refused
+      await vi.advanceTimersByTimeAsync(0);
+      expect(r.calls).toHaveLength(1);
+      await vi.advanceTimersByTimeAsync(PAY_RETRY_LATER_MS - 1);
+      expect(r.calls).toHaveLength(1); // not the transient cadence (PAY_RETRY_BASE_MS)
+      await vi.advanceTimersByTimeAsync(1);
+      expect(r.calls).toHaveLength(2);
+      // A burst of flushes (a close drain polls every 25 ms) asks nothing inside the backoff.
+      for (let i = 0; i < 20; i++) {
+        await r.payer.flush();
+        await vi.advanceTimersByTimeAsync(25);
+      }
+      expect(r.calls).toHaveLength(2);
+      await vi.advanceTimersByTimeAsync(300_000);
+      // 2, 4, 8, 16 s, then every 30 s: about 13 asks in 5 minutes, and never given up.
+      expect(r.calls.length).toBeGreaterThanOrEqual(10);
+      expect(r.calls.length).toBeLessThanOrEqual(Math.ceil(300_000 / PAY_RETRY_LATER_MAX_MS) + 6);
+      expect(r.unpayable).toEqual([]);
+      expect(r.sent()).toEqual([]);
+      melting = false;
+      await vi.advanceTimersByTimeAsync(PAY_RETRY_LATER_MAX_MS);
+      expect(r.sent()).toEqual([[CORE_A, 0, 0]]);
+      expect(r.payer.stats()).toMatchObject({ pays: 1, unpayableBlocks: 0 });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('a deferred refusal ends a transient streak: its time never counts toward giving up', async () => {
+    vi.useFakeTimers();
+    try {
+      let mode: 'transient' | 'limited' | 'ok' = 'transient';
+      const r = rig6(() =>
+        mode === 'transient'
+          ? new Error('no-balance: not enough sats at this mint')
+          : mode === 'limited'
+            ? limited()
+            : null,
+      );
+      r.payer.onDownload(CORE_A, 0, NOISE);
+      await vi.advanceTimersByTimeAsync(PAY_GIVE_UP_MS - PAY_RETRY_MAX_MS - 100); // a long streak
+      expect(r.calls.length).toBeGreaterThanOrEqual(MAX_PAY_FAILURES);
+      expect(r.unpayable).toEqual([]);
+      mode = 'limited'; // a melt at the mint: two minutes of "not now"
+      await vi.advanceTimersByTimeAsync(120_000);
+      expect(r.unpayable).toEqual([]);
+      mode = 'transient'; // the melt is over; the mint blips once more
+      const before = r.calls.length;
+      await vi.advanceTimersByTimeAsync(PAY_RETRY_LATER_MAX_MS);
+      expect(r.calls.length).toBeGreaterThan(before);
+      // A fresh transient streak: not written off at once (the old streak's age plus the melt's
+      // would have been far past PAY_GIVE_UP_MS).
+      expect(r.unpayable).toEqual([]);
+      mode = 'ok';
+      await vi.advanceTimersByTimeAsync(PAY_RETRY_MAX_MS + 10);
+      expect(r.sent()).toEqual([[CORE_A, 0, 0]]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // The round-5 verifier's sequence: a streak of transient failures on session A's range, then A
+  // closes (its range given up with a final code); 40 s later session B's range of the same core
+  // fails once, transiently. Round 5 kept the old streak (n ≥ 3, first failure 40 s ago), so B's
+  // range was written off at that first failure.
+  it("a range given up with a final code ends the core's streak: a later transient failure starts afresh and is paid once it clears", async () => {
+    vi.useFakeTimers();
+    try {
+      let aClosed = false;
+      let bDown = false;
+      const r = rig6((range) => {
+        if (range.toBlock < 5)
+          return aClosed
+            ? new Error('session-closed: no play session covers these blocks')
+            : new Error('backend-down: the host is busy');
+        return bDown ? new Error('backend-down: the host is busy') : null;
+      });
+      r.payer.onDownload(CORE_A, 0, NOISE); // session A
+      await vi.advanceTimersByTimeAsync(2 * PAY_RETRY_MAX_MS); // 0, 250, 750, 1750, 3750, 7750 ms
+      expect(r.calls.length).toBeGreaterThanOrEqual(MAX_PAY_FAILURES);
+      aClosed = true;
+      await vi.advanceTimersByTimeAsync(PAY_RETRY_MAX_MS);
+      expect(r.unpayable).toEqual([[CORE_A, 0, 0]]);
+      await vi.advanceTimersByTimeAsync(40_000);
+      bDown = true;
+      r.payer.onDownload(CORE_A, 5, NOISE); // session B, a mint blip
+      await vi.advanceTimersByTimeAsync(0);
+      expect(r.unpayable).toEqual([[CORE_A, 0, 0]]); // B's range NOT written off
+      bDown = false;
+      await vi.advanceTimersByTimeAsync(PAY_RETRY_BASE_MS);
+      expect(r.sent()).toEqual([[CORE_A, 5, 5]]);
+      expect(r.unpayable).toEqual([[CORE_A, 0, 0]]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("the final code also frees the core's next run from the old backoff: tried in the same pass", async () => {
+    let closed = false;
+    const r = rig6(
+      (range) =>
+        range.toBlock < 5
+          ? new Error(closed ? 'forbidden: outside the video' : 'backend-down: busy')
+          : null,
+      { batch: 8, clock: () => 0 },
+    );
+    r.payer.onDownload(CORE_A, 0, NOISE);
+    await settle();
+    expect(r.calls).toEqual([[CORE_A, 0, 0]]); // refused: a backoff that (clock 0) never ends
+    closed = true;
+    r.payer.onDownload(CORE_A, 6, NOISE);
+    // The clock stands still, so only a retry TIMER could end the backoff; wait for it to fire
+    // (PAY_RETRY_BASE_MS, real time), when block 0 is given up for good and block 6 is paid in the
+    // same pass — not held back by the streak block 0 left behind.
+    await until(() => r.sent().length === 1, 2_000);
+    expect(r.unpayable).toEqual([[CORE_A, 0, 0]]);
+    expect(r.sent()).toEqual([[CORE_A, 6, 6]]);
+  });
+
+  it('streaks read the injected monotonic clock, never Date.now(): a wall-clock step writes nothing off; a step of the clock itself does', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+    try {
+      let mono = 0;
+      const r = rig6(() => new Error('no-balance: not enough sats at this mint'), {
+        clock: () => mono,
+      });
+      r.payer.onDownload(CORE_A, 0, NOISE);
+      await vi.advanceTimersByTimeAsync(0);
+      // Three more tries on the backoff, the monotonic clock moving with the timers.
+      for (const d of [PAY_RETRY_BASE_MS, 2 * PAY_RETRY_BASE_MS, 4 * PAY_RETRY_BASE_MS]) {
+        mono += d;
+        await vi.advanceTimersByTimeAsync(d);
+      }
+      expect(r.calls).toHaveLength(MAX_PAY_FAILURES + 1);
+      // The wall clock jumps a day ahead (NTP, a resume from suspend): nothing is written off.
+      vi.setSystemTime(Date.now() + 24 * 60 * 60_000);
+      mono += 8 * PAY_RETRY_BASE_MS;
+      await vi.advanceTimersByTimeAsync(8 * PAY_RETRY_BASE_MS);
+      expect(r.calls).toHaveLength(MAX_PAY_FAILURES + 2);
+      expect(r.unpayable).toEqual([]);
+      // …and a step back of the wall clock holds no retry back.
+      vi.setSystemTime(Date.now() - 48 * 60 * 60_000);
+      mono += PAY_RETRY_MAX_MS;
+      await vi.advanceTimersByTimeAsync(PAY_RETRY_MAX_MS);
+      expect(r.calls).toHaveLength(MAX_PAY_FAILURES + 3);
+      expect(r.unpayable).toEqual([]);
+      // The monotonic clock itself past PAY_GIVE_UP_MS: the next failure gives the range up.
+      mono += PAY_GIVE_UP_MS;
+      await vi.advanceTimersByTimeAsync(PAY_RETRY_MAX_MS);
+      expect(r.unpayable).toEqual([[CORE_A, 0, 0]]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('a clock that stands still cannot stall a retry: the retry timer ends the backoff', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      let down = true;
+      const r = rig6(() => (down ? new Error('backend-down: the host is busy') : null), {
+        clock: () => 1_000,
+      });
+      r.payer.onDownload(CORE_A, 0, NOISE);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(r.calls).toHaveLength(1);
+      down = false;
+      await vi.advanceTimersByTimeAsync(PAY_RETRY_BASE_MS - 1);
+      expect(r.calls).toHaveLength(1);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(r.sent()).toEqual([[CORE_A, 0, 0]]);
+      // …and a frozen clock never gives up either (its streak never ages): fail-safe.
+      const f = rig6(() => new Error('internal: boom'), { clock: () => 5 });
+      f.payer.onDownload(CORE_B, 0, NOISE);
+      await vi.advanceTimersByTimeAsync(3 * PAY_GIVE_UP_MS);
+      expect(f.unpayable).toEqual([]);
+      expect(f.calls.length).toBeGreaterThan(MAX_PAY_FAILURES);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it.each([
+    ['is not a number', (): number => Number.NaN],
+    [
+      'throws',
+      (): number => {
+        throw new Error('no clock');
+      },
+    ],
+    [
+      'runs backwards',
+      (
+        (t) => (): number =>
+          (t -= 1_000)
+      )(1e9),
+    ],
+  ] as const)(
+    'a clock that %s stands still: retries come on their timers (never a loop), nothing is given up',
+    async (_what, clock) => {
+      vi.useFakeTimers();
+      try {
+        const r = rig6(() => new Error('backend-down: the host is busy'), { clock });
+        r.payer.onDownload(CORE_A, 0, NOISE);
+        await vi.advanceTimersByTimeAsync(0);
+        expect(r.calls).toHaveLength(1);
+        // No retry inside the first backoff: a clock read as NaN would have armed a 1 ms timer.
+        await vi.advanceTimersByTimeAsync(PAY_RETRY_BASE_MS - 1);
+        expect(r.calls).toHaveLength(1);
+        await vi.advanceTimersByTimeAsync(1);
+        expect(r.calls).toHaveLength(2);
+        // Ten minutes on: spaced by the backoff (at most one try per PAY_RETRY_MAX_MS once it is
+        // at its longest), and never written off — a streak on a clock that stands still never ages.
+        await vi.advanceTimersByTimeAsync(10 * 60_000);
+        expect(r.calls.length).toBeLessThanOrEqual(8 + Math.ceil((10 * 60_000) / PAY_RETRY_MAX_MS));
+        expect(r.calls.length).toBeGreaterThan(MAX_PAY_FAILURES + 10);
+        expect(r.unpayable).toEqual([]);
+      } finally {
+        vi.useRealTimers();
+      }
+    },
+  );
+
+  it('dispose(): a PAY that fails after it arms no retry, and nothing more is built', async () => {
+    vi.useFakeTimers();
+    try {
+      let refuse: (e: Error) => void = () => undefined;
+      const engine = new mocks.MockPaymentEngine({ mode: 'honest' });
+      let calls = 0;
+      const perCore = new Map<CoreKeyHex, PricePolicy>([[CORE_A, basePolicy(MANIFEST_PRICE)]]);
+      const payer = new UpstreamPayer({
+        engine: {
+          pay: () => {
+            calls++;
+            return new Promise<PayMessage>((_resolve, reject) => {
+              refuse = reject;
+            });
+          },
+          spent: () => engine.spent(),
+        },
+        logger: capturedLogger().logger,
+        payEveryBlocks: 1,
+        tailMs: 0,
+        ownMints: [MINT_A, MINT_B],
+        policyFor: manifestPolicyResolver(() => perCore),
+      });
+      const protocol = new FakePayProtocol({ autoAck: true });
+      payer.attachPeer(NOISE, protocol);
+      protocol.remoteHello(hello());
+      payer.onDownload(CORE_A, 0, NOISE);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(calls).toBe(1);
+      payer.dispose();
+      refuse(new Error('backend-down: the host is busy'));
+      await vi.advanceTimersByTimeAsync(0);
+      // No retry timer armed for it: a disposed payer leaves nothing behind to wake it.
+      expect(vi.getTimerCount()).toBe(0);
+      await vi.advanceTimersByTimeAsync(10 * PAY_RETRY_LATER_MAX_MS);
+      payer.onDownload(CORE_A, 1, NOISE);
+      await payer.flush();
+      expect(calls).toBe(1);
+      expect(protocol.sentPays).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('dispose() while a PAY is being built: that PAY still goes out (its proofs are built), no other core is built after it', async () => {
+    const engine = new mocks.MockPaymentEngine({ mode: 'honest' });
+    const built: CoreKeyHex[] = [];
+    let finishA: () => void = () => undefined;
+    const perCore = new Map<CoreKeyHex, PricePolicy>([
+      [CORE_A, basePolicy(MANIFEST_PRICE)],
+      [CORE_B, basePolicy(MANIFEST_PRICE)],
+    ]);
+    const payer = new UpstreamPayer({
+      engine: {
+        pay: async (range, seeder, policy, o) => {
+          built.push(range.core);
+          if (range.core === CORE_A)
+            await new Promise<void>((resolve) => {
+              finishA = resolve;
+            });
+          return engine.pay(range, seeder, policy, o);
+        },
+        spent: () => engine.spent(),
+      },
+      logger: capturedLogger().logger,
+      payEveryBlocks: 1,
+      tailMs: 0,
+      ownMints: [MINT_A, MINT_B],
+      policyFor: manifestPolicyResolver(() => perCore),
+    });
+    const protocol = new FakePayProtocol({ autoAck: false });
+    payer.attachPeer(NOISE, protocol);
+    protocol.remoteHello(hello());
+    payer.onDownload(CORE_A, 0, NOISE);
+    await settle();
+    expect(built).toEqual([CORE_A]); // being built
+    payer.onDownload(CORE_B, 0, NOISE); // pending behind it, in the same pass
+    payer.dispose();
+    finishA();
+    await settle();
+    await payer.flush();
+    expect(built).toEqual([CORE_A]);
+    expect(protocol.sentPays.map((m) => m.range.core)).toEqual([CORE_A]);
+  });
+
+  describe('monotonicClock', () => {
+    it('is performance.now() where the runtime has it (called on performance)', () => {
+      const perf = {
+        t: 42,
+        now(this: { t: number }): number {
+          return this.t;
+        },
+      };
+      const c = monotonicClock({ performance: perf, dateNow: () => 1e12 });
+      expect(c()).toBe(42);
+      perf.t = 50;
+      expect(c()).toBe(50);
+      // The runtime's own: Node has performance.
+      const real = monotonicClock();
+      expect(Math.abs(real() - performance.now())).toBeLessThan(1_000);
+    });
+
+    it('without performance (Bare): Date.now() made steady — never backwards, a step forward counts at most MAX_CLOCK_STEP_MS, NaN counts nothing', () => {
+      let wall = 1_000_000;
+      const c = monotonicClock({ performance: undefined, dateNow: () => wall });
+      expect(c()).toBe(0);
+      wall += 250;
+      expect(c()).toBe(250);
+      wall -= 60 * 60_000; // an hour back
+      expect(c()).toBe(250);
+      wall += 1_000; // time goes on from there
+      expect(c()).toBe(1_250);
+      wall += 24 * 60 * 60_000; // a day ahead (a resume from suspend)
+      expect(c()).toBe(1_250 + MAX_CLOCK_STEP_MS);
+      wall = Number.NaN;
+      expect(c()).toBe(1_250 + MAX_CLOCK_STEP_MS);
+      wall = 5_000;
+      expect(c()).toBe(1_250 + MAX_CLOCK_STEP_MS);
+      wall += 100;
+      expect(c()).toBe(1_350 + MAX_CLOCK_STEP_MS);
+      // MAX_CLOCK_STEP_MS is past the longest wait between two reads during a transient streak.
+      expect(MAX_CLOCK_STEP_MS).toBeGreaterThan(PAY_RETRY_MAX_MS);
+      // A performance object without a now() function is not a clock.
+      const d = monotonicClock({ performance: { now: 'x' }, dateNow: () => 7 });
+      expect(d()).toBe(0);
+    });
+  });
+});
+
+// ---- lane P2-owed-viewer (contracts v6 amendment; ADRs 0015 and 0018 amendments) ------------
+
+describe('UpstreamPayer — PRICE { free: true } is not a price (ADR 0015 amendment)', () => {
+  it('blocks of a core the seeder serves free are never pended nor paid (no 0-sat PAY); a later priced PRICE ends it', async () => {
+    const { payer, protocol } = unit(1);
+    protocol.remoteHello(hello());
+    payer.onDownload(CORE_A, 0, NOISE);
+    await payer.flush();
+    expect(protocol.sentPays).toHaveLength(1);
+    // Free from now on: pending blocks of it are dropped, later ones never pended.
+    payer.onDownload(CORE_A, 1, NOISE);
+    protocol.remotePrice({
+      type: 'PRICE',
+      core: CORE_A,
+      satsPerBlock: 0 as Sats,
+      effectiveFromBlock: 0,
+      free: true,
+    });
+    payer.onDownload(CORE_A, 2, NOISE);
+    await payer.flush();
+    expect(protocol.sentPays).toHaveLength(1);
+    // Another core is paid as ever; free is per core.
+    payer.onDownload(CORE_B, 0, NOISE);
+    await payer.flush();
+    expect(protocol.sentPays.map((p) => p.range.core)).toEqual([CORE_A, CORE_B]);
+    // Sold again: at its price, never at 0.
+    protocol.remotePrice({
+      type: 'PRICE',
+      core: CORE_A,
+      satsPerBlock: 3 as Sats,
+      effectiveFromBlock: 3,
+    });
+    payer.onDownload(CORE_A, 3, NOISE);
+    await payer.flush();
+    expect(protocol.sentPays).toHaveLength(3);
+    const last = protocol.sentPays[2]!;
+    expect(last.range).toEqual({ core: CORE_A, fromBlock: 3, toBlock: 3 });
+    const total = [...last.seederProofs.proofs, ...last.creatorProofs.proofs].reduce(
+      (n, p) => n + p.amount,
+      0,
+    );
+    expect(total).toBe(3);
+  });
+});
+
+describe('UpstreamPayer — owed blocks from before (ADR 0018 amendment)', () => {
+  const RECORDED = basePolicy(MANIFEST_PRICE);
+  function owedRig(o: { owed?: boolean; recorded?: PricePolicy | null } = {}) {
+    const engine = new mocks.MockPaymentEngine({ mode: 'honest' });
+    const owedCalls: { range: [number, number]; carryIn: number; peer: string }[] = [];
+    const given: [number, number][] = [];
+    const payer = new UpstreamPayer({
+      engine,
+      logger: capturedLogger().logger,
+      payEveryBlocks: 4,
+      tailMs: 0,
+      ownMints: [MINT_A, MINT_B],
+      policyFor: () => basePolicy(MANIFEST_PRICE),
+      onUnpayable: (_n, r) => given.push([r.fromBlock, r.toBlock]),
+      ...(o.owed === false
+        ? {}
+        : {
+            owed: {
+              policyFor: () => (o.recorded === undefined ? RECORDED : o.recorded),
+              pay: (range, seeder, policy, opts, peer) => {
+                owedCalls.push({
+                  range: [range.fromBlock, range.toBlock],
+                  carryIn: opts.carryIn,
+                  peer,
+                });
+                return engine.pay(range, seeder, policy, opts);
+              },
+            },
+          }),
+    });
+    const protocol = new FakePayProtocol({ autoAck: true });
+    payer.attachPeer(NOISE, protocol);
+    return { payer, protocol, owedCalls, given };
+  }
+  const priced = {
+    type: 'PRICE',
+    core: CORE_A,
+    satsPerBlock: 3 as Sats,
+    effectiveFromBlock: 0,
+  } as const;
+
+  it('taken only on an open connection, after the core’s priced PRICE, with an owed engine; never twice', async () => {
+    const r = owedRig();
+    expect(r.payer.addOwed(NOISE, CORE_A, [1, 2])).toBe(0); // not open yet
+    r.protocol.remoteHello(hello());
+    expect(r.payer.addOwed(NOISE, CORE_A, [1, 2])).toBe(0); // no priced PRICE for it here
+    r.protocol.remotePrice({ ...priced, satsPerBlock: 0 as Sats, free: true });
+    expect(r.payer.addOwed(NOISE, CORE_A, [1, 2])).toBe(0); // free now: rule 3, not payable
+    r.protocol.remotePrice(priced);
+    expect(r.payer.addOwed('ab'.repeat(32), CORE_A, [1])).toBe(0); // unknown peer
+    expect(r.payer.addOwed(NOISE, CORE_A, [1, 2, -1, 1.5])).toBe(2);
+    await r.payer.flush();
+    expect(r.payer.addOwed(NOISE, CORE_A, [1, 2])).toBe(0); // paid already on this connection
+    const gw = owedRig({ owed: false }); // the gateway: no owed engine, no old tail paid
+    gw.protocol.remoteHello(hello());
+    gw.protocol.remotePrice(priced);
+    expect(gw.payer.addOwed(NOISE, CORE_A, [1])).toBe(0);
+    expect(gw.payer.stats()).toMatchObject({ owedAccepted: 0, owedPaid: 0 });
+  });
+
+  it('paid at once and apart — never in one PAY with this connection’s blocks — on the connection’s carry chain, at the seeder’s asked price', async () => {
+    const r = owedRig();
+    r.protocol.remoteHello(hello());
+    r.protocol.remotePrice(priced);
+    // Blocks 4..5 of this connection are pending below a batch; 2..3 and 6 are owed from before.
+    r.payer.onDownload(CORE_A, 4, NOISE);
+    r.payer.onDownload(CORE_A, 5, NOISE);
+    expect(r.payer.addOwed(NOISE, CORE_A, [2, 3, 6])).toBe(3);
+    await r.payer.flush();
+    const ranges = r.protocol.sentPays.map((p) => [p.range.fromBlock, p.range.toBlock]);
+    expect(ranges).toEqual([
+      [2, 3],
+      [4, 5],
+      [6, 6],
+    ]);
+    // The owed ones through the owed engine (with the peer), the fresh ones through the payer's.
+    expect(r.owedCalls.map((c) => c.range)).toEqual([
+      [2, 3],
+      [6, 6],
+    ]);
+    expect(r.owedCalls.every((c) => c.peer === NOISE)).toBe(true);
+    // One carry chain for the core on this connection: 0 only for its first PAY.
+    expect(r.owedCalls[0]!.carryIn).toBe(0);
+    for (const p of r.protocol.sentPays) {
+      const n = [...p.seederProofs.proofs, ...p.creatorProofs.proofs].reduce(
+        (a, b) => a + b.amount,
+        0,
+      );
+      expect(n).toBe((p.range.toBlock - p.range.fromBlock + 1) * 3); // the seeder's asked 3 ≤ 5
+    }
+    expect(r.payer.stats()).toMatchObject({ owedAccepted: 3, owedPaid: 3 });
+  });
+
+  it('a core that turns free after its owed blocks were taken: they are not paid (rule 3: free never covers blocks counted before)', async () => {
+    const r = owedRig();
+    r.protocol.remoteHello(hello());
+    r.protocol.remotePrice(priced);
+    // The PAY of block 1 waits for its ACK (one per core in flight), so 7 is still pending when
+    // the core turns free.
+    const unacked = new FakePayProtocol({ autoAck: false });
+    r.payer.attachPeer('cd'.repeat(32), unacked);
+    unacked.remoteHello(hello());
+    unacked.remotePrice(priced);
+    r.payer.onDownload(CORE_A, 1, 'cd'.repeat(32));
+    await r.payer.flush('cd'.repeat(32));
+    expect(r.payer.addOwed('cd'.repeat(32), CORE_A, [7])).toBe(1);
+    unacked.remotePrice({ ...priced, satsPerBlock: 0 as Sats, free: true });
+    unacked.remoteAck({ type: 'ACK', core: CORE_A, fromBlock: 1, toBlock: 1, ok: true });
+    await r.payer.flush('cd'.repeat(32));
+    expect(unacked.sentPays.map((p) => p.range.fromBlock)).toEqual([1]);
+    expect(r.owedCalls).toEqual([]);
+    expect(r.given).toEqual([[7, 7]]);
+  });
+
+  it('not payable at the terms recorded (or asked above them): given up — respected, never paid', async () => {
+    const none = owedRig({ recorded: null });
+    none.protocol.remoteHello(hello());
+    none.protocol.remotePrice(priced);
+    none.payer.addOwed(NOISE, CORE_A, [7, 8]);
+    await none.payer.flush();
+    expect(none.protocol.sentPays).toHaveLength(0);
+    expect(none.given).toEqual([[7, 8]]);
+    const dear = owedRig({ recorded: basePolicy(2) });
+    dear.protocol.remoteHello(hello());
+    dear.protocol.remotePrice(priced); // asks 3 > the recorded 2
+    dear.payer.addOwed(NOISE, CORE_A, [7]);
+    await dear.payer.flush();
+    expect(dear.protocol.sentPays).toHaveLength(0);
+    expect(dear.given).toEqual([[7, 7]]);
+    expect(dear.payer.stats()).toMatchObject({ owedAccepted: 1, owedPaid: 0, unpayableBlocks: 1 });
   });
 });

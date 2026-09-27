@@ -14,7 +14,10 @@ import { HostArgsError } from '../flags.js';
 import type { Host } from '../host.js';
 import { createHost } from '../host.js';
 import { memoryLogger } from '../log.js';
+import { CLOSE_DRAIN_MS } from '../../worker/host.js';
+import { QUIT_FLUSH_MS } from '../host.js';
 import type { ParentPortLike } from '../main.js';
+import * as entry from '../main.js';
 import { runHost } from '../main.js';
 import { FakeWorker, fakeSpawner } from './support/fake-worker.js';
 import { eventually } from './support/rig.js';
@@ -22,7 +25,11 @@ import { eventually } from './support/rig.js';
 const dirs: string[] = [];
 const hosts: Host[] = [];
 afterEach(async () => {
-  for (const h of hosts.splice(0)) h.stop();
+  for (const h of hosts.splice(0)) {
+    h.stop();
+    // Lane P2-owed-viewer: tail authorisations of sessions `stop` dropped land before the rm.
+    await h.adapter.flushTails().catch(() => undefined);
+  }
   for (const d of dirs.splice(0)) await rm(d, { recursive: true, force: true });
 });
 
@@ -108,5 +115,15 @@ describe('createHost dev fences (programmatic callers too)', () => {
       }),
     ).rejects.toThrow(HostArgsError);
     expect(spawner.spawned).toEqual([]);
+  });
+});
+
+// Lane R6-reconcile: the packaged host bundle's exports are pinned to exactly `runHost`
+// (packaging `stage.test.ts`, which needs a staged build); this pins the source entry the same
+// way, in a plain unit run. The quit flush's bound moved to host.ts for it.
+describe('the entry module', () => {
+  it('exports runHost only; the quit flush lives in host.ts and outlasts a session drain', () => {
+    expect(Object.keys(entry)).toEqual(['runHost']);
+    expect(QUIT_FLUSH_MS).toBeGreaterThan(CLOSE_DRAIN_MS);
   });
 });

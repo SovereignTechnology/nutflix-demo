@@ -158,7 +158,7 @@ describe('forgeConfig', () => {
     expect(statSync(join(root, 'chrome-sandbox')).mode & 0o7777).toBe(0o4755);
   });
 
-  it('packageAfterCopy flips the five fuses and drops the staging-only devDependencies', async () => {
+  it('packageAfterCopy flips the six fuses and drops the staging-only devDependencies', async () => {
     const app = join(root, 'Nutflix-linux-x64');
     const buildPath = join(app, 'resources', 'app');
     mkdirSync(buildPath, { recursive: true });

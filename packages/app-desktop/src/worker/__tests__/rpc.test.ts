@@ -113,12 +113,25 @@ function rig(
 }
 
 describe('WorkerRpc', () => {
+  // Lane P2-owed-viewer: `play.close` now answers `{ unpaid }` (the session's unpaid tail), so the
+  // void-result case uses `play.pause`, which still answers nothing; play.close's result is below.
   it('dispatches a valid request and answers; a void result has no `r`', async () => {
     const r = rig();
-    r.send({ op: 'req', id: 7, m: 'play.close', a: { sid: SID } });
+    r.send({ op: 'req', id: 7, m: 'play.pause', a: { sid: SID } });
     await r.settle();
-    expect(r.calls).toEqual([{ op: 'req', id: 7, m: 'play.close', a: { sid: SID } }]);
+    expect(r.calls).toEqual([{ op: 'req', id: 7, m: 'play.pause', a: { sid: SID } }]);
     expect(r.out).toEqual([{ op: 'res', id: 7, ok: true }]);
+  });
+
+  it('play.close answers the unpaid tail; a result outside its shape is an internal error', async () => {
+    const good = rig(() => Promise.resolve({ unpaid: 3 }));
+    good.send({ op: 'req', id: 8, m: 'play.close', a: { sid: SID } });
+    await good.settle();
+    expect(good.out).toEqual([{ op: 'res', id: 8, ok: true, r: { unpaid: 3 } }]);
+    const bad = rig(() => Promise.resolve(undefined));
+    bad.send({ op: 'req', id: 9, m: 'play.close', a: { sid: SID } });
+    await bad.settle();
+    expect(bad.out).toMatchObject([{ op: 'res', id: 9, ok: false, e: { code: 'internal' } }]);
   });
 
   it('`ready` follows a successful `init` response, never precedes it', async () => {

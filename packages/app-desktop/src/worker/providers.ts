@@ -13,18 +13,35 @@
  * `--dev-mocks` (`dev/dev-mocks.ts`) is the explicit, loudly logged, loopback-fenced way to
  * run against `MockPaymentEngine('honest')` — D1.
  */
-import type { MintUrl, NostrPubkey, PaymentEngineSeeder, PaymentEngineConfig } from '@sovit/core';
+import type {
+  MintUrl,
+  NostrPubkey,
+  PaymentEngineSeeder,
+  PaymentEngineConfig,
+  payment,
+} from '@sovit/core';
 
 import type { PayWiring } from './net/peer-node.js';
-import type { PayFn } from './pay/viewer-payer.js';
+import type { PayFn, PayOwedFn } from './pay/viewer-payer.js';
 
 export interface WorkerProviders {
-  /** Verifies PAYs from peers that download from us (seeder side). */
-  readonly seederEngine: PaymentEngineSeeder & {
-    readonly config?: Pick<PaymentEngineConfig, 'flushEveryBlocks' | 'flushEveryMs'>;
-  };
+  /**
+   * Verifies PAYs from peers that download from us (seeder side). Also an `UnpaidLedger` (both
+   * engines of `@sovit/core` are): our seeder reports a viewer's unpaid blocks in `OWED` and
+   * `ACK.outstanding` (contracts v6 amendment).
+   */
+  readonly seederEngine: PaymentEngineSeeder &
+    payment.UnpaidLedger & {
+      readonly config?: Pick<PaymentEngineConfig, 'flushEveryBlocks' | 'flushEveryMs'>;
+    };
   /** Builds OUR `PAY` for blocks we downloaded (viewer side; `PaymentEngineViewer.pay`). */
   readonly pay: PayFn;
+  /**
+   * Lane P2-owed-viewer (ADR 0018 amendment): builds OUR `PAY` for blocks of a session's tail — a
+   * seeder reported them owed and our record holds them — under that session's id (open or
+   * closed: the host checks its session or its tail authorisation). Absent: no old tail is paid.
+   */
+  readonly payOwed?: PayOwedFn;
   /** Mints the viewer's wallet can pay with. */
   readonly viewerMints: readonly MintUrl[];
   /** One `pay/1` per connection + the HELLO we send. */

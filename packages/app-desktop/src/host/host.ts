@@ -48,6 +48,7 @@ import {
   unavailableReason,
 } from './wallet.js';
 import { WALLET_DIR } from './wallet-journal.js';
+import { TAIL_DIR } from './tails.js';
 import type { Nip46Connector } from './signer/desktop-signer.js';
 import { DesktopSigner } from './signer/desktop-signer.js';
 import { MainBridge } from './signer/main-bridge.js';
@@ -93,6 +94,15 @@ export interface HostOptions {
     'now' | 'sleep' | 'pollAttempts' | 'pollIntervalMs' | 'playWaitMs'
   >;
 }
+
+/**
+ * Fix round 4: how long an app quit waits, at most, for the open play sessions' tails to be paid
+ * (the worker drains each session for up to its `CLOSE_DRAIN_MS`, 5 s, in parallel) before the
+ * worker is stopped (`Host.shutdown`, run by the entry `main.ts` on SIGTERM). Main waits a little
+ * longer for this process to exit (`QUIT_GRACE_MS`, main.ts). Here, not in the entry module, whose
+ * exports the packaged bundle pins to `runHost` (lane R6-reconcile).
+ */
+export const QUIT_FLUSH_MS = 7000;
 
 export class Host {
   readonly adapter: DesktopNetworkAdapter;
@@ -185,6 +195,11 @@ export class Host {
       clearTimeout(timer);
     }
     this.stop();
+    // Lane P2-owed-viewer: the sessions just closed (or dropped by `stop`) keep their tails on
+    // disk before the process exits. A private-file write: bounded by the disk, not the network.
+    // `stop` has dropped the signer flow's plane by now: the adapter also waits for the writes of
+    // planes the flow closed (independent review, MEDIUM).
+    await this.adapter.flushTails().catch(() => undefined);
   }
 
   stop(): void {
@@ -331,6 +346,8 @@ export async function createHost(o: HostOptions): Promise<Host> {
       log: log.child('money'),
       // ADR 0014 amendment (issue #8): the wallet journal, sealed, per identity.
       journalDir: join(o.userData, WALLET_DIR),
+      // Lane P2-owed-viewer: closed sessions' tail authorisations, per identity.
+      tailDir: join(o.userData, TAIL_DIR),
       ...(create ? { createWallet: true } : {}),
       ...(o.mintRequest === undefined ? {} : { mintRequest: o.mintRequest }),
       ...(o.now === undefined ? {} : { now: o.now }),

@@ -96,7 +96,9 @@ const RESULTS: { readonly [M in WorkerMethod]: readonly WorkerMethodTable[M][1][
   'play.pause': [undefined],
   'play.resume': [undefined],
   'play.prefetch': [undefined],
-  'play.close': [undefined],
+  // Lane P2-owed-viewer: play.close answers the session's unpaid tail (it answered nothing before;
+  // the host now keeps a tail authorisation for what is left — ADR 0018 amendment).
+  'play.close': [{ unpaid: 0 }, { unpaid: 12 }],
   'seeder.status': [status],
   'seeder.configure': [undefined],
   'seeder.melt': [{ paid: true }],
@@ -310,6 +312,17 @@ describe('host → worker', () => {
       validateWorkerResult['play.open']({ key: R.hyper.core, link: 'http://127.0.0.1:0/x' }),
     ).toBe(false);
     expect(validateWorkerResult.init({})).toBe(false);
+    // Lane P2-owed-viewer: the unpaid tail is a bounded count, exact keys, nothing else.
+    for (const bad of [
+      undefined,
+      {},
+      { unpaid: -1 },
+      { unpaid: 1.5 },
+      { unpaid: '3' },
+      { unpaid: 2 ** 21 },
+      { unpaid: 1, extra: true },
+    ])
+      expect(validateWorkerResult['play.close'](bad), JSON.stringify(bad)).toBe(false);
     expect(validateWorkerResult['image.fetch']({ hex: 'abc' })).toBe(false); // odd length
     expect(validateWorkerResult['image.fetch']({ hex: 'ZZ' })).toBe(false);
     expect(isHostToWorker({ op: 'req', id: 1, m: 'studio.publish', a: draft })).toBe(false); // wrong direction
@@ -389,6 +402,45 @@ describe('worker → host', () => {
         creatorProofs: LOCKED,
       }),
     ).toBe(true);
+    // Lane P2-owed-viewer (found building the independent review's 90/10 test): a set whose share
+    // is 0 sats by the split is legitimately EMPTY (contracts v5, `PayMessage`) — at 90/10 a PAY
+    // of 3 blocks at 2 sats gives the creator 0. The guard refused such a PAY after the host had
+    // built it (its proofs spent, locked to the seeder), and the payer asked again. A PAY carries
+    // at least one proof, in one set or the other; a set to redeem or nutzap is never empty.
+    const empty = { ...LOCKED, proofs: [] };
+    expect(
+      validateHostResult['pay.build']({
+        range: RANGE,
+        carryIn: 60,
+        seederProofs: LOCKED,
+        creatorProofs: empty,
+      }),
+    ).toBe(true);
+    expect(
+      validateHostResult['pay.build']({
+        range: RANGE,
+        carryIn: 0,
+        seederProofs: empty,
+        creatorProofs: LOCKED,
+      }),
+    ).toBe(true);
+    expect(
+      validateHostResult['pay.build']({
+        range: RANGE,
+        carryIn: 0,
+        seederProofs: empty,
+        creatorProofs: empty,
+      }),
+    ).toBe(false);
+    expect(
+      validateHostResult['pay.build']({
+        range: RANGE,
+        carryIn: 0,
+        seederProofs: LOCKED,
+        creatorProofs: { ...empty, unit: 'usd' },
+      }),
+    ).toBe(false);
+    expect(validateHostArgs['seller.nutzap']({ set: empty, core: R.hyper.core })).toBe(false);
     expect(validateHostResult['seller.keyset'](null)).toBe(true);
     expect(
       validateHostResult['seller.keyset']({

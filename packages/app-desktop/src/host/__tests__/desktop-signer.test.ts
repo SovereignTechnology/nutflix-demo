@@ -88,6 +88,8 @@ interface Opened {
   readonly create: boolean;
   readonly signer: Signer;
   closed: boolean;
+  /** Lane P2-owed-viewer: its tail writes land when this resolves (tests hold it). */
+  tails: Promise<void>;
 }
 
 let userData: string;
@@ -131,7 +133,7 @@ function setup(o: {
       if (!create && !walletExists)
         return Promise.reject(new Error('no-wallet: no NIP-60 wallet event was found'));
       walletExists = true;
-      const rec: Opened = { create, signer: s, closed: false };
+      const rec: Opened = { create, signer: s, closed: false, tails: Promise.resolve() };
       opened.push(rec);
       return Promise.resolve({
         wallet: {},
@@ -139,6 +141,7 @@ function setup(o: {
         close: () => {
           rec.closed = true;
         },
+        flushTails: () => rec.tails,
       } as unknown as MoneyPlane);
     },
     swap: async (change) => {
@@ -452,6 +455,60 @@ describe('DesktopSigner — lock, sign out, exclusivity', () => {
     await s.signer.unlock();
     expect(s.main.asked).toEqual([{ kind: 'unlock-passphrase', retry: false }]);
     expect(s.signer.signer()).toBeDefined();
+  });
+
+  // Independent review (lane P2-owed-viewer, MEDIUM + info): closing a money plane starts the
+  // writes of its sessions' tail authorisations, and nothing waited for them — the host's quit
+  // asked the plane the signer had just dropped (none), and a quick sign-in opened the next plane,
+  // whose book read the file before those writes landed and later overwrote it without them.
+  it('the tail writes of a closed plane: shutdown waits for them, and the next plane opens only after they land', async () => {
+    const s = setup({});
+    s.main.script = localScript('passphrase', 'generate');
+    await s.signer.connect({ kind: 'local' });
+    const first = s.opened.at(-1)!;
+    let land!: () => void;
+    first.tails = new Promise<void>((r) => {
+      land = r;
+    });
+    // Locked with a tail write in flight; unlocked at once — the next plane waits for the write.
+    await s.signer.lock();
+    expect(first.closed).toBe(true);
+    const unlocked = s.signer.unlock();
+    // Unlocked (the prompt answered, the key derived): the plane would be opened right after.
+    for (let i = 0; i < 1000 && s.signer.signer() === undefined; i++)
+      await new Promise((r) => setTimeout(r, 5));
+    expect(s.signer.signer()).toBeDefined();
+    await new Promise((r) => setTimeout(r, 20));
+    expect(s.opened).toHaveLength(1);
+    let flushed = false;
+    const flush = s.signer.flushTails().then(() => {
+      flushed = true;
+    });
+    await new Promise((r) => setTimeout(r, 10));
+    expect(flushed).toBe(false);
+    land();
+    await unlocked;
+    await flush;
+    expect(s.opened).toHaveLength(2);
+    // Shutdown: the plane is dropped at once, and `flushTails` still waits for its writes.
+    const second = s.opened.at(-1)!;
+    let land2!: () => void;
+    second.tails = new Promise<void>((r) => {
+      land2 = r;
+    });
+    const closing = s.signer.close();
+    expect(second.closed).toBe(true);
+    expect(s.signer.money()).toBeUndefined();
+    let done = false;
+    const flush2 = s.signer.flushTails().then(() => {
+      done = true;
+    });
+    await new Promise((r) => setTimeout(r, 10));
+    expect(done).toBe(false);
+    land2();
+    await flush2;
+    await closing;
+    expect(done).toBe(true);
   });
 
   it('sign out forgets the keychain and the identity; the key file stays', async () => {
