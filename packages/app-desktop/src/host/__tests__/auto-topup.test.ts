@@ -1745,7 +1745,7 @@ describe('AutoTopUp — round 5 (info): a quote is never released right after it
     s.t += 1;
     await again.resume();
     expect(await openOnDisk()).toBe(0);
-  });
+  }, 30_000); // real top-ups: see the note above `r6Top`
 
   // Lane R6-reconcile: what the bound leaves out (core's own turn at the source and its round trips
   // before the request) is covered by this run of the host's start — the process that sent the
@@ -1769,7 +1769,7 @@ describe('AutoTopUp — round 5 (info): a quote is never released right after it
     s.t += 1;
     await again.resume();
     expect(await openOnDisk()).toBe(0);
-  });
+  }, 30_000); // real top-ups: see the note above `r6Top`
 });
 
 describe('AutoTopUp — round 5 (info): an open top-up whose source is gone for good', () => {
@@ -1813,7 +1813,7 @@ describe('AutoTopUp — round 5 (info): an open top-up whose source is gone for 
     expect(await s.wallet.balance(TARGET)).toBe(2_000);
     expect(s.ledger.snapshot().entries.at(-1)).toMatchObject({ state: 'done', from: SECOND });
     expect(JSON.stringify(s.log.lines)).not.toMatch(/topup\.test|lnbc/);
-  });
+  }, 30_000); // real top-ups: see the note above `r6Top`
 
   it.each([
     'the source says PAID',
@@ -1854,8 +1854,18 @@ describe('AutoTopUp — round 5 (info): an open top-up whose source is gone for 
         expect(s.lightning.paid).toHaveLength(1);
       }
     },
+    30_000, // real top-ups: see the note above `r6Top`
   );
 });
+
+/*
+ * Lane R6-reconcile: the tests this lane added or changed that run real top-ups (a TestMint
+ * pair, simulated Lightning, the real wallet) take an explicit 30 s, the file's timeout for heavy
+ * tests (round 5, R5-4). Measured alone on this shared box at load average 25-28 on 8 cores
+ * (2026-09-27): 1.1-4.9 s each; in the mutation runs at the same load, two of them (the lapse
+ * release, the start-by at its edge) and several older tests of the same shape ran past the
+ * default 5 s. No code path is timed by them (the play-bound tests measure the bound itself).
+ */
 
 /**
  * Lane R6-reconcile: an AutoTopUp over `s`'s wallet and ledger with its own play bound, monotonic
@@ -1939,7 +1949,7 @@ describe('AutoTopUp — lane R6-reconcile: a kept quote is released on answers, 
     expect(s.log.lines.map((l) => l.msg)).toContain(
       'auto top-up melt not paid: its quote is released',
     );
-  });
+  }, 30_000); // real top-ups: see the note above `r6Top`
 
   it('past the lapse, a source that cannot be read keeps the quote (every trigger); once it answers (PENDING) the quote is released', async () => {
     const EXPIRY_S = T0 / 1000 + 600;
@@ -1968,7 +1978,7 @@ describe('AutoTopUp — lane R6-reconcile: a kept quote is released on answers, 
     expect(s.log.lines.map((l) => l.msg)).toContain(
       'auto top-up invoice expired unpaid: its quote is released',
     );
-  });
+  }, 30_000); // real top-ups: see the note above `r6Top`
 });
 
 // Lane R6-reconcile (the round-5 verifier): PLAY_TOP_UP_WAIT_MS is the whole play's bound — the
@@ -2002,7 +2012,9 @@ describe('AutoTopUp — lane R6-reconcile: one bound for the whole play', () => 
     expect(await top.checkForPlay([TARGET])).toBe('in-flight');
     const took = performance.now() - started;
     expect(took).toBeGreaterThanOrEqual(W - 2);
-    expect(took).toBeLessThan(1.3 * W); // not 0.6 W, then a whole bound for the run
+    // Not 0.6 W, then a whole bound for the run (≥ 1.6 W: timers are never early); the margin
+    // is for a loaded box's late timers.
+    expect(took).toBeLessThan(1.45 * W);
     melting.release();
     expect(await top.inFlight).toBe('done');
     expect(await s.wallet.balance(TARGET)).toBe(2_000);
@@ -2027,7 +2039,8 @@ describe('AutoTopUp — lane R6-reconcile: one bound for the whole play', () => 
     expect(await top.checkForPlay([TARGET, SECOND])).toBe('in-flight');
     const took = performance.now() - started;
     expect(took).toBeGreaterThanOrEqual(W - 2);
-    expect(took).toBeLessThan(1.3 * W); // not 0.6 W, then a whole bound for the second mint
+    // Not 0.6 W, then a whole bound for the second mint (≥ 1.6 W); the margin as above.
+    expect(took).toBeLessThan(1.45 * W);
     quoting.release();
     expect(await top.inFlight).toBe('done');
     expect(await balance(SECOND)).toBe(2_000);
@@ -2109,6 +2122,7 @@ describe('AutoTopUp — lane R6-reconcile: a melt starts within TOP_UP_MELT_STAR
         'auto top-up melt not started: too long since its reservation',
       );
     },
+    30_000, // real top-ups: see the note above `r6Top`
   );
 });
 

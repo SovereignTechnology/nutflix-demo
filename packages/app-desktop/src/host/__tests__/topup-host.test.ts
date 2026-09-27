@@ -585,7 +585,9 @@ describe('cross-lane review round 4 through the whole host', () => {
     const took = performance.now() - since;
     expect(!res.ok && res.error.code).toBe('no-balance');
     expect(!res.ok && res.error.message).toMatch(/a top-up is on its way/);
-    expect(took).toBeLessThan(1.3 * W); // not 0.6 W, then a whole bound for the second mint
+    // Not 0.6 W, then a whole bound for the second mint (≥ 1.6 W: timers are never early); the
+    // margin is for a loaded box's late timers.
+    expect(took).toBeLessThan(1.4 * W);
     expect(w.asked.map((f) => (f as { target?: MintUrl }).target)).toEqual([TARGET, SECOND]);
     // The second mint's top-up finishes in the background.
     t.hold(null);

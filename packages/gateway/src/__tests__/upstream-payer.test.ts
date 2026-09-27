@@ -1205,7 +1205,7 @@ describe('UpstreamPayer — deferred refusals, streaks and the clock (lane R6-re
   });
 
   it.each([
-    ['not a number', (): number => Number.NaN],
+    ['is not a number', (): number => Number.NaN],
     [
       'throws',
       (): number => {
@@ -1276,6 +1276,9 @@ describe('UpstreamPayer — deferred refusals, streaks and the clock (lane R6-re
       expect(calls).toBe(1);
       payer.dispose();
       refuse(new Error('backend-down: the host is busy'));
+      await vi.advanceTimersByTimeAsync(0);
+      // No retry timer armed for it: a disposed payer leaves nothing behind to wake it.
+      expect(vi.getTimerCount()).toBe(0);
       await vi.advanceTimersByTimeAsync(10 * PAY_RETRY_LATER_MAX_MS);
       payer.onDownload(CORE_A, 1, NOISE);
       await payer.flush();
@@ -1284,6 +1287,47 @@ describe('UpstreamPayer — deferred refusals, streaks and the clock (lane R6-re
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it('dispose() while a PAY is being built: that PAY still goes out (its proofs are built), no other core is built after it', async () => {
+    const engine = new mocks.MockPaymentEngine({ mode: 'honest' });
+    const built: CoreKeyHex[] = [];
+    let finishA: () => void = () => undefined;
+    const perCore = new Map<CoreKeyHex, PricePolicy>([
+      [CORE_A, basePolicy(MANIFEST_PRICE)],
+      [CORE_B, basePolicy(MANIFEST_PRICE)],
+    ]);
+    const payer = new UpstreamPayer({
+      engine: {
+        pay: async (range, seeder, policy, o) => {
+          built.push(range.core);
+          if (range.core === CORE_A)
+            await new Promise<void>((resolve) => {
+              finishA = resolve;
+            });
+          return engine.pay(range, seeder, policy, o);
+        },
+        spent: () => engine.spent(),
+      },
+      logger: capturedLogger().logger,
+      payEveryBlocks: 1,
+      tailMs: 0,
+      ownMints: [MINT_A, MINT_B],
+      policyFor: manifestPolicyResolver(() => perCore),
+    });
+    const protocol = new FakePayProtocol({ autoAck: false });
+    payer.attachPeer(NOISE, protocol);
+    protocol.remoteHello(hello());
+    payer.onDownload(CORE_A, 0, NOISE);
+    await settle();
+    expect(built).toEqual([CORE_A]); // being built
+    payer.onDownload(CORE_B, 0, NOISE); // pending behind it, in the same pass
+    payer.dispose();
+    finishA();
+    await settle();
+    await payer.flush();
+    expect(built).toEqual([CORE_A]);
+    expect(protocol.sentPays.map((m) => m.range.core)).toEqual([CORE_A]);
   });
 
   describe('monotonicClock', () => {
