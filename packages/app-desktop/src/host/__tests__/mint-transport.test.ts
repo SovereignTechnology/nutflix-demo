@@ -28,6 +28,7 @@ import { fileURLToPath } from 'node:url';
 import { getPubKeyFromPrivKey, MintOperationError } from '@cashu/cashu-ts';
 import type { CashuP2pkPubkey, MintUrl, RelayUrl, Sats } from '@sovit/core';
 import { mocks, nostr, signer as signerMod } from '@sovit/core';
+import ts from 'typescript';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { MELT_REQUEST_TIMEOUT_MS, MINT_REQUEST_TIMEOUT_MS } from '../../ipc/deadlines.js';
@@ -257,19 +258,162 @@ describe('the money plane’s default mint transport sends each request once (fi
     };
     await walk(src);
     const hits: string[] = [];
+    const typeOnly: string[] = [];
     for (const f of files) {
-      const text = await readFile(f, 'utf8');
-      if (/from '@cashu\/cashu-ts'|new Mint\(|CashuMintConnections\(/.test(text))
-        hits.push(relative(src, f));
+      const r = mintReach(f, await readFile(f, 'utf8'));
+      if (r.reaches.length > 0) hits.push(relative(src, f));
+      else if (r.typeRefs > 0) typeOnly.push(relative(src, f));
     }
     expect(hits).toEqual(['host/money.ts']);
     const money = await readFile(join(src, 'host', 'money.ts'), 'utf8');
+    // money.ts: ONE construction, and the class is not otherwise used as a value (no alias).
+    const inMoney = mintReach('money.ts', money);
+    expect(inMoney.reaches).toEqual(['new CashuMintConnections']);
     expect(money.match(/CashuMintConnections\(/g)).toHaveLength(1);
     expect(money).toMatch(
       /new walletMod\.CashuMintConnections\(\{\s*request: \(mint\) => o\.mintRequest\?\.\(mint\) \?\? single,/,
     );
+    // Integration fix 2: recovery/core.ts names the class in a type only (so tsc checks the seed
+    // option's key) — seen, and not a way to a mint.
+    expect(typeOnly).toContain('host/recovery/core.ts');
+  });
+
+  it('the pin tells a way to reach a mint from a mention of one (integration fix 2)', () => {
+    const reach = (text: string): readonly string[] => mintReach('x.ts', text).reaches;
+    // Ways to a mint: cashu-ts in any form (a type-only import too, as the pin always had it), a
+    // construction, and the class as a value (an alias, a subclass, a construct call).
+    for (const text of [
+      "import { Mint } from '@cashu/cashu-ts';",
+      "import type { Proof } from '@cashu/cashu-ts';",
+      "export * from '@cashu/cashu-ts';",
+      "import cashu = require('@cashu/cashu-ts');",
+      "const m = await import('@cashu/cashu-ts');",
+      "const m = require('@cashu/cashu-ts');",
+      "type P = import('@cashu/cashu-ts').Proof;",
+      'new walletMod.CashuMintConnections({ request });',
+      'new CashuMintConnections();',
+      'new Mint(url, { customRequest });',
+      'const C = walletMod.CashuMintConnections; new C();',
+      'const { CashuMintConnections: C } = walletMod;',
+      "const C = walletMod['CashuMintConnections'];",
+      "const M = cashu['Mint'];",
+      'class Mine extends walletMod.CashuMintConnections {}',
+      'Reflect.construct(walletMod.CashuMintConnections, [{}]);',
+      "import { CashuMintConnections } from '@sovit/core';",
+      'export { CashuMintConnections };',
+    ])
+      expect(reach(text), text).not.toEqual([]);
+    // Mentions only: comments, strings, and the class in a type.
+    for (const text of [
+      '// new walletMod.CashuMintConnections({ request, seed }) — and new Mint(',
+      "/** CashuMintConnections(…), from '@cashu/cashu-ts' */ const x = 1;",
+      "const s = 'from \\'@cashu/cashu-ts\\' new Mint( CashuMintConnections(';",
+      'type O = ConstructorParameters<typeof walletMod.CashuMintConnections>[0];',
+      'let c: walletMod.CashuMintConnections | undefined;',
+      'class F implements walletMod.CashuMintConnections {}',
+      'interface I extends walletMod.CashuMintConnections {}',
+      "import type { CashuMintConnections } from '@sovit/core';",
+      "import { type CashuMintConnections } from '@sovit/core';",
+      'export type { CashuMintConnections };',
+      'export { type CashuMintConnections };',
+    ])
+      expect(reach(text), text).toEqual([]);
   });
 });
+
+const CASHU_TS = '@cashu/cashu-ts';
+const MINT_CLASSES: ReadonlySet<string> = new Set(['Mint', 'CashuMintConnections']);
+
+/**
+ * Where a source file could reach a mint (the pin above): `@cashu/cashu-ts` imported in any form
+ * (statically — `import type` too —, re-exported, `require`d or `import()`ed, or named in an
+ * `import()` type), `new Mint(…)` / `new …CashuMintConnections(…)`, or `CashuMintConnections` used
+ * as a VALUE anywhere else (an alias, a destructuring, `obj['…']`, a subclass, an export — each
+ * a way to construct one later). A reference in a TYPE (`typeof walletMod.CashuMintConnections`
+ * inside `ConstructorParameters<…>`, a field's type, `implements`), a comment and a string are
+ * not: integration fix 2 — `recovery/core.ts` names the class in a type so tsc checks the seed
+ * option's key, and its comment spells the constructor call; neither constructs anything. Parsed
+ * with the TypeScript compiler (as `packaging/stage.ts` does), not matched as text.
+ */
+function mintReach(
+  fileName: string,
+  text: string,
+): { readonly reaches: readonly string[]; readonly typeRefs: number } {
+  const kind = fileName.endsWith('.tsx') ? ts.ScriptKind.TSX : ts.ScriptKind.TS;
+  const sf = ts.createSourceFile(fileName, text, ts.ScriptTarget.Latest, true, kind);
+  const reaches: string[] = [];
+  let typeRefs = 0;
+  const isCashu = (n: ts.Node | undefined): boolean =>
+    n !== undefined && ts.isStringLiteralLike(n) && n.text === CASHU_TS;
+  /** The parent node (the source file's is `undefined`, whatever the declared type says). */
+  const parentOf = (x: ts.Node): ts.Node | undefined => x.parent;
+  /** A class's `extends` constructs the base class; every other heritage clause is a type. */
+  const inType = (n: ts.Node): boolean => {
+    for (let p = parentOf(n); p !== undefined; p = parentOf(p)) {
+      if (ts.isHeritageClause(p))
+        return !(p.token === ts.SyntaxKind.ExtendsKeyword && ts.isClassLike(p.parent));
+      if (ts.isImportSpecifier(p))
+        return p.isTypeOnly || p.parent.parent.phaseModifier === ts.SyntaxKind.TypeKeyword;
+      if (ts.isExportSpecifier(p)) return p.isTypeOnly || p.parent.parent.isTypeOnly;
+      if (ts.isTypeNode(p) && !ts.isExpressionWithTypeArguments(p)) return true;
+      if (ts.isStatement(p)) return false;
+    }
+    return false;
+  };
+  const visit = (n: ts.Node): void => {
+    if (
+      (ts.isImportDeclaration(n) || ts.isExportDeclaration(n)) &&
+      isCashu(n.moduleSpecifier ?? undefined)
+    )
+      reaches.push(`import ${CASHU_TS}`);
+    else if (
+      ts.isImportEqualsDeclaration(n) &&
+      ts.isExternalModuleReference(n.moduleReference) &&
+      isCashu(n.moduleReference.expression)
+    )
+      reaches.push(`import ${CASHU_TS}`);
+    else if (
+      ts.isCallExpression(n) &&
+      (n.expression.kind === ts.SyntaxKind.ImportKeyword ||
+        (ts.isIdentifier(n.expression) && n.expression.text === 'require')) &&
+      isCashu(n.arguments[0])
+    )
+      reaches.push(`import ${CASHU_TS}`);
+    else if (
+      ts.isImportTypeNode(n) &&
+      isCashu(ts.isLiteralTypeNode(n.argument) ? n.argument.literal : undefined)
+    )
+      reaches.push(`import ${CASHU_TS}`);
+    else if (ts.isNewExpression(n)) {
+      const callee = n.expression;
+      const name = ts.isIdentifier(callee)
+        ? callee.text
+        : ts.isPropertyAccessExpression(callee)
+          ? callee.name.text
+          : undefined;
+      if (name !== undefined && MINT_CLASSES.has(name)) {
+        reaches.push(`new ${name}`);
+        // Its callee is this construction, not another use of the class.
+        ts.forEachChild(n, (c) => {
+          if (c !== callee) visit(c);
+        });
+        return;
+      }
+    } else if (
+      ts.isElementAccessExpression(n) &&
+      ts.isStringLiteralLike(n.argumentExpression) &&
+      MINT_CLASSES.has(n.argumentExpression.text)
+    )
+      reaches.push(`[${n.argumentExpression.text}]`);
+    else if (ts.isIdentifier(n) && n.text === 'CashuMintConnections') {
+      if (inType(n)) typeRefs++;
+      else reaches.push('CashuMintConnections as a value');
+    }
+    ts.forEachChild(n, visit);
+  };
+  visit(sf);
+  return { reaches, typeRefs };
+}
 
 /** A request the slow mint holds: `METHOD /path`, and how to answer it. */
 interface Held {
