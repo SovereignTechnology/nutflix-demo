@@ -574,11 +574,7 @@ function view(q: WindowForm): View {
 /** ADR 0016: the words, shown from the page's own list; hidden after a while or on blur. */
 function recoveryShow(indices: readonly number[], again: boolean): View {
   const grid = el('ol', { class: 'words', 'aria-label': 'Recovery phrase' });
-  const hidden = el(
-    'p',
-    { class: 'words-hidden', hidden: true },
-    'The words are hidden. ',
-  );
+  const hidden = el('p', { class: 'words-hidden', hidden: true }, 'The words are hidden. ');
   const reveal = el('button', { type: 'button', class: 'link' }, 'Show the words');
   hidden.append(reveal);
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -727,12 +723,7 @@ function recoveryRestore(): View {
         'div',
         { class: 'word-fields' },
         ...fields.map((f, n) =>
-          el(
-            'div',
-            { class: 'word-field' },
-            el('label', { for: f.id }, `${String(n + 1)}.`),
-            f,
-          ),
+          el('div', { class: 'word-field' }, el('label', { for: f.id }, `${String(n + 1)}.`), f),
         ),
       ),
       wordDatalist('nf-words'),
@@ -761,16 +752,35 @@ function recoveryRestore(): View {
   };
 }
 
-function isForm(x: unknown): x is WindowForm {
+/**
+ * The page's own check of the question main hands it (main already checked it against the IPC
+ * guards; this is the page refusing to render anything else). ADR 0016: a question with words
+ * carries exactly 12 indices into the page's list — never text — and a confirmation exactly
+ * three ascending positions.
+ */
+export function isForm(x: unknown): x is WindowForm {
   if (typeof x !== 'object' || x === null) return false;
-  const k = (x as { kind?: unknown }).kind;
-  // ADR 0016: a question with words must carry exactly what the page can show.
-  if (k === 'recovery-show') return isIndexList((x as { words?: unknown }).words, 12, 2048);
-  if (k === 'recovery-confirm')
-    return isIndexList((x as { positions?: unknown }).positions, 3, PHRASE_WORDS);
+  const o = x as Record<string, unknown>;
+  const k = o['kind'];
+  const keys = Object.keys(o).sort().join(',');
+  if (k === 'recovery-show')
+    return (
+      keys === 'again,kind,words' &&
+      typeof o['again'] === 'boolean' &&
+      isIndexList(o['words'], PHRASE_WORDS, WORDS.length)
+    );
+  if (k === 'recovery-confirm') {
+    const p = o['positions'];
+    return (
+      keys === 'kind,positions,retry' &&
+      typeof o['retry'] === 'boolean' &&
+      isIndexList(p, 3, PHRASE_WORDS) &&
+      p.every((v, i) => i === 0 || v > (p[i - 1] ?? PHRASE_WORDS))
+    );
+  }
+  if (k === 'recovery-restore') return keys === 'kind';
+  if (k === 'recovery-reauth') return keys === 'kind,retry' && typeof o['retry'] === 'boolean';
   return (
-    k === 'recovery-restore' ||
-    k === 'recovery-reauth' ||
     k === 'local-setup' ||
     k === 'unlock-passphrase' ||
     k === 'new-passphrase' ||
@@ -807,14 +817,15 @@ export function mount(root: HTMLElement, api: PromptApi, q: WindowForm): void {
   const clear = (): void => {
     for (const s of v.secrets ?? []) s.value = '';
   };
-  let unmount: (() => void) | undefined;
+  /** The view's own cleanup (`onMount`'s return), run once the answer is sent. */
+  const mounted: { off?: (() => void) | undefined } = {};
   const send = (a: Answer): void => {
     if (sent) return;
     sent = true;
     for (const c of form.querySelectorAll<HTMLInputElement | HTMLButtonElement>('input, button'))
       c.disabled = true;
     clear();
-    unmount?.();
+    mounted.off?.();
     void api.answer(a === null && v.safeNo !== undefined ? v.safeNo : a);
   };
   form.addEventListener('submit', (e) => {
@@ -840,7 +851,7 @@ export function mount(root: HTMLElement, api: PromptApi, q: WindowForm): void {
     if (e.key === 'Escape') send(null);
   });
   root.replaceChildren(form);
-  unmount = v.onMount?.();
+  mounted.off = v.onMount?.();
   // A money-shaped, destructive or outward question defaults to its safe answer.
   (v.safeNo !== undefined ? cancel : (v.focus ?? submit)).focus();
 }

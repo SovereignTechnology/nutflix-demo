@@ -1,6 +1,6 @@
 /**
  * `window.nutflix` (design §3 row 2, D3/D5, SE-1). Exactly the `NetworkAdapter` shape plus
- * `desktop.ffmpeg` and `desktop.signer.*` (ADR 0013):
+ * `desktop.ffmpeg`, `desktop.signer.*` (ADR 0013) and `desktop.wallet.recovery.*` (ADR 0016):
  *
  *   - every `MethodTable` method → one numbered call through the IPC gate;
  *   - callback members (`notifications`, `seeder.onStatus`, `wallet.onChange`) → topics;
@@ -282,6 +282,18 @@ export function createBridge(t: Transport, deps: BridgeDeps): NutflixBridge {
         lock: call('desktop.signer.lock'),
         signOut: call('desktop.signer.signOut'),
         onStatus: (cb) => t.subscribe({ t: 'signer.status' }, cb),
+      },
+      // ADR 0016: names an ACTION only — whatever the page passes, nothing but the method goes
+      // on the wire (main's gate refuses any argument too); every word is shown and typed in
+      // main's prompt window.
+      wallet: {
+        recovery: {
+          status: () => t.call('desktop.wallet.recovery.status', []),
+          setup: () => t.call('desktop.wallet.recovery.setup', []),
+          show: () => t.call('desktop.wallet.recovery.show', []),
+          restore: () => t.call('desktop.wallet.recovery.restore', []),
+          onProgress: (cb) => t.subscribe({ t: 'recovery.progress' }, cb),
+        },
       },
     },
   };

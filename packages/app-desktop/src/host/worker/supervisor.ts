@@ -330,7 +330,7 @@ export class WorkerSupervisor {
     if (!validateWorkerArgs.init(init)) {
       // A configuration error (e.g. a dev bootstrap without --dev-mocks): restarting cannot
       // fix it, so fail at once instead of crash-looping.
-      this.log.error('invalid worker init; the media worker stays down');
+      this.log.error('worker init invalid (the media worker stays down)');
       this.gen++;
       this.teardown('invalid init');
       this.setState('failed');

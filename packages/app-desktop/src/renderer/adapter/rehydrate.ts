@@ -13,6 +13,7 @@
  * as the same `File` (SE-1: the preload, not the renderer, turns it into a token).
  */
 import type { NetworkAdapter, PlaySession, UploadInput, Wallet } from '@sovit/core';
+import type { RecoveryControls } from '@sovit/ui';
 import type { IpcError } from '../../ipc/errors.js';
 import { INTERNAL_MESSAGE, fromWireError } from '../../ipc/errors.js';
 import { isErrorCode } from '../../ipc/guards.js';
@@ -163,5 +164,22 @@ export function adapterFromBridge(b: NutflixBridge): NetworkAdapter {
     settings: () => settle(b.settings()),
     updateSettings: (patch) => settle(b.updateSettings(patch)),
     notifications: (cb) => b.notifications(rehydrating(cb)),
+  };
+}
+
+/**
+ * ADR 0016: the shell's recovery phrase flows (`desktop.wallet.recovery.*`) for Settings, errors
+ * rebuilt like the adapter's (`cancelled: …`, `rate-limited: …` keep their prefix). Every call
+ * names an action; nothing but states, counts, amounts and mint URLs comes back.
+ */
+export function recoveryFromBridge(
+  r: NutflixBridge['desktop']['wallet']['recovery'],
+): RecoveryControls {
+  return {
+    status: () => settle(r.status()),
+    setup: () => settle(r.setup()),
+    show: () => settle(r.show()),
+    restore: () => settle(r.restore()),
+    onProgress: (cb) => r.onProgress(rehydrating(cb)),
   };
 }

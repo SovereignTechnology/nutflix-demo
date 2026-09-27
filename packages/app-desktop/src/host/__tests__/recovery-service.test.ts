@@ -365,11 +365,11 @@ describe('setup: a new phrase (ADR 0016 §1, D2, D5)', () => {
     w.confirm = () => true;
     const r = await w.svc.setup();
     expect(w.asked.filter((f) => f.kind === 'recovery-confirm')).toHaveLength(CONFIRM_ATTEMPTS);
-    expect(
-      w.asked
-        .filter((f) => f.kind === 'recovery-confirm')
-        .map((f) => f.retry),
-    ).toEqual([false, true, true]);
+    expect(w.asked.filter((f) => f.kind === 'recovery-confirm').map((f) => f.retry)).toEqual([
+      false,
+      true,
+      true,
+    ]);
     expect(r.status.state).toBe('not-confirmed');
     expectNoPhrase(w, [r]);
   });

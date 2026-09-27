@@ -1,8 +1,8 @@
 /**
  * Settings screen (build-plan §6.1 row "Settings"): signer, relays, default mints (+ auto
- * top-up), seeding on/off + disk cap, data saver (prefetch depth, "buffer = money"), hover
- * preview and theme — one page of sections with a YouTube-style section nav on the left at
- * wide widths.
+ * top-up), the wallet's recovery phrase (ADR 0016, shell-provided), seeding on/off + disk cap,
+ * data saver (prefetch depth, "buffer = money"), hover preview and theme — one page of sections
+ * with a YouTube-style section nav on the left at wide widths.
  *
  * Talks ONLY to `NetworkAdapter` (`settings` / `updateSettings`, `signer`, `seeder.*`,
  * `wallet.mints|balances`, `profile`, `image`); renders ONLY `@sovit/ui` components + semantic
@@ -27,6 +27,7 @@ import {
 import type { ScreenProps } from '../shared/route.js';
 import { AppearanceSection } from './AppearanceSection.js';
 import { PlaybackSection } from './PlaybackSection.js';
+import { RecoverySection, type RecoveryControls } from './RecoverySection.js';
 import { RelaysSection } from './RelaysSection.js';
 import { SeedingSection, useSeederStatus } from './SeedingSection.js';
 import { SignerSection, useSigner } from './SignerSection.js';
@@ -35,7 +36,7 @@ import { describeLoadError, type SignerKind } from './model.js';
 import { useSettingsStore, type FailureNotice } from './useSettingsStore.js';
 
 export type SettingsSectionId =
-  'account' | 'appearance' | 'playback' | 'relays' | 'mints' | 'seeding';
+  'account' | 'appearance' | 'playback' | 'relays' | 'mints' | 'recovery' | 'seeding';
 
 export const SETTINGS_SECTIONS: readonly {
   readonly id: SettingsSectionId;
@@ -46,6 +47,7 @@ export const SETTINGS_SECTIONS: readonly {
   { id: 'playback', label: 'Playback and performance' },
   { id: 'relays', label: 'Relays' },
   { id: 'mints', label: 'Mints and top-up' },
+  { id: 'recovery', label: 'Recovery phrase' },
   { id: 'seeding', label: 'Seeding' },
 ];
 
@@ -57,6 +59,12 @@ export interface SettingsProps extends ScreenProps {
    * once the flow finishes.
    */
   readonly onChangeSigner?: ((kind: SignerKind) => void | Promise<void>) | undefined;
+  /**
+   * ADR 0016: the shell's recovery phrase flows (desktop). Each call names an action; the words
+   * are shown and typed outside this screen. Without it the section says the phrase is not
+   * available here (on the web: not covered).
+   */
+  readonly recovery?: RecoveryControls | undefined;
   /**
    * Called with the adapter-confirmed settings after every successful save — the shell
    * applies `theme` (and hands `hoverPreview` to Home) here. Also called for saves that
@@ -78,6 +86,7 @@ export function Settings({
   navigate,
   miniPlayer,
   onChangeSigner,
+  recovery,
   onSettingsChange,
   onToast,
   inlineToasts = false,
@@ -252,6 +261,13 @@ export function Settings({
           signedOut={signer.signedOut}
           navigate={navigate}
           headingRef={refFor('mints')}
+        />
+        <RecoverySection
+          id={sectionId('recovery')}
+          adapter={adapter}
+          recovery={recovery}
+          signedIn={signer.signedIn}
+          headingRef={refFor('recovery')}
         />
         <SeedingSection
           id={sectionId('seeding')}

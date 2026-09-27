@@ -331,15 +331,15 @@ export class RecoveryService {
 
     const entropy = core.phrases.generate();
     let words: number[] = [];
+    /** The copy handed to main (posted as a structured clone), zeroed once answered. */
+    let posted: number[] = [];
     let env: RecoveryEnvelope;
     try {
       words = [...core.phrases.toIndices(entropy)];
       if (words.length !== RECOVERY_WORDS) fail('internal', 'the phrase has the wrong length');
-      const shown = await this.o.bridge.ask({
-        kind: 'recovery-show',
-        words: [...words],
-        again: false,
-      });
+      posted = [...words];
+      const shown = await this.o.bridge.ask({ kind: 'recovery-show', words: posted, again: false });
+      posted.fill(0);
       if (shown?.kind !== 'recovery-show')
         fail('cancelled', 'the new recovery phrase was discarded (nothing was saved)');
       // From here the phrase is kept: sealed on this device, copied to the relays.
@@ -389,6 +389,7 @@ export class RecoveryService {
     } finally {
       entropy.fill(0);
       words.fill(0);
+      posted.fill(0);
     }
     return await this.finishReissue(pubkey, env);
   }
@@ -431,7 +432,7 @@ export class RecoveryService {
     const plane = this.o.plane();
     if (plane !== undefined && plane.seeded === undefined)
       await this.o.reopenMoney().catch((e: unknown) => {
-        this.log.warn('the wallet did not reopen with the recovery phrase', {
+        this.log.warn('reopen with the recovery phrase failed', {
           reason: reasonOf(e),
         });
       });
@@ -474,7 +475,7 @@ export class RecoveryService {
     const plane = this.o.plane();
     const seeded = plane?.pubkey === pubkey ? plane.seeded : undefined;
     if (plane === undefined || seeded === undefined) {
-      this.log.warn('the wallet is not using the recovery phrase yet: nothing was reissued');
+      this.log.warn('recovery phrase not in use by the wallet yet: nothing reissued');
       return { sats: 0, fee: 0, failed: 0, complete: false };
     }
     let failed = 0;
@@ -512,7 +513,7 @@ export class RecoveryService {
       })),
     });
     if (!ok) {
-      this.log.info('the user did not confirm the reissue: the balance stays uncovered for now');
+      this.log.info('reissue not confirmed by the user: the balance stays uncovered for now');
       return { sats: 0, fee: 0, failed: failed + asked.length, complete: false };
     }
     let sats = 0;
@@ -539,6 +540,7 @@ export class RecoveryService {
     if (env === null) fail('not-found', 'there is no recovery phrase on this device');
     await this.reauth(signer, pubkey);
     let words: number[] = [];
+    let posted: number[] = [];
     let entropy: walletMod.RecoveryEntropy | undefined;
     try {
       try {
@@ -552,7 +554,9 @@ export class RecoveryService {
       words = [...core.phrases.toIndices(entropy)];
       entropy.fill(0);
       if (words.length !== RECOVERY_WORDS) fail('internal', 'the phrase has the wrong length');
-      const a = await this.o.bridge.ask({ kind: 'recovery-show', words: [...words], again: true });
+      posted = [...words];
+      const a = await this.o.bridge.ask({ kind: 'recovery-show', words: posted, again: true });
+      posted.fill(0);
       if (
         a?.kind === 'recovery-show' &&
         a.done &&
@@ -572,6 +576,7 @@ export class RecoveryService {
     } finally {
       entropy?.fill(0);
       words.fill(0);
+      posted.fill(0);
     }
   }
 
@@ -661,7 +666,7 @@ export class RecoveryService {
             if (RANK[r.outcome] > RANK[row.outcome]) row.outcome = r.outcome;
           }
         } catch (e) {
-          this.log.warn('a restore pass failed', { phrase, reason: reasonOf(e) });
+          this.log.warn('a restore pass failed', { pass: phrase, reason: reasonOf(e) });
           for (const row of rows.values())
             if (RANK[row.outcome] < RANK.unreachable) row.outcome = 'unreachable';
         } finally {

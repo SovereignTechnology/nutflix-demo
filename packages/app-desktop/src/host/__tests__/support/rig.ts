@@ -56,6 +56,8 @@ export interface RigOptions {
   readonly pool?: nostr.FakeRelayPool;
   /** Issue #2: the auto top-up's clock and target polling. */
   readonly topUp?: HostOptions['topUp'];
+  /** ADR 0016: a fake of lane N1's NUT-13 code (`support/fake-recovery.ts`). */
+  readonly recoveryCore?: HostOptions['recoveryCore'];
 }
 
 /** Polls `check` every few ms until it returns a value, or fails with `what` after `ms`. */
@@ -103,6 +105,7 @@ export async function rig(o: RigOptions = {}): Promise<Rig> {
     ...(o.signerCost === undefined ? {} : { signerCost: o.signerCost }),
     ...(o.nip46 === undefined ? {} : { nip46: o.nip46 }),
     ...(o.topUp === undefined ? {} : { topUp: o.topUp }),
+    ...(o.recoveryCore === undefined ? {} : { recoveryCore: o.recoveryCore }),
     imageTransport: o.imageTransport ?? (() => Promise.reject(new Error('no network in tests'))),
   });
   late.host = host;

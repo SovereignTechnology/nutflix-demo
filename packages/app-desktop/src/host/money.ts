@@ -237,7 +237,7 @@ export class MoneyPlane {
     // "covered": logged, wiped at once, and the recovery status reads `unreadable`.
     const seeded = o.seed?.core.seeded(parts.wallet);
     if (o.seed !== undefined && seeded === undefined) {
-      o.log.error('the wallet did not take the recovery phrase: new ecash is not covered');
+      o.log.error('recovery phrase not taken by the wallet: new ecash is not covered');
       o.seed.material.seed.wipe();
     }
     this.seeded = seeded;

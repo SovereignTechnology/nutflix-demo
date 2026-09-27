@@ -107,6 +107,14 @@ function wipe(a: PromptAnswer | null): void {
     (a.words as number[]).fill(0);
 }
 
+/**
+ * ADR 0016: main's copy of a phrase question's word indices, zeroed once its window is gone (or
+ * the question was dropped) — numbers, zeroed as far as JS allows.
+ */
+function forget(form: WindowForm): void {
+  if (form.kind === 'recovery-show') (form.words as number[]).fill(0);
+}
+
 /** `n`..`max` word indices, copied into main's own array — numbers only, never a string. */
 function indices(x: unknown, lengths: readonly number[]): number[] | undefined {
   if (!Array.isArray(x) || !lengths.includes(x.length)) return undefined;
@@ -279,6 +287,7 @@ export class PromptService {
 
   /** The host no longer needs `req` (its deadline): close it without answering. */
   cancel(req: number): void {
+    for (const q of this.queue) if (q.req === req) forget(q.form);
     this.queue = this.queue.filter((q) => q.req !== req);
     const c = this.current;
     if (c?.req === req) {
@@ -289,6 +298,7 @@ export class PromptService {
 
   /** The host went away: close its questions, answer nothing (nobody is listening). Main's own stay. */
   cancelAll(): void {
+    for (const q of this.queue) if (q.local === undefined) forget(q.form);
     this.queue = this.queue.filter((q) => q.local !== undefined);
     const c = this.current;
     if (c !== null && c.local === undefined) {
@@ -380,6 +390,7 @@ export class PromptService {
       } catch {
         // Fail closed: no protection, no words.
         this.d.log?.('warn', 'prompt.protection-failed');
+        forget(next.form);
         try {
           win.close();
         } catch {
@@ -396,6 +407,7 @@ export class PromptService {
     win.onClosed(() => {
       if (this.current !== cur) return;
       this.current = null;
+      forget(cur.form);
       if (!cur.settled) {
         if (cur.local !== undefined) cur.local(false);
         else this.d.answer(cur.req, null);

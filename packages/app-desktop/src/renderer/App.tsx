@@ -19,7 +19,9 @@
  *   Wallet    `intent` (extras)
  *   Settings  `onSettingsChange` → theme + hoverPreview, `onToast` → shell stack;
  *             `onChangeSigner` → `desktop.signer.connect` (ADR 0013: the kind only — the flow
- *             runs in main's trusted prompt window), when the host offers the signer flow
+ *             runs in main's trusted prompt window), when the host offers the signer flow;
+ *             `recovery` → `desktop.wallet.recovery.*` (ADR 0016: an action only — the words
+ *             are shown and typed in main's prompt window), with the signer flow too
  *
  * Screens are keyed by route NAME only: Watch is not remounted watch → watch, Shorts not
  * shorts → shorts, Studio not across tabs. The coordinator learns the mounted screen in a
@@ -50,7 +52,7 @@ import {
   applyTheme,
   isTextEntryTarget,
 } from '@sovit/ui';
-import type { FfmpegStatus, SearchFilterState, ToastItem } from '@sovit/ui';
+import type { FfmpegStatus, RecoveryControls, SearchFilterState, ToastItem } from '@sovit/ui';
 import type { PlaybackCoordinator } from './coordinator.js';
 import type { Router } from './router.js';
 import { Header } from './shell/Header.js';
@@ -98,6 +100,8 @@ export interface ShellProps {
   readonly probeFfmpeg?: ((recheck: boolean) => Promise<FfmpegStatus>) | undefined;
   /** ADR 0013: the signer flow; absent (tests) or refused by the host (--dev-mocks) = none. */
   readonly signerFlow?: SignerFlow | undefined;
+  /** ADR 0016: the recovery phrase flows; offered to Settings only with the signer flow. */
+  readonly recovery?: RecoveryControls | undefined;
 }
 
 /** Studio's `resolveFile`: the File itself — the preload, never the page, turns it into a token. */
@@ -138,6 +142,7 @@ export function Shell({
   router,
   probeFfmpeg,
   signerFlow,
+  recovery,
 }: ShellProps): ReactElement {
   const rs = useRouterState(router);
   const { route, extras } = rs.entry;
@@ -410,7 +415,7 @@ export function Shell({
           {...common}
           onSettingsChange={onSettingsChange}
           onToast={pushToast}
-          {...(flowOn ? { onChangeSigner } : {})}
+          {...(flowOn ? { onChangeSigner, recovery } : {})}
         />
       );
       break;

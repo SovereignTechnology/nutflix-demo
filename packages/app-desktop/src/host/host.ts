@@ -436,14 +436,16 @@ export async function createHost(o: HostOptions): Promise<Host> {
       },
       relays: {
         pool,
-        write: () => settings
-          .get()
-          .relays.filter((r) => r.write)
-          .map((r) => r.url),
-        read: () => settings
-          .get()
-          .relays.filter((r) => r.read)
-          .map((r) => r.url),
+        write: () =>
+          settings
+            .get()
+            .relays.filter((r) => r.write)
+            .map((r) => r.url),
+        read: () =>
+          settings
+            .get()
+            .relays.filter((r) => r.read)
+            .map((r) => r.url),
       },
       log,
       ...(o.now === undefined ? {} : { now: o.now }),

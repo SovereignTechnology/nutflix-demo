@@ -29,6 +29,8 @@ describe('src/ipc boundaries', () => {
     // find the unpacked tree of a packaged build; it is held to the same rules as the rest.
     // Lane I2-paygate (ADR 0012 amendment) added `deadlines.ts`: numbers the host and the worker
     // share (the worker's `pay.build` deadline, the mint timeouts), held to the same rules.
+    // Lane N2 (ADR 0016) added `recovery-checksum.ts`: main's re-check of a typed recovery
+    // phrase's BIP-39 checksum from its word indices (main's bundle holds only src/main + src/ipc).
     expect(sources.map((s) => s.f).sort()).toEqual([
       'asar-path.ts',
       'codec.ts',
@@ -38,6 +40,7 @@ describe('src/ipc boundaries', () => {
       'guards.ts',
       'index.ts',
       'protocol.ts',
+      'recovery-checksum.ts',
       'wiremap.ts',
       'worker-guards.ts',
       'worker-protocol.ts',

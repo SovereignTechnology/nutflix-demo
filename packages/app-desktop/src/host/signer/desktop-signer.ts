@@ -414,7 +414,7 @@ export class DesktopSigner implements IdentityProvider {
     await this.forgetKeychain('passphrase');
     if (this.methodValue === 'passphrase' || this.methodValue === 'keychain')
       await this.setMethod(null);
-    this.log.info('the local key was removed from this device');
+    this.log.info('local key removed from this device');
     await this.changed(false, false);
   }
 
@@ -506,7 +506,7 @@ export class DesktopSigner implements IdentityProvider {
       if (this.resumeOut !== null) {
         const r = await this.o.bridge.keychain('put', 'nip46', this.resumeOut);
         this.rememberedValue = r.ok;
-        if (!r.ok) this.log.warn('the OS keychain did not store the remote signer session');
+        if (!r.ok) this.log.warn('OS keychain refused to store the remote signer session');
       } else {
         await this.forgetKeychain('nip46');
         this.rememberedValue = false;

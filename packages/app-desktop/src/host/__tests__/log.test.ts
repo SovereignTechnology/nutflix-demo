@@ -1,3 +1,9 @@
+import { readFile, readdir } from 'node:fs/promises';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+import { entropyToMnemonic } from '@scure/bip39';
+import { wordlist } from '@scure/bip39/wordlists/english.js';
 import * as fc from 'fast-check';
 import { describe, expect, it } from 'vitest';
 
@@ -89,5 +95,102 @@ describe('createLogger', () => {
     const log = memoryLogger();
     log.child('a').child('b').debug('d');
     expect(log.lines.map((l) => l.scope)).toEqual(['host.a.b']);
+  });
+});
+
+/**
+ * ADR 0016 related finding 3: the logger's canary for word phrases. A recovery phrase is 12
+ * lower-case BIP-39 words of 3–8 letters; any run of 8 or more such words becomes `<redacted>`,
+ * however it is separated or numbered, wherever it sits — before the path and token rules could
+ * split it into pieces that pass.
+ */
+describe('redact — word phrases (ADR 0016)', () => {
+  const phraseOf = (entropy: Uint8Array): string[] =>
+    entropyToMnemonic(entropy, wordlist).split(' ');
+  const VECTOR = phraseOf(new Uint8Array(16).fill(0x7f));
+
+  it.each<[string, (w: string[]) => string]>([
+    ['spaces', (w) => w.join(' ')],
+    ['commas', (w) => w.join(', ')],
+    ['newlines (control characters)', (w) => w.join('\n')],
+    ['numbered', (w) => w.map((x, i) => `${String(i + 1)}. ${x}`).join(' ')],
+    ['numbered with parens', (w) => w.map((x, i) => `${String(i + 1)}) ${x}`).join(' ')],
+    ['slashes', (w) => w.join('/')],
+    ['dashes', (w) => w.join('-')],
+    ['pipes and tabs', (w) => w.join(' |\t')],
+    ['in quotes inside a sentence', (w) => `error: "${w.join(' ')}" was refused`],
+    ['as a path segment', (w) => `open /tmp/${w.join('/')}/x failed`],
+  ])('%s', (_what, fmt) => {
+    const out = redact(`seed ${fmt(VECTOR)} end`);
+    expect(out).toContain('<redacted>');
+    // No two phrase words in a row survive, and at most a stray single word.
+    for (let i = 0; i + 2 <= VECTOR.length; i++)
+      expect(out).not.toContain(VECTOR.slice(i, i + 2).join(' '));
+    expect(VECTOR.filter((w) => out.includes(w)).length).toBeLessThanOrEqual(1);
+  });
+
+  it('any 12-word phrase, any position, is redacted whole (property)', () => {
+    fc.assert(
+      fc.property(
+        fc.uint8Array({ minLength: 16, maxLength: 16 }),
+        fc.string({ maxLength: 40 }).filter((x) => !/[a-z]$/.test(x)),
+        fc.string({ maxLength: 40 }).filter((x) => !/^[a-z]/.test(x)),
+        (entropy, before, after) => {
+          const words = phraseOf(entropy);
+          const out = redact(`${before} ${words.join(' ')} ${after}`);
+          for (let i = 0; i + 3 <= words.length; i++)
+            expect(out).not.toContain(words.slice(i, i + 3).join(' '));
+        },
+      ),
+      { numRuns: 300 },
+    );
+  });
+
+  it('eight words are a phrase; seven, capitalised prose, or short words are not', () => {
+    expect(redact(VECTOR.slice(0, 8).join(' '))).toBe('<redacted>');
+    expect(redact(VECTOR.slice(0, 7).join(' '))).toBe(VECTOR.slice(0, 7).join(' '));
+    expect(redact('the wallet could not be created')).toBe('the wallet could not be created');
+    expect(redact('payments stay unavailable')).toBe('payments stay unavailable');
+  });
+
+  it('through the logger: message, fields, and a worker line', () => {
+    const log = memoryLogger();
+    const text = VECTOR.join(' ');
+    log.info(`restored with ${text}`, { phrase: text, line: `worker said ${text}` });
+    const all = JSON.stringify(log.lines);
+    for (let i = 0; i + 2 <= VECTOR.length; i++)
+      expect(all).not.toContain(VECTOR.slice(i, i + 2).join(' '));
+    expect(all.match(/<redacted>/g)?.length).toBe(3);
+  });
+
+  // The rule over-redacts prose on purpose; our own constant messages must still say what
+  // happened, so none of them may trip it (a message that does is reworded, not the rule relaxed).
+  it('no constant log message of the host (or the worker) is swallowed by the rule', async () => {
+    const src = join(dirname(fileURLToPath(import.meta.url)), '..', '..');
+    const files: string[] = [];
+    const walk = async (d: string): Promise<void> => {
+      for (const e of await readdir(d, { withFileTypes: true })) {
+        const p = join(d, e.name);
+        if (e.isDirectory()) {
+          if (e.name !== '__tests__') await walk(p);
+        } else if (e.name.endsWith('.ts')) files.push(p);
+      }
+    };
+    await walk(join(src, 'host'));
+    await walk(join(src, 'worker'));
+    const swallowed: string[] = [];
+    let seen = 0;
+    for (const f of files) {
+      const text = await readFile(f, 'utf8');
+      for (const m of text.matchAll(
+        /\blog\.(?:debug|info|warn|error)\(\s*(['`])((?:\\.|(?!\1)[^\\])*)\1/g,
+      )) {
+        const msg = m[2] ?? '';
+        seen++;
+        if (redact(msg) !== msg) swallowed.push(msg);
+      }
+    }
+    expect(seen).toBeGreaterThan(50);
+    expect(swallowed).toEqual([]);
   });
 });

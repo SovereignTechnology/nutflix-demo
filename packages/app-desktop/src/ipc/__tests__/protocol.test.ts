@@ -75,8 +75,9 @@ describe('MethodTable ⇔ NetworkAdapter (contracts v4)', () => {
       'wallet.onChange': 'wallet.change',
     });
     expectTypeOf<(typeof TOPIC_NAMES)[number]>().toEqualTypeOf<TopicName>();
-    // + `signer.status` (ADR 0013), a shell-only topic like the session and upload ones.
-    expect(new Set(TOPIC_NAMES).size).toBe(7);
+    // + `signer.status` (ADR 0013), a shell-only topic like the session and upload ones, and
+    // `recovery.progress` (ADR 0016: a restore's progress — numbers and the user's mint URLs).
+    expect(new Set(TOPIC_NAMES).size).toBe(8);
   });
 
   it('argument tuples equal the contract parameters', () => {
