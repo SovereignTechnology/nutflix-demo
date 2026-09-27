@@ -283,17 +283,21 @@ describe('ADR 0016 D3: another device’s phrase restores without being adopted'
     const mint = mintAt(MINT_A);
     const theirs = await newSeed();
     const ours = await newSeed();
-    const y = device({ mints: [mint], seed: theirs });
+    // The other device is far along (counter 100+), past anything x has leased: had the restore
+    // moved x's counters past ITS signatures, x's file and cursor would show it.
+    const y = device({ mints: [mint], seed: theirs, counters: knownCounters(mint.keysetId, 100) });
     await fund(y, mint, 20);
     const x = device({ mints: [mint], seed: ours });
     await fund(x, mint, 3);
     const before = { ...x.counters.state?.next };
+    const cursor = await x.conns.seeding!.counters.snapshot();
     const [r] = await x.wallet.seeded!.restoreFromSeed(theirs, [MINT_A]);
     expect(r).toEqual({ mint: MINT_A, outcome: 'restored', restoredSats: 20 });
     expect(x.counters.state?.next).toEqual(before);
+    expect(await x.conns.seeding!.counters.snapshot()).toEqual(cursor);
     await fund(x, mint, 5);
     const oursSet = derivedSecrets(ours, mint.keysetId);
-    const theirsSet = derivedSecrets(theirs, mint.keysetId);
+    const theirsSet = derivedSecrets(theirs, mint.keysetId, 128); // y's are at 100+
     const fresh = (await x.store.proofs(MINT_A)).filter((p) => !theirsSet.has(p.secret));
     expect(proofTotal(fresh)).toBe(8);
     for (const p of fresh) expect(oursSet.has(p.secret)).toBe(true);
