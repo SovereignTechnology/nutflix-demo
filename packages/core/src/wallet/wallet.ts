@@ -56,7 +56,7 @@ import type {
   SeededWallet,
   SeedMaterial,
 } from './recovery-api.js';
-import { DurableCounterSource, seedBytes } from './seed.js';
+import { DurableCounterSource, markSeeded, seedBytes } from './seed.js';
 import { heldSecrets, proofTotal, type ProofStore } from './store.js';
 import { cashuRequestFn } from './transport.js';
 
@@ -145,6 +145,7 @@ export class CashuMintConnections implements MintConnections {
               outputDataCreator: seedGuardedOutputs(s.seed),
             }),
       });
+      if (s !== undefined) markSeeded(cashu, s.seed);
       w = cashu.loadMint().then(() => {
         s?.counters.addProbe(counterProbe(cashu, s.seed));
         return cashu;

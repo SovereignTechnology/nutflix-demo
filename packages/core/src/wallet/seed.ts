@@ -267,6 +267,23 @@ export function sameSeed(a: RecoverySeed, b: RecoverySeed | undefined): boolean 
   return x.length === y.length && sodium.sodium_memcmp(x, y);
 }
 
+/** cashu-ts wallets built with a seed (`CashuMintConnections`) → that seed. */
+const SEEDED = new WeakMap<object, RecoverySeed>();
+
+/** Record that `wallet` (a cashu-ts wallet) derives NUT-13 outputs from `seed`. */
+export function markSeeded(wallet: object, seed: RecoverySeed): void {
+  SEEDED.set(wallet, seed);
+}
+
+/**
+ * The seed `wallet` was built with, if any — so the `Spender` notices a `MintConnections` wrapper
+ * that hands out seeded wallets but dropped `seeding` (it would otherwise make random outputs
+ * without a word, and `close` would wipe nothing).
+ */
+export function seededWith(wallet: object): RecoverySeed | undefined {
+  return SEEDED.get(wallet);
+}
+
 // ---------------------------------------------------------------------------------------
 // Counters
 // ---------------------------------------------------------------------------------------

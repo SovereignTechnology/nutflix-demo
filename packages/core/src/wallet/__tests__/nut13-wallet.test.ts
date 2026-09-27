@@ -22,6 +22,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { MemoryCounterStore } from '../../mocks/counter-store.js';
 import { TestMint } from '../../mocks/test-mint.js';
 import { MemoryProofStore, proofTotal, type ProofStore } from '../store.js';
+import { CashuWallet } from '../wallet.js';
 import { recoveryPhrases } from '../seed.js';
 import {
   INVOICE_20,
@@ -107,6 +108,31 @@ describe('ADR 0016 §4: output types are explicit per operation', () => {
     const mine = derivedSecrets(seed, mint.keysetId);
     for (const s of await secrets(d.store)) expect(mine.has(s)).toBe(false);
     expect(d.conns.seeding).toBeUndefined();
+  });
+
+  it('a MintConnections wrapper that drops `seeding` is refused loudly, not turned into random outputs', async () => {
+    const mint = mintA();
+    const seed = await newSeed();
+    const d = device({ mints: [mint], seed });
+    // The desktop's money plane wraps its connections like this (host/money.ts).
+    const dropped = new CashuWallet({
+      mints: { wallet: (m) => d.conns.wallet(m) },
+      store: new MemoryProofStore(),
+    });
+    expect(dropped.seeded).toBeUndefined();
+    const q = await dropped.mintQuote(MINT_A, sats(7));
+    mint.payQuote(q.quoteId);
+    await expect(dropped.pollQuote(q)).rejects.toMatchObject({
+      code: 'invalid-argument',
+      message: expect.stringContaining('seeding'),
+    });
+    // Forwarded, the same wallets work (and derive).
+    const forwarded = new CashuWallet({
+      mints: { wallet: (m) => d.conns.wallet(m), seeding: d.conns.seeding! },
+      store: new MemoryProofStore(),
+    });
+    expect(forwarded.seeded).toBeDefined();
+    expect(await forwarded.pollQuote(q)).toEqual({ state: 'ISSUED', minted: 7 });
   });
 
   it('a mint without NUT-09 cannot restore: outputs there stay random and no counter is used', async () => {

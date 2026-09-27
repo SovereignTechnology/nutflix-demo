@@ -100,6 +100,7 @@ import {
   RecoverySeedError,
   sameSeed,
   seedBytes,
+  seededWith,
   type CounterProbe,
   type DurableCounterSource,
   type UnpublishedRange,
@@ -357,7 +358,14 @@ export class Spender {
    * mint can restore them — NUT-09, and an output keyset NUT-13 derives for (hex, v1 or v2).
    */
   private seededAt(w: CashuTsWallet): boolean {
-    if (this.ctx.mints.seeding === undefined || !supports(w, 9)) return false;
+    const seeding = this.ctx.mints.seeding;
+    const built = seededWith(w);
+    if (built !== undefined && built !== seeding?.seed)
+      throw new WalletError(
+        'invalid-argument',
+        'these connections derive NUT-13 outputs but did not pass on `seeding` (a MintConnections wrapper must forward it)',
+      );
+    if (seeding === undefined || !supports(w, 9)) return false;
     try {
       const k = w.getKeyset();
       return k.hasHexId && (k.version === 0 || k.version === 1);
