@@ -186,6 +186,8 @@ async function plane(
     counters?: walletMod.CounterStore;
     pool?: nostr.FakeRelayPool;
     create?: boolean;
+    /** Issue #2's hook: a PAY that reached the wallet names its mint (never a refused one). */
+    onPayment?: (mint: MintUrl) => void;
   } = {},
 ): Promise<{ plane: MoneyPlane; seed: walletMod.RecoverySeed | undefined }> {
   const core = recoveryCore();
@@ -203,6 +205,7 @@ async function plane(
     ...(o.create === false ? {} : { createWallet: true }),
     now: () => tick++ as UnixSeconds,
     clock: () => s.clock.now,
+    ...(o.onPayment === undefined ? {} : { onPayment: o.onPayment }),
     ...(seed === undefined
       ? {}
       : {
@@ -307,7 +310,8 @@ describe('W8a: a restore holds its mint — the PAY-behind-restore loss', () => 
 describe('W8a: the seeded PAY deadline', () => {
   it('the seeded belt: a PAY that waited behind another longer than 12.6 s is refused before the wallet (unseeded it had 105.6 s)', async () => {
     const s = await setup();
-    const { plane: p } = await plane(s);
+    const paid: MintUrl[] = [];
+    const { plane: p } = await plane(s, { onPayment: (m) => paid.push(m) });
     await fund(p, s.mint, 200);
     await p.startupRestore;
     p.authorizeSession(SID, { core: CORE, blob: BLOB, policy: POLICY }, CREATOR);
@@ -330,6 +334,10 @@ describe('W8a: the seeded PAY deadline', () => {
       message: `rate-limited: ${PAY_TOO_LATE}`,
     });
     expect(s.t.reached.filter((r) => isSwap(r.path))).toHaveLength(2); // the first PAY's sends
+    // Refused by the gate's belt, before the wallet: the auto top-up hook heard only the first
+    // PAY (a refusal by a send's own check, inside the build, would have named the mint too).
+    await settleIo();
+    expect(paid).toEqual([MINT]);
   });
 
   it('a PAY at a mint this plane has not loaded: loaded and probed before its turn, so the seeded belt admits it', async () => {
@@ -392,6 +400,40 @@ describe('W8a: the seeded PAY deadline', () => {
   });
 });
 
+describe('W8a: each send of a PAY is bounded by what is left after it', () => {
+  it('the second send, behind a redeem that slipped in between the two, still runs when only it is left to fit (not refused by the whole PAY’s bound)', async () => {
+    const s = await setup();
+    const { plane: p } = await plane(s, { phrase: null });
+    await fund(p, s.mint, 200);
+    p.authorizeSession(SID, { core: CORE, blob: BLOB, policy: POLICY }, CREATOR);
+    const h = p.handlers();
+    // The PAY's first send (the seeder's share) is at the mint…
+    s.t.hold(isSwap);
+    const pay = observe(h['pay.build']!(build()));
+    const first = await s.t.next();
+    // …when a seeder's redeem arrives: core queues it before the PAY's second send.
+    const redeem = observe(
+      h['seller.redeem']!({ mint: MINT, proofs: s.mint.issue(8, { p2pk: p.p2pk }) }),
+    );
+    await settleIo();
+    first.release();
+    const redeemSwap = await s.t.next();
+    s.t.hold(null);
+    // The redeem hangs past the whole PAY's bound, but within what the last send needs.
+    const lastSend = sendStartByMs(0, true, false, 1);
+    const wholePay = sendStartByMs(0, true, false, 2);
+    s.clock.now += Math.floor((wholePay + lastSend) / 2);
+    redeemSwap.release();
+    await settleIo();
+    await settleIo();
+    expect(redeem).toMatchObject({ done: true, value: { ok: true, sats: 8 } });
+    expect(pay.error).toBeUndefined();
+    expect(pay.done).toBe(true);
+    expect(s.t.reached.filter((r) => isSwap(r.path))).toHaveLength(3);
+    expect(await p.wallet.balance(MINT)).toBe(200 + 8 - 4);
+  });
+});
+
 describe('W8a: the wallet lifecycle at close', () => {
   it('the swap waits (bounded) for the wallet to drain; once it moved on, the watermark is never written — made when the wallet drained in time', async () => {
     const s = await setup();
@@ -422,6 +464,42 @@ describe('W8a: the wallet lifecycle at close', () => {
     q.plane.close();
     await q.plane.drained();
     expect(c2.saved.length).toBe(before + 1);
+  });
+});
+
+describe('W8a: an open that fails after its connections were built', () => {
+  it('closes the counter source it built: the next open, with another phrase over the same store, is not refused', async () => {
+    const s = await setup();
+    const counters = new mocks.MemoryCounterStore();
+    const real = recoveryCore();
+    if (real === undefined) throw new Error('recoveryCore() is not wired');
+    const seed = await seedOf(PHRASE);
+    // A core whose seeded view throws: the open fails after the connections (and their counter
+    // source over `counters`) were built.
+    const failing = {
+      ...real,
+      seeded: (): never => {
+        throw new Error('internal: seeded view failed');
+      },
+    };
+    await expect(
+      MoneyPlane.open({
+        signer: s.signer,
+        journalDir: null,
+        tailDir: null,
+        pool: new nostr.FakeRelayPool(),
+        relays: () => [{ url: RELAY, read: true, write: true }],
+        defaultMints: () => [MINT],
+        log: memoryLogger('warn'),
+        mintRequest: () => s.mint.request,
+        createWallet: true,
+        seed: { material: { seed, counters }, core: failing },
+      }),
+    ).rejects.toThrow(/seeded view failed/);
+    expect(seed.wiped).toBe(true);
+    // Core refuses a store whose live source belongs to another phrase; this one was closed.
+    const other = await plane(s, { counters, phrase: OTHER_PHRASE });
+    expect(other.plane.seeded).toBeDefined();
   });
 });
 
