@@ -397,6 +397,19 @@ describe('setup: a new phrase (ADR 0016 §1, D2, D5)', () => {
     expect(w.log.lines.some((l) => l['reason'] === 'recovery-unreadable')).toBe(true);
   });
 
+  it('a seed the wallet did not take: the phrase is on this device but the status says unreadable, never covered', async () => {
+    const w = await world();
+    userWhoWritesItDown(w);
+    w.confirm = () => true;
+    w.core.takesSeed = false;
+    const r = await w.svc.setup();
+    expect(w.plane()?.seeded).toBeUndefined();
+    expect(r.status.state).toBe('unreadable');
+    expect((await w.svc.status()).state).toBe('unreadable');
+    // Nothing was reissued into outputs the phrase could not restore.
+    expect(w.core.wallet.reissued).toEqual([]);
+  });
+
   it('a phrase sealed to another identity does not open: the plane derives nothing from it', async () => {
     const w = await world();
     userWhoWritesItDown(w);

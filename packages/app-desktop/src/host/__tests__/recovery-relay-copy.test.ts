@@ -158,6 +158,42 @@ describe('reading the copies (restore only)', () => {
     expect(r.unreadable).toBe(2);
   });
 
+  it('a relay that ignores the filter: another author re-publishing our ciphertext is not a copy', async () => {
+    const s = await me();
+    const other = await me();
+    const base = new nostr.FakeRelayPool();
+    const E1 = '11'.repeat(16);
+    const sealed = await s.nip44Encrypt(s.pk, JSON.stringify({ v: 1, entropy: E1, created: 1 }));
+    const ours = await s.signEvent({
+      kind: walletMod.RECOVERY_RELAY_KIND,
+      created_at: 10,
+      tags: [['d', `nutflix/nut13/${'01'.repeat(16)}`]],
+      content: sealed,
+    });
+    const theirs = await other.signEvent({
+      kind: walletMod.RECOVERY_RELAY_KIND,
+      created_at: 11,
+      tags: [['d', `nutflix/nut13/${'02'.repeat(16)}`]],
+      content: sealed,
+    });
+    // Answers every query with both events, whatever the filter says.
+    const pool: nostr.PoolLike = {
+      query: () => Promise.resolve([ours, theirs]),
+      subscribe: (r, f, h) => base.subscribe(r, f, h),
+      publish: (r, e) => base.publish(r, e),
+      close: () => {
+        base.close();
+      },
+    };
+    const r = await readRelayCopies({
+      signer: s,
+      pubkey: s.pk,
+      relays: { pool, write: () => [], read: () => [R] },
+    });
+    expect(r.copies).toEqual([{ device: '01'.repeat(16), entropy: E1 }]);
+    expect(r.unreadable).toBe(0);
+  });
+
   it('no read relay → nothing read at all', async () => {
     const s = await me();
     const pool = new nostr.FakeRelayPool();
