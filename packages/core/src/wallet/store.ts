@@ -38,7 +38,10 @@ export interface PendingOutput {
  * says what became of them.
  */
 export interface PendingOp {
-  /** The first output's `B_` (random, so unique). */
+  /**
+   * The first output's `B_`: unique while outputs are random, or derived from counters that never
+   * repeat (NUT-13, ADR 0016 §3 — the lease-ahead `DurableCounterSource`).
+   */
   readonly id: string;
   /**
    * `melt` (ADR 0014 amendment, issue #8): a NUT-05 melt; `keep` holds its NUT-08 blank change
@@ -172,6 +175,12 @@ export interface ProofStore {
    * response is lost cannot be recovered.
    */
   pending?(mint: MintUrl): Promise<readonly PendingOp[]>;
+  /**
+   * Transitions not yet published where they are durable (`Nip60ProofStore`: the relay outbox).
+   * A seeded wallet moves its NUT-13 `published` watermark only while this is 0 (ADR 0016 §3); a
+   * store without it counts as always published.
+   */
+  unsynced?(): number;
   history(opts?: {
     readonly limit?: number;
     readonly mint?: MintUrl;

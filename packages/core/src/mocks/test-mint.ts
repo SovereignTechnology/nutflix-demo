@@ -16,6 +16,10 @@
  * `markSpent()` spends proofs behind everyone's back, `failNext()` injects a mint outage,
  * `holdNextMelt()` / `settleMelts()` answer a melt PENDING (its Lightning payment in flight) and
  * settle it later, as cdk and Nutshell do, `failNextMelt()` refuses a melt request with a code.
+ * NUT-13 (ADR 0016): `rotateKeyset()` retires the active keyset (it stays listed, its proofs stay
+ * spendable, as at a real mint) and makes a new one; `keysetVersion: 0` gives a v1 (`00…`) id,
+ * whose NUT-13 derivation is BIP-32; `nut12: false` signs without DLEQ; `hostileRestore()` makes
+ * `/v1/restore` sign whatever it is asked (a hostile mint amplifying a restore).
  */
 import {
   Amount,
@@ -97,6 +101,21 @@ export interface TestMintOptions {
     readonly ttl: number;
     readonly cachedEndpoints: readonly { readonly method: 'GET' | 'POST'; readonly path: string }[];
   };
+  /**
+   * The keyset id version (NUT-02): 1 (default) gives a v2 `01…` id (NUT-13 derives by HMAC), 0 a
+   * v1 `00…` id (NUT-13 derives by BIP-32, the counter a hardened index).
+   */
+  readonly keysetVersion?: 0 | 1;
+  /** NUT-12 DLEQ proofs on every signature (default on, like Nutshell and cdk). */
+  readonly nut12?: boolean;
+}
+
+/** One keyset: its keys, and whether it still signs (inactive keysets only redeem). */
+interface TestKeyset {
+  readonly id: string;
+  readonly pub: Readonly<Record<string, Uint8Array>>;
+  readonly priv: Readonly<Record<string, Uint8Array>>;
+  active: boolean;
 }
 
 /**
@@ -154,9 +173,13 @@ interface HeldMelt {
 
 export class TestMint {
   readonly url: MintUrl;
-  readonly keysetId: string;
-  private readonly pub: Readonly<Record<string, Uint8Array>>;
-  private readonly priv: Readonly<Record<string, Uint8Array>>;
+  /** Every keyset, oldest first; the last one is active (`rotateKeyset`). */
+  private readonly sets: TestKeyset[] = [];
+  private readonly keySeed: Uint8Array | undefined;
+  private readonly keysetVersion: 0 | 1;
+  private readonly nut12: boolean;
+  /** `/v1/restore` signs every output it is asked about (`hostileRestore`). */
+  private signOnRestore = false;
   private readonly inputFeePpk: number;
   private readonly feeReserve: number;
   private readonly nut20: boolean;
@@ -198,10 +221,67 @@ export class TestMint {
     this.nut09 = o.nut09 ?? true;
     this.nut19 = o.nut19;
     this.quoteExpiry = o.quoteExpiry ?? 4_102_444_800;
-    const pair = createNewMintKeys(16, o.seed, { unit: 'sat', input_fee_ppk: this.inputFeePpk });
-    this.keysetId = pair.keysetId;
-    this.pub = pair.pubKeys;
-    this.priv = pair.privKeys;
+    this.keySeed = o.seed;
+    this.keysetVersion = o.keysetVersion ?? 1;
+    this.nut12 = o.nut12 ?? true;
+    this.addKeyset();
+  }
+
+  /** The active keyset's id (the one new outputs are signed under). */
+  get keysetId(): string {
+    return this.active().id;
+  }
+
+  /** Every keyset id, oldest first (the last is active). */
+  get keysetIds(): readonly string[] {
+    return this.sets.map((k) => k.id);
+  }
+
+  private active(): TestKeyset {
+    const k = this.sets.at(-1);
+    if (k === undefined) throw new Error('test-mint: no keyset');
+    return k;
+  }
+
+  private get pub(): Readonly<Record<string, Uint8Array>> {
+    return this.active().pub;
+  }
+
+  private get priv(): Readonly<Record<string, Uint8Array>> {
+    return this.active().priv;
+  }
+
+  private addKeyset(): string {
+    // A seeded mint's later keysets are seeded too (their own seed: the n-th keyset's).
+    const seed =
+      this.keySeed === undefined
+        ? undefined
+        : Uint8Array.from(this.keySeed, (b, i) => (i === 0 ? (b + this.sets.length) & 0xff : b));
+    const pair = createNewMintKeys(16, seed, {
+      unit: 'sat',
+      input_fee_ppk: this.inputFeePpk,
+      versionByte: this.keysetVersion,
+    });
+    for (const k of this.sets) k.active = false;
+    this.sets.push({ id: pair.keysetId, pub: pair.pubKeys, priv: pair.privKeys, active: true });
+    return pair.keysetId;
+  }
+
+  /**
+   * Retire the active keyset and sign under a new one (a keyset rotation). The old one stays in
+   * `/v1/keysets` (inactive) and `/v1/keys/{id}`, and its proofs stay spendable. Returns the new id.
+   */
+  rotateKeyset(): string {
+    return this.addKeyset();
+  }
+
+  /** `/v1/restore` signs every output it is asked about, as a hostile mint could. */
+  hostileRestore(on = true): void {
+    this.signOnRestore = on;
+  }
+
+  private keysOf(id: string): TestKeyset | undefined {
+    return this.sets.find((k) => k.id === id);
   }
 
   /** The keyset in the contracts' shape (`MintKeyset`), for offline DLEQ verification. */
@@ -326,7 +406,9 @@ export class TestMint {
         amount: a,
         secret: secretStr,
         C: C.toHex(true),
-        dleq: { s: hex(dleq.s), e: hex(dleq.e), r: r.toString(16).padStart(64, '0') },
+        ...(this.nut12
+          ? { dleq: { s: hex(dleq.s), e: hex(dleq.e), r: r.toString(16).padStart(64, '0') } }
+          : {}),
       });
     }
     return out;
@@ -358,15 +440,22 @@ export class TestMint {
 
   private route(method: string, path: string, body: Record<string, unknown>): unknown {
     if (method === 'GET' && path === '/v1/info') return this.info();
-    if (method === 'GET' && (path === '/v1/keys' || path === `/v1/keys/${this.keysetId}`))
-      return { keysets: [this.keysDto()] };
-    if (method === 'GET' && path.startsWith('/v1/keys/'))
-      throw new MintOperationError(12001, 'Keyset is not known');
+    // Like Nutshell and cdk: `/v1/keys` serves the active keysets, `/v1/keys/{id}` any keyset.
+    if (method === 'GET' && path === '/v1/keys')
+      return { keysets: this.sets.filter((k) => k.active).map((k) => this.keysDto(k)) };
+    if (method === 'GET' && path.startsWith('/v1/keys/')) {
+      const k = this.keysOf(path.slice('/v1/keys/'.length));
+      if (k === undefined) throw new MintOperationError(12001, 'Keyset is not known');
+      return { keysets: [this.keysDto(k)] };
+    }
     if (method === 'GET' && path === '/v1/keysets')
       return {
-        keysets: [
-          { id: this.keysetId, unit: 'sat', active: true, input_fee_ppk: this.inputFeePpk },
-        ],
+        keysets: this.sets.map((k) => ({
+          id: k.id,
+          unit: 'sat',
+          active: k.active,
+          input_fee_ppk: this.inputFeePpk,
+        })),
       };
     if (method === 'POST' && path === '/v1/swap') return this.swap(body);
     if (method === 'POST' && path === '/v1/checkstate') return this.checkState(body);
@@ -396,7 +485,7 @@ export class TestMint {
         '8': { supported: true },
         '10': { supported: true },
         '11': { supported: true },
-        '12': { supported: true },
+        ...(this.nut12 ? { '12': { supported: true } } : {}),
         ...(this.nut09 ? { '9': { supported: true } } : {}),
         ...(this.nut20 ? { '20': { supported: true } } : {}),
         ...(this.nut19 === undefined
@@ -411,10 +500,10 @@ export class TestMint {
     };
   }
 
-  private keysDto(): unknown {
+  private keysDto(k: TestKeyset): unknown {
     const keys: Record<string, string> = {};
-    for (const [amount, k] of Object.entries(this.pub)) keys[amount] = hex(k);
-    return { id: this.keysetId, unit: 'sat', active: true, input_fee_ppk: this.inputFeePpk, keys };
+    for (const [amount, key] of Object.entries(k.pub)) keys[amount] = hex(key);
+    return { id: k.id, unit: 'sat', active: k.active, input_fee_ppk: this.inputFeePpk, keys };
   }
 
   private y(secret: string): string {
@@ -439,8 +528,10 @@ export class TestMint {
     for (const raw of inputs) {
       const p = wireProof(raw);
       const amount = num(p.amount);
-      if (p.id !== this.keysetId) throw new MintOperationError(12001, 'Keyset is not known');
-      const priv = this.priv[String(amount)];
+      // Inactive keysets still redeem (a rotation retires signing, not the proofs).
+      const ks = this.keysOf(p.id);
+      if (ks === undefined) throw new MintOperationError(12001, 'Keyset is not known');
+      const priv = ks.priv[String(amount)];
       if (!priv) throw new MintOperationError(11005, 'amount has no key');
       const secret = enc.encode(p.secret);
       let ok: boolean;
@@ -496,13 +587,13 @@ export class TestMint {
       seen.add(raw.B_);
       const B_ = pointFromHex(raw.B_);
       const sig = createBlindSignature(B_, priv, this.keysetId);
-      const dleq = createDLEQProof(B_, priv);
+      const dleq = this.nut12 ? createDLEQProof(B_, priv) : undefined;
       signatures.push({
         id: this.keysetId,
         // A plain JSON number, as on the wire (an `Amount` would serialise as a string).
         amount: amount as unknown as Amount,
         C_: sig.C_.toHex(true),
-        dleq: { s: hex(dleq.s), e: hex(dleq.e) },
+        ...(dleq === undefined ? {} : { dleq: { s: hex(dleq.s), e: hex(dleq.e) } }),
       });
       total += amount;
     }
@@ -544,7 +635,13 @@ export class TestMint {
     const outs: SerializedBlindedMessage[] = [];
     const signatures: SerializedBlindedSignature[] = [];
     for (const o of outputs as SerializedBlindedMessage[]) {
-      const sig = this.promises.get(o.B_);
+      let sig = this.promises.get(o.B_);
+      if (sig === undefined && this.signOnRestore) {
+        // A hostile mint: signs (a 1-sat output) whatever it is asked about.
+        const one = { ...o, amount: 1 as unknown as Amount };
+        sig = this.sign([one]).signatures[0];
+        if (sig !== undefined) this.remember([one], [sig]);
+      }
       if (sig === undefined) continue;
       outs.push(o);
       signatures.push(sig);

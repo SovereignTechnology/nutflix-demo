@@ -5,15 +5,35 @@
 export type { Wallet, WalletHistoryEntry, WalletChangeEvent } from '../contracts/wallet.js';
 export {
   PENDING_SETTLE_AFTER_S,
+  RESTORE_BATCH,
+  RESTORE_EMPTY_BATCHES,
+  RESTORE_MAX_BATCHES,
+  RESTORE_MAX_KEYSETS,
   Spender,
   WalletError,
   fromCashu,
   toCashu,
   type MintConnections,
+  type Seeding,
   type SpendContext,
   type WalletErrorCode,
   type WalletKey,
 } from './spend.js';
+export {
+  COUNTER_LEASE,
+  COUNTER_LIMIT,
+  CounterStateError,
+  DurableCounterSource,
+  RECOVERY_WORDS,
+  RecoveryPhraseError,
+  RecoverySeedError,
+  isCounterState,
+  recoveryPhrases,
+  wipeEntropy,
+  type CounterProbe,
+  type CounterRange,
+  type UnpublishedRange,
+} from './seed.js';
 export {
   MemoryProofStore,
   PENDING_KINDS,
