@@ -22,7 +22,7 @@ import {
 } from '@sovit/core';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { MELT_REQUEST_TIMEOUT_MS } from '../../ipc/deadlines.js';
+import { MELT_REQUEST_TIMEOUT_MS, WORKER_HOST_REQUEST_TIMEOUT_MS } from '../../ipc/deadlines.js';
 import { memoryLogger } from '../log.js';
 import { GateRefusal, PAY_STILL_BUILDING } from '../pay-melt-gate.js';
 import { JsonFile } from '../settings/json-file.js';
@@ -34,6 +34,8 @@ import {
   TOP_UP_EXPIRED_RELEASE_AFTER_MS,
   TOP_UP_FAIL_BACKOFF_MS,
   TOP_UP_MAX_BACKOFF_MS,
+  TOP_UP_MELT_RETURNED_BY_MS,
+  TOP_UP_MELT_START_BY_MS,
   TOP_UP_MIN_INTERVAL_MS,
   TOP_UP_RELEASE_AFTER_MS,
   TOP_UP_RESOLVE_EVERY_MS,
@@ -896,7 +898,10 @@ describe('AutoTopUp — review F3: a reservation in flight when the host died', 
     // it at once and this check read 'cap' right away.)
     expect(await again.check(TARGET)).toBe('unresolved');
     expect(await s.wallet.balance(TARGET)).toBe(30_000);
-    later(s, MELT_REQUEST_TIMEOUT_MS + TOP_UP_RELEASE_AFTER_MS);
+    // Lane R6-reconcile (the round-5 verifier): that latest is now the reservation plus
+    // TOP_UP_MELT_RETURNED_BY_MS (the melt's start-by and the PAY/melt gate's wait come before the
+    // melt request), so the clock moves that much further; the outcome asserted is unchanged.
+    later(s, TOP_UP_MELT_RETURNED_BY_MS + TOP_UP_RELEASE_AFTER_MS);
     // 30 000 moved + 10 002 still reserved: another 10 002 would pass 50 000.
     expect(await again.check(TARGET)).toBe('cap');
     expect(await s.wallet.balance(TARGET)).toBe(30_000);
@@ -1600,7 +1605,7 @@ describe('AutoTopUp — round 4 (info): the startup settle first, a play waits a
       playWaitMs: 30,
     });
     const started = Date.now();
-    expect(await top.checkForPlay(TARGET)).toBe('in-flight');
+    expect(await top.checkForPlay([TARGET])).toBe('in-flight');
     expect(Date.now() - started).toBeGreaterThanOrEqual(60 + 25);
     expect(top.inFlight).not.toBeNull();
     release();
@@ -1608,7 +1613,7 @@ describe('AutoTopUp — round 4 (info): the startup settle first, a play waits a
     expect(await s.wallet.balance(TARGET)).toBe(2_000);
     // Quick top-ups are simply awaited: nothing in flight, the outcome itself.
     later(s);
-    expect(await top.checkForPlay(TARGET)).toBe('not-due');
+    expect(await top.checkForPlay([TARGET])).toBe('not-due');
   });
 });
 
@@ -1655,7 +1660,7 @@ describe('AutoTopUp — round 5 (low): the play bound starts before the run’s 
     });
     const top = playTop(s, recovery);
     const started = performance.now();
-    expect(await orStillWaiting(top.checkForPlay(TARGET))).toBe('in-flight');
+    expect(await orStillWaiting(top.checkForPlay([TARGET]))).toBe('in-flight');
     expect(performance.now() - started).toBeLessThan(2_000);
     expect(top.inFlight).not.toBeNull();
     expect(s.lightning.paid).toEqual([]); // still waiting for the settle: nothing quoted
@@ -1680,7 +1685,7 @@ describe('AutoTopUp — round 5 (low): the play bound starts before the run’s 
       await slow; // the target takes its time
       return poll(q);
     });
-    expect(await orStillWaiting(top.checkForPlay(TARGET))).toBe('in-flight');
+    expect(await orStillWaiting(top.checkForPlay([TARGET]))).toBe('in-flight');
     expect(polls).toHaveBeenCalledTimes(1); // the run's own resolveOpen is what it waits on
     answer();
     expect(await top.inFlight).toBe('unresolved'); // still pending at the source: nothing new
@@ -1715,7 +1720,12 @@ describe('AutoTopUp — round 5 (info): a quote is never released right after it
     expect(s.lightning.paid).toHaveLength(1);
   });
 
-  it('after a restart (when the melt returned is not known): kept until the reservation plus the melt timeout plus TOP_UP_RELEASE_AFTER_MS', async () => {
+  // Lane R6-reconcile (the round-5 verifier): this test pinned the release at the reservation plus
+  // the melt timeout plus TOP_UP_RELEASE_AFTER_MS. That bound left out the seal (a bunker may take
+  // minutes) and the PAY/melt gate's wait, both between the reservation and the melt request; the
+  // bound is now TOP_UP_MELT_RETURNED_BY_MS (the melt's start-by + the gate's wait + the melt
+  // timeout). Still kept at round 5's moment, and released at the new one.
+  it('after a restart (when the melt returned is not known): kept until the reservation plus TOP_UP_MELT_RETURNED_BY_MS (start-by, gate wait, melt timeout) plus TOP_UP_RELEASE_AFTER_MS', async () => {
     const s = await setup({ fund: 20_000, amountSats: 2_000 });
     s.source.failNextMelt();
     expect(await s.top.check(TARGET)).toBe('failed');
@@ -1723,7 +1733,37 @@ describe('AutoTopUp — round 5 (info): a quote is never released right after it
     const again = await s.restart();
     const openOnDisk = async (): Promise<number> =>
       (await TopUpLedger.open(s.dir, memoryLogger(), () => s.t)).openEntries(OWNER).length;
-    s.t = entry!.at + MELT_REQUEST_TIMEOUT_MS + TOP_UP_RELEASE_AFTER_MS - 1;
+    s.t = entry!.at + MELT_REQUEST_TIMEOUT_MS + TOP_UP_RELEASE_AFTER_MS; // round 5 released here
+    await again.resume();
+    expect(await openOnDisk()).toBe(1);
+    expect(TOP_UP_MELT_RETURNED_BY_MS).toBe(
+      TOP_UP_MELT_START_BY_MS + WORKER_HOST_REQUEST_TIMEOUT_MS + MELT_REQUEST_TIMEOUT_MS,
+    );
+    s.t = entry!.at + TOP_UP_MELT_RETURNED_BY_MS + TOP_UP_RELEASE_AFTER_MS - 1;
+    await again.resume();
+    expect(await openOnDisk()).toBe(1);
+    s.t += 1;
+    await again.resume();
+    expect(await openOnDisk()).toBe(0);
+  });
+
+  // Lane R6-reconcile: what the bound leaves out (core's own turn at the source and its round trips
+  // before the request) is covered by this run of the host's start — the process that sent the
+  // melt had exited by then. A restart long after the reservation keeps the quote for
+  // TOP_UP_RELEASE_AFTER_MS past that start, not a moment less.
+  it('after a restart long after the reservation: kept until the restart plus TOP_UP_RELEASE_AFTER_MS', async () => {
+    const s = await setup({ fund: 20_000, amountSats: 2_000 });
+    s.source.failNextMelt();
+    expect(await s.top.check(TARGET)).toBe('failed');
+    const [entry] = s.ledger.snapshot().entries;
+    s.t = entry!.at + 2 * 60 * 60_000; // two hours later, the host starts again
+    const startedAt = s.t;
+    const again = await s.restart();
+    const openOnDisk = async (): Promise<number> =>
+      (await TopUpLedger.open(s.dir, memoryLogger(), () => s.t)).openEntries(OWNER).length;
+    await again.resume();
+    expect(await openOnDisk()).toBe(1); // far past the bound, and still kept at the start
+    s.t = startedAt + TOP_UP_RELEASE_AFTER_MS - 1;
     await again.resume();
     expect(await openOnDisk()).toBe(1);
     s.t += 1;
@@ -1737,12 +1777,17 @@ describe('AutoTopUp — round 5 (info): an open top-up whose source is gone for 
   const EXPIRY_S = T0 / 1000 + 600;
   const LAPSED = EXPIRY_S * 1000 + TOP_UP_EXPIRED_RELEASE_AFTER_MS;
 
-  it('released once the target still says UNPAID a day past its invoice’s expiry, not before (settled unknown, never failed: counted like any melt that may have run); the next top-up from the new source runs', async () => {
+  // Lane R6-reconcile (the round-5 verifier): round 5 released at the lapse also when the source
+  // could not be read at all (it went offline for good, here `failNext`). A read that failed says
+  // nothing — the melt may have paid — so only a source that ANSWERS short of PAID (UNPAID, or its
+  // payment stuck PENDING, as here) lets the kept quote go; a source gone for good now keeps it
+  // (the case moved to the "kept past the lapse" table below; residual R5-R1). Every other
+  // assertion of this test is unchanged.
+  it('released once the target still says UNPAID a day past its invoice’s expiry while the source answers short of PAID (its payment stuck PENDING), not before (settled unknown, never failed: counted like any melt that may have run); the next top-up from the new source runs', async () => {
     const s = await setup({ fund: 20_000, amountSats: 2_000, targetQuoteExpiry: EXPIRY_S });
     s.source.holdNextMelt(1); // answered PENDING: journaled, the quote kept
     expect(await s.top.check(TARGET)).toBe('failed');
-    // The source goes away for good; the user picks another one.
-    s.source.failNext(1_000_000);
+    // The source's Lightning payment never settles; the user picks another source.
     const funding = await s.wallet.mintQuote(SECOND, 20_000 as Sats);
     s.second.payQuote(funding.quoteId);
     await s.wallet.pollQuote(funding);
@@ -1751,7 +1796,7 @@ describe('AutoTopUp — round 5 (info): an open top-up whose source is gone for 
       autoTopUp: { belowSats: 1_000 as Sats, fromMint: SECOND, amountSats: 2_000 as Sats },
     };
     pastBackoff(s);
-    expect(await s.top.check(TARGET)).toBe('unresolved'); // the source cannot be asked
+    expect(await s.top.check(TARGET)).toBe('unresolved'); // still journaled, PENDING at the source
     s.t = LAPSED - 1;
     await s.top.resume();
     expect(s.ledger.openEntries(OWNER)).toHaveLength(1); // not a moment before
@@ -1770,7 +1815,12 @@ describe('AutoTopUp — round 5 (info): an open top-up whose source is gone for 
     expect(JSON.stringify(s.log.lines)).not.toMatch(/topup\.test|lnbc/);
   });
 
-  it.each(['the source says PAID', 'the invoice has no expiry'] as const)(
+  it.each([
+    'the source says PAID',
+    'the invoice has no expiry',
+    // Lane R6-reconcile (the round-5 verifier): a failed read is no answer.
+    'the source cannot be read (gone for good)',
+  ] as const)(
     'kept past the lapse when %s (the target owes it / nothing proves it unpayable)',
     async (why) => {
       let unpaid = true;
@@ -1791,9 +1841,11 @@ describe('AutoTopUp — round 5 (info): an open top-up whose source is gone for 
         s.source.settleMelts('paid');
         await s.wallet.recoverPending(); // nothing journaled any more; the source says PAID
       } else s.source.failNext(1_000_000); // the source gone: it says nothing
+      const settle = vi.spyOn(s.ledger, 'settle');
       s.t = LAPSED + DAY_MS;
       expect(await s.top.check(TARGET)).toBe('unresolved');
       expect(s.ledger.openEntries(OWNER)).toHaveLength(1);
+      expect(settle).not.toHaveBeenCalled();
       if (why === 'the source says PAID') {
         unpaid = false; // the target sees it after all: minted once
         later(s);
@@ -1801,6 +1853,261 @@ describe('AutoTopUp — round 5 (info): an open top-up whose source is gone for 
         expect(await s.wallet.balance(TARGET)).toBe(2_000);
         expect(s.lightning.paid).toHaveLength(1);
       }
+    },
+  );
+});
+
+/**
+ * Lane R6-reconcile: an AutoTopUp over `s`'s wallet and ledger with its own play bound, monotonic
+ * clock and first-funding answer, whose vault the test may change (a journal or a source that
+ * cannot be read, a slow seal).
+ */
+function r6Top(
+  s: Setup,
+  o: {
+    readonly vault?: (v: TopUpVault) => TopUpVault;
+    readonly clock?: () => number;
+    readonly playWaitMs?: number;
+    readonly ask?: (q: FirstFundingQuestion) => Promise<boolean>;
+  } = {},
+): AutoTopUp {
+  return new AutoTopUp({
+    settings: () => s.settings,
+    wallet: () => s.current,
+    vault: (w) => {
+      if (w !== s.current) return undefined;
+      const v = testVault({ owner: OWNER, store: s.store, mints: s.conns, recovery: s.recovery });
+      return o.vault === undefined ? v : o.vault(v);
+    },
+    ledger: s.ledger,
+    askFirstFunding: o.ask ?? (() => Promise.resolve(true)),
+    log: s.log,
+    now: () => s.t,
+    ...(o.clock === undefined ? {} : { clock: o.clock }),
+    sleep: () => Promise.resolve(),
+    pollAttempts: 3,
+    ...(o.playWaitMs === undefined ? {} : { playWaitMs: o.playWaitMs }),
+  });
+}
+
+/** Resolves after `ms` of real time. */
+function sleepMs(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
+}
+
+/** A promise the test releases, and its release. */
+function gate(): { readonly wait: Promise<void>; readonly release: () => void } {
+  let release: () => void = () => undefined;
+  const wait = new Promise<void>((r) => {
+    release = r;
+  });
+  return { wait, release };
+}
+
+// Lane R6-reconcile (the round-5 verifier): a kept quote goes only on AFFIRMATIVE answers. The
+// journal's `meltPending` is three states (yes, no, not known) and only "no" counts as nothing
+// journaled; past the lapse, a source mint that cannot be read is no answer either.
+describe('AutoTopUp — lane R6-reconcile: a kept quote is released on answers, never on a failed read', () => {
+  it('a journal that cannot be read is not "nothing journaled": kept past the guard while the source says UNPAID, released once the journal answers no', async () => {
+    const s = await setup({ fund: 20_000, amountSats: 2_000 });
+    let journal: 'fails' | 'reads' = 'fails';
+    const asked: string[] = [];
+    const top = r6Top(s, {
+      vault: (v) => ({
+        ...v,
+        meltPending: (mint, quoteId) => {
+          asked.push(journal);
+          return journal === 'fails'
+            ? Promise.reject(new Error('the journal cannot be read'))
+            : v.meltPending(mint, quoteId);
+        },
+      }),
+    });
+    s.source.failNextMelt(); // refused with a code: nothing journaled, the source's quote UNPAID
+    expect(await top.check(TARGET)).toBe('failed');
+    later(s, TOP_UP_RELEASE_AFTER_MS); // past the release guard
+    await top.resume();
+    expect(asked).toEqual(['fails']); // asked, and it could not say
+    expect(s.ledger.openEntries(OWNER)).toHaveLength(1);
+    journal = 'reads';
+    await top.resume();
+    expect(asked).toEqual(['fails', 'reads']);
+    expect(s.ledger.openEntries(OWNER)).toEqual([]);
+    expect(s.ledger.snapshot().entries).toMatchObject([{ state: 'unknown', sats: 2_002 }]);
+    expect(s.log.lines.map((l) => l.msg)).toContain(
+      'auto top-up melt not paid: its quote is released',
+    );
+  });
+
+  it('past the lapse, a source that cannot be read keeps the quote (every trigger); once it answers (PENDING) the quote is released', async () => {
+    const EXPIRY_S = T0 / 1000 + 600;
+    const LAPSED = EXPIRY_S * 1000 + TOP_UP_EXPIRED_RELEASE_AFTER_MS;
+    const s = await setup({ fund: 20_000, amountSats: 2_000, targetQuoteExpiry: EXPIRY_S });
+    let source: 'down' | 'up' = 'down';
+    const top = r6Top(s, {
+      vault: (v) => ({
+        ...v,
+        meltState: (mint, quoteId) =>
+          source === 'down'
+            ? Promise.reject(new Error('mint-error: the source cannot be reached'))
+            : v.meltState(mint, quoteId),
+      }),
+    });
+    s.source.holdNextMelt(1); // answered PENDING: journaled, the quote kept
+    expect(await top.check(TARGET)).toBe('failed');
+    for (const at of [LAPSED, LAPSED + DAY_MS, LAPSED + 30 * DAY_MS]) {
+      s.t = at;
+      await top.resume();
+      expect(s.ledger.openEntries(OWNER)).toHaveLength(1);
+    }
+    source = 'up'; // it answers: the payment is still PENDING there, for an invoice long expired
+    await top.resume();
+    expect(s.ledger.openEntries(OWNER)).toEqual([]);
+    expect(s.log.lines.map((l) => l.msg)).toContain(
+      'auto top-up invoice expired unpaid: its quote is released',
+    );
+  });
+});
+
+// Lane R6-reconcile (the round-5 verifier): PLAY_TOP_UP_WAIT_MS is the whole play's bound — the
+// finishing of open top-ups, the run, and every mint the play tries — the questions' time aside.
+// Real timers: a phase that is late can only make the play later, never earlier.
+describe('AutoTopUp — lane R6-reconcile: one bound for the whole play', () => {
+  const W = 2_000;
+
+  it('the finishing of open top-ups and the run share it: a slow finishing leaves the run only the rest', async () => {
+    const s = await setup({ fund: 20_000, amountSats: 2_000 });
+    s.source.holdNextMelt(1); // a top-up into SECOND answered PENDING: open, kept
+    expect(await s.top.check(SECOND)).toBe('failed');
+    pastBackoff(s);
+    const poll = s.wallet.pollQuote.bind(s.wallet);
+    let first = true;
+    vi.spyOn(s.wallet, 'pollQuote').mockImplementation(async (q) => {
+      if (first) {
+        first = false;
+        await sleepMs(0.6 * W); // the play's own finishing of it: 60 % of the bound
+      }
+      return poll(q);
+    });
+    const melting = gate();
+    const melt = s.wallet.melt.bind(s.wallet);
+    vi.spyOn(s.wallet, 'melt').mockImplementation(async (q) => {
+      await melting.wait;
+      return melt(q);
+    });
+    const top = r6Top(s, { playWaitMs: W });
+    const started = performance.now();
+    expect(await top.checkForPlay([TARGET])).toBe('in-flight');
+    const took = performance.now() - started;
+    expect(took).toBeGreaterThanOrEqual(W - 2);
+    expect(took).toBeLessThan(1.3 * W); // not 0.6 W, then a whole bound for the run
+    melting.release();
+    expect(await top.inFlight).toBe('done');
+    expect(await s.wallet.balance(TARGET)).toBe(2_000);
+  }, 30_000);
+
+  it('every mint of the play shares it: a first mint that took 60 % of it (not due after all) leaves the second only the rest', async () => {
+    const s = await setup({ fund: 20_000, amountSats: 2_000 });
+    const balance = s.wallet.balance.bind(s.wallet);
+    vi.spyOn(s.wallet, 'balance').mockImplementation(async (mint) => {
+      if (mint !== TARGET) return balance(mint);
+      await sleepMs(0.6 * W);
+      return 5_000 as Sats; // enough after all: that mint is not due
+    });
+    const quoting = gate();
+    const mintQuote = s.wallet.mintQuote.bind(s.wallet);
+    vi.spyOn(s.wallet, 'mintQuote').mockImplementation(async (mint, amount) => {
+      if (mint === SECOND) await quoting.wait;
+      return mintQuote(mint, amount);
+    });
+    const top = r6Top(s, { playWaitMs: W });
+    const started = performance.now();
+    expect(await top.checkForPlay([TARGET, SECOND])).toBe('in-flight');
+    const took = performance.now() - started;
+    expect(took).toBeGreaterThanOrEqual(W - 2);
+    expect(took).toBeLessThan(1.3 * W); // not 0.6 W, then a whole bound for the second mint
+    quoting.release();
+    expect(await top.inFlight).toBe('done');
+    expect(await balance(SECOND)).toBe(2_000);
+  }, 30_000);
+
+  it('the time a first mint’s question was open stays aside for the rest of the play', async () => {
+    const s = await setup({ fund: 20_000, amountSats: 2_000 });
+    const quoting = gate();
+    const mintQuote = s.wallet.mintQuote.bind(s.wallet);
+    vi.spyOn(s.wallet, 'mintQuote').mockImplementation(async (mint, amount) => {
+      if (mint === SECOND) await quoting.wait;
+      return mintQuote(mint, amount);
+    });
+    const top = r6Top(s, {
+      playWaitMs: W,
+      ask: async (q) => {
+        if (q.target !== TARGET) return true;
+        // The user takes their time over the first mint (a minute on the wall clock, so the next
+        // attempt is not spaced out) and changes the amount meanwhile: that run ends not due.
+        await sleepMs(0.6 * W);
+        s.t += TOP_UP_MIN_INTERVAL_MS;
+        s.settings = {
+          ...s.settings,
+          autoTopUp: { ...s.settings.autoTopUp!, amountSats: 2_500 as Sats },
+        };
+        return true;
+      },
+    });
+    const started = performance.now();
+    expect(await top.checkForPlay([TARGET, SECOND])).toBe('in-flight');
+    const took = performance.now() - started;
+    expect(took).toBeGreaterThanOrEqual(1.6 * W - 2); // the question's 0.6 W aside, then the bound
+    expect(took).toBeLessThan(2.2 * W);
+    quoting.release();
+    expect(await top.inFlight).toBe('done');
+    expect(await s.wallet.balance(SECOND)).toBe(2_500);
+  }, 30_000);
+});
+
+// Lane R6-reconcile (the round-5 verifier): between the reservation and the melt the run seals
+// the record through the signer (a NIP-46 bunker may ask its user). A melt that does not start
+// within TOP_UP_MELT_START_BY_MS of the reservation never starts, so a restart can bound when
+// it returned (TOP_UP_MELT_RETURNED_BY_MS).
+describe('AutoTopUp — lane R6-reconcile: a melt starts within TOP_UP_MELT_START_BY_MS of its reservation, or not at all', () => {
+  it.each([
+    ['exactly at the start-by: the melt goes', TOP_UP_MELT_START_BY_MS, 'done'],
+    [
+      '1 ms past it: nothing melts, the reservation settles failed (not counted)',
+      TOP_UP_MELT_START_BY_MS + 1,
+      'failed',
+    ],
+  ] as const)(
+    'a seal that took long (a bunker asking its user), %s',
+    async (_what, sealMs, outcome) => {
+      const s = await setup({ fund: 20_000, amountSats: 2_000 });
+      let mono = 0;
+      const top = r6Top(s, {
+        clock: () => mono,
+        vault: (v) => ({
+          ...v,
+          seal: async (plain) => {
+            mono += sealMs; // the monotonic clock; the wall clock does not move
+            return v.seal(plain);
+          },
+        }),
+      });
+      expect(await top.check(TARGET)).toBe(outcome);
+      if (outcome === 'done') {
+        expect(s.lightning.paid).toHaveLength(1);
+        expect(await s.wallet.balance(TARGET)).toBe(2_000);
+        return;
+      }
+      expect(s.lightning.paid).toEqual([]);
+      expect(await s.wallet.balance(SOURCE)).toBe(20_000);
+      expect(s.ledger.snapshot().entries).toMatchObject([{ state: 'failed' }]);
+      expect(s.ledger.openEntries(OWNER)).toEqual([]);
+      expect(s.ledger.used(s.t)).toBe(0);
+      expect(s.log.lines.map((l) => l.msg)).toContain(
+        'auto top-up melt not started: too long since its reservation',
+      );
     },
   );
 });

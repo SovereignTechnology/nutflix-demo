@@ -615,13 +615,11 @@ export class DesktopNetworkAdapter implements NetworkAdapter {
         // is tried (and asked about) for the same play. Round 4 (info), round 5: waited for at
         // most `PLAY_TOP_UP_WAIT_MS` in all, the time the first-funding question is open aside;
         // a slower top-up finishes in the background and the play fails `no-balance` now (the
-        // user retries).
-        for (const m of mints) {
-          const out = await top.checkForPlay(m);
-          if (out === 'in-flight')
-            fail('no-balance', 'a top-up is on its way to this mint: try again in a moment');
-          if (out !== 'not-due') break;
-        }
+        // user retries). Lane R6-reconcile: ONE call for all of the video's mints, so that bound
+        // is the play's — it used to be one call, and one bound, per mint.
+        const out = await top.checkForPlay(mints);
+        if (out === 'in-flight')
+          fail('no-balance', 'a top-up is on its way to this mint: try again in a moment');
         balances = await Promise.all(mints.map((m) => this.wallet.balance(m)));
       } else {
         mints.forEach((m, i) => {

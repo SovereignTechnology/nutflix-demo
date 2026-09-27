@@ -46,14 +46,14 @@
  * retry, the next trigger, a new wallet after a lock/unlock or a signer swap, the next start —
  * finishes it first (`resolveOpen`): minted exactly once when the target says PAID (core's
  * journaled `pollQuote`), released only while the quote is still UNPAID and either the melt is
- * settled as not paid (no journal entry left, the source mint's own quote state UNPAID) or, whatever
- * the source says short of PAID, a day has passed since the invoice expired (round 5: a source
- * gone for good) and the source still answers, short of PAID (lane R6-reconcile: a source that
- * cannot be read keeps it). Never within `TOP_UP_RELEASE_AFTER_MS` of its melt returning (round 5,
- * R4-R2). No new top-up runs into a target with one open (`unresolved`). When the journal settles the melt
- * as paid, its history line is found by the anchor the record keeps and reads "top-up"; the entry
- * says `done`. Every run waits for the money plane's startup settle first (what a crash cut off at
- * the target is restored before its balance is read).
+ * settled as not paid (the journal ANSWERS that nothing is left, the source mint's own quote state
+ * UNPAID) or a day has passed since the invoice expired and the source mint ANSWERS short of PAID
+ * (round 5; lane R6-reconcile: UNPAID or PENDING — a read that fails, at the journal or at the
+ * source, releases nothing). Never within `TOP_UP_RELEASE_AFTER_MS` of its melt returning (round
+ * 5, R4-R2). No new top-up runs into a target with one open (`unresolved`). When the journal
+ * settles the melt as paid, its history line is found by the anchor the record keeps and reads
+ * "top-up"; the entry says `done`. Every run waits for the money plane's startup settle first
+ * (what a crash cut off at the target is restored before its balance is read).
  *
  * History (NIP-60 kind 7376): minting at the target already writes `in … "top-up"` and the melt
  * writes `out … "melt to Lightning"` at the source — nothing more is written (no double entry).
@@ -132,17 +132,21 @@ export const TOP_UP_RELEASE_AFTER_MS = walletMod.PENDING_SETTLE_AFTER_S * 1000;
  */
 export const TOP_UP_MELT_START_BY_MS = 5 * 60_000;
 /**
- * Lane R6-reconcile (the round-5 verifier): the latest a top-up's melt can have returned, counted
- * from its reservation — what a restart, which lost the melt's own time, counts the release guard
- * from. The melt's start-by (`TOP_UP_MELT_START_BY_MS`, which covers the seal), the money plane's
- * PAY/melt gate's wait for the PAY in flight at the source (the worker's deadline,
- * `WORKER_HOST_REQUEST_TIMEOUT_MS`), then the melt request itself (`MELT_REQUEST_TIMEOUT_MS`).
- * Not in it: core's own turn at the source (a redeem, a NUT-07 check or the settle loop there
- * first) and its round trips before the request (the mint's load, the quote's lookup, the journal
- * settle) — neither has a fixed bound. What covers them is the host's own start: a melt never
- * outlives the host process that sent it, and a restarted host starts after the old one exited
- * (main respawns it only on its exit, and holds the single-instance lock). The release guard
- * therefore counts from the later of the two.
+ * Lane R6-reconcile (the round-5 verifier): how long after its reservation a top-up's melt request
+ * can have returned, as far as the host bounds it — what the release guard counts from when the
+ * melt's own time is not known (an entry of an earlier run of the host). Round 5 counted the melt
+ * request alone (`MELT_REQUEST_TIMEOUT_MS`), but two waits come before it: the seal (a NIP-46
+ * bunker may ask its user), now bounded by the melt's start-by (`TOP_UP_MELT_START_BY_MS`), and
+ * the PAY/melt gate's wait for the PAY in flight at the source, at most its `meltWaitMs` (the
+ * worker's deadline, `WORKER_HOST_REQUEST_TIMEOUT_MS`). So: start-by + gate + melt request, 15
+ * minutes. Still NOT in it, because they have no fixed bound: core's own turn at the source (a
+ * redeem, a NUT-07 check or the journal's settle loop there first) and its round trips before the
+ * request (the mint's load, the quote's lookup, the journal settle). The release guard therefore
+ * counts from the LATER of this bound and the start of this run of the host: a melt request never
+ * outlives the host process that sent it (the startup settle only reads a journaled melt, it never
+ * sends one again), and a host starts only after the one before it exited (main respawns it on
+ * its exit alone, under the single-instance lock). The guard's own `TOP_UP_RELEASE_AFTER_MS` then
+ * covers a request still on its way to the mint when that process died.
  */
 export const TOP_UP_MELT_RETURNED_BY_MS =
   TOP_UP_MELT_START_BY_MS + WORKER_HOST_REQUEST_TIMEOUT_MS + MELT_REQUEST_TIMEOUT_MS;
@@ -342,8 +346,9 @@ export class AutoTopUp {
   private readonly clock: () => number;
   private readonly sleep: (ms: number) => Promise<void>;
   /**
-   * When this AutoTopUp was made (wall clock): an open top-up of an earlier run of the host had
-   * its melt returned — or its process gone — before this (lane R6-reconcile).
+   * When this AutoTopUp was made — once per run of the host (wall clock, like the ledger's `at`):
+   * a melt of an earlier run was sent, if at all, before this (lane R6-reconcile; see
+   * `TOP_UP_MELT_RETURNED_BY_MS`).
    */
   private readonly startedAt: number;
   private flight: Flight | null = null;
@@ -568,8 +573,10 @@ export class AutoTopUp {
     // taken the target off the list, or signed out meanwhile.
     if (!(await this.stillWanted(w, target, from, amount))) return 'not-due';
     if (!this.o.ledger.fits(reserved)) return 'cap';
-    const entry = await this.o.ledger.reserve({ amount, sats: reserved, target, from });
+    // Read as the ledger stamps the entry (`at`, at the call), not after its write: the melt's
+    // start-by counts from no later than the time a restart counts from.
     const reservedAt = this.clock();
+    const entry = await this.o.ledger.reserve({ amount, sats: reserved, target, from });
 
     const before = await this.historyBefore(w, from, amount, reserved);
     const sourceBefore = await balanceOrNull(w, from);
@@ -741,8 +748,9 @@ export class AutoTopUp {
    * says PAID (`pollQuote` mints it — journaled by core, so a lost answer is restored, never minted
    * twice), or released while the quote is still UNPAID once the melt is settled as not paid, or
    * (round 5) once the invoice has been expired for `TOP_UP_EXPIRED_RELEASE_AFTER_MS` and the source
-   * does not say PAID — never within `TOP_UP_RELEASE_AFTER_MS` of the melt returning. Anything
-   * else — a target that cannot be asked, a melt still pending, a record that does not open —
+   * answers short of PAID (lane R6-reconcile: an answer, never a failed read) — never within
+   * `TOP_UP_RELEASE_AFTER_MS` of the melt returning. Anything else — a target or source that cannot
+   * be asked, a journal that cannot be read, a melt still pending, a record that does not open —
    * leaves it open for the next time. Never rejects.
    */
   private async resolveOpen(w: Wallet, v: TopUpVault): Promise<void> {
@@ -774,7 +782,8 @@ export class AutoTopUp {
         // later of the latest it can have returned and this host's start.
         const now = this.now();
         const returned =
-          this.meltReturned.get(e.id) ?? Math.max(e.at + TOP_UP_MELT_RETURNED_BY_MS, this.startedAt);
+          this.meltReturned.get(e.id) ??
+          Math.max(e.at + TOP_UP_MELT_RETURNED_BY_MS, this.startedAt);
         if (!(now >= returned + TOP_UP_RELEASE_AFTER_MS)) continue;
         // Round 5: the target still says UNPAID a day after the invoice expired — it can no
         // longer be paid, whatever the source answers short of PAID.
