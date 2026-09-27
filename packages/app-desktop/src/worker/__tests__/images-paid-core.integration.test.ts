@@ -17,13 +17,16 @@
  *      deadline (the placeholder);
  *   3. a second read of that core asks nothing of anyone either;
  *   4. the video still plays in full from the same seeders, fully paid, nobody banned;
- *   5. once played, the core is refused as an image, and never marked free on our own seeder.
+ *   5. once played, the core is refused as an image, and never marked free on our own seeder;
+ *   6. (lane W8b-p2p, round-8 review, MEDIUM) and still after a worker RESTART with seeding on —
+ *      for that played video and for one we uploaded: an attacker's thumbnail URL naming either
+ *      used to mark it free on our seeder, which then served the whole video free.
  */
 import { createHash, randomBytes } from 'node:crypto';
 
 import type { CoreKeyHex, NostrPubkey, Sha256Hex, VideoManifest } from '@sovit/core';
 import { manifest } from '@sovit/core';
-import type { Logger } from '@sovit/seeder';
+import type { Logger, SeedCore } from '@sovit/seeder';
 import { createLogger, nodeFs, toHex } from '@sovit/seeder';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 
@@ -53,6 +56,8 @@ describe('fix round 4: an image URL naming a paid core (images over Pear × F33 
   let imageUrl: string;
   let videoCore: CoreKeyHex;
   let videoImage: { url: string; sha256: Sha256Hex; size: number };
+  let hub: LoopbackPayHub;
+  let workerStorage: string;
   /** PRICE frames the worker's pay/1 ends received: `[core, free]`. */
   let readPrices: () => [string, boolean][] = () => [];
 
@@ -72,9 +77,10 @@ describe('fix round 4: an image URL naming a paid core (images over Pear × F33 
   beforeAll(async () => {
     testnet = await startDevTestnet();
     teardown.push(() => testnet.destroy());
-    const hub = new LoopbackPayHub();
+    hub = new LoopbackPayHub();
     const fixDir = await tempDir('nf-r4-img-fixtures-');
     const workerDir = await tempDir('nf-r4-img-worker-');
+    workerStorage = workerDir.dir;
     teardown.push(
       () => fixDir.rm(),
       () => workerDir.rm(),
@@ -176,6 +182,39 @@ describe('fix round 4: an image URL naming a paid core (images over Pear × F33 
     // …and the viewer never counted it against S1: its playback credit is whole.
     expect(payer().seeders.stats().unpaid).toBe(0);
     expect(payer().seeders.router.debt(net.s1.noiseKeyHex())).toBe(0);
+  }, 60_000);
+
+  // Lane W8b-p2p (round-8 review, LOW): two thumbnails of one profile core read at once opened two
+  // Hypercore sessions; the upload gate moved to the second, the release closed only the second,
+  // and the first stayed open and replicating with no gate — against ADR 0015's "neither
+  // announced nor replicated" when serving is off.
+  it('two reads of one profile core at once share one session, and with serving off that session is closed when the last read ends', async () => {
+    const own = worker.host.internals.seeder!;
+    const core = manifest.decodeHyperUrl(imageUrl, JPEG.byteLength)!.core;
+    expect(own.blobs.coreByKey(core)).toBeUndefined(); // closed after the first test's read
+    const opened: SeedCore[] = [];
+    const real = own.blobs.openCoreByKey.bind(own.blobs);
+    own.blobs.openCoreByKey = async (key: Uint8Array): Promise<SeedCore> => {
+      const sc = await real(key);
+      opened.push(sc);
+      return sc;
+    };
+    try {
+      const args = { url: imageUrl, sha256: JPEG_SHA, size: JPEG.byteLength };
+      const [a, b] = await Promise.all([
+        worker.call('image.fetch', args),
+        worker.call('image.fetch', args),
+      ]);
+      expect(a.hex).toBe(b.hex);
+      await expect.poll(() => own.blobs.coreByKey(core), { timeout: 5000 }).toBeUndefined();
+      const ofCore = opened.filter((sc) => sc.keyHex === core);
+      expect(ofCore).toHaveLength(2);
+      expect(new Set(ofCore.map((sc) => sc.core)).size).toBe(1); // one session
+      expect(ofCore.every((sc) => sc.core.closed)).toBe(true); // nothing left replicating
+      expect(own.isFreeCore(core)).toBe(false);
+    } finally {
+      own.blobs.openCoreByKey = real;
+    }
   }, 60_000);
 
   it("the reviewer's probe: image.fetch naming the paid video's core is refused, and neither fixture seeder is overrun or bans us", async () => {
@@ -306,4 +345,113 @@ describe('fix round 4: an image URL naming a paid core (images over Pear × F33 
     expect(Buffer.from(got.body).equals(Buffer.from(JPEG))).toBe(true);
     await worker.call('play.close', { sid });
   }, 60_000);
+
+  // Lane W8b-p2p (round-8 review, MEDIUM): per-core prices lived in memory only, so after a
+  // restart nothing here knew the played video was sold; an attacker's thumbnail naming it marked
+  // it free on our seeder (seeding on keeps the replica open), and anyone downloaded the whole
+  // video from us for nothing. The same for a video we uploaded. Reproduced before the fix: the
+  // read returned the video's bytes ('loaded') and `isFreeCore` was true.
+  it('after a worker restart with seeding on, an image URL naming a video we played or uploaded is refused and never served free', async () => {
+    const own = worker.host.internals.seeder!;
+    // Our own upload, as `upload()` leaves it at the seeder: the rendition stored, its core priced.
+    const put = await own.putBytes(syntheticBytes(3 * BLOCK, 0x33));
+    if (!put.ok) throw new Error('put failed');
+    own.setCorePolicy(put.entry.coreKey, video.price);
+    const uploadImage = {
+      url: manifest.encodeHyperUrl({ core: put.entry.coreKey, blob: put.entry.blob }),
+      sha256: put.entry.sha256,
+      size: put.entry.size,
+    };
+    await worker.close();
+    worker = startWorker({ hub, logLevel: 'error', imageTimeoutMs: 2500 });
+    await worker.call('init', {
+      v: 1,
+      storage: workerStorage,
+      seeding: { enabled: true, diskCapBytes: 1024 ** 3, serveImages: true },
+      prefetchSeconds: 30,
+      dev: {
+        mocks: true,
+        fixtures: false,
+        bootstrap: testnet.bootstrap.map((b) => ({ host: '127.0.0.1' as const, port: b.port })),
+      },
+    });
+    await worker.event(
+      (e): e is Extract<WorkerEvent, { e: 'ready' }> => e.e === 'ready',
+      5000,
+      'ready',
+    );
+    const again = worker.host.internals.seeder!;
+    for (const img of [videoImage, uploadImage]) {
+      const core = manifest.decodeHyperUrl(img.url, img.size)!.core;
+      const outcome = await worker.call('image.fetch', img).then(
+        () => 'loaded',
+        (e: unknown) => (e instanceof Error ? e.message : String(e)),
+      );
+      expect(outcome).toMatch(/^forbidden/);
+      expect(again.isFreeCore(core)).toBe(false);
+      expect(again.setFreeCore(core, true)).toBe(false); // the seeder itself refuses it
+      expect(again.corePolicyMap().has(core)).toBe(true);
+    }
+    // The rule is the same one as before the restart: the profile core the test above played
+    // under a (hostile) manifest got a price then, and it is still sold now…
+    await expect(
+      worker.call('image.fetch', { url: imageUrl, sha256: JPEG_SHA, size: JPEG.byteLength }),
+    ).rejects.toThrow(/^forbidden/);
+    // …while an honest image core nobody priced still loads, and is served free by us.
+    const sc = await net.s1.seeder.blobs.openCore('nutflix-profile-2');
+    const blob = await sc.blobs.put(JPEG);
+    net.s1.seeder.setFreeCore(sc.keyHex, true);
+    net.s1.node.join(sc.core.discoveryKey, { server: true, client: false });
+    await net.s1.node.flush();
+    const { hex } = await worker.call('image.fetch', {
+      url: manifest.encodeHyperUrl({ core: sc.keyHex, blob }),
+      sha256: JPEG_SHA,
+      size: JPEG.byteLength,
+    });
+    expect(Buffer.from(hex, 'hex').equals(Buffer.from(JPEG))).toBe(true);
+    expect(again.isFreeCore(sc.keyHex)).toBe(true); // an image replica, served free
+  }, 90_000);
+
+  // Lane W8b-p2p: kept across restarts, a price on OUR OWN profile core (a hostile manifest naming
+  // it as a video) would stay for good, and our avatar and thumbnails would never be served free
+  // again. A play open naming it is refused, and a price an earlier run left on it is dropped.
+  it('our own profile core is never priced: a play open naming it is refused, and a price an earlier run left on it is dropped at start', async () => {
+    const own = worker.host.internals.seeder!;
+    const profile = (await own.openCore('nutflix-profile')).keyHex;
+    await expect.poll(() => own.isFreeCore(profile), { timeout: 5000 }).toBe(true);
+    const sid = randomBytes(16).toString('hex') as SessionId;
+    await expect(
+      worker.call('play.open', {
+        sid,
+        videoId: video.id,
+        rendition: {
+          label: 'x',
+          hyper: { core: profile, blob: video.renditions[0]!.hyper.blob },
+          size: video.renditions[0]!.size,
+        },
+        policy: video.price,
+        prefetchSeconds: 30,
+      }),
+    ).rejects.toThrow(/^forbidden/);
+    expect(own.corePolicyMap().has(profile)).toBe(false);
+    expect(own.isFreeCore(profile)).toBe(true);
+    // What an earlier run could have left (the manifest played before the core was open).
+    own.setCorePolicy(profile, video.price);
+    await worker.close();
+    worker = startWorker({ hub, logLevel: 'error', imageTimeoutMs: 2500 });
+    await worker.call('init', {
+      v: 1,
+      storage: workerStorage,
+      seeding: { enabled: true, diskCapBytes: 1024 ** 3, serveImages: true },
+      prefetchSeconds: 30,
+      dev: {
+        mocks: true,
+        fixtures: false,
+        bootstrap: testnet.bootstrap.map((b) => ({ host: '127.0.0.1' as const, port: b.port })),
+      },
+    });
+    const next = worker.host.internals.seeder!;
+    await expect.poll(() => next.isFreeCore(profile), { timeout: 5000 }).toBe(true);
+    expect(next.corePolicyMap().has(profile)).toBe(false);
+  }, 90_000);
 });

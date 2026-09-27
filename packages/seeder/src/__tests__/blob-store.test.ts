@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import { unlink, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 
+import Corestore from 'corestore';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import { BlobStore } from '../blobs/blob-store.js';
@@ -234,5 +235,88 @@ describe('BlobStore (Corestore + Hyperblobs + CAS index + disk cap)', () => {
     expect(Buffer.from(back!).equals(Buffer.from(data))).toBe(true);
     await store2.close();
     store = store2; // afterEach closes it again (idempotent)
+  });
+
+  // Lane W8b-p2p (round-8 review, LOW): two image reads of one profile core at once opened two
+  // Hypercore sessions. The seeder's gate moved to the second, `closeCoreByKey` closed only the
+  // second, and the first stayed open and replicating with no upload gate.
+  it('opens of one core at once share ONE session: one onCoreOpened, and one close closes it (by key, by name)', async () => {
+    const other = new Corestore(path.join(dir, 'origin'));
+    const src = other.get({ name: 'profile' });
+    await src.ready();
+    const key = src.key;
+    const hex = Buffer.from(key).toString('hex');
+    await other.close();
+    const [a, b, c] = await Promise.all([
+      store.openCoreByKey(key),
+      store.openCoreByKey(key),
+      store.openCoreByKey(key),
+    ]);
+    expect(b).toBe(a);
+    expect(c).toBe(a);
+    expect(opened).toEqual([`key:${hex}`]);
+    await store.closeCoreByKey(hex);
+    expect(a.core.closed).toBe(true); // the only session: nothing left replicating
+    expect(store.coreByKey(hex)).toBeUndefined();
+    // Reopened later: a fresh session, gated again.
+    const again = await store.openCoreByKey(key);
+    expect(again).not.toBe(a);
+    expect(again.core.closed).toBe(false);
+    expect(opened).toEqual([`key:${hex}`, `key:${hex}`]);
+    const [n1, n2] = await Promise.all([store.openCore('mine'), store.openCore('mine')]);
+    expect(n2).toBe(n1);
+    expect(opened.filter((n) => n === 'mine')).toEqual(['mine']);
+  });
+
+  it('a core opened by key and by name at once is one session, under its name (never closed as a replica)', async () => {
+    const mine = await store.openCore('mine');
+    const key = mine.core.key;
+    await store.close();
+    await index.flushed();
+    const index2 = new CasIndex({ ...adapters, dataDir: dir });
+    await index2.load();
+    const seen: string[] = [];
+    const store2 = new BlobStore({
+      storageDir: path.join(dir, 'store'),
+      blockSize: BLOCK,
+      ...adapters,
+      index: index2,
+      diskCap: new DiskCap(10 * BLOCK, 0),
+      logger: capturedLogger().logger,
+      onCoreOpened: (c) => {
+        seen.push(c.name);
+      },
+    });
+    store = store2; // afterEach closes it
+    await store2.ready();
+    const [byKey, byName] = await Promise.all([store2.openCoreByKey(key), store2.openCore('mine')]);
+    expect(byName.core).toBe(byKey.core); // one session
+    expect(seen).toHaveLength(1);
+    const hex = Buffer.from(key).toString('hex');
+    expect(store2.coreByKey(hex)?.name).toBe('mine');
+    await expect(store2.closeCoreByKey(hex)).rejects.toThrow(/opened by name/);
+    expect(byName.core.closed).toBe(false);
+  });
+
+  it('an open that fails closes its session, and a retry opens afresh', async () => {
+    const other = new Corestore(path.join(dir, 'origin2'));
+    const src = other.get({ name: 'x' });
+    await src.ready();
+    const key = src.key;
+    await other.close();
+    const real = store.store.get.bind(store.store);
+    let closedFailed = false;
+    (store.store as unknown as { get: unknown }).get = () => ({
+      ready: () => Promise.reject(new Error('storage error')),
+      close: () => {
+        closedFailed = true;
+        return Promise.resolve();
+      },
+    });
+    await expect(store.openCoreByKey(key)).rejects.toThrow('storage error');
+    expect(closedFailed).toBe(true);
+    (store.store as unknown as { get: unknown }).get = real;
+    const sc = await store.openCoreByKey(key);
+    expect(sc.core.closed).toBe(false);
   });
 });
