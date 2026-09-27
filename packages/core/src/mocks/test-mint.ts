@@ -19,7 +19,8 @@
  * NUT-13 (ADR 0016): `rotateKeyset()` retires the active keyset (it stays listed, its proofs stay
  * spendable, as at a real mint) and makes a new one; `keysetVersion: 0` gives a v1 (`00…`) id,
  * whose NUT-13 derivation is BIP-32; `nut12: false` signs without DLEQ; `hostileRestore()` makes
- * `/v1/restore` sign whatever it is asked (a hostile mint amplifying a restore).
+ * `/v1/restore` sign whatever it is asked (a hostile mint amplifying a restore). A melt whose
+ * blanks were already signed is refused 10002 before it spends or pays, as at Nutshell and cdk.
  */
 import {
   Amount,
@@ -636,8 +637,9 @@ export class TestMint {
     const signatures: SerializedBlindedSignature[] = [];
     for (const o of outputs as SerializedBlindedMessage[]) {
       let sig = this.promises.get(o.B_);
-      if (sig === undefined && this.signOnRestore) {
-        // A hostile mint: signs (a 1-sat output) whatever it is asked about.
+      if (sig === undefined && this.signOnRestore && o.id === this.keysetId) {
+        // A hostile mint: signs (a 1-sat output) whatever it is asked about under its active
+        // keyset (an inactive one no longer signs).
         const one = { ...o, amount: 1 as unknown as Amount };
         sig = this.sign([one]).signatures[0];
         if (sig !== undefined) this.remember([one], [sig]);
@@ -778,6 +780,14 @@ export class TestMint {
     const blanks = Array.isArray(body['outputs'])
       ? (body['outputs'] as SerializedBlindedMessage[])
       : [];
+    // Like Nutshell and cdk (and the swap here): outputs already signed refuse the melt BEFORE
+    // anything is spent or paid (NUT-13 counter collisions on the blanks, ADR 0016 §4).
+    const seenBlank = new Set<string>();
+    for (const b of blanks) {
+      if (this.promises.has(b.B_) || seenBlank.has(b.B_))
+        throw new MintOperationError(10002, 'Blinded message of output already signed');
+      seenBlank.add(b.B_);
+    }
     const refund = inputs.total - q.amount - this.fee((body['inputs'] as unknown[]).length);
     if (this.holdMelts > 0) {
       // The Lightning payment is in flight: PENDING, the inputs held, no change yet.

@@ -284,7 +284,12 @@ export class Spender {
   /** The last reissue plan per mint and the exact proofs it covered (ADR 0016 D5). */
   private readonly plans = new Map<
     MintUrl,
-    { readonly amount: number; readonly inputs: number; readonly feeSats: number; readonly secrets: string }
+    {
+      readonly amount: number;
+      readonly inputs: number;
+      readonly feeSats: number;
+      readonly secrets: string;
+    }
   >();
 
   constructor(private readonly ctx: SpendContext) {}
@@ -409,9 +414,7 @@ export class Spender {
   ): Promise<LockedProofSet> {
     const journal = this.journaling(w);
     // Proofs a pending send or melt may have spent stay out of the selection until it is settled.
-    const busy = journal
-      ? heldSecrets((await this.settle(opts.mint, w)).left)
-      : new Set<string>();
+    const busy = journal ? heldSecrets((await this.settle(opts.mint, w)).left) : new Set<string>();
     const held = (await this.ctx.store.proofs(opts.mint))
       .filter((p) => !busy.has(p.secret))
       .map(toCashu);
@@ -439,6 +442,7 @@ export class Spender {
         result = await w.send(amount, selected, { includeFees: false }, outputs);
       } catch (e) {
         await this.reconcile(opts.mint, w, selected);
+        await this.collided(w, e);
         throw new WalletError('mint-error', `P2PK swap failed (${errorName(e)})`);
       }
       await this.ctx.store.commit(sendTx(opts.mint, selected, result, amount, memo));
@@ -462,7 +466,7 @@ export class Spender {
       try {
         result = await w.completeSwap(preview);
       } catch (e) {
-        if (isDefinitive(e) && !isAlreadySigned(e)) {
+        if (await this.refused(w, op, e)) {
           await this.drop(op);
           await this.reconcile(opts.mint, w, selected);
           throw new WalletError('mint-error', `P2PK swap failed (${errorName(e)})`);
@@ -546,13 +550,16 @@ export class Spender {
     memo: string,
   ): Promise<Sats> {
     if (!this.journaling(w)) {
-      let fresh: Proof[];
-      try {
-        fresh = await w.receive(inputs, undefined, this.own(w));
-      } catch (e) {
-        throw receiveError(e);
-      }
-      return this.commitIn(mint, fresh, memo);
+      return this.twice(async () => {
+        let fresh: Proof[];
+        try {
+          fresh = await w.receive(inputs, undefined, this.own(w));
+        } catch (e) {
+          await this.collided(w, e);
+          throw receiveError(e);
+        }
+        return this.commitIn(mint, fresh, memo);
+      });
     }
     return this.twice(() => this.receiveOnce(w, mint, inputs, memo));
   }
@@ -678,6 +685,7 @@ export class Spender {
         res = await w.meltProofsBolt11(q, selected, undefined, this.own(w));
       } catch (e) {
         await this.reconcile(quote.mint, w, selected);
+        await this.collided(w, e);
         throw new WalletError('mint-error', `melt failed (${errorName(e)})`);
       }
     } else {
@@ -702,7 +710,7 @@ export class Spender {
       try {
         res = await w.completeMelt(preview);
       } catch (e) {
-        if (op === undefined || (isDefinitive(e) && !isAlreadySigned(e))) {
+        if (op === undefined || (await this.refused(w, op, e))) {
           // Refused by the mint (or not journaled): what is still unspent stays.
           if (op !== undefined) await this.drop(op);
           await this.reconcile(quote.mint, w, selected);
@@ -800,7 +808,13 @@ export class Spender {
           ? await key.withSecretHex((privkey) =>
               w.prepareMint('bolt11', quote.amount, locked, { privkey }, output),
             )
-          : await w.prepareMint('bolt11', quote.amount, { quote: quote.quoteId }, undefined, output);
+          : await w.prepareMint(
+              'bolt11',
+              quote.amount,
+              { quote: quote.quoteId },
+              undefined,
+              output,
+            );
     } catch (e) {
       throw new WalletError('mint-error', `minting failed (${errorName(e)})`);
     }
@@ -813,6 +827,7 @@ export class Spender {
     try {
       proofs = await w.completeMint(preview);
     } catch (e) {
+      if (op === undefined) await this.collided(w, e);
       const r = op === undefined ? null : await this.afterFailure(w, op, e, memo);
       if (r !== null) return proofTotal(r.keep.map(fromCashu)) as Sats;
       throw new WalletError('mint-error', `minting failed (${errorName(e)})`);
@@ -1054,7 +1069,10 @@ export class Spender {
     } catch (e) {
       throw new WalletError('mint-error', `reissue failed (${errorName(e)})`);
     }
-    const history = plan.feeSats > 0 ? { direction: 'out' as const, amount: plan.feeSats, memo: REISSUE_MEMO } : undefined;
+    const history =
+      plan.feeSats > 0
+        ? { direction: 'out' as const, amount: plan.feeSats, memo: REISSUE_MEMO }
+        : undefined;
     const done = (keep: Proof[]): ReissueResult => ({
       mint: plan.mint,
       reissued: proofTotal(keep.map(fromCashu)) as Sats,
@@ -1066,6 +1084,7 @@ export class Spender {
         keep = (await w.completeSwap(preview)).keep;
       } catch (e) {
         await this.reconcile(plan.mint, w, inputs);
+        await this.collided(w, e);
         throw new WalletError('mint-error', `reissue failed (${errorName(e)})`);
       }
       await this.ctx.store.commit({
@@ -1090,7 +1109,7 @@ export class Spender {
     try {
       keep = (await w.completeSwap(preview)).keep;
     } catch (e) {
-      if (isDefinitive(e) && !isAlreadySigned(e)) {
+      if (await this.refused(w, op, e)) {
         await this.drop(op);
         await this.reconcile(plan.mint, w, inputs);
         throw new WalletError('mint-error', `reissue failed (${errorName(e)})`);
@@ -1176,9 +1195,12 @@ export class Spender {
 
   /**
    * Add what a restore found (ADR 0016 §5, steps 5–6): SPENT proofs dropped (NUT-07; PENDING ones
-   * left out too — a melt in flight decides them), held ones matched by secret and not added
-   * twice (a held one the mint reports SPENT leaves the store). Verified proofs (DLEQ) count as
-   * they are; unverified ones (a mint without NUT-12) are swapped into fresh outputs first.
+   * left out too — a melt in flight decides them, and a later restore finds them if it failed),
+   * held ones matched by secret and not added twice (a held one the mint reports SPENT leaves the
+   * store). At a NUT-12 mint every restored proof carries a DLEQ checked against the claimed
+   * amount's key (`restoreBatch`), so it counts as it is: ONE transition, one history line. At a
+   * mint without NUT-12 nothing proves an amount, so what is unspent is swapped into fresh outputs
+   * of this wallet first (the mint verifies every input): again one history line, the swap's.
    */
   private async adopt(
     w: CashuTsWallet,
@@ -1204,6 +1226,7 @@ export class Spender {
       return report(mint, 'unreachable', 0);
     }
     const held = new Map((await this.ctx.store.proofs(mint)).map((p) => [p.secret, p]));
+    const proven = supports(w, 12);
     const spentHeld: CashuProof[] = [];
     const verified: CashuProof[] = [];
     const unverified: Proof[] = [];
@@ -1212,7 +1235,7 @@ export class Spender {
       if (states[i] === 'SPENT') {
         if (mine !== undefined) spentHeld.push(mine);
       } else if (states[i] === 'UNSPENT' && mine === undefined) {
-        if (f.verified) verified.push(fromCashu(f.proof));
+        if (proven && f.verified) verified.push(fromCashu(f.proof));
         else unverified.push(f.proof);
       }
     });
@@ -1228,12 +1251,16 @@ export class Spender {
       });
     let refused = false;
     if (unverified.length > 0) {
-      try {
-        added += await this.swapIn(w, mint, unverified, memo);
-      } catch {
-        // The mint refused them (an amount it lied about does not verify), or they were spent
-        // meanwhile: they count for nothing.
-        refused = true;
+      const total = proofTotal(unverified.map(fromCashu));
+      // Dust the mint's input fee would eat entirely is left where it is (not a refusal).
+      if (total - feeOf(w, unverified.map(fromCashu)) >= 1) {
+        try {
+          added += await this.swapIn(w, mint, unverified, memo);
+        } catch {
+          // The mint refused them (an amount it lied about does not verify), or they were spent
+          // meanwhile: they count for nothing.
+          refused = true;
+        }
       }
     }
     return report(mint, added > 0 ? 'restored' : refused ? 'refused' : 'nothing', added);
@@ -1303,13 +1330,34 @@ export class Spender {
     e: unknown,
     memo: string,
   ): Promise<Restored | null> {
-    if (isDefinitive(e) && !isAlreadySigned(e)) {
+    if (await this.refused(w, op, e)) {
       await this.drop(op);
       return null;
     }
     const r = await this.resolveSafe(w, op, true, memo);
     if (r.state === 'collision') throw new CounterCollision();
     return r.state === 'executed' ? r : null;
+  }
+
+  /**
+   * A journaled request failed: was it a plain refusal (nothing executed; the entry can go)? A
+   * coded answer other than "already signed" is one — unless the outputs were seeded and the mint
+   * holds signatures on them: then another wallet on this phrase signed our counters first
+   * (ADR 0016 §4), whatever code the mint uses for that. Found on the real-mint lane: cdk-mintd
+   * 0.18.1 answers such a mint or melt request 20006 "Invoice already paid or pending", Nutshell
+   * 0.21 answers 11003; only 10002 is the spec's. So seeded outputs are checked by NUT-09 (one
+   * request, only on a refusal), and signatures send the failure through `resolve`, which tells a
+   * collision (the operation never ran) from our own earlier attempt (it ran).
+   */
+  private async refused(w: CashuTsWallet, op: PendingOp, e: unknown): Promise<boolean> {
+    if (!isDefinitive(e) || isAlreadySigned(e)) return false;
+    if (!this.seededAt(w)) return true;
+    try {
+      const got = await this.restoreOp(w, op);
+      return got === null || (got.keep.length === 0 && got.send.length === 0 && got.foreign === 0);
+    } catch {
+      return false; // a malformed restore answer: not proof of a plain refusal — resolve decides
+    }
   }
 
   private async settle(
@@ -1356,7 +1404,7 @@ export class Spender {
   ): Promise<Resolution> {
     const got = await this.restoreOp(w, op);
     if (got === null) return { state: 'unknown' };
-    if (got.keep.length > 0 || got.send.length > 0) {
+    if (got.keep.length > 0 || got.send.length > 0 || got.foreign > 0) {
       // Signed outputs prove nothing alone once outputs are derived from a phrase: the mint must
       // also show the operation ran, or those signatures are another wallet's (ADR 0016 §4).
       const ran = await this.ran(w, op);
@@ -1369,6 +1417,11 @@ export class Spender {
         await this.advancePast(w, op);
         return { state: 'collision' };
       }
+      // It ran, so every output it signed is ours, for the amounts we asked: a signature for
+      // another amount or keyset under one of them is a lie (ADR 0014) — the entry is kept for
+      // an honest answer (`resolveSafe` reads this as unknown).
+      if (got.foreign > 0)
+        throw new WalletError('bad-mint-response', 'a restored signature does not match');
       const keep = got.keep.map(fromCashu);
       const kept = proofTotal(keep);
       await this.ctx.store.commit({
@@ -1434,7 +1487,10 @@ export class Spender {
    * operation of ours spends every input — so signatures on its outputs are a collision.
    * `pending`: an input is in flight (a melt paying). `unknown`: the mint could not be asked.
    */
-  private async ran(w: CashuTsWallet, op: PendingOp): Promise<'yes' | 'no' | 'pending' | 'unknown'> {
+  private async ran(
+    w: CashuTsWallet,
+    op: PendingOp,
+  ): Promise<'yes' | 'no' | 'pending' | 'unknown'> {
     try {
       if (op.kind === 'mint') {
         const [quote] = op.key;
@@ -1465,9 +1521,37 @@ export class Spender {
    * operation instead.
    */
   private async advancePast(w: CashuTsWallet, op: PendingOp): Promise<void> {
+    await this.advanceKeysets(
+      w,
+      op.keep.map((o) => o.blindedMessage.id),
+    );
+  }
+
+  /**
+   * A NON-journaled operation (a store without a journal) was answered "outputs already signed"
+   * while its outputs were seeded: every attempt there derives fresh counters (nothing is reused
+   * without a journal), so it is never our own earlier attempt — it is a NUT-13 counter collision
+   * (ADR 0016 §4). The counters move past what the mint signed and `twice` runs it again; the mint
+   * refused the request, so its inputs are unspent (the caller reconciled them). Returns for any
+   * other failure.
+   */
+  private async collided(w: CashuTsWallet, e: unknown): Promise<void> {
+    if (!this.seededAt(w) || !isOutputSigned(e)) return;
+    let id: string;
+    try {
+      id = w.getKeyset().id;
+    } catch {
+      return;
+    }
+    await this.advanceKeysets(w, [id]);
+    throw new CounterCollision();
+  }
+
+  /** Move this device's counters for `ids` past whatever the mint signed beyond them. */
+  private async advanceKeysets(w: CashuTsWallet, ids: readonly string[]): Promise<void> {
     const s = this.ctx.mints.seeding;
     if (s === undefined) return;
-    for (const id of new Set(op.keep.map((o) => o.blindedMessage.id))) {
+    for (const id of new Set(ids)) {
       try {
         if (!w.keyChain.hasKeyset(id)) continue;
         const keyset = await w.keyChain.ensureKeysetKeys(id);
@@ -1520,7 +1604,10 @@ export class Spender {
    * NUT-08 blanks: the mint assigns their amounts, so a signature's amount is the mint's (its
    * key for that amount checks the DLEQ and unblinds it), where every other output's must match.
    */
-  private async restoreOp(w: CashuTsWallet, op: PendingOp): Promise<Restored | null> {
+  private async restoreOp(
+    w: CashuTsWallet,
+    op: PendingOp,
+  ): Promise<(Restored & { readonly foreign: number }) | null> {
     const outs = [...op.keep, ...op.send].map(fromPending);
     let res: { outputs: { B_: string }[]; signatures: SerializedBlindedSignature[] };
     try {
@@ -1542,22 +1629,30 @@ export class Spender {
       const sig = res.signatures[i];
       if (sig !== undefined) byB.set(o.B_, sig);
     });
+    let foreign = 0;
     const proofs = outs.map((o): Proof | null => {
       const sig = byB.get(o.blindedMessage.B_);
       if (sig === undefined) return null;
+      if (dleq && sig.dleq === undefined)
+        throw new WalletError('bad-mint-response', 'a restored signature has no DLEQ');
+      // Signed under another keyset or for another amount than we asked: not OUR operation's
+      // signature — another wallet's on the same NUT-13 counters (ADR 0016 §4), or a lie. `resolve`
+      // tells the two apart by whether the operation ran.
       if (
         sig.id !== o.blindedMessage.id ||
         (!blanks &&
-          Amount.from(sig.amount).toNumber() !== Amount.from(o.blindedMessage.amount).toNumber()) ||
-        (dleq && sig.dleq === undefined)
-      )
-        throw new WalletError('bad-mint-response', 'a restored signature does not match');
+          Amount.from(sig.amount).toNumber() !== Amount.from(o.blindedMessage.amount).toNumber())
+      ) {
+        foreign++;
+        return null;
+      }
       return o.toProof(sig, w.getKeyset(sig.id));
     });
     const n = op.keep.length;
     return {
       keep: proofs.slice(0, n).filter((p): p is Proof => p !== null),
       send: proofs.slice(n).filter((p): p is Proof => p !== null),
+      foreign,
     };
   }
 
@@ -1699,14 +1794,33 @@ function hasCode(e: unknown): boolean {
   return typeof e === 'object' && e !== null && typeof (e as { code?: unknown }).code === 'number';
 }
 
-/** The mint already signed these outputs or issued this quote: maybe our own earlier attempt. */
+/**
+ * The mint already signed these outputs or issued this quote: maybe our own earlier attempt, or a
+ * NUT-13 counter collision (`resolve` tells them apart). 11003 is Nutshell 0.21's code for
+ * outputs already signed (`isOutputSigned`).
+ */
 function isAlreadySigned(e: unknown): boolean {
   if (typeof e !== 'object' || e === null) return false;
   const code = (e as { code?: unknown }).code;
   const msg = e instanceof Error ? e.message : '';
   return (
-    code === 10002 || code === 20002 || /already (been )?(signed|issued)|signed before/i.test(msg)
+    isOutputSigned(e) ||
+    code === 20002 ||
+    /already (been )?(signed|issued)|signed before/i.test(msg)
   );
+}
+
+/**
+ * The mint already signed one of these OUTPUTS — not a quote already issued (20002). The spec's
+ * code is 10002; Nutshell 0.21 answers 11003 "outputs have already been signed before." (found on
+ * the real-mint lane). Without a journal nothing reuses outputs, so on seeded outputs this is a
+ * collision.
+ */
+function isOutputSigned(e: unknown): boolean {
+  if (typeof e !== 'object' || e === null) return false;
+  const code = (e as { code?: unknown }).code;
+  const msg = e instanceof Error ? e.message : '';
+  return code === 10002 || code === 11003 || /already (been )?signed|signed before/i.test(msg);
 }
 
 function sameKey(a: string, b: string): boolean {
@@ -1752,7 +1866,12 @@ function restorableKeysets(w: CashuTsWallet, max: number): Keyset[] {
 }
 
 /** `count` deterministic outputs of `seed` under `keyset` from `start` (amounts left to the mint). */
-function derived(seed: RecoverySeed, keyset: HasKeysetKeys, start: number, count: number): OutputData[] {
+function derived(
+  seed: RecoverySeed,
+  keyset: HasKeysetKeys,
+  start: number,
+  count: number,
+): OutputData[] {
   return OutputData.createDeterministicData(
     0,
     seedBytes(seed),

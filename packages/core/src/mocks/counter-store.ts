@@ -44,6 +44,7 @@ export class MemoryCounterStore implements CounterStore {
   }
 }
 
+/** A deep copy of exactly what was written (a malformed test state stays malformed). */
 function copy(s: CounterState): CounterState {
-  return { v: 1, next: { ...s.next }, published: { ...s.published } };
+  return JSON.parse(JSON.stringify(s)) as CounterState;
 }

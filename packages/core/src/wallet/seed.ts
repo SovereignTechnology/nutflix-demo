@@ -92,6 +92,18 @@ function checkEntropy(e: Uint8Array): void {
     throw new RecoveryPhraseError('length');
 }
 
+/**
+ * Entropy about to be USED (shown, or turned into a seed): refused when it is all zeros. No CSPRNG
+ * makes that (2^-128), but a wiped buffer is exactly that, and its phrase ("abandon … about") is
+ * public: outputs derived from it are ecash anyone can restore. OR-folded, no early exit.
+ */
+function checkLive(e: Uint8Array): void {
+  checkEntropy(e);
+  let acc = 0;
+  for (const b of e) acc |= b;
+  if (acc === 0) throw new RecoverySeedError('wiped');
+}
+
 /** Entropy in secure memory; the library's copy is zeroed. */
 function adopt(raw: Uint8Array): RecoveryEntropy {
   try {
@@ -118,7 +130,7 @@ function generate(): RecoveryEntropy {
 }
 
 function toIndices(entropy: RecoveryEntropy): readonly number[] {
-  checkEntropy(entropy);
+  checkLive(entropy);
   return entropyToMnemonic(entropy, wordlist)
     .split(' ')
     .map((w) => {
@@ -178,7 +190,7 @@ class SecureSeed implements RecoverySeed {
 }
 
 async function toSeed(entropy: RecoveryEntropy): Promise<RecoverySeed> {
-  checkEntropy(entropy);
+  checkLive(entropy);
   const raw = await mnemonicToSeed(entropyToMnemonic(entropy, wordlist), '');
   try {
     return new SecureSeed(secureCopy(raw));
@@ -188,11 +200,50 @@ async function toSeed(entropy: RecoveryEntropy): Promise<RecoverySeed> {
 }
 
 /** ADR 0016 §1: the phrase operations (`recovery-api.ts` `RecoveryPhrases`). */
-export const recoveryPhrases: RecoveryPhrases = { generate, toIndices, fromIndices, fromWords, toSeed };
+export const recoveryPhrases: RecoveryPhrases = {
+  generate,
+  toIndices,
+  fromIndices,
+  fromWords,
+  toSeed,
+};
 
 /** Zero entropy once it is sealed or shown. Idempotent. */
 export function wipeEntropy(entropy: RecoveryEntropy): void {
   if (entropy instanceof Uint8Array) zero(entropy);
+}
+
+/**
+ * Entropy read back from where the shell keeps it (the sealed file, the relay copy — ADR 0016
+ * D2): exactly 16 bytes, copied into secure memory. The caller's buffer is left as it is (the
+ * caller zeroes its own plaintext). Throws `RecoveryPhraseError('length')` for anything else.
+ * Outside `RecoveryPhrases` only because that seam is frozen (docs/contract-requests/N1-nut13-core.md).
+ */
+export function entropyFromBytes(bytes: Uint8Array): RecoveryEntropy {
+  checkEntropy(bytes);
+  return secureCopy(bytes) as RecoveryEntropy;
+}
+
+const ENTROPY_HEX = /^[0-9a-f]{32}$/;
+
+/**
+ * `RecoveryRelayCopy.entropy` (32 lower-case hex characters) back to entropy in secure memory.
+ * Throws `RecoveryPhraseError('length')` for any other string. The hex string itself is a JS
+ * string and cannot be wiped (ADR 0016 residual).
+ */
+export function entropyFromHex(hex: string): RecoveryEntropy {
+  if (typeof hex !== 'string' || !ENTROPY_HEX.test(hex)) throw new RecoveryPhraseError('length');
+  const b = sodium.sodium_malloc(ENTROPY_BYTES);
+  for (let i = 0; i < ENTROPY_BYTES; i++) b[i] = parseInt(hex.slice(2 * i, 2 * i + 2), 16);
+  return b as RecoveryEntropy;
+}
+
+/** Entropy as `RecoveryRelayCopy.entropy`: 32 lower-case hex characters (an unwipeable string). */
+export function entropyToHex(entropy: RecoveryEntropy): string {
+  checkEntropy(entropy);
+  let s = '';
+  for (const byte of entropy) s += byte.toString(16).padStart(2, '0');
+  return s;
 }
 
 /**
@@ -464,7 +515,8 @@ export class DurableCounterSource {
     const known = answers.filter((a): a is number => a !== undefined);
     if (known.length === 0 || !known.every(isCounter)) throw new CounterStateError('unprobed');
     const past = Math.max(from, ...known);
-    if (this.isClosed) throw new CounterStateError('closed');
+    // Again after the probe's await: `close()` may have run meanwhile.
+    if (this.closed) throw new CounterStateError('closed');
     if (past > from) s.cursor.set(keysetId, past);
     s.safe.add(keysetId);
     return s;
