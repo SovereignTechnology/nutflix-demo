@@ -155,6 +155,42 @@ describe('TailBook: tail authorisations on disk, per identity', () => {
     expect(JSON.parse(await readFile(elsewhere, 'utf8'))).toMatchObject({ tails: [{ sid: SID }] });
   });
 
+  // Fix round 7 (lane P2-owed-viewer): one book owns the identity's file at a time. Once its plane
+  // closed, the next plane's book reads and writes the file; a later write from the closed one
+  // would put back what it held, erasing what the next one saved since.
+  it('a closed book: writes started before the close land (flush waits for them); later ones write nothing and reject', async () => {
+    const dir = await tmp();
+    const log = memoryLogger('warn');
+    const file = join(dir, `${PK}.json`);
+    const a = await TailBook.open({ dir, pubkey: PK, log });
+    await a.add(tail());
+    const started = a.add(tail({ sid: SID2 }));
+    a.close();
+    await started;
+    await a.flush();
+    const sids = async () =>
+      (JSON.parse(await readFile(file, 'utf8')) as { tails: { sid: string }[] }).tails
+        .map((t) => t.sid)
+        .sort();
+    expect(await sids()).toEqual([SID, SID2].sort());
+    // The next book owns the file now: it saves a tail of its own.
+    const b = await TailBook.open({ dir, pubkey: PK, log });
+    const s3 = 'ef'.repeat(16) as SessionId;
+    await b.add(tail({ sid: s3 }));
+    // The closed book's later writes are refused; the file keeps the next book's content.
+    const late = a.get(SID)!;
+    late.paidBlocks = 0;
+    await expect(a.save()).rejects.toThrow(/closed/);
+    await expect(a.add(tail({ sid: '12'.repeat(16) as SessionId }))).rejects.toThrow(/closed/);
+    expect(a.get('12'.repeat(16))).toBeUndefined();
+    await a.flush();
+    expect(await sids()).toEqual([SID, SID2, s3].sort());
+    // A memory-only book is fenced alike.
+    const m = await TailBook.open({ dir: null, pubkey: PK, log });
+    m.close();
+    await expect(m.save()).rejects.toThrow(/closed/);
+  });
+
   it('keeps at most MAX_TAILS, the ones expiring first going; refuses an empty budget or a bad sid', async () => {
     let now = 0;
     const b = await TailBook.open({
@@ -411,6 +447,89 @@ describe('MoneyPlane: tail authorisations (ADR 0018 amendment)', () => {
     expect(await second).toBe('session-closed');
     expect(before - (await plane.wallet.balance(MINT))).toBe(2 * POLICY.satsPerBlock);
     plane.close();
+  }, 30_000);
+
+  // Fix round 7 (lane P2-owed-viewer, the verifier's residual of finding 5): a tail's PAY waiting
+  // for its turn at the mint when the plane closed (signed out, locked) was refused at its turn and
+  // gave its blocks back by saving the CLOSED plane's book — after the next plane had read the file
+  // and saved a tail of its own, which that late write erased from disk. The closed plane's book is
+  // fenced at the close: what it would have given back stays taken (respected, never paid).
+  it('a tail PAY still waiting at the mint when the plane closes: at its turn it writes nothing over the next plane’s tails', async () => {
+    const dir = await tmp();
+    const gate: { hold: boolean; release: (() => void) | null } = { hold: false, release: null };
+    const wrap =
+      (inner: RequestFn): RequestFn =>
+      <T>(args: Parameters<RequestFn>[0]): Promise<T> => {
+        const path = `${(args.method ?? 'GET').toUpperCase()} ${new URL(args.endpoint).pathname}`;
+        if (!gate.hold || path !== 'POST /v1/swap') return inner<T>(args);
+        gate.hold = false;
+        return new Promise<T>((resolve, reject) => {
+          gate.release = () => {
+            inner<T>(args).then(resolve, reject);
+          };
+        });
+      };
+    const { plane, open } = await planeRig({ dir, fund: 200, wrap });
+    const file = join(dir, `${plane.pubkey}.json`);
+    const onDisk = async () =>
+      (JSON.parse(await readFile(file, 'utf8')) as { tails: { sid: string; paidBlocks: number }[] })
+        .tails;
+    const h = plane.handlers();
+    plane.authorizeSession(SID, { core: CORE, blob: BLOB, policy: POLICY }, CREATOR);
+    await plane.revokeSession(SID, 2); // a tail of 2 blocks
+    plane.authorizeSession(SID2, { core: CORE, blob: BLOB, policy: POLICY }, CREATOR);
+    // An open session's PAY holds the mint's turn (its swap held at the mint)…
+    gate.hold = true;
+    const first = code(h['pay.build']!(build({ sid: SID2 })));
+    for (let i = 0; i < 500 && gate.release === null; i++)
+      await new Promise((r) => setTimeout(r, 2));
+    const release = gate.release;
+    if (release === null) throw new Error('the first PAY never reached the mint');
+    // …the tail's PAY takes its block off the budget on disk, then waits for its turn.
+    const second = code(
+      h['pay.build']!(build({ range: { core: CORE, fromBlock: 10, toBlock: 10 } })),
+    );
+    for (let i = 0; i < 500; i++) {
+      if ((await onDisk()).find((t) => t.sid === SID)?.paidBlocks === 1) break;
+      await new Promise((r) => setTimeout(r, 2));
+    }
+    await new Promise((r) => setTimeout(r, 20));
+    // Signed out (or locked), then back in at once: the next plane reads the file after the
+    // closed one's writes landed, and saves a tail of its own.
+    plane.close();
+    await plane.flushTails();
+    const next = await open(false);
+    const s3 = 'ef'.repeat(16) as SessionId;
+    next.authorizeSession(s3, { core: CORE, blob: BLOB, policy: POLICY }, CREATOR);
+    await next.revokeSession(s3, 2);
+    expect((await onDisk()).map((t) => t.sid).sort()).toEqual([SID, SID2, s3].sort());
+    // The tail PAY's turn comes: the closed plane refuses it, and writes nothing.
+    release();
+    expect(await second).toBe('payments-unavailable');
+    await first;
+    await plane.flushTails();
+    await next.flushTails();
+    const after = await onDisk();
+    expect(after.map((t) => t.sid).sort()).toEqual([SID, SID2, s3].sort());
+    // What the refused PAY would have given back stays taken: the conservative side.
+    expect(after.find((t) => t.sid === SID)?.paidBlocks).toBe(1);
+    // The next plane's book agrees with the file: SID has 1 block left, s3 its 2 — asked for one
+    // block more than each has, both are refused on their budget (`forbidden`, not
+    // `session-closed`), before the wallet. (Nothing is spent here: this rig keeps no wallet
+    // journal, so the next plane's wallet still lists the proofs the closed plane's PAY swapped.)
+    const h2 = next.handlers();
+    expect(
+      await code(h2['pay.build']!(build({ range: { core: CORE, fromBlock: 11, toBlock: 12 } }))),
+    ).toBe('forbidden');
+    expect(
+      await code(
+        h2['pay.build']!(build({ sid: s3, range: { core: CORE, fromBlock: 10, toBlock: 12 } })),
+      ),
+    ).toBe('forbidden');
+    expect(await code(h2['pay.build']!(build({ sid: '34'.repeat(16) as SessionId })))).toBe(
+      'session-closed',
+    );
+    next.close();
   }, 30_000);
 
   it('a plane closed with sessions open (signed out, locked) keeps their tails; a closed plane makes none', async () => {

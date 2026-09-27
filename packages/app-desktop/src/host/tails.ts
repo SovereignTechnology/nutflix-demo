@@ -22,6 +22,15 @@
  * The file is bounded (`MAX_TAILS`, `MAX_TAIL_FILE_BYTES`) and checked entry by entry on load:
  * anything malformed or expired is dropped. It names cores and session ids (viewing history, like
  * the worker's own storage) and no secret; nothing here logs either.
+ *
+ * One book owns the file at a time (fix round 7): each money plane opens its own, and a plane that
+ * closes (signed out, locked, another signer, shutdown) `close`s its book — the writes it started
+ * still land, and `flush` waits for them; nothing later writes the file. The next plane's book
+ * opens only once those have landed (`DesktopSigner.changed`), so it reads everything the closed
+ * one wrote, and from then on it alone writes. Without the fence, a PAY that was waiting for its
+ * turn at the mint when the plane closed gave its blocks back at its turn by saving the CLOSED
+ * book, erasing whatever the next one had saved since. Those blocks stay off the budget on disk:
+ * the conservative side (respected, never paid).
  */
 import { join } from 'node:path';
 
@@ -94,6 +103,8 @@ export class TailBook {
   private readonly now: () => number;
   private readonly log: Logger;
   private chain: Promise<void> = Promise.resolve();
+  /** Its plane closed: the file is the next book's (see the module comment). */
+  private closed = false;
 
   private constructor(o: TailBookOptions, path: string | null) {
     this.path = path;
@@ -135,6 +146,7 @@ export class TailBook {
 
   /** Keep a closed session's tail (persisted; replaces any earlier one of the same session). */
   add(t: Omit<TailAuth, 'paidBlocks' | 'expiresAt'>): Promise<void> {
+    if (this.closed) return Promise.reject(closedError());
     if (!(t.budgetBlocks >= 1) || !isSessionId(t.sid)) return Promise.resolve();
     const budgetBlocks = Math.min(MAX_TAIL_BLOCKS, Math.floor(t.budgetBlocks));
     this.tails.set(t.sid, {
@@ -149,9 +161,11 @@ export class TailBook {
 
   /**
    * Write the book as it is now (serialised after any write in flight). Rejects when the write
-   * fails (the caller decides what that refuses).
+   * fails (the caller decides what that refuses), and at once, writing nothing, once the book is
+   * closed.
    */
   save(): Promise<void> {
+    if (this.closed) return Promise.reject(closedError());
     const path = this.path;
     if (path === null) return Promise.resolve();
     const run = this.chain.then(() =>
@@ -164,6 +178,15 @@ export class TailBook {
   /** Resolves once every write already started has finished (the host's quit waits for it). */
   flush(): Promise<void> {
     return this.chain;
+  }
+
+  /**
+   * Its plane closed: the writes already started still land (`flush` waits for them, and never
+   * waits for more), and every later `add` and `save` rejects, writing nothing — the next plane's
+   * book owns the file (see the module comment).
+   */
+  close(): void {
+    this.closed = true;
   }
 
   /** Diagnostics and tests. */
@@ -222,4 +245,9 @@ export class TailBook {
     this.prune();
     if (dropped > 0) this.log.warn('malformed tail authorisations dropped', { dropped });
   }
+}
+
+/** A closed book's refusal (never shown: every caller of a late write swallows it). */
+function closedError(): Error {
+  return new Error('payments-unavailable: the tail book is closed');
 }

@@ -181,8 +181,10 @@ export class DesktopSigner implements IdentityProvider {
   private plane: MoneyPlane | undefined;
   /**
    * Lane P2-owed-viewer (independent review): the tail-authorisation writes of every plane closed
-   * so far — `MoneyPlane.close` starts one per session still open. The host's quit waits for them
-   * (`flushTails`), and so does the next plane's open (its book reads the same file).
+   * so far — `MoneyPlane.close` starts one per session still open, then closes its tail book, so
+   * these are every write a closed plane makes (fix round 7: a tail PAY still waiting at a mint
+   * then writes nothing). The host's quit waits for them (`flushTails`), and so does the next
+   * plane's open (its book reads the same file, and owns it from then on).
    */
   private retiring: Promise<void> = Promise.resolve();
   /** Why the last money plane did not open (an error code prefix), or `null`. */
@@ -680,7 +682,8 @@ export class DesktopSigner implements IdentityProvider {
       const s = this.signer();
       if (s === undefined || this.closed) return;
       // The next plane's tail book reads the file the closed ones are still writing: after them,
-      // or it would miss those tails and its next save would drop them (independent review).
+      // or it would miss those tails and its next save would drop them (independent review). A
+      // closed plane's book writes nothing later (fix round 7), so this book then owns the file.
       await this.retiring;
       // Shut down meanwhile: no plane after `close` (its key would never be wiped).
       if (this.isClosed()) return;

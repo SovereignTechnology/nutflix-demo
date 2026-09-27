@@ -14,6 +14,10 @@ Diff: `ea9d4dc` (this lane's base: `54f49bb`, with `stage-3/owed-seeder` and
   missed: 1 HIGH (fresh PAYs lost their carry), 1 MEDIUM, 1 LOW and 6 INFO; building the HIGH's
   test found a second HIGH (N1: a PAY with an empty creator share refused after it was built).
   All fixed but one INFO and a half, deferred with reasons; 17 more mutation checks, all caught.
+- **Round 7 (2026-09-27):** the section after it. The verifier found finding 5 not fully closed
+  (a tail PAY waiting at the mint across a sign-out and quick sign-in could save the closed
+  plane's tail book over the next plane's); fixed by fencing a closed plane's book, 3 tests that
+  failed before the fix, 4 more mutation checks, all caught.
 
 ## Executive summary
 
@@ -655,3 +659,142 @@ On the fixes (the code as committed; this record changes no code):
 - Mutation checks: 17 of 17 caught (M46–M62), M52 after its test was tightened.
 - Real mints: `gateway/real-mint-swarm.integration` and `seeder/owed.integration` with `NUTFLIX_REAL_MINT_URL` at Nutshell `:3399` and at cdk-mintd `:3397` (`_URL_2` `:3398`): 11 of 11 at each. `desktop-carry`, like `desktop-owed`, is TestMint-only (the worker's guard admits only `https` mints).
 - Not run: the Electron e2e (as instructed).
+
+## Round 7 (fix round 7, 2026-09-27)
+
+The lane's independent verifier re-checked the fixes and made one finding (INFO): finding 5 of the
+independent review (sign-out then quick sign-in could lose tails) was not fully closed. The
+orchestrator's decision: close the retired plane's `TailBook` race fully, so that a tail PAY still
+waiting at the PAY/melt gate when the plane is retired never saves the old book over the next
+plane's, and test a sign-out then a quick sign-in with a waiting tail PAY.
+
+### Finding and outcome
+
+| # | Severity | Where | Outcome |
+| - | -------- | ----- | ------- |
+| R7-1 | INFO | `host/money.ts:579` | fixed |
+
+**R7-1. A tail PAY waiting at the gate saved the retired plane's book after the next plane's
+had loaded (INFO).**
+
+- *Verified*, first by reading and then by two tests that failed before the fix.
+  - `DesktopSigner.retire()` takes `plane.flushTails()` as a snapshot of the book's write chain
+    when the plane closes.
+  - A tail PAY waiting for its turn at the mint behind a slow PAY gets that turn later. Then
+    `this.open()` throws `payments-unavailable`, and the catch in `payBuild` runs
+    `void this.tails.save()` on the CLOSED plane's book. That write is outside the snapshot.
+  - If the user has signed in again meanwhile, `changed()` has already waited for the snapshot
+    and opened the next plane. That plane's book has read the file and may have saved a tail. The
+    late write then replaces the file with the old book, and the next plane's tail is gone from
+    disk until that plane writes again.
+  - Both new race tests reproduced exactly this: the file listed the next plane's tail before the
+    turn and did not list it after.
+  - Effect, as the verifier said: small. The lost tail is still in the next book's memory, so it
+    is lost only on a crash, or on a quit with nothing more to save, before that book writes again.
+    Those blocks are respected, never paid; there is no ban and no fund loss. The lane record's
+    claim that the next plane opens only after the closed plane's writes land was, on this path,
+    not true.
+- *Fix: one book owns the file at a time.*
+  - `TailBook.close()` fences a book. Writes it had already started still land, and `flush()`
+    waits for them and never for more. Every later `add` and `save` rejects at once
+    (`payments-unavailable: the tail book is closed`) and writes nothing.
+  - `MoneyPlane.close()` keeps its open sessions' tails, which are the book's last writes, and
+    then closes the book. So the snapshot `DesktopSigner` waits for is now every write the closed
+    plane will ever make, and the next plane's book owns the file from its open on.
+  - The late rollback is refused, and the blocks it would have given back stay off the tail's
+    budget on disk: the conservative side the verifier pointed to (respected, never paid; the new
+    residual R11).
+  - The verifier's narrower alternative (`!this.closed` at the one call site) would have left the
+    book writable by any other late path. The fence covers every write path of a closed book:
+    `lookup`'s expiry save, `add`, and `save` itself. It fails closed: a caller that needs a write
+    to have landed (the pre-spend save before a tail PAY is built) is refused, never told that a
+    closed book wrote. That pre-spend save cannot be reached on a closed plane anyway (`open()`
+    runs synchronously just before it); the rejection is defence in depth.
+  - A save queued before the close but still running after it serialises the old book's memory
+    at its run time, a rollback included. It is in the snapshot, so it lands before the next plane
+    opens. That is harmless.
+  - `DesktopSigner`'s comments and ADR 0018 "viewer side as built" now say that one book owns the
+    file.
+- *Tests* (each failed before the fix):
+  - `tails` "a closed book: writes started before the close land (flush waits for them); later
+    ones write nothing and reject". Failed with `a.close is not a function`.
+  - `tails` "a tail PAY still waiting at the mint when the plane closes: at its turn it writes
+    nothing over the next plane's tails". Two real planes share one tail directory. An open
+    session's PAY holds the mint's turn (its swap is held at the TestMint). A tail's PAY takes
+    its block off the budget on disk and waits. The plane closes, and a second plane opens and
+    saves a tail. When the turn comes the PAY gets `payments-unavailable`, and the file still
+    lists all three tails, the first with its block still taken. The next book agrees: both
+    tails are refused on their budget, before the wallet. Before the fix, the next plane's tail
+    was missing from the file.
+  - `signer-host` "sign out, then sign in at once, with a tail PAY waiting at the mint". The same
+    sequence on the production path: `desktop.signer.signOut`, then `desktop.signer.connect`
+    (which unlocks the kept key file), with the host restarting the worker around each plane
+    change. Before the fix, the next plane's tail was missing from the file.
+  - The race test's first draft also spent on the next plane and got `mint-error`. That rig keeps
+    no wallet journal (`journalDir: null`), so the next plane's wallet still listed the proofs the
+    closed plane's in-flight PAY had swapped. This is the ADR 0014 journal's job in production
+    (the entry is on disk before the request, and its inputs are held out until the mint can
+    say). It is not this finding, so the test now checks the next book by budget refusals and
+    spends nothing.
+- *Mutations.* M63–M66.
+
+### Sharp edges (round 7)
+
+- `TailBook.save()` on a closed book rejects rather than resolving. A resolved promise would
+  tell a caller that awaits it (the pre-spend save) that its budget change is on disk when it is
+  not.
+- `flush()` is a snapshot on an open book and the final word on a closed one. `DesktopSigner`
+  relies on the second: `retire()` closes the plane, then takes `flushTails()`.
+- Nothing new is logged. No secret or peer-identifying value is involved. No locked path or
+  contract was touched.
+
+### Mutation checks (round 7)
+
+Each mutation broke one guard. The touched suites (`tails`, `signer-host`; M66 also `money`)
+were run, and each file was restored byte for byte and checked against a saved sha256. Nothing
+was committed while a mutation was in place.
+
+| # | Mutation | Caught by |
+| - | -------- | --------- |
+| M63 | `TailBook.save` ignores the fence | tails "a closed book…", tails "a tail PAY still waiting at the mint…", signer-host "sign out, then sign in at once…" |
+| M64 | `MoneyPlane.close` does not close its book | tails "a tail PAY still waiting at the mint…", signer-host "sign out, then sign in at once…" |
+| M65 | `TailBook.add` ignores the fence | tails "a closed book…" |
+| M66 | the book closed BEFORE the open sessions' tails are kept | tails "a tail PAY still waiting at the mint…", tails "a plane closed with sessions open…", signer-host "sign out, then sign in at once…", signer-host "a session the quit could not close in time…" |
+
+4 of 4 caught.
+
+### Residuals after round 7
+
+- R1–R10 stand.
+- **R11 (new): the blocks of a tail PAY that fails after its plane closed** (refused at its turn,
+  or failing in flight). The closed book writes nothing, so those blocks are not given back to
+  the tail's budget: respected, never paid. At most one PAY's range for each such PAY, and only
+  when a sign-out, lock, signer swap or quit lands while it waits or runs. No fund loss and no
+  ban.
+
+### Gates (round 7)
+
+- `npx tsc -b --force`: clean (after the new host test's session ids were typed one by one; the
+  first run refused a destructured array under `noUncheckedIndexedAccess`). `npm run build`:
+  clean, run after the forced `tsc` so the packaging tests' freshness check holds.
+- eslint and prettier on every changed file (5 TypeScript files, 3 docs): clean.
+  `npm run check:locked`: OK (no locked path touched, no contract changed).
+  `npm run lint:electron`: OK (245 files, 0 violations). No dependency changed.
+- Touched suites (`tails`, `signer-host`, `desktop-signer`, `money`, `host`,
+  `desktop-owed.integration`): 80 of 80.
+- The whole suite, `npx vitest run --maxWorkers=2`, took 14 min 52 s on a shared box (load 13–20
+  on 8 cores from other sessions' Rust builds and test runs). 223 files: 3457 passed, 3 failed,
+  22 skipped.
+  - The 3 failures were all in `money.test`, each at its 5 s timeout: "only for a registered
+    session…", "onPayment names the mint…" and "the belt…". None reaches the changed code: they
+    use open sessions, `tailDir: null` and no `close()`.
+  - Rerun alone at load 16–20, they failed the same way, on this fix and equally on HEAD's
+    `money.ts` and `tails.ts` (restored by hash afterwards). "the belt" took 6040 ms and 5767 ms
+    on HEAD.
+  - A diagnostic run with a CLI `--testTimeout=30000` passed 17 of 17. Nothing in the code
+    changed for it.
+  - Rerun alone once the load fell to 8.9, with the default timeout: 17 of 17.
+  - No timeout was raised. Net: 3460 passed, 22 skipped, 0 failed.
+- Mutation checks: M63–M66, 4 of 4 caught.
+- Not re-run: the real-mint lanes (no gateway, seeder or mint path changed) and the Electron e2e
+  (as instructed).

@@ -442,7 +442,10 @@ export class MoneyPlane {
     return this.keepTail(sid, s, unpaid);
   }
 
-  /** Every tail write started so far has finished (the host's quit waits for it). */
+  /**
+   * Every tail write started so far has finished (the host's quit waits for it). Once the plane
+   * is closed, that is every write its book will ever make.
+   */
   flushTails(): Promise<void> {
     return this.tails.flush();
   }
@@ -518,7 +521,8 @@ export class MoneyPlane {
   /**
    * Wipe a wallet key held in memory and the journal key; later calls reject, and an operation
    * still in flight can journal nothing more (its entry, already on disk, is settled at the next
-   * open).
+   * open). Lane P2-owed-viewer: the open sessions' tails are the tail book's last writes; the book
+   * is then closed (`tails.ts`).
    */
   close(): void {
     if (this.closed) return;
@@ -527,6 +531,10 @@ export class MoneyPlane {
     // without saying what they left unpaid, so each keeps its remaining budget as a tail.
     for (const [sid, s] of this.sessions) void this.keepTail(sid, s, null);
     this.sessions.clear();
+    // Fix round 7: those are the book's last writes (`flushTails` waits for them). The next plane's
+    // book owns the file from here on; a tail PAY still waiting for its turn at a mint is refused
+    // at its turn and writes nothing (its blocks stay off the budget on disk: respected, never paid).
+    this.tails.close();
     this.settles.stop();
     this.closeKey();
     this.closeJournal();
@@ -604,6 +612,9 @@ export class MoneyPlane {
       );
     } catch (err) {
       s.paidBlocks -= blocks;
+      // The blocks go back to the tail's budget on disk — unless the plane closed while the PAY
+      // waited for its turn: its book is then closed and writes nothing (fix round 7), so the
+      // next plane's book, which owns the file by now, is never overwritten with this one.
       if (tail !== undefined) void this.tails.save().catch(() => undefined);
       if (err instanceof walletMod.WalletError && err.code === 'insufficient-funds')
         throw hostError('no-balance', 'not enough sats at this mint to keep streaming');

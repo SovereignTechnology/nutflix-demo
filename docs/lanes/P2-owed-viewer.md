@@ -15,6 +15,8 @@ Commits:
 - `3340a41`: mutation-check gaps closed, ADR and contract-request text;
 - `8d14a2f`: this record and the review record;
 - then the independent review's fixes (section 3 below), with this record and the review record
+  updated;
+- then fix round 7 (section 4 below), with this record and the review record ("Round 7")
   updated.
 
 Review record: `docs/reviews/2026-09-26-pre-push-owed-viewer.md`. Decisions: Cameron 2026-09-26,
@@ -161,6 +163,30 @@ more defect. The review record ("Independent review") has each finding, scenario
 - **Deferred.** The directory fsync in Bare's `writeAtomic` (R9); a write-ahead tail for a
   full-app crash (R2, Cameron's call).
 
+### 4. Fix round 7 (2026-09-27): a closed plane's tail book writes nothing
+
+The lane's verifier found that finding 5 (sign-out then quick sign-in) was not fully closed; the
+orchestrator decided to close it fully. The review record ("Round 7") has the detail.
+
+- **The race.** A tail's PAY waiting for its turn at the mint (behind a PAY whose swap is slow)
+  when the plane closed was refused at its turn (`payments-unavailable`) and gave its blocks back
+  by saving the CLOSED plane's book (`money.ts`, the `payBuild` catch). That write was outside
+  what `DesktopSigner` waited for, so it could land after the next plane had read the file and
+  saved a tail of its own, erasing that tail from disk until the next plane's next write.
+- **The fix.** One tail book owns the identity's file at a time. `TailBook.close()` fences a
+  book: the writes it started still land (`flush` waits for them and never for more); every later
+  `add` and `save` rejects at once and writes nothing. `MoneyPlane.close()` keeps its open
+  sessions' tails (the book's last writes), then closes the book. The late rollback is therefore
+  refused, and the blocks it would have given back stay off the budget on disk: the conservative
+  side (respected, never paid). `DesktopSigner`'s wait for the closed plane's writes is now a
+  wait for every write that plane will ever make.
+- **Tests** (each failed before the fix): `tails` "a closed book…" (the fence, file and memory
+  books), `tails` "a tail PAY still waiting at the mint when the plane closes…" (the verifier's
+  sequence on two real planes over one directory), and `signer-host` "sign out, then sign in at
+  once, with a tail PAY waiting at the mint" (the production path: the signer flow's sign-out and
+  connect through the host, the worker restarted around each plane change).
+- **Mutations** M63–M66, 4 of 4 caught.
+
 ## Files
 
 - **Seeder:** `packages/seeder/src/net/one-peer.ts`: `single`, `free`, `lostOf`, `forgive`.
@@ -206,6 +232,9 @@ more defect. The review record ("Independent review") has each finding, scenario
     `real-providers-sessions`, `worker-guards`, `desktop-signer`, `signer-host`, `tails`,
     `unpaid-record`, `seeder-credit` extended;
   - ADR 0018 "viewer side as built" updated.
+- **Fix round 7:** `host/tails.ts` (`close`, the fence), `host/money.ts` (`close` closes the
+  book), `host/signer/desktop-signer.ts` (comments); tests `tails` and `signer-host` extended;
+  ADR 0018 "viewer side as built" (one book owns the file).
 
 ## Tests
 
@@ -287,10 +316,28 @@ rules it needed"); `single` replaces the router's probe test with the same shape
   open and `flushTails` wait), `tails` (the tail expiring at the gate's turn), `unpaid-record`
   (the `full` word and the bound, the age-out), `seeder-credit` (a pre-open free-core reply).
 
+**Fix round 7's tests** (each failed before the fix):
+
+- `tails` "a closed book: writes started before the close land…; later ones write nothing and
+  reject": a write started before `close` lands and `flush` waits for it; the next book saves a
+  tail; the closed book's `save` and `add` reject and the file keeps the next book's content; a
+  memory-only book is fenced alike.
+- `tails` "a tail PAY still waiting at the mint when the plane closes…": an open session's PAY
+  holds the mint's turn (its swap held at the TestMint); a tail's PAY takes its block off the
+  budget on disk and waits; the plane closes; a second plane opens on the same directory and saves
+  a tail; the turn comes: `payments-unavailable`, and the file still lists all three tails, the
+  first with its block still taken. The next plane's book agrees (budget refusals, before the
+  wallet). Before the fix the next plane's tail was gone from the file.
+- `signer-host` "sign out, then sign in at once, with a tail PAY waiting at the mint": the same
+  sequence on the production path (`desktop.signer.signOut`, then `desktop.signer.connect`, which
+  unlocks the kept key file; the worker restarted around each plane change). Before the fix the
+  next plane's tail was gone from the file.
+
 **Mutation checks:** 45 in the lane's own review, all caught (the review record has the table).
 M13 and M40 needed a new test first. M43–M45 are end to end; with M45 (the ledger's earlier-run
 word ignored) the daemon bans the viewer. The independent review added M46–M62 (its table; M61 and M62 end to end), plus
-the reviewer's own survivor (money.ts:565), now M54 and caught.
+the reviewer's own survivor (money.ts:565), now M54 and caught. Fix round 7 added M63–M66 (the
+review record's "Round 7"), 4 of 4 caught.
 
 **Real mints:** `gateway/real-mint-swarm.integration` and `seeder/owed.integration`, with
 `NUTFLIX_REAL_MINT_URL` at Nutshell 0.21.0 (`:3399`, `_URL_2` `:3398`) and cdk-mintd 0.18.1
@@ -334,6 +381,22 @@ Run on the final code (`3340a41`; this record and the review record change no co
 - **Mutation checks:** M46–M62, 17 of 17 caught (M52 after its test was tightened).
 - **Real mints:** `gateway/real-mint-swarm.integration` and `seeder/owed.integration` with `NUTFLIX_REAL_MINT_URL` at Nutshell `:3399` and at cdk-mintd `:3397` (`_URL_2` `:3398`): 11 of 11 at each. `desktop-carry`, like `desktop-owed`, is TestMint-only (the worker's guard admits only `https` mints).
 
+### After fix round 7
+
+- **`npx tsc -b --force`** (clean once the new host test's session ids were typed one by one),
+  **`npm run build`** (after the forced `tsc`), **eslint** and **prettier** on every changed file
+  (5 TypeScript files, 3 docs), **`check:locked`**, and **`lint:electron`** (245 files, 0
+  violations): all clean. No dependency changed.
+- **Touched suites** (`tails`, `signer-host`, `desktop-signer`, `money`, `host`,
+  `desktop-owed.integration`): 80 of 80.
+- **Whole suite,** `--maxWorkers=2`, load 13–20 on 8 cores: 223 files; 3457 passed, 3 failed, 22
+  skipped. The 3 failures were `money.test` cases at their 5 s timeout. None reaches the changed
+  code. Rerun alone under the same load they failed the same way on HEAD's sources too; alone at
+  load 8.9 with the default timeout they passed 17 of 17. No timeout was raised. Net: 3460
+  passed, 22 skipped, 0 failed.
+- **Mutation checks:** M63–M66, 4 of 4 caught.
+- **Not re-run:** the real-mint lanes (no mint path changed) and the Electron e2e.
+
 ## Residuals
 
 - **R1: tails outlive their session.** A compromised worker keeps up to `MAX_TAIL_BLOCKS` of each
@@ -357,6 +420,11 @@ Run on the final code (`3340a41`; this record and the review record change no co
   process crash, not a power loss.
 - **R10: an unbounded wait on the disk** (independent review). A sign-in after a sign-out waits
   for the closed plane's tail writes, as the quit does; a disk that never answers holds it.
+- **R11: the blocks of a tail PAY that fails after its plane closed** (fix round 7): refused at
+  its turn at the mint, or failing in flight. The closed plane's book writes nothing, so the blocks
+  that PAY took off the tail's budget on disk are not given back: respected, never paid. At most
+  one PAY's range per such PAY, and only when a sign-out, lock, signer swap or quit lands while it
+  waits or runs. No fund loss and no ban.
 - **Lane P1's R1 is resolved:** the viewer no longer reads `free` as sold. **P1's R9 is
   resolved:** the image path marks free before the open.
 
@@ -375,7 +443,7 @@ Run on the final code (`3340a41`; this record and the review record change no co
 ## Proposed `docs/status.md` row
 
 ```
-| Viewer pays the seeder's count + images only where "free" (ADRs 0015/0018 amendments 2026-09-26) | `stage-3/owed-viewer` (off `54f49bb`, owed-seeder + int-reconcile merged) | **done (viewer side)** — image reads ask a seeder only after its `PRICE { free: true }` (no probe; router `free`: a free read that times out leaves no debt; a pricing gateway no longer stops an honest free image); `SeederCredit` starts each seeder from its report (one block at a time until it is in, then window − `OWED`, re-based by every `ACK.outstanding`); the worker keeps a durable record of blocks received and unpaid per seeder pubkey + core with their session terms, plus a write-ahead "may be at its window" ledger; on `OWED` it pays only reported ∩ recorded blocks under the recorded session's id; `play.close` answers the unpaid tail and the host keeps per-identity tail authorisations (≤ 1024 blocks, 7 days, checked like any PAY, budget on disk before the build); the gateway gets credit-from-report and pays no old tail. Four tail scenarios end to end against a seeder daemon over hyperswarm (graceful close, crash, over-claim, expiry), three image scenarios on the testnet, 45 mutation checks, real-mint lanes green at Nutshell and cdk-mintd. Independent review fixed: every desktop PAY now carries its chain's `carryIn` (fresh PAYs went out with 0 — refused `malformed` after any carry, proofs spent) and none is built without one; a PAY with an empty creator share is admitted (the worker's guard refused it after the host built it); quit waits for the signer flow's tail writes; the gateway's report ignores replies to requests made before our HELLO; the record's write-ahead word survives its bound and age-out; `desktop-carry` end to end at 3 sats/block, 90/10; 62 mutation checks. Open: R1 (tails outlive their session, capped), R2 (full-app crash leaves no tail authorisation), R3/R4 (no end-of-report marker: 10 s wait; gateway crash-at-window), R9 (no directory fsync in Bare's `writeAtomic`) |
+| Viewer pays the seeder's count + images only where "free" (ADRs 0015/0018 amendments 2026-09-26) | `stage-3/owed-viewer` (off `54f49bb`, owed-seeder + int-reconcile merged) | **done (viewer side)** — image reads ask a seeder only after its `PRICE { free: true }` (no probe; router `free`: a free read that times out leaves no debt; a pricing gateway no longer stops an honest free image); `SeederCredit` starts each seeder from its report (one block at a time until it is in, then window − `OWED`, re-based by every `ACK.outstanding`); the worker keeps a durable record of blocks received and unpaid per seeder pubkey + core with their session terms, plus a write-ahead "may be at its window" ledger; on `OWED` it pays only reported ∩ recorded blocks under the recorded session's id; `play.close` answers the unpaid tail and the host keeps per-identity tail authorisations (≤ 1024 blocks, 7 days, checked like any PAY, budget on disk before the build); the gateway gets credit-from-report and pays no old tail. Four tail scenarios end to end against a seeder daemon over hyperswarm (graceful close, crash, over-claim, expiry), three image scenarios on the testnet, 45 mutation checks, real-mint lanes green at Nutshell and cdk-mintd. Independent review fixed: every desktop PAY now carries its chain's `carryIn` (fresh PAYs went out with 0 — refused `malformed` after any carry, proofs spent) and none is built without one; a PAY with an empty creator share is admitted (the worker's guard refused it after the host built it); quit waits for the signer flow's tail writes; the gateway's report ignores replies to requests made before our HELLO; the record's write-ahead word survives its bound and age-out; `desktop-carry` end to end at 3 sats/block, 90/10. Fix round 7: a closed plane's tail book writes nothing more, so a tail PAY waiting at the mint across a sign-out and quick sign-in can no longer overwrite the next plane's tails; 66 mutation checks. Open: R1 (tails outlive their session, capped), R2 (full-app crash leaves no tail authorisation), R3/R4 (no end-of-report marker: 10 s wait; gateway crash-at-window), R9 (no directory fsync in Bare's `writeAtomic`) |
 ```
 
 ## Proposed `docs/security-review.md` text (§5 or §6)
@@ -404,6 +472,9 @@ Run on the final code (`3340a41`; this record and the review record change no co
 >   the worker's guard admits it and refuses a PAY with no proof at all (independent review: it
 >   refused the host's PAY after it was built, and the payer built another).
 > - The quit waits for every tail-authorisation write, the signer flow's closed plane included.
+>   One tail book owns the identity's file at a time: a closed plane's book writes nothing more,
+>   so a tail PAY still waiting at a mint across a sign-out and quick sign-in cannot overwrite
+>   the next plane's book (fix round 7).
 > - Logs carry counts only.
 >
 > **Residual:**
