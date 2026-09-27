@@ -672,6 +672,10 @@ export class DesktopSigner implements IdentityProvider {
       this.plane = undefined;
       this.planeError = null;
       this.retire(old);
+      // W8a: the closed plane's wallet drains (bounded, `PLANE_DRAIN_MS`) before a rotation moves
+      // the counters file aside and before the next plane opens over it: its late watermark write
+      // then lands before them, or never.
+      await old?.drained();
       if (between !== undefined)
         try {
           await between();
@@ -727,12 +731,16 @@ export class DesktopSigner implements IdentityProvider {
     return this.closed;
   }
 
-  /** Close `plane` (its sessions keep their tails) and remember its tail writes. */
+  /**
+   * Close `plane` (its sessions keep their tails) and remember its tail writes — and (W8a) its
+   * wallet's drain, bounded: the host's quit waits for both (`flushTails`).
+   */
   private retire(plane: MoneyPlane | undefined): void {
     if (plane === undefined) return;
     plane.close();
     const flushed = plane.flushTails().catch(() => undefined);
-    this.retiring = Promise.all([this.retiring, flushed]).then(() => undefined);
+    const drained = plane.drained().catch(() => undefined);
+    this.retiring = Promise.all([this.retiring, flushed, drained]).then(() => undefined);
   }
 
   private emit(): void {

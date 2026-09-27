@@ -247,7 +247,10 @@ describe('the counters file (core’s CounterStore)', () => {
       JSON.stringify({ v: 1, next: { [V1]: MAX_COUNTER + 1 }, published: {} }),
       JSON.stringify({ v: 1, next: { nothex: 1 }, published: {} }),
       JSON.stringify({ v: 1, next: { [V1]: 5 }, published: { [V1]: 6 } }),
-      JSON.stringify({ v: 1, next: {}, published: { [V1]: 0 } }),
+      // W8a: `{ [V1]: 0 }` with no `next` was listed here, but core writes exactly that (a probed
+      // keyset whose watermark moved before a lease; the final review's [high], second trigger):
+      // it loads now (core drops it). Above 0 it is still damaged.
+      JSON.stringify({ v: 1, next: {}, published: { [V1]: 1 } }),
     ]) {
       await writeFile(s.path, bad, { mode: 0o600 });
       await expect(s.load()).rejects.toThrow(/^counters-unreadable: /);
@@ -320,8 +323,60 @@ describe('the counters file (core’s CounterStore)', () => {
       { v: 1, next: { [V1]: 1 }, published: { [tag('3E')]: 0 } },
     ])
       expect(parseCounterState(bad), JSON.stringify(bad)).toBeNull();
-    // A watermark without its keyset's `next` is still refused (only the binding has none).
-    expect(parseCounterState({ v: 1, next: {}, published: { [V1]: 0 } })).toBeNull();
+    // A watermark without its keyset's `next` is refused unless it is 0. W8a: this line pinned
+    // `{ [V1]: 0 }` as refused — but core writes exactly that (a keyset its probe moved, whose
+    // watermark moved before any lease: `seed.ts` `save`, `min(published, next ?? 0)`), and every
+    // later save was then refused (the final review's [high], second trigger). Above 0 it is
+    // still not what core writes.
+    expect(parseCounterState({ v: 1, next: {}, published: { [V1]: 0 } })).toEqual({
+      v: 1,
+      next: {},
+      published: { [V1]: 0 },
+    });
+    expect(parseCounterState({ v: 1, next: {}, published: { [V1]: 1 } })).toBeNull();
+  });
+
+  it('W8a: core’s real counter source writes a probed keyset’s watermark with no lease — the file takes it, and a lease at another mint is still saved after it', async () => {
+    const d = await dir();
+    const urlA = 'https://mint-a.recovery-files.test' as MintUrl;
+    const urlB = 'https://mint-b.recovery-files.test' as MintUrl;
+    const a = new mocks.TestMint({ url: urlA, seed: new Uint8Array(32).fill(0x71) });
+    const b = new mocks.TestMint({ url: urlB, seed: new Uint8Array(32).fill(0x72) });
+    const request = (m: MintUrl) => (m === urlA ? a.request : b.request);
+    // This phrase already signed at mint A (another wallet of it, or a counters file lost).
+    const first = await seedOf('6b'.repeat(16));
+    const earlier = new walletMod.CashuWallet({
+      mints: new walletMod.CashuMintConnections({
+        request,
+        seed: { seed: first, counters: new mocks.MemoryCounterStore() },
+      }),
+      store: new walletMod.MemoryProofStore(),
+    });
+    const q0 = await earlier.mintQuote(urlA, 8 as Sats);
+    a.payQuote(q0.quoteId);
+    await earlier.pollQuote(q0);
+    await earlier.close();
+    // This device, over the desktop's counters file: mint A is prepared for a PAY (the probe finds
+    // that signature and moves the cursor — no lease) and the PAY is then refused; with nothing in
+    // flight the watermark moves over that cursor.
+    const seed = await seedOf('6b'.repeat(16));
+    const store = new FileCounterStore(d, PK);
+    const wallet = new walletMod.CashuWallet({
+      mints: new walletMod.CashuMintConnections({ request, seed: { seed, counters: store } }),
+      store: new walletMod.MemoryProofStore(),
+    });
+    await wallet.prepare(urlA);
+    await wallet.notePublished();
+    // A top-up at mint B leases counters there: that save carries mint A's watermark at 0 with no
+    // `next`. Refused before this fix, and the top-up failed with it.
+    const q = await wallet.mintQuote(urlB, 16 as Sats);
+    b.payQuote(q.quoteId);
+    expect(await wallet.pollQuote(q)).toMatchObject({ state: 'ISSUED', minted: 16 });
+    await wallet.close();
+    const onDisk = await new FileCounterStore(d, PK).load();
+    expect(onDisk?.next[b.keysetId]).toBeGreaterThan(0);
+    expect(onDisk?.published[a.keysetId]).toBe(0);
+    expect(onDisk?.next[a.keysetId]).toBeUndefined();
   });
 
   it('core’s real counter source over the counters file: a seeded mint saves its lease with the binding, and a new store reads it back', async () => {

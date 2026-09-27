@@ -52,6 +52,7 @@ export function spyRecoveryCore(o: { readonly loseOption?: boolean } = {}): SpyR
         asked.push(w);
         return real.seeded(w);
       },
+      phraseTag: (seed) => real.phraseTag(seed),
     },
     materials,
     asked,

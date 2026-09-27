@@ -29,6 +29,22 @@
  *     loaded mint leaves 15.6 s to start; one at a mint not loaded, or two, leave none — every PAY
  *     there is refused (`rate-limited:`, retried) until the settle loop clears them.
  *
+ *   - A wallet with a recovery phrase (ADR 0016; lane W8a, final cross-lane review) costs more per
+ *     send: an answer lost after its swap is decided by a NUT-09 restore AND a NUT-07 check
+ *     (signatures on seeded outputs may be another wallet's on the same phrase), a refusal is
+ *     checked by a restore before the reconcile, each send may save a counters-file lease, a keyset
+ *     the counters file does not know is probed (one NUT-09 batch), and a counter collision costs a
+ *     skip-ahead batch and a save. Core bounds a PAY's sends for this (`SendBound`): a collision is
+ *     reported, never run again, its skip-ahead asks one batch — so it ends the PAY, at most once.
+ *     The money plane loads the mint and probes its active keyset BEFORE the PAY takes its turn
+ *     (`CashuWallet.prepare`), so a seeded PAY is modelled at a loaded mint with one probe left in
+ *     it (a keyset rotated in meanwhile). A seeded PAY with no entries at its mint has 12.6 s to
+ *     start; with any entry there, none.
+ *   - Each send of a PAY is asked again when its own turn at the mint comes (`SendBound.onTurn`,
+ *     `sendStartByMs`): an operation the gate does not see (a redeem, the settle loop) may hold the
+ *     mint when a PAY build reaches core, and core's queue is FIFO — a send that would start too
+ *     late for what is left of the PAY is refused there with nothing spent.
+ *
  * `payBuildWorstMs` is a model of what the host bounds, not a proof over every path. It counts
  * mint round trips at the host transport's timeout and relay publishes at nostr-tools' timeouts,
  * for a PAY alone at its mint. A journal entry the PAY's own settle resolves costs no more (its
@@ -65,6 +81,50 @@ export const PAY_BUILD_SENDS = 2;
 export const SEND_ROUND_TRIPS = 2;
 
 /**
+ * What a send adds with a recovery phrase (ADR 0016; W8a): after a lost answer, the NUT-09 restore
+ * is followed by a NUT-07 check (does the mint show the send ran, or are the signatures another
+ * wallet's on this phrase?); after a refusal, a restore comes before the reconcile's NUT-07.
+ */
+export const SEEDED_SEND_EXTRA_ROUND_TRIPS = 1;
+
+/**
+ * A probe inside a seeded PAY build: one NUT-09 batch for a keyset the counters file does not
+ * know. The money plane probes the mint's active keyset before the PAY takes its turn
+ * (`CashuWallet.prepare`), so one is due inside a build only for a keyset rotated in since: once.
+ */
+export const PAY_BUILD_SEEDED_PROBE_ROUND_TRIPS = 1;
+
+/**
+ * A NUT-13 counter collision inside a PAY build: one skip-ahead batch (core caps it for a bounded
+ * send, `SendBound`) and no second attempt — the collision ends the PAY with nothing spent, so it
+ * is counted once per PAY.
+ */
+export const PAY_BUILD_COLLISION_ROUND_TRIPS = 1;
+
+/**
+ * Each journal entry at the mint, with a recovery phrase: its settle may find a collision and skip
+ * ahead one batch (once: the entry is gone after it).
+ */
+export const SEEDED_SETTLE_EXTRA_ROUND_TRIPS_PER_ENTRY = 1;
+
+/**
+ * One save of the NUT-13 counters file (`host/recovery/files.ts`: read, a fresh temp file written
+ * and fsynced, renamed, the directory fsynced). An allowance for a local disk, not a bound the code
+ * enforces — like the wallet journal's own writes, which the model does not count either (a disk
+ * that stalls for seconds stalls every write).
+ */
+export const COUNTER_SAVE_WORST_MS = 1_000;
+
+/**
+ * Counters-file saves of a seeded PAY build: each send's lease (a reservation past the leased range
+ * saves the next lease first), the collision skip-ahead's, and one per journal entry (a collision
+ * its settle finds).
+ */
+export const SEEDED_SEND_COUNTER_SAVES = 1;
+export const PAY_BUILD_COLLISION_COUNTER_SAVES = 1;
+export const SEEDED_SETTLE_COUNTER_SAVES_PER_ENTRY = 1;
+
+/**
  * Mint round trips, one after another, of one PAY build with no journal entries at its mint: the
  * mint load, then each send's swap and follow-up: 1 + 2 × 2.
  */
@@ -86,10 +146,13 @@ export const PAY_BUILD_SETTLE_ROUND_TRIPS_PER_ENTRY = 2;
 export const RELAY_PUBLISH_WORST_MS = 7_400;
 
 /**
- * Relay publishes, one after another, of one PAY build: each send commits the wallet's new token
- * event, the deletion of the old one and a history line (NIP-60), published in order.
+ * Relay publishes of one send: it commits the wallet's new token event, the deletion of the old one
+ * and a history line (NIP-60), published in order.
  */
-export const PAY_BUILD_RELAY_PUBLISHES = 6;
+export const SEND_RELAY_PUBLISHES = 3;
+
+/** Relay publishes, one after another, of one PAY build: each of its sends'. */
+export const PAY_BUILD_RELAY_PUBLISHES = PAY_BUILD_SENDS * SEND_RELAY_PUBLISHES;
 
 /**
  * The host's side of one PAY build at its worst, outside a melt, with no journal entries at its
@@ -111,27 +174,74 @@ function entries(n: number): number {
 }
 
 /**
- * One PAY build's worst host-side time with `pending` journal entries at its mint, `loaded`
- * when that mint has loaded (no load round trip). `payBuildWorstMs(0, false)` is
- * `PAY_BUILD_WORST_MS`.
+ * One PAY build's worst host-side time — or, with `sends`, the worst of its last `sends` sends —
+ * with `pending` journal entries at its mint, `loaded` when that mint has loaded (no load round
+ * trip), `seeded` when the wallet derives from a recovery phrase (W8a: the extra round trips and
+ * counters-file saves above). `payBuildWorstMs(0, false)` is `PAY_BUILD_WORST_MS`.
  */
-export function payBuildWorstMs(pending: number, loaded: boolean): number {
+export function payBuildWorstMs(
+  pending: number,
+  loaded: boolean,
+  seeded = false,
+  sends: number = PAY_BUILD_SENDS,
+): number {
+  const n = entries(pending);
+  const k = Number.isSafeInteger(sends) && sends >= 1 ? sends : PAY_BUILD_SENDS;
+  const perSend =
+    SEND_ROUND_TRIPS +
+    (seeded ? SEEDED_SEND_EXTRA_ROUND_TRIPS : 0) +
+    n * PAY_BUILD_SETTLE_ROUND_TRIPS_PER_ENTRY;
   const trips =
     (loaded ? 0 : MINT_LOAD_ROUND_TRIPS) +
-    PAY_BUILD_SENDS *
-      (SEND_ROUND_TRIPS + entries(pending) * PAY_BUILD_SETTLE_ROUND_TRIPS_PER_ENTRY);
-  return trips * MINT_REQUEST_TIMEOUT_MS + PAY_BUILD_RELAY_PUBLISHES * RELAY_PUBLISH_WORST_MS;
+    k * perSend +
+    (seeded
+      ? PAY_BUILD_SEEDED_PROBE_ROUND_TRIPS +
+        PAY_BUILD_COLLISION_ROUND_TRIPS +
+        n * SEEDED_SETTLE_EXTRA_ROUND_TRIPS_PER_ENTRY
+      : 0);
+  const saves = seeded
+    ? k * SEEDED_SEND_COUNTER_SAVES +
+      PAY_BUILD_COLLISION_COUNTER_SAVES +
+      n * SEEDED_SETTLE_COUNTER_SAVES_PER_ENTRY
+    : 0;
+  return (
+    trips * MINT_REQUEST_TIMEOUT_MS +
+    k * SEND_RELAY_PUBLISHES * RELAY_PUBLISH_WORST_MS +
+    saves * COUNTER_SAVE_WORST_MS
+  );
 }
 
 /**
  * The belt of ONE PAY (cross-lane review round 4): how soon after its request arrived it must
- * reach the wallet, with `pending` journal entries at its mint and `loaded` as above — what is
- * left of the worker's deadline after that PAY's worst time, never more than
+ * reach the wallet, with `pending` journal entries at its mint and `loaded` / `seeded` as above —
+ * what is left of the worker's deadline after that PAY's worst time, never more than
  * `PAY_BUILD_START_BY_MS`. Negative when no start is early enough: the PAY is refused.
  */
-export function payBuildStartByMs(pending: number, loaded: boolean): number {
+export function payBuildStartByMs(pending: number, loaded: boolean, seeded = false): number {
   return Math.min(
     PAY_BUILD_START_BY_MS,
-    WORKER_HOST_REQUEST_TIMEOUT_MS - payBuildWorstMs(pending, loaded),
+    WORKER_HOST_REQUEST_TIMEOUT_MS - payBuildWorstMs(pending, loaded, seeded),
   );
 }
+
+/**
+ * The bound of ONE SEND of a PAY at its turn at the mint (W8a, `SendBound.onTurn`): how soon after
+ * the PAY's request arrived that send must start, with `sendsLeft` sends of the PAY still to run
+ * (itself included) — what is left of the worker's deadline after their worst time. A send that
+ * starts later is refused with nothing spent: an operation queued ahead of it at the mint (one the
+ * gate does not see) ran too long, or the send before it did.
+ */
+export function sendStartByMs(
+  pending: number,
+  loaded: boolean,
+  seeded: boolean,
+  sendsLeft: number,
+): number {
+  return WORKER_HOST_REQUEST_TIMEOUT_MS - payBuildWorstMs(pending, loaded, seeded, sendsLeft);
+}
+
+/** A seeded PAY's worst at a loaded mint with no journal entries (W8a; the belt below). */
+export const PAY_BUILD_SEEDED_WORST_MS = payBuildWorstMs(0, true, true);
+
+/** A seeded PAY's belt at a loaded mint with no journal entries: 12.6 s. */
+export const PAY_BUILD_SEEDED_START_BY_MS = payBuildStartByMs(0, true, true);

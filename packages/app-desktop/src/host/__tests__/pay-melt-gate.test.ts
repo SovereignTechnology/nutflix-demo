@@ -13,8 +13,10 @@ import { toWireError } from '../../ipc/errors.js';
 import type { GateTimers } from '../pay-melt-gate.js';
 import {
   GateRefusal,
+  HOLD_AT_MINT,
   MELT_AT_MINT,
   PAY_STILL_BUILDING,
+  PAY_STILL_BUILDING_HOLD,
   PAY_TOO_LATE,
   PayMeltGate,
 } from '../pay-melt-gate.js';
@@ -322,8 +324,89 @@ describe('PayMeltGate: a melt and a PAY build at one mint never overlap', () => 
     expect(() => new PayMeltGate({ startByMs: 0, meltWaitMs: 0 })).not.toThrow();
   });
 
+  it('W8a: a hold (a restore, a reissue, a settle) marks its mint like a melt — PAYs refused at once and never built, the one in flight waited for, waiting ones refused — and the mark always clears', async () => {
+    const { g, timers } = gate();
+    const order: string[] = [];
+    const first = deferred<string>();
+    const pay1 = observe(
+      g.pay(A, g.now(), async () => {
+        order.push('pay 1 starts');
+        const r = await first.promise;
+        order.push('pay 1 ends');
+        return r;
+      }),
+    );
+    let built = 0;
+    const build = (): Promise<string> => {
+      built++;
+      return Promise.resolve('pay');
+    };
+    const waiting = observe(g.pay(A, g.now(), build));
+    await tick();
+    const scan = deferred<string>();
+    const hold = observe(
+      g.hold(A, () => {
+        order.push('restore');
+        return scan.promise;
+      }),
+    );
+    await tick();
+    // The PAY waiting its turn is refused now; the hold waits for the PAY in flight.
+    expect(refusal(waiting.error)).toBe(`rate-limited: ${HOLD_AT_MINT}`);
+    expect(hold.done).toBe(false);
+    expect(g.refusal(A)?.message).toBe(`rate-limited: ${HOLD_AT_MINT}`);
+    expect(g.melting(A)).toBe(false); // a hold is not a melt
+    first.resolve('pay 1');
+    await tick();
+    expect(pay1).toMatchObject({ done: true, value: 'pay 1' });
+    expect(order).toEqual(['pay 1 starts', 'pay 1 ends', 'restore']);
+    // While the restore runs: every PAY at A refused at once and never built; B is its own.
+    await expect(g.pay(A, g.now(), build)).rejects.toThrow(`rate-limited: ${HOLD_AT_MINT}`);
+    expect(built).toBe(0);
+    expect(await g.pay(B, g.now(), build)).toBe('pay');
+    // A melt meanwhile: both marks count; the melt's reason is the one a PAY hears.
+    const melting = deferred<string>();
+    const melt = observe(g.melt(A, () => melting.promise));
+    await tick();
+    await expect(g.pay(A, g.now(), build)).rejects.toThrow(`rate-limited: ${MELT_AT_MINT}`);
+    melting.resolve('paid');
+    await tick();
+    expect(melt).toMatchObject({ done: true, value: 'paid' });
+    await expect(g.pay(A, g.now(), build)).rejects.toThrow(`rate-limited: ${HOLD_AT_MINT}`);
+    scan.reject(new Error('the mint went away'));
+    await tick();
+    expect(hold.done).toBe(true);
+    expect(g.refusal(A)).toBeUndefined(); // cleared by a hold that threw
+    expect(await g.pay(A, g.now(), build)).toBe('pay');
+    // A hold waits at most the worker's deadline for a PAY in flight: then refused unrun.
+    const stuck = deferred<string>();
+    const pay = g.pay(A, g.now(), () => stuck.promise);
+    let ran = 0;
+    const late = observe(
+      g.hold(A, () => {
+        ran++;
+        return Promise.resolve('scanned');
+      }),
+    );
+    await tick();
+    expect(timers.armed.map((t) => t.ms)).toEqual([WORKER_HOST_REQUEST_TIMEOUT_MS]);
+    timers.armed.shift()!.fn();
+    await tick();
+    expect(refusal(late.error)).toBe(`rate-limited: ${PAY_STILL_BUILDING_HOLD}`);
+    expect(ran).toBe(0);
+    expect(g.refusal(A)).toBeUndefined();
+    stuck.resolve('built');
+    expect(await pay).toBe('built');
+  });
+
   it('every refusal is a GateRefusal: code rate-limited, and it crosses the wire as such', () => {
-    for (const detail of [MELT_AT_MINT, PAY_TOO_LATE, PAY_STILL_BUILDING]) {
+    for (const detail of [
+      MELT_AT_MINT,
+      PAY_TOO_LATE,
+      PAY_STILL_BUILDING,
+      HOLD_AT_MINT,
+      PAY_STILL_BUILDING_HOLD,
+    ]) {
       const e = new GateRefusal(detail);
       expect(e.code).toBe('rate-limited');
       expect(toWireError(e)).toEqual({ code: 'rate-limited', message: `rate-limited: ${detail}` });

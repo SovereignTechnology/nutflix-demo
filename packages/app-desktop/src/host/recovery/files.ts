@@ -246,12 +246,19 @@ function counterMap(x: unknown, binding = false): Record<string, number> | null 
 
 /**
  * Exactly a `CounterState` as core writes it — every keyset id hex (v1 or v2), every counter an
- * integer in `[0, 2^31]`, every `published` watermark at or below its keyset's `next`, and at most
- * one phrase binding (`published` only, → 0) — or `null`.
+ * integer in `[0, 2^31]`, every `published` watermark at or below its keyset's `next` (a keyset
+ * with no `next` at 0), and at most one phrase binding (`published` only, → 0) — or `null`.
  *
  * Integration fix 2: the binding was refused (not a keyset id, no `next`), so once core wrote it
  * the desktop saved no lease: every seeded operation — a reissue, a top-up, a send's change —
  * failed before it reached the mint, and the counters file stayed without the binding.
+ *
+ * Lane W8a (the same review finding's second trigger): core also writes a keyset's `published`
+ * at 0 with no `next` — a probe moved its cursor (this seed had signed there before) and the
+ * watermark moved before any lease was taken there (`seed.ts` `save`: `min(published, next ?? 0)`;
+ * a load drops such an entry). It was refused too, and then every later save was, until an
+ * operation leased under that keyset. The money plane's pre-PAY probe (`CashuWallet.prepare`)
+ * makes a probe with no lease after it ordinary.
  */
 export function parseCounterState(raw: unknown): walletMod.CounterState | null {
   if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return null;
@@ -267,7 +274,7 @@ export function parseCounterState(raw: unknown): walletMod.CounterState | null {
       continue;
     }
     const n = next[k];
-    if (n === undefined || p > n) return null;
+    if (n === undefined ? p !== 0 : p > n) return null;
   }
   return { v: 1, next, published };
 }

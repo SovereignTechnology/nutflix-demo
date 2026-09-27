@@ -33,7 +33,15 @@ import {
   writeEnvelope,
 } from '../recovery/files.js';
 import type { PlaneSeed } from '../recovery/service.js';
-import { CONFIRM_ATTEMPTS, RecoveryService, reasonOf } from '../recovery/service.js';
+import type { RecoveryTimers } from '../recovery/service.js';
+import {
+  CONFIRM_ATTEMPTS,
+  RELAY_RETRY_FIRST_MS,
+  RELAY_RETRY_MAX_MS,
+  RESTORE_ROUNDS,
+  RecoveryService,
+  reasonOf,
+} from '../recovery/service.js';
 import { MainBridge } from '../signer/main-bridge.js';
 import { CANCEL_LIMIT, UNLOCK_ATTEMPTS } from '../signer/desktop-signer.js';
 import { FakeRecoveryCore, entropyHexOf, wordsOf } from './support/fake-recovery.js';
@@ -62,6 +70,8 @@ interface FakePlane {
     balances(): Promise<ReadonlyMap<MintUrl, Sats>>;
     mints(): Promise<readonly MintUrl[]>;
   };
+  /** W8a: journal entries per mint (`World.pending`). */
+  pendingAt(mint: MintUrl): Promise<number>;
   close(): void;
 }
 
@@ -84,8 +94,43 @@ interface World {
   answer: (f: PromptForm) => PromptAnswer | null | Promise<PromptAnswer | null>;
   confirm: (f: ConfirmForm) => boolean;
   balances: Map<MintUrl, number>;
+  /** W8a: journal entries the plane reports per mint (none by default). */
+  pending: Map<MintUrl, number>;
+  /** W8a: the relay copy retry's timers, fired by hand. */
+  readonly timers: ManualTimers;
+  /** W8a: `closeSessions` and reopens, in order. */
+  readonly lifecycle: string[];
   clock: number;
   openPlane(): Promise<void>;
+}
+
+/** Timers a test fires by hand (W8a: the relay copy retry). */
+interface ManualTimers extends RecoveryTimers {
+  readonly armed: { readonly ms: number; readonly fn: () => void }[];
+  /** Fire the next armed timer; resolves once what it started has settled. */
+  fire(): Promise<void>;
+}
+
+function manualTimers(): ManualTimers {
+  const armed: { ms: number; fn: () => void }[] = [];
+  return {
+    armed,
+    setTimeout: (fn, ms) => {
+      const h = { ms, fn };
+      armed.push(h);
+      return h;
+    },
+    clearTimeout: (h) => {
+      const i = armed.indexOf(h as { ms: number; fn: () => void });
+      if (i >= 0) armed.splice(i, 1);
+    },
+    fire: async () => {
+      const h = armed.shift();
+      if (h === undefined) throw new Error('no timer armed');
+      h.fn();
+      for (let i = 0; i < 5; i++) await new Promise((r) => setTimeout(r, 10));
+    },
+  };
 }
 
 async function world(
@@ -118,6 +163,9 @@ async function world(
   w.answer = () => null;
   w.confirm = () => false;
   w.balances = new Map();
+  w.pending = new Map();
+  const timers = manualTimers();
+  const lifecycle: string[] = [];
   w.clock = 1_000_000;
   const asked: PromptForm[] = [];
   const confirms: ConfirmForm[] = [];
@@ -155,6 +203,7 @@ async function world(
           Promise.resolve(new Map(w.balances) as unknown as ReadonlyMap<MintUrl, Sats>),
         mints: () => Promise.resolve([MINT_A, MINT_B]),
       },
+      pendingAt: (mint) => Promise.resolve(w.pending.get(mint) ?? 0),
       close: () => {
         seed?.material.seed.wipe();
       },
@@ -167,6 +216,7 @@ async function world(
     signer: () => signer,
     plane: () => plane as unknown as MoneyPlane | undefined,
     reopenMoney: async (between) => {
+      lifecycle.push('reopen');
       const old = plane;
       plane = undefined;
       old?.close();
@@ -202,6 +252,11 @@ async function world(
     log,
     now: () => 1_760_000_000 as UnixSeconds,
     clock: () => w.clock,
+    timers,
+    closeSessions: () => {
+      lifecycle.push('close sessions');
+      return Promise.resolve();
+    },
   });
   svc.onProgress((p) => progress.push(p));
   if (core !== undefined) core.wallet.balances.clear();
@@ -218,6 +273,8 @@ async function world(
     out,
     progress,
     reopens,
+    timers,
+    lifecycle,
     plane: () => plane,
     openPlane: async () => {
       plane = makePlane(await svc.seedFor(signer, pubkey));
@@ -774,7 +831,13 @@ describe('guard rails', () => {
     w.core.wallet.plans.set(MINT_A, { inputs: 3, feeSats: 3 });
     const r = await w.svc.setup();
     expect(w.confirms).toEqual([]);
-    expect(r.status.reissuePending).toBe(false);
+    // W8a (orchestrator decision, final cross-lane review [low] service.ts:456): a reissue is
+    // complete only when no dust is left outside the phrase at a mint — this line pinned
+    // `false`, which marked the backup finished (and would have retired a replaced phrase's relay
+    // copy) while the 3 sats stayed restorable only by the old phrase. The plan is still never
+    // asked; the dust mint is counted and "Finish backup" stays offered.
+    expect(r.status.reissuePending).toBe(true);
+    expect(r.reissueFailed).toBe(1);
   });
 });
 
@@ -1131,5 +1194,251 @@ describe('fix round 7: a retry never moves a covered mint again', () => {
     expect(w.core.wallet.reissued.map((p) => p.mint)).toEqual([MINT_A, MINT_A]);
     expect(r.status).toEqual({ state: 'covered', reissuePending: false, relayCopy: true });
     expectNoPhrase(w, [r]);
+  });
+});
+
+/**
+ * Lane W8a (final cross-lane review, money plane / NUT-13): each test failed before its fix.
+ */
+describe('W8a: restore follows core’s resume', () => {
+  const K = `00${'ab'.repeat(7)}`;
+  const noWords = (w: World): void => {
+    w.answer = (f) =>
+      f.kind === 'recovery-restore' ? { kind: 'recovery-restore', words: [] } : null;
+  };
+  async function covered(): Promise<World> {
+    const w = await world();
+    w.core.phrases.queue.push(ENTROPY_1);
+    userWhoWritesItDown(w);
+    w.confirm = () => true;
+    await w.svc.setup();
+    noWords(w);
+    return w;
+  }
+  const callsOf = (w: World) =>
+    w.core.wallet.restoreCalls
+      .filter((c) => c.entropyHex === entropyHex(ENTROPY_1))
+      .map((c) => ({ mints: c.mints, resume: c.resume }));
+
+  it('a scan the batch cap stopped is continued from where it stopped until it is complete: the sats of every call add up, and it never reads “refused”', async () => {
+    const w = await covered();
+    w.core.wallet.steps.set(entropyHex(ENTROPY_1), {
+      [MINT_A]: [
+        { outcome: 'refused', restoredSats: 0, resume: { [K]: 20_000 } },
+        { outcome: 'restored', restoredSats: 30, resume: { [K]: 40_000 } },
+        { outcome: 'nothing', restoredSats: 0 },
+      ],
+    });
+    w.progress.length = 0;
+    const r = await w.svc.restore();
+    expect(r.reports).toEqual([
+      { mint: MINT_A, outcome: 'restored', restoredSats: 30 },
+      { mint: MINT_B, outcome: 'nothing', restoredSats: 0 },
+    ]);
+    expect(callsOf(w)).toEqual([
+      { mints: [MINT_A, MINT_B], resume: undefined },
+      { mints: [MINT_A], resume: { [MINT_A]: { [K]: 20_000 } } },
+      { mints: [MINT_A], resume: { [MINT_A]: { [K]: 40_000 } } },
+    ]);
+    expect(w.progress.filter((p) => p.mint === MINT_A).length).toBeGreaterThan(2);
+    // Complete: the next restore starts that mint from the start again.
+    w.core.wallet.restoreCalls.length = 0;
+    await w.svc.restore();
+    expect(callsOf(w)).toEqual([{ mints: [MINT_A, MINT_B], resume: undefined }]);
+    expectNoPhrase(w, [r]);
+  });
+
+  it(`bounded per restore (${String(RESTORE_ROUNDS)} calls a mint): still unfinished, the mint reads "could not be reached" — not "refused" — and the next restore continues from the kept cursor`, async () => {
+    const w = await covered();
+    const steps = Array.from({ length: RESTORE_ROUNDS + 5 }, (_, i) => ({
+      outcome: 'refused' as const,
+      restoredSats: 0,
+      resume: { [K]: 20_000 * (i + 1) },
+    }));
+    w.core.wallet.steps.set(entropyHex(ENTROPY_1), { [MINT_A]: steps });
+    const r = await w.svc.restore();
+    expect(r.reports[0]).toEqual({ mint: MINT_A, outcome: 'unreachable', restoredSats: 0 });
+    const calls = callsOf(w);
+    expect(calls).toHaveLength(RESTORE_ROUNDS);
+    expect(w.log.lines.some((l) => l.msg.includes('not finished'))).toBe(true);
+    w.core.wallet.restoreCalls.length = 0;
+    await w.svc.restore();
+    // It goes on from the cursor the last call returned (never from 0 again).
+    expect(callsOf(w)[0]).toEqual({
+      mints: [MINT_A, MINT_B],
+      resume: { [MINT_A]: { [K]: 20_000 * RESTORE_ROUNDS } },
+    });
+  });
+
+  it('a call that does not move the scan on (a batch that cannot be asked) stops it for now; the cursor is kept', async () => {
+    const w = await covered();
+    w.core.wallet.steps.set(entropyHex(ENTROPY_1), {
+      [MINT_A]: [
+        { outcome: 'refused', restoredSats: 0, resume: { [K]: 20_000 } },
+        { outcome: 'unreachable', restoredSats: 0, resume: { [K]: 20_000 } },
+      ],
+    });
+    const r = await w.svc.restore();
+    expect(callsOf(w)).toHaveLength(2);
+    expect(r.reports[0]).toEqual({ mint: MINT_A, outcome: 'unreachable', restoredSats: 0 });
+    w.core.wallet.restoreCalls.length = 0;
+    await w.svc.restore();
+    expect(callsOf(w)[0]?.resume).toEqual({ [MINT_A]: { [K]: 20_000 } });
+  });
+
+  it('info (b): the typed all-zero phrase (“abandon … about”) is refused by name — nothing scanned, no row “could not be reached”', async () => {
+    const w = await covered();
+    const zero = w.core.phrases.toIndices(new Uint8Array(16) as walletMod.RecoveryEntropy);
+    w.answer = (f) =>
+      f.kind === 'recovery-restore' ? { kind: 'recovery-restore', words: [...zero] } : null;
+    const err = await w.svc.restore().catch((e: unknown) => e);
+    expect(err).toMatchObject({
+      code: 'invalid-argument',
+      message: expect.stringContaining('public example phrase'),
+    });
+    expect(w.core.wallet.restoreCalls).toEqual([]);
+  });
+});
+
+describe('W8a: a reissue is complete only when nothing is left outside the phrase', () => {
+  it('an operation still journaled at a mint: its spendable balance moves, but the mint is not recorded, the backup stays pending and the replaced relay copy stays — until a later "Finish backup" finds it clean', async () => {
+    const w = await world();
+    w.core.phrases.queue.push(ENTROPY_1, ENTROPY_2);
+    userWhoWritesItDown(w);
+    w.confirm = () => true;
+    w.balances.set(MINT_A, 100);
+    w.core.wallet.balances.set(MINT_A, 100);
+    w.core.wallet.plans.set(MINT_A, { inputs: 3, feeSats: 1 });
+    await w.svc.setup(); // ENTROPY_1, complete
+    const path = recoveryPath(w.dir, w.pubkey);
+    const first = await readEnvelope(path);
+    expect(first).toMatchObject({ reissued: true, replaces: null });
+    // A melt is pending at mint A (a slow Lightning payment) when the user rotates.
+    w.pending.set(MINT_A, 1);
+    const blanks = (): number =>
+      w.pool.published.filter(
+        (p) => p.event.kind === walletMod.RECOVERY_RELAY_KIND && p.event.content === '',
+      ).length;
+    const r = await w.svc.setup(); // rotation → ENTROPY_2
+    expect(r.reissuedSats).toBe(99);
+    expect(r.reissueFailed).toBe(1);
+    expect(r.status.reissuePending).toBe(true);
+    const second = await readEnvelope(path);
+    expect(second).toMatchObject({ reissued: false, reissuedMints: [], replaces: first?.device });
+    expect(blanks()).toBe(0); // ENTROPY_1's copy stays: it still restores what the melt holds
+    // The melt failed and its inputs came back: "Finish backup" moves them, and only then does the
+    // replaced copy go.
+    w.pending.delete(MINT_A);
+    const again = await w.svc.setup();
+    expect(again.status.reissuePending).toBe(false);
+    expect(await readEnvelope(path)).toMatchObject({
+      reissued: true,
+      reissuedMints: [MINT_A],
+      replaces: null,
+    });
+    expect(blanks()).toBe(1);
+  });
+
+  it('a mint whose whole balance is held (nothing spendable) blocks it too', async () => {
+    const w = await world();
+    userWhoWritesItDown(w);
+    w.confirm = () => true;
+    w.balances.set(MINT_A, 0);
+    w.pending.set(MINT_A, 2);
+    const r = await w.svc.setup();
+    expect(w.confirms).toEqual([]);
+    expect(r.status.reissuePending).toBe(true);
+    expect(r.reissueFailed).toBe(1);
+    w.pending.clear();
+    expect((await w.svc.setup()).status.reissuePending).toBe(false);
+  });
+});
+
+describe('W8a: the relay copy is retried until a relay takes it', () => {
+  it('a copy no relay took is retried with a bounded backoff (the pending flag is the envelope’s `relayCopy`); once published, the status says so and the retries stop', async () => {
+    const w = await world();
+    userWhoWritesItDown(w);
+    w.confirm = () => true;
+    let refuse = true;
+    const publish = w.pool.publish.bind(w.pool);
+    (w.pool as unknown as { publish: nostr.PoolLike['publish'] }).publish = (relays, ev) =>
+      refuse && ev.kind === walletMod.RECOVERY_RELAY_KIND
+        ? Promise.resolve(relays.map((url) => ({ url, ok: false, reason: 'down' })))
+        : publish(relays, ev);
+    const r = await w.svc.setup();
+    expect(r.status.relayCopy).toBe(false);
+    expect(w.timers.armed.map((t) => t.ms)).toEqual([RELAY_RETRY_FIRST_MS]);
+    // Still down: the wait doubles, up to the cap.
+    const waits: number[] = [];
+    for (let i = 0; i < 9; i++) {
+      await w.timers.fire();
+      waits.push(w.timers.armed[0]?.ms ?? -1);
+    }
+    expect(waits.slice(0, 3)).toEqual([
+      2 * RELAY_RETRY_FIRST_MS,
+      4 * RELAY_RETRY_FIRST_MS,
+      8 * RELAY_RETRY_FIRST_MS,
+    ]);
+    expect(waits.at(-1)).toBe(RELAY_RETRY_MAX_MS);
+    expect((await readEnvelope(recoveryPath(w.dir, w.pubkey)))?.relayCopy).toBe(false);
+    expect((await w.svc.status()).relayCopy).toBe(false);
+    // The relays are back: the next retry publishes the sealed copy, records it, and stops.
+    refuse = false;
+    await w.timers.fire();
+    const env = await readEnvelope(recoveryPath(w.dir, w.pubkey));
+    expect(env?.relayCopy).toBe(true);
+    const copy = w.pool.published.filter((p) => p.event.kind === walletMod.RECOVERY_RELAY_KIND);
+    expect(copy.at(-1)?.event.content).toBe(env?.sealed);
+    expect((await w.svc.status()).relayCopy).toBe(true);
+    expect(w.timers.armed).toEqual([]);
+    expectNoPhrase(w);
+  });
+
+  it('a plane opened with a copy still unpublished schedules the retry; stop() cancels it', async () => {
+    const w = await world();
+    userWhoWritesItDown(w);
+    w.confirm = () => true;
+    await w.svc.setup();
+    const path = recoveryPath(w.dir, w.pubkey);
+    const env = await readEnvelope(path);
+    if (env === null) throw new Error('no envelope');
+    // Fire what the setup left armed (its reopen found the new envelope before the publish): a
+    // copy already on a relay leaves nothing to do, and nothing is armed again.
+    while (w.timers.armed.length > 0) await w.timers.fire();
+    // A copy recorded unpublished (a crash before the retry landed): the next plane open retries.
+    await writeEnvelope(w.dir, path, { ...env, relayCopy: false });
+    await w.openPlane();
+    expect(w.timers.armed.map((t) => t.ms)).toEqual([RELAY_RETRY_FIRST_MS]);
+    await w.timers.fire();
+    expect((await readEnvelope(path))?.relayCopy).toBe(true);
+    expect(w.timers.armed).toEqual([]);
+    await writeEnvelope(w.dir, path, { ...env, relayCopy: false });
+    await w.openPlane();
+    expect(w.timers.armed).toHaveLength(1);
+    w.svc.stop();
+    expect(w.timers.armed).toEqual([]);
+    await w.openPlane(); // stopped: nothing scheduled any more
+    expect(w.timers.armed).toEqual([]);
+  });
+});
+
+describe('W8a: the reopen and the counters store', () => {
+  it('info: the play sessions are closed through the worker before each reopen (their tails carry what was left unpaid)', async () => {
+    const w = await world();
+    userWhoWritesItDown(w);
+    w.confirm = () => true;
+    await w.svc.setup();
+    expect(w.lifecycle).toEqual(['close sessions', 'reopen']);
+  });
+
+  it('one counters store object per identity: every plane open gets the same one', async () => {
+    const w = await world();
+    userWhoWritesItDown(w);
+    w.confirm = () => true;
+    await w.svc.setup();
+    const a = await w.svc.seedFor(w.signer, w.pubkey);
+    const b = await w.svc.seedFor(w.signer, w.pubkey);
+    expect(a?.material.counters).toBeDefined();
+    expect(b?.material.counters).toBe(a?.material.counters);
   });
 });

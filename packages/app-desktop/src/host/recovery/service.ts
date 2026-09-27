@@ -28,7 +28,16 @@
  *            and mint addresses (`recovery-restore`, checksum re-checked here by core), this
  *            device's phrases (current and retired) and every relay copy the identity decrypts —
  *            read ONLY here — each scanned from counter 0 at the wallet's mints and the typed
- *            ones, with progress, and one report row per mint.
+ *            ones, with progress, and one report row per mint. Lane W8a: a scan core's batch cap
+ *            stopped is CONTINUED from where it stopped (core's `resume`), call after call, up to
+ *            `RESTORE_ROUNDS` calls per phrase and mint per restore; one still unfinished keeps its
+ *            cursor in this process, so the next restore goes on from there.
+ *
+ * Lane W8a also: a reissue is complete only when no journal entry and no dust is left under the
+ * old phrase (or random) at a mint; the relay copy is retried, with a bounded backoff, until a
+ * relay took it (`relayCopy` in the envelope is the persisted "pending" flag, and the status reads
+ * it), and so is a replaced phrase's retirement; the play sessions are closed through the worker
+ * before a reopen, so their tails carry what the worker reported unpaid.
  *
  * Secrets: the entropy exists as bytes (zeroed after use), inside the NIP-44 plaintext (a JS
  * string, which cannot be wiped: ADR 0016 §2 residual) and as word indices in the prompt form
@@ -95,6 +104,35 @@ import {
 /** Tries at the three-word confirmation before it counts as "not confirmed". */
 export const CONFIRM_ATTEMPTS = 3;
 
+/**
+ * Lane W8a: core calls a restore makes per phrase and mint, each bounded by core (at most
+ * `RESTORE_MAX_BATCHES` batches of 100 per keyset past this device's own counters), following the
+ * `resume` the previous one returned: 50 × 20 000 = one million counters per keyset per restore. A
+ * scan still unfinished keeps its cursor for the next restore (a hostile mint that signs everything
+ * cannot hold the restore — and the PAYs its gate refuses at that mint — for longer than this).
+ */
+export const RESTORE_ROUNDS = 50;
+
+/** Lane W8a: the relay copy's retry backoff — the first wait, doubled up to the last (ms). */
+export const RELAY_RETRY_FIRST_MS = 30_000;
+export const RELAY_RETRY_MAX_MS = 60 * 60_000;
+
+export interface RecoveryTimers {
+  setTimeout(fn: () => void, ms: number): unknown;
+  clearTimeout(handle: unknown): void;
+}
+
+const realTimers: RecoveryTimers = {
+  setTimeout: (fn, ms) => {
+    const t = setTimeout(fn, ms);
+    t.unref();
+    return t;
+  },
+  clearTimeout: (h) => {
+    clearTimeout(h as ReturnType<typeof setTimeout>);
+  },
+};
+
 export interface RecoveryServiceOptions {
   /** Lane N1's code (the wiring point), or `undefined`: no phrase on this build. */
   readonly core: RecoveryCore | undefined;
@@ -123,6 +161,15 @@ export interface RecoveryServiceOptions {
     readonly bytes: (n: number) => Uint8Array;
     readonly int: (max: number) => number;
   };
+  /**
+   * Lane W8a (info item): close every play session through the worker before the money plane
+   * reopens (setup, rotation, "Finish backup"), bounded by the caller — the worker pays each
+   * session's tail and reports what is left unpaid, so the tail authorisation it leaves is that
+   * count, not the session's whole remaining budget. Default: nothing to close.
+   */
+  readonly closeSessions?: () => Promise<void>;
+  /** Tests: the relay copy retry's timers (default: `setTimeout`, unref'd). */
+  readonly timers?: RecoveryTimers;
 }
 
 /** What the money plane opens with when this device has a phrase (`seedFor`). */
@@ -171,6 +218,22 @@ function hex(b: Uint8Array): string {
   return s;
 }
 
+/**
+ * Whether a restore call moved the scan on (W8a): a keyset finished (gone from `now`), or one's
+ * counter went up. `was` undefined: the first call of this scan, which always counts.
+ */
+function moved(
+  was: Readonly<Record<string, number>> | undefined,
+  now: Readonly<Record<string, number>>,
+): boolean {
+  if (was === undefined) return true;
+  for (const [k, c] of Object.entries(was)) {
+    const n = now[k];
+    if (n === undefined || n > c) return true;
+  }
+  return false;
+}
+
 /** A seam `RecoveryPhraseError`'s problem (`length` / `word` / `checksum`), never a word. */
 function problemOf(e: unknown): string {
   const p = (e as { problem?: unknown } | null)?.problem;
@@ -189,6 +252,20 @@ export class RecoveryService {
   private busy = false;
   private cancels: number[] = [];
   private coolUntil = 0;
+  /**
+   * Lane W8a: ONE counters store object per identity in this process (core keeps one live counter
+   * source per store object, and refuses a second phrase's while one is open over it).
+   */
+  private readonly counters = new Map<NostrPubkey, FileCounterStore>();
+  /**
+   * Lane W8a: where an unfinished restore stopped, per identity, phrase (core's `phraseTag`) and
+   * mint — the next restore continues from there. In memory only.
+   */
+  private readonly resumeAt = new Map<string, Readonly<Record<string, number>>>();
+  private readonly timers: RecoveryTimers;
+  /** Lane W8a: the relay copy retry, if one is scheduled or running. */
+  private retry: { pubkey: NostrPubkey; attempt: number; timer: unknown } | undefined;
+  private stopped = false;
 
   constructor(o: RecoveryServiceOptions) {
     this.o = o;
@@ -199,6 +276,24 @@ export class RecoveryService {
       bytes: (n) => new Uint8Array(randomBytes(n)),
       int: (max) => randomInt(max),
     };
+    this.timers = o.timers ?? realTimers;
+  }
+
+  /** Host shutdown: no more relay copy retries. */
+  stop(): void {
+    this.stopped = true;
+    if (this.retry !== undefined) this.timers.clearTimeout(this.retry.timer);
+    this.retry = undefined;
+  }
+
+  /** This identity's counters store (one object per identity per process; W8a). */
+  private countersFor(pubkey: NostrPubkey): FileCounterStore {
+    let c = this.counters.get(pubkey);
+    if (c === undefined) {
+      c = new FileCounterStore(this.o.dir, pubkey);
+      this.counters.set(pubkey, c);
+    }
+    return c;
   }
 
   // ---- the money plane's seed ------------------------------------------------------------
@@ -220,8 +315,10 @@ export class RecoveryService {
       if (env === null) return undefined;
       entropy = await this.unseal(signer, pubkey, env);
       const seed = await core.phrases.toSeed(entropy);
+      // W8a: a relay copy still to publish, or a replaced one still to retire, is retried.
+      if (this.relayWorkLeft(env)) this.scheduleRelayRetry(pubkey, false);
       return {
-        material: { seed, counters: new FileCounterStore(this.o.dir, pubkey) },
+        material: { seed, counters: this.countersFor(pubkey) },
         core,
       };
     } catch (e) {
@@ -249,6 +346,8 @@ export class RecoveryService {
       return { state: 'unreadable', reissuePending: false, relayCopy: false };
     }
     if (env === null) return { state: 'not-on-device', reissuePending: false, relayCopy: false };
+    // W8a: a copy still to publish is being retried (the status says so until a relay took it).
+    if (this.relayWorkLeft(env)) this.scheduleRelayRetry(plane.pubkey, false);
     const inUse = !this.unreadable.has(plane.pubkey) && plane.seeded !== undefined;
     return {
       state: !inUse ? 'unreadable' : env.confirmed ? 'covered' : 'not-confirmed',
@@ -369,6 +468,7 @@ export class RecoveryService {
         replaces: old === null ? null : old.device,
         sealed,
       };
+      await this.closeSessions();
       await this.o.reopenMoney(() => this.saveNew(pubkey, old, fresh));
       const saved = await readEnvelope(path).catch(() => null);
       if (saved?.device !== fresh.device)
@@ -387,10 +487,13 @@ export class RecoveryService {
       if (published) {
         env = { ...env, relayCopy: true };
         await writeEnvelope(this.o.dir, path, env);
-      } else
+      } else {
         this.log.warn(
-          'the recovery phrase copy reached no relay: it is sealed on this device only',
+          'the recovery phrase copy reached no relay: it is sealed on this device only (retried)',
         );
+        // W8a: retried with a backoff until a relay takes it (`relayCopy: false` persists it).
+        this.scheduleRelayRetry(pubkey, true);
+      }
       if (shown.done && (await this.confirmWords(words))) {
         env = { ...env, confirmed: true };
         await writeEnvelope(this.o.dir, path, env);
@@ -439,12 +542,14 @@ export class RecoveryService {
     // A plane that is not deriving from the phrase yet (its reopen failed, or never ran) opens
     // again first: the reissue must land in seeded outputs.
     const plane = this.o.plane();
-    if (plane !== undefined && plane.seeded === undefined)
+    if (plane !== undefined && plane.seeded === undefined) {
+      await this.closeSessions();
       await this.o.reopenMoney().catch((e: unknown) => {
         this.log.warn('reopen with the recovery phrase failed', {
           reason: reasonOf(e),
         });
       });
+    }
     // Each mint reissued is recorded at once, so a retry (a mint refused or unreachable this
     // time, a plan the dialog cannot show) never moves a covered mint again nor charges its fee
     // twice (fix round 7).
@@ -464,6 +569,8 @@ export class RecoveryService {
         reissued: true,
         replaces: retired ? null : cur.replaces,
       });
+      // W8a: a retirement that did not land is retried with the relay copy's backoff.
+      if (!retired) this.scheduleRelayRetry(pubkey, true);
     }
     return {
       status: await this.status(),
@@ -498,6 +605,12 @@ export class RecoveryService {
   /**
    * Plan and (after the native dialog) reissue every mint's balance not in `done` — the mints
    * already reissued under this phrase — calling `record` after each mint that moved.
+   *
+   * Lane W8a: a mint counts as moved — recorded, and the reissue complete — only when nothing is
+   * left there outside this phrase: no journal entry (a send or melt whose answer is unknown holds
+   * inputs the plan left out, and a pending operation's change derives from the phrase it was made
+   * under) and no dust the fee would eat. Such a mint is counted in `blocked` and planned again by
+   * the next "Finish backup", so the replaced phrase's relay copy stays until then.
    */
   private async reissueAll(
     pubkey: NostrPubkey,
@@ -527,17 +640,37 @@ export class RecoveryService {
       return { sats: 0, fee: 0, failed: 0, complete: false };
     }
     let covered = 0;
+    let blocked = 0;
+    /** Nothing journaled at `mint` (a read that fails counts as something). */
+    const clean = async (mint: MintUrl): Promise<boolean> => {
+      try {
+        return (await plane.pendingAt(mint)) === 0;
+      } catch {
+        return false;
+      }
+    };
     for (const [mint, amount] of balances) {
-      if (amount <= 0) continue;
-      // Already under this phrase: its balance is seeded outputs now (fix round 7).
+      // Already under this phrase: its balance is seeded outputs now (fix round 7); it was
+      // recorded only once nothing else was left there (W8a).
       if (done.includes(mint)) {
-        covered++;
+        if (amount > 0) covered++;
+        continue;
+      }
+      if (amount <= 0) {
+        // Nothing spendable — but an operation still journaled there may bring proofs back that
+        // are not under this phrase (W8a).
+        if (!(await clean(mint))) blocked++;
         continue;
       }
       try {
         const p = await seeded.reissuePlan(mint);
-        // Dust whose fee would eat it all stays as it is (nothing sensible to move).
-        if (p.mint !== mint || p.amount <= 0 || p.feeSats >= p.amount) continue;
+        if (p.mint !== mint || p.amount <= 0) continue;
+        // Dust whose fee would eat it all stays as it is (nothing sensible to move) — and stays
+        // outside the phrase, so the reissue is not complete (W8a).
+        if (p.feeSats >= p.amount) {
+          blocked++;
+          continue;
+        }
         // Each plan must be one main's dialog can show (an https mint, bounded inputs): one
         // that is not — an http dev mint, say — is left out and counted, and never sinks the
         // question for every other mint (independent review IR1).
@@ -559,7 +692,13 @@ export class RecoveryService {
     const room = Math.max(0, MAX_REISSUED_MINTS - done.length);
     const asked = plans.slice(0, Math.min(MAX_REISSUE_PLANS, room));
     failed += plans.length - asked.length;
-    if (asked.length === 0) return { sats: 0, fee: 0, failed, complete: failed === 0 };
+    if (blocked > 0)
+      this.log.info(
+        'reissue not complete at some mints: an operation in flight or dust (Finish backup moves it later)',
+        { mints: blocked },
+      );
+    if (asked.length === 0)
+      return { sats: 0, fee: 0, failed: failed + blocked, complete: failed === 0 && blocked === 0 };
     const ok = await this.confirm({
       kind: 'recovery-reissue',
       plans: asked.map((p) => ({
@@ -574,7 +713,7 @@ export class RecoveryService {
       // A declined fee dialog is a dismissed prompt: a renderer that keeps reopening it is
       // paused like any other (independent review IR2). The result still reports the state.
       this.dismissed();
-      return { sats: 0, fee: 0, failed: failed + asked.length, complete: false };
+      return { sats: 0, fee: 0, failed: failed + blocked + asked.length, complete: false };
     }
     let sats = 0;
     let fee = 0;
@@ -591,6 +730,13 @@ export class RecoveryService {
       }
       sats += moved.reissued;
       fee += moved.feeSats;
+      // W8a: an operation still journaled at this mint (its inputs held out of the plan, or its
+      // change made under another phrase): what was spendable moved, but the mint is planned
+      // again by the next "Finish backup" — not recorded, and the reissue not complete.
+      if (!(await clean(p.mint))) {
+        blocked++;
+        continue;
+      }
       // The balance is under the phrase whatever happens next; a record that did not land only
       // lets a later retry move this mint once more.
       await record(p.mint).catch((e: unknown) => {
@@ -602,9 +748,10 @@ export class RecoveryService {
     this.log.info('balance reissued under the recovery phrase', {
       mints: asked.length,
       failed,
+      blocked,
       covered,
     });
-    return { sats, fee, failed, complete: failed === 0 };
+    return { sats, fee, failed: failed + blocked, complete: failed === 0 && blocked === 0 };
   }
 
   private async showNow(): Promise<undefined> {
@@ -678,6 +825,16 @@ export class RecoveryService {
         } finally {
           (a.words as number[]).fill(0);
         }
+        // W8a (info item): the all-zero phrase ("abandon … about") passes the checksum, but its
+        // outputs are anyone's and core refuses to use it — said so here, instead of every mint
+        // row reading "could not be reached".
+        if (typed.every((b) => b === 0)) {
+          typed.fill(0);
+          fail(
+            'invalid-argument',
+            'the typed words are the public example phrase: nothing of yours can be restored with it',
+          );
+        }
         add(typed);
       }
       let localUnreadable = 0;
@@ -725,6 +882,7 @@ export class RecoveryService {
       });
       const rows = new Map<MintUrl, { outcome: RestoreOutcomeWire; restoredSats: number }>();
       for (const m of mints) rows.set(m, { outcome: 'nothing', restoredSats: 0 });
+      let unfinished = 0;
       for (let i = 0; i < found.length; i++) {
         const entropy = found[i];
         if (entropy === undefined) continue;
@@ -733,7 +891,7 @@ export class RecoveryService {
         try {
           seed = await core.phrases.toSeed(entropy);
           entropy.fill(0);
-          const reports = await seeded.restoreFromSeed(seed, mints, (p) => {
+          const pass = await this.restorePass(core, seeded, seed, pubkey, mints, (p) => {
             if (!rows.has(p.mint)) return;
             this.emit({
               phrase,
@@ -743,11 +901,12 @@ export class RecoveryService {
               keysets: p.keysets,
             });
           });
-          for (const r of reports) {
-            const row = rows.get(r.mint);
+          for (const [mint, r] of pass) {
+            const row = rows.get(mint);
             if (row === undefined) continue;
             if (Number.isSafeInteger(r.restoredSats) && r.restoredSats > 0)
               row.restoredSats += r.restoredSats;
+            if (r.unfinished) unfinished++;
             if (RANK[r.outcome] > RANK[row.outcome]) row.outcome = r.outcome;
           }
         } catch (e) {
@@ -759,6 +918,10 @@ export class RecoveryService {
           seed?.wipe();
         }
       }
+      if (unfinished > 0)
+        this.log.info('a restore is not finished at some mints: the next restore continues it', {
+          unfinished,
+        });
       const reports = [...rows].map(([mint, r]) => ({
         mint,
         outcome: r.outcome,
@@ -772,6 +935,175 @@ export class RecoveryService {
     } finally {
       for (const e of found) e.fill(0);
     }
+  }
+
+  /**
+   * One phrase at `mints` (W8a): core's restore, CONTINUED from where each mint's scan stopped
+   * (`RestoreDetail.resume`) until it is complete — at most `RESTORE_ROUNDS` calls, and only while
+   * each call moves the scan on. A mint still unfinished keeps its cursor for the next restore of
+   * this identity (and starts from a kept one now). Per mint: the sats added, the outcome — a scan
+   * left unfinished with nothing added reads `unreachable` (the wire has no "not finished" yet:
+   * docs/contract-requests/W8a-money.md), never core's `refused` for a batch cap it could go on
+   * past — and whether it is unfinished.
+   */
+  private async restorePass(
+    core: RecoveryCore,
+    seeded: walletMod.CoreSeededWallet,
+    seed: walletMod.RecoverySeed,
+    pubkey: NostrPubkey,
+    mints: readonly MintUrl[],
+    onProgress: (p: walletMod.RestoreProgress) => void,
+  ): Promise<
+    Map<MintUrl, { outcome: RestoreOutcomeWire; restoredSats: number; unfinished: boolean }>
+  > {
+    const tag = core.phraseTag(seed);
+    const key = (m: MintUrl): string => `${pubkey}|${tag}|${m}`;
+    const cursors = new Map<MintUrl, Readonly<Record<string, number>>>();
+    for (const m of mints) {
+      const c = this.resumeAt.get(key(m));
+      if (c !== undefined) cursors.set(m, c);
+    }
+    const out = new Map<
+      MintUrl,
+      { outcome: RestoreOutcomeWire; restoredSats: number; unfinished: boolean }
+    >();
+    let todo = [...mints];
+    for (let round = 0; round < RESTORE_ROUNDS && todo.length > 0; round++) {
+      const resume = new Map([...cursors].filter(([m]) => todo.includes(m)));
+      const reports = await seeded.restoreFromSeed(
+        seed,
+        todo,
+        onProgress,
+        resume.size > 0 ? { resume } : undefined,
+      );
+      const next: MintUrl[] = [];
+      for (const r of reports) {
+        if (!todo.includes(r.mint)) continue;
+        const acc = out.get(r.mint) ?? { outcome: 'nothing', restoredSats: 0, unfinished: false };
+        if (Number.isSafeInteger(r.restoredSats) && r.restoredSats > 0)
+          acc.restoredSats += r.restoredSats;
+        const was = cursors.get(r.mint);
+        if (r.resume === undefined) {
+          // Complete: this call's outcome is the scan's (a tail call's `nothing` does not hide
+          // what an earlier call restored: sats decide below).
+          cursors.delete(r.mint);
+          acc.unfinished = false;
+          acc.outcome = r.outcome;
+        } else {
+          cursors.set(r.mint, r.resume);
+          acc.unfinished = true;
+          acc.outcome =
+            r.outcome === 'refused' || r.outcome === 'nothing' ? 'unreachable' : r.outcome;
+          // Go on only while a call moves the scan on (a batch that cannot be asked stops it).
+          if (moved(was, r.resume)) next.push(r.mint);
+        }
+        out.set(r.mint, acc);
+      }
+      todo = next;
+    }
+    for (const m of mints) {
+      const c = cursors.get(m);
+      if (c === undefined) this.resumeAt.delete(key(m));
+      else this.resumeAt.set(key(m), c);
+    }
+    for (const acc of out.values()) if (acc.restoredSats > 0) acc.outcome = 'restored';
+    return out;
+  }
+
+  /**
+   * Lane W8a: close the play sessions through the worker before a reopen (`closeSessions`), so
+   * their tails carry what the worker reported unpaid. Best effort: a failure is logged.
+   */
+  private async closeSessions(): Promise<void> {
+    try {
+      await this.o.closeSessions?.();
+    } catch (e) {
+      this.log.warn('the play sessions could not be closed before the reopen', {
+        reason: reasonOf(e),
+      });
+    }
+  }
+
+  // ---- the relay copy retry (W8a) ---------------------------------------------------------
+
+  /** A relay copy still to publish, or a replaced one still to retire (after the reissue). */
+  private relayWorkLeft(env: RecoveryEnvelope): boolean {
+    return !env.relayCopy || (env.replaces !== null && env.reissued);
+  }
+
+  /**
+   * Retry the relay copy of `pubkey`'s phrase (and a replaced copy's retirement) after a bounded
+   * backoff: `RELAY_RETRY_FIRST_MS`, doubled per `attempt` up to `RELAY_RETRY_MAX_MS`, for as long
+   * as this process runs, until a relay took it. Not `fresh`: nothing changes while a retry of this
+   * identity is already scheduled or running. One retry at a time, for the identity asked last.
+   */
+  private scheduleRelayRetry(pubkey: NostrPubkey, fresh: boolean, attempt = 0): void {
+    if (this.stopped) return;
+    const cur = this.retry;
+    if (!fresh && cur?.pubkey === pubkey) return;
+    if (cur !== undefined && cur.timer !== null) this.timers.clearTimeout(cur.timer);
+    const delay = Math.min(RELAY_RETRY_MAX_MS, RELAY_RETRY_FIRST_MS * 2 ** Math.min(attempt, 16));
+    const r = { pubkey, attempt, timer: null as unknown };
+    r.timer = this.timers.setTimeout(() => {
+      r.timer = null;
+      void this.relayRetryNow(r);
+    }, delay);
+    this.retry = r;
+  }
+
+  private async relayRetryNow(r: { pubkey: NostrPubkey; attempt: number }): Promise<void> {
+    if (this.stopped || this.retry !== r) return;
+    const signer = this.o.signer();
+    const plane = this.o.plane();
+    // Signed out, locked or another identity: the next plane open of this one schedules again.
+    if (signer === undefined || plane?.pubkey !== r.pubkey) {
+      this.retry = undefined;
+      return;
+    }
+    // A flow is writing the envelope now: try again after the next wait.
+    if (this.busy) {
+      this.scheduleRelayRetry(r.pubkey, true, r.attempt + 1);
+      return;
+    }
+    this.busy = true;
+    let left = true;
+    try {
+      left = await this.relayRetryOnce(signer, r.pubkey);
+    } catch (e) {
+      this.log.warn('the relay copy retry failed', { reason: reasonOf(e) });
+    } finally {
+      this.busy = false;
+    }
+    if (this.retry !== r) return;
+    this.retry = undefined;
+    if (left) this.scheduleRelayRetry(r.pubkey, true, r.attempt + 1);
+  }
+
+  /** One retry; `true` while something is still left to do. */
+  private async relayRetryOnce(signer: Signer, pubkey: NostrPubkey): Promise<boolean> {
+    const path = recoveryPath(this.o.dir, pubkey);
+    const env = await readEnvelope(path);
+    if (env === null || !this.relayWorkLeft(env)) return false;
+    let next = env;
+    if (!env.relayCopy) {
+      const published = await publishRelayCopy({
+        signer,
+        relays: this.o.relays,
+        device: env.device,
+        sealed: env.sealed,
+        now: this.now,
+      }).catch(() => false);
+      if (published) {
+        next = { ...next, relayCopy: true };
+        this.log.info('the recovery phrase copy reached a relay on a retry');
+      }
+    }
+    if (next.replaces !== null && next.reissued && (await this.retireCopy(pubkey, next.replaces))) {
+      next = { ...next, replaces: null };
+      this.log.info('the replaced phrase’s relay copy was retired on a retry');
+    }
+    if (next !== env) await writeEnvelope(this.o.dir, path, next);
+    return this.relayWorkLeft(next);
   }
 
   // ---- helpers ---------------------------------------------------------------------------
