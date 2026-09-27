@@ -82,6 +82,7 @@ import { hostError } from './errors.js';
 import type { Logger } from './log.js';
 import { hostMintRequest } from './mint-transport.js';
 import { PayMeltGate } from './pay-melt-gate.js';
+import type { PlaneSeed } from './recovery/service.js';
 import { TailBook } from './tails.js';
 import type { TopUpVault } from './topup/auto-topup.js';
 import { openWalletJournal } from './wallet-journal.js';
@@ -141,6 +142,13 @@ export interface MoneyPlaneOptions {
    * request arrived and whether it may still reach the wallet (`PAY_BUILD_START_BY_MS`).
    */
   readonly clock?: () => number;
+  /**
+   * ADR 0016: this device's recovery phrase (`RecoveryService.seedFor`). With it, every mint
+   * connection derives its outputs from the seed and draws NUT-13 counters from the counters
+   * file, and `seeded` is the wallet's seeded view (reissue, restore). The plane owns the seed:
+   * it is wiped when the plane closes (or fails to open).
+   */
+  readonly seed?: PlaneSeed;
 }
 
 /**
@@ -184,6 +192,8 @@ export class MoneyPlane {
   readonly mints: readonly MintUrl[];
   /** How the wallet key is held (the UI must say which, build-plan §3). */
   readonly mode: 'signer' | 'memory';
+  /** ADR 0016: the wallet's seeded view, when the plane opened with this device's phrase. */
+  readonly seeded: walletMod.SeededWallet | undefined;
   /**
    * The startup settle of a journal a crash left entries in (ADR 0014 amendment): its counts, or
    * `null` when there was nothing to settle (or it failed; the next payment retries).
@@ -212,6 +222,7 @@ export class MoneyPlane {
   private readonly now: () => UnixSeconds;
   private readonly closeKey: () => void;
   private readonly closeJournal: () => void;
+  private readonly closeSeed: () => void;
   private closed = false;
 
   private constructor(
@@ -243,6 +254,17 @@ export class MoneyPlane {
     };
     this.closeJournal = () => {
       parts.journal?.close();
+    };
+    // ADR 0016: a seed the wallet did not take (core's option not recognised) is never a silent
+    // "covered": logged, wiped at once, and the recovery status reads `unreadable`.
+    const seeded = o.seed?.core.seeded(parts.wallet);
+    if (o.seed !== undefined && seeded === undefined) {
+      o.log.error('recovery phrase not taken by the wallet: new ecash is not covered');
+      o.seed.material.seed.wipe();
+    }
+    this.seeded = seeded;
+    this.closeSeed = () => {
+      o.seed?.material.seed.wipe();
     };
     this.now = o.now ?? ((): UnixSeconds => Math.floor(Date.now() / 1000) as UnixSeconds);
     this.viewer = new payment.RealPaymentEngine({
@@ -305,20 +327,23 @@ export class MoneyPlane {
       const gate = new PayMeltGate(o.clock === undefined ? {} : { clock: o.clock });
       const conns = new walletMod.CashuMintConnections({
         request: (mint) => o.mintRequest?.(mint) ?? single,
+        // ADR 0016: with this device's phrase, every output derives from it and draws NUT-13
+        // counters from the counters file (core's option, recovery/core.ts WIRING POINT).
+        ...(o.seed === undefined ? {} : o.seed.core.seedOption(o.seed.material)),
       });
       // Which mints have loaded (cached by `conns` from then on): a PAY's belt counts no load
-      // round trip for them.
+      // round trip for them. Recorded by wrapping `conns.wallet` on this instance, so the wallet
+      // is handed the connections object itself (ADR 0016: a seeded wallet finds its seed there).
       const loaded = new Set<MintUrl>();
-      const mints: walletMod.MintConnections = {
-        wallet: (mint) =>
-          conns.wallet(mint).then((w) => {
-            loaded.add(mint);
-            return w;
-          }),
-      };
+      const load = conns.wallet.bind(conns);
+      conns.wallet = (mint) =>
+        load(mint).then((w) => {
+          loaded.add(mint);
+          return w;
+        });
       const wallet = new GatedCashuWallet(
         {
-          mints,
+          mints: conns,
           store,
           key: nip60.key,
           configuredMints: [...new Set([...nip60.mints, ...o.defaultMints()])],
@@ -376,6 +401,7 @@ export class MoneyPlane {
     } catch (err) {
       nip60.close();
       journal?.close();
+      o.seed?.material.seed.wipe();
       throw err;
     }
   }
@@ -504,6 +530,8 @@ export class MoneyPlane {
     this.settles.stop();
     this.closeKey();
     this.closeJournal();
+    // The seam's contract: core refuses to derive from a wiped seed (never from zeros).
+    this.closeSeed();
   }
 
   // ---- viewer ----------------------------------------------------------------------------

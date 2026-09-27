@@ -76,6 +76,18 @@ describe('scripts/bundle.ts', () => {
     expect(html).not.toMatch(/<script>|\sstyle=|\son[a-z]+=/i);
   });
 
+  it('ADR 0016: the prompt page carries the BIP-39 English list (and no other) inside prompt.js — no new runtime file', () => {
+    const js = readFileSync(join(out, 'prompt', 'prompt.js'), 'utf8');
+    // The whole English list, bundled in (the page maps word indices through it).
+    for (const w of ['abandon', 'ability', 'legal', 'winner', 'zone', 'zoo'])
+      expect(js).toContain(w);
+    // No other language's list (French, Spanish, Czech first words).
+    expect(js).not.toMatch(/abaisser|ábaco|abdikace/);
+    // Nothing reaches out: no fetch/XHR/WebSocket in the page.
+    expect(js).not.toMatch(/\bfetch\(|XMLHttpRequest|WebSocket/);
+    expect(readdirSync(join(out, 'prompt')).sort()).toEqual([...PROMPT_FILES].sort());
+  });
+
   it('the renderer bundle is a browser ESM bundle with production React and no Node/core runtime', () => {
     const js = readFileSync(join(out, 'renderer', 'app.js'), 'utf8');
     expect(js).not.toMatch(/\brequire\(/);

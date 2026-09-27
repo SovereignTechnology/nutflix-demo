@@ -4,3 +4,12 @@
  */
 export { SETTINGS_SECTIONS, Settings } from './Settings.js';
 export type { SettingsProps, SettingsSectionId } from './Settings.js';
+export type {
+  RecoveryControls,
+  RecoveryProgressView,
+  RecoveryRestoreOutcome,
+  RecoveryRestoreView,
+  RecoverySetupView,
+  RecoveryState,
+  RecoveryStatusView,
+} from './RecoverySection.js';

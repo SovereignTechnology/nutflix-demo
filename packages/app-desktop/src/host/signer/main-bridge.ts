@@ -1,7 +1,7 @@
 /**
  * The host's side of main's trusted prompt window and OS-keychain store (ADR 0013): `HostOut`
  * `prompt` / `prompt-cancel` / `keychain` out, `HostIn` `prompt-answer` / `keychain-result` in,
- * matched by request id.
+ * matched by request id. ADR 0016 adds main's native dialog: `confirm` out, `confirm-result` in.
  *
  * An answer must fit the question: the wrong kind, an unlock method or flow the question did not
  * offer, or a keychain value nobody asked for is treated as a cancel and any secret in it is wiped.
@@ -10,14 +10,28 @@
 import { signer as signerMod } from '@sovit/core';
 
 import { promptAnswerFits } from '../../ipc/guards.js';
-import type { HostOut, KeychainSlot, PromptAnswer, PromptForm } from '../../ipc/protocol.js';
+import type {
+  ConfirmForm,
+  HostOut,
+  KeychainSlot,
+  PromptAnswer,
+  PromptForm,
+} from '../../ipc/protocol.js';
 
 import type { Timers } from '../worker/supervisor.js';
 
 /** How long the prompt window may stay open before the host gives up on it. */
 export const PROMPT_TIMEOUT_MS = 5 * 60_000;
+/**
+ * ADR 0016: a NEW or re-shown recovery phrase (`recovery-show`) — the user is writing 12 words
+ * down, which can take longer than any other question; the page hides the words itself after
+ * two minutes or on blur (independent review IR9). A timeout discards a new phrase.
+ */
+export const RECOVERY_SHOW_TIMEOUT_MS = 30 * 60_000;
 /** How long a keychain operation may take (safeStorage can wait on the OS keyring's own prompt). */
 export const KEYCHAIN_TIMEOUT_MS = 60_000;
+/** ADR 0016: how long main's native dialog may stay unanswered before it counts as "no". */
+export const CONFIRM_TIMEOUT_MS = 5 * 60_000;
 
 const realTimers: Timers = {
   setTimeout: (fn, ms) => setTimeout(fn, ms),
@@ -30,7 +44,9 @@ export interface MainBridgeOptions {
   readonly post: (out: HostOut) => void;
   readonly timers?: Timers;
   readonly promptTimeoutMs?: number;
+  readonly recoveryShowTimeoutMs?: number;
   readonly keychainTimeoutMs?: number;
+  readonly confirmTimeoutMs?: number;
 }
 
 export interface KeychainResult {
@@ -44,16 +60,25 @@ interface PendingPrompt {
   readonly resolve: (a: PromptAnswer | null) => void;
   readonly timer: unknown;
 }
+interface PendingConfirm {
+  readonly resolve: (ok: boolean) => void;
+  readonly timer: unknown;
+}
 interface PendingKeychain {
   readonly op: 'get' | 'put' | 'forget';
   readonly resolve: (r: KeychainResult) => void;
   readonly timer: unknown;
 }
 
-/** Wipe any secret an answer carries. */
+/**
+ * Wipe any secret an answer carries — ADR 0016: the word indices of a confirmation or a typed
+ * phrase too (numbers, zeroed as far as JS allows; independent review IR11).
+ */
 export function wipeAnswer(a: PromptAnswer | null | undefined): void {
   if (a?.kind === 'secret') signerMod.wipe(a.value);
   else if (a?.kind === 'bunker') signerMod.wipe(a.uri);
+  else if (a?.kind === 'recovery-confirm' || a?.kind === 'recovery-restore')
+    (a.words as number[]).fill(0);
 }
 
 export class MainBridge {
@@ -62,6 +87,7 @@ export class MainBridge {
   private next = 1;
   private readonly prompts = new Map<number, PendingPrompt>();
   private readonly keychainReqs = new Map<number, PendingKeychain>();
+  private readonly confirms = new Map<number, PendingConfirm>();
   private closed = false;
 
   constructor(o: MainBridgeOptions) {
@@ -80,14 +106,43 @@ export class MainBridge {
     if (this.closed) return Promise.resolve(null);
     const req = this.id();
     return new Promise((resolve) => {
+      const ms =
+        form.kind === 'recovery-show'
+          ? (this.o.recoveryShowTimeoutMs ?? RECOVERY_SHOW_TIMEOUT_MS)
+          : (this.o.promptTimeoutMs ?? PROMPT_TIMEOUT_MS);
       const timer = this.timers.setTimeout(() => {
         if (!this.prompts.delete(req)) return;
         this.o.post({ kind: 'prompt-cancel', req });
         resolve(null);
-      }, this.o.promptTimeoutMs ?? PROMPT_TIMEOUT_MS);
+      }, ms);
       this.prompts.set(req, { form, resolve, timer });
       this.o.post({ kind: 'prompt', req, form });
     });
+  }
+
+  /**
+   * ADR 0016: ask in main's native dialog (Cancel the default). `true` only for the confirm
+   * button; a timeout, a host shutdown or a dialog that could not open is `false`.
+   */
+  confirm(form: ConfirmForm): Promise<boolean> {
+    if (this.closed) return Promise.resolve(false);
+    const req = this.id();
+    return new Promise((resolve) => {
+      const timer = this.timers.setTimeout(() => {
+        if (this.confirms.delete(req)) resolve(false);
+      }, this.o.confirmTimeoutMs ?? CONFIRM_TIMEOUT_MS);
+      this.confirms.set(req, { resolve, timer });
+      this.o.post({ kind: 'confirm', req, form });
+    });
+  }
+
+  /** `HostIn` `confirm-result`: answers only a question still waiting. */
+  onConfirmResult(req: number, ok: boolean): void {
+    const c = this.confirms.get(req);
+    if (c === undefined) return;
+    this.confirms.delete(req);
+    this.timers.clearTimeout(c.timer);
+    c.resolve(ok);
   }
 
   /** Main's keychain store. Never rejects: a failure is `{ ok: false }`. */
@@ -163,5 +218,10 @@ export class MainBridge {
       k.resolve({ ok: false, value: null });
     }
     this.keychainReqs.clear();
+    for (const [, c] of this.confirms) {
+      this.timers.clearTimeout(c.timer);
+      c.resolve(false);
+    }
+    this.confirms.clear();
   }
 }

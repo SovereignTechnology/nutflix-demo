@@ -34,6 +34,7 @@ import type {
 } from '@sovit/core';
 import type {
   AnyCallMsg,
+  ConfirmForm,
   ErrorCode,
   FileToken,
   GrantFileMsg,
@@ -43,6 +44,7 @@ import type {
   PromptAnswer,
   PromptForm,
   ImageMime,
+  ReissuePlanWire,
   Method,
   MethodTable,
   NfMediaImgUrl,
@@ -57,13 +59,18 @@ import type {
   WireMap,
 } from './protocol.js';
 import {
+  BIP39_LIST_SIZE,
   ERROR_CODES,
   IMAGE_MIMES,
   IPC_V,
   KEYCHAIN_SLOTS,
   LIMITS,
   MAX_AUTH_URL,
+  MAX_REISSUE_PLANS,
+  MAX_RESTORE_MINTS,
   MAX_SECRET_BYTES,
+  RECOVERY_CONFIRM_WORDS,
+  RECOVERY_WORDS,
 } from './protocol.js';
 
 export type { Guard };
@@ -499,6 +506,11 @@ export const validateArgs: { readonly [M in Method]: Guard<MethodTable[M][0]> } 
   'desktop.signer.unlock': tuple([]),
   'desktop.signer.lock': tuple([]),
   'desktop.signer.signOut': tuple([]),
+  // ADR 0016: the renderer names an action, nothing else — no word, index, mint or amount.
+  'desktop.wallet.recovery.status': tuple([]),
+  'desktop.wallet.recovery.setup': tuple([]),
+  'desktop.wallet.recovery.show': tuple([]),
+  'desktop.wallet.recovery.restore': tuple([]),
 });
 
 function wrapAll<T extends Record<string, Guard<unknown>>>(table: T): T {
@@ -542,7 +554,7 @@ export const isTopic: Guard<Topic> = safe(
     obj({ t: oneOf(['seeder.status', 'notifications', 'wallet.change'] as const) }),
     obj({ t: oneOf(['session.peers', 'session.spend'] as const), sid: isSessionId }),
     obj({ t: literal('upload.progress'), uploadId: isUploadId }),
-    obj({ t: literal('signer.status') }),
+    obj({ t: oneOf(['signer.status', 'recovery.progress'] as const) }),
   ),
 );
 
@@ -610,17 +622,76 @@ const isTopUpFirstForm = (x: unknown): x is Extract<PromptForm, { kind: 'top-up-
     amount: int(1, LIMITS.maxAutoTopUpAmountSats) as Guard<Sats>,
   })(x) && x.target !== x.source;
 
+// ---- the recovery phrase (ADR 0016) --------------------------------------------------------
+//
+// A word crosses every hop as its index into the BIP-39 English list, never as text: the prompt
+// page maps indices through its own bundled list, so neither the host nor anything upstream can
+// put prose in the trusted window, and nothing that is not a small integer is accepted as a word.
+
+/** One BIP-39 English word, as its index. */
+export const isWordIndex: Guard<number> = int(0, BIP39_LIST_SIZE - 1);
+/** A whole phrase: exactly `RECOVERY_WORDS` indices. */
+export const isPhraseIndices: Guard<readonly number[]> = safe(
+  arrayOf(isWordIndex, RECOVERY_WORDS, RECOVERY_WORDS),
+);
+/** The confirmation's positions: `RECOVERY_CONFIRM_WORDS` distinct 0-based positions, ascending. */
+export const isConfirmPositions: Guard<readonly number[]> = safe(
+  (x): x is readonly number[] =>
+    arrayOf(int(0, RECOVERY_WORDS - 1), RECOVERY_CONFIRM_WORDS, RECOVERY_CONFIRM_WORDS)(x) &&
+    x.every((p, i) => i === 0 || p > (x[i - 1] ?? RECOVERY_WORDS)),
+);
+/** A restore's typed phrase: none (`[]`) or a whole one. */
+const isTypedPhrase = (x: unknown): x is readonly number[] =>
+  arrayOf(isWordIndex, RECOVERY_WORDS)(x) && (x.length === 0 || x.length === RECOVERY_WORDS);
+
+/**
+ * One mint's reissue for main's dialog: an https mint, a fee below the amount, inputs bounded.
+ * The host checks each plan with it before asking (a plan that fails is left out and counted,
+ * never allowed to sink the whole question: independent review IR1).
+ */
+export const isReissuePlanWire: Guard<ReissuePlanWire> = safe(
+  (x): x is ReissuePlanWire =>
+    obj({
+      mint: isMintUrl,
+      amount: isPositiveSats,
+      inputs: int(1, 100_000),
+      feeSats: isSats,
+    })(x) && x.feeSats < x.amount,
+);
+
+/** ADR 0016: a native-dialog question from the host (data only; main holds the words). */
+export const isConfirmForm: Guard<ConfirmForm> = safe(
+  union(
+    (x): x is Extract<ConfirmForm, { kind: 'recovery-reissue' }> =>
+      obj({
+        kind: literal('recovery-reissue'),
+        plans: arrayOf(isReissuePlanWire, MAX_REISSUE_PLANS, 1),
+      })(x) && new Set(x.plans.map((p) => p.mint)).size === x.plans.length,
+    obj({ kind: literal('recovery-reveal') }),
+    obj({ kind: literal('recovery-rotate') }),
+  ),
+);
+
 /** ADR 0013: a question for main's prompt window (data only; the page holds the words). */
 export const isPromptForm: Guard<PromptForm> = safe(
   union(
     obj({ kind: literal('local-setup'), hasKey: bool, keychain: bool }),
     obj({ kind: literal('unlock-passphrase'), retry: bool }),
     obj({
-      kind: oneOf(['new-passphrase', 'import-nsec', 'create-wallet', 'remove-key'] as const),
+      kind: oneOf([
+        'new-passphrase',
+        'import-nsec',
+        'create-wallet',
+        'remove-key',
+        'recovery-restore',
+      ] as const),
     }),
     obj({ kind: literal('bunker'), keychain: bool }),
     obj({ kind: literal('bunker-auth'), url: isAuthUrl }),
     isTopUpFirstForm,
+    obj({ kind: literal('recovery-show'), words: isPhraseIndices, again: bool }),
+    obj({ kind: literal('recovery-confirm'), positions: isConfirmPositions, retry: bool }),
+    obj({ kind: literal('recovery-reauth'), retry: bool }),
   ),
 );
 
@@ -638,6 +709,15 @@ export const isPromptAnswer: Guard<PromptAnswer> = safe(
     obj({ kind: literal('remove-key'), confirm: bool }),
     obj({ kind: literal('bunker-auth'), open: bool }),
     obj({ kind: literal('top-up-first'), confirm: bool }),
+    obj({ kind: literal('recovery-show'), done: bool }),
+    obj({
+      kind: literal('recovery-confirm'),
+      words: arrayOf(isWordIndex, RECOVERY_CONFIRM_WORDS, RECOVERY_CONFIRM_WORDS),
+    }),
+    obj(
+      { kind: literal('recovery-restore'), words: isTypedPhrase },
+      { mints: arrayOf(isMintUrl, MAX_RESTORE_MINTS, 1) },
+    ),
   ),
 );
 
@@ -672,6 +752,14 @@ export function promptAnswerFits(form: PromptForm, a: PromptAnswer): boolean {
       return a.kind === 'bunker-auth';
     case 'top-up-first':
       return a.kind === 'top-up-first';
+    case 'recovery-show':
+      return a.kind === 'recovery-show';
+    case 'recovery-confirm':
+      return a.kind === 'recovery-confirm' && a.words.length === form.positions.length;
+    case 'recovery-restore':
+      return a.kind === 'recovery-restore';
+    case 'recovery-reauth':
+      return a.kind === 'secret';
   }
 }
 
@@ -689,6 +777,7 @@ export const isHostIn: Guard<HostIn> = safe(
       ok: bool,
       value: nullable(isSecretBytes),
     }),
+    obj({ kind: literal('confirm-result'), req: isMsgId, ok: bool }),
   ),
 );
 
@@ -726,6 +815,7 @@ export const isHostOut: Guard<HostOut> = safe(
         slot: isKeychainSlot,
         value: isSecretBytes,
       })(x),
+    obj({ kind: literal('confirm'), req: isMsgId, form: isConfirmForm }),
   ),
 );
 

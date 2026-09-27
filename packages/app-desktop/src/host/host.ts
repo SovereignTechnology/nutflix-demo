@@ -52,6 +52,9 @@ import { TAIL_DIR } from './tails.js';
 import type { Nip46Connector } from './signer/desktop-signer.js';
 import { DesktopSigner } from './signer/desktop-signer.js';
 import { MainBridge } from './signer/main-bridge.js';
+import type { RecoveryCore } from './recovery/core.js';
+import { recoveryCore } from './recovery/core.js';
+import { RecoveryService } from './recovery/service.js';
 import { TopicRegistry } from './topics.js';
 import { AutoTopUp } from './topup/auto-topup.js';
 import type { AutoTopUpOptions } from './topup/auto-topup.js';
@@ -93,6 +96,11 @@ export interface HostOptions {
     AutoTopUpOptions,
     'now' | 'sleep' | 'pollAttempts' | 'pollIntervalMs' | 'playWaitMs'
   >;
+  /**
+   * ADR 0016: core's NUT-13 code. Default: the wiring point `recoveryCore()` (lane N1; `undefined`
+   * before it merges). Tests inject fakes; `null` = explicitly none.
+   */
+  readonly recoveryCore?: RecoveryCore | null;
 }
 
 /**
@@ -111,6 +119,8 @@ export class Host {
   /** ADR 0013: main's prompt window and keychain, and the signer flow using them. */
   readonly bridge: MainBridge | undefined;
   readonly signerFlow: DesktopSigner | undefined;
+  /** ADR 0016: the recovery phrase (with the signer flow only). */
+  readonly recovery: RecoveryService | undefined;
   private readonly images: ImageService;
   /** Posts to main (dropped once stopped; a throwing transport is logged, never rethrown). */
   readonly post: (out: HostOut) => void;
@@ -127,12 +137,14 @@ export class Host {
     readonly log: Logger;
     readonly bridge?: MainBridge;
     readonly signerFlow?: DesktopSigner;
+    readonly recovery?: RecoveryService;
   }) {
     this.adapter = parts.adapter;
     this.worker = parts.worker;
     this.images = parts.images;
     this.bridge = parts.bridge;
     this.signerFlow = parts.signerFlow;
+    this.recovery = parts.recovery;
     this.post = (out) => {
       if (this.stopped) return;
       try {
@@ -174,6 +186,9 @@ export class Host {
       case 'keychain-result':
         if (this.bridge === undefined) signerMod.wipe(msg.value);
         else this.bridge.onKeychainResult(msg.req, msg.ok, msg.value);
+        return;
+      case 'confirm-result':
+        this.bridge?.onConfirmResult(msg.req, msg.ok);
         return;
     }
   }
@@ -336,8 +351,27 @@ export async function createHost(o: HostOptions): Promise<Host> {
     post?: (out: HostOut) => void;
     worker?: WorkerSupervisor;
     autoTopUp?: AutoTopUp;
+    recovery?: RecoveryService;
   } = {};
-  const openMoney = (signer: Signer, create: boolean): Promise<MoneyPlane> =>
+  const walletDir = join(o.userData, WALLET_DIR);
+  const openMoney = async (signer: Signer, create: boolean): Promise<MoneyPlane> => {
+    // ADR 0016: this device's recovery phrase, when it has one (the plane owns the seed).
+    const seed =
+      late.recovery === undefined
+        ? undefined
+        : await late.recovery.seedFor(signer, await signer.getPublicKey());
+    try {
+      return await openPlane(signer, create, seed);
+    } catch (e) {
+      seed?.material.seed.wipe();
+      throw e;
+    }
+  };
+  const openPlane = (
+    signer: Signer,
+    create: boolean,
+    seed: Awaited<ReturnType<RecoveryService['seedFor']>>,
+  ): Promise<MoneyPlane> =>
     MoneyPlane.open({
       signer,
       pool,
@@ -345,10 +379,11 @@ export async function createHost(o: HostOptions): Promise<Host> {
       defaultMints: () => settings.get().defaultMints,
       log: log.child('money'),
       // ADR 0014 amendment (issue #8): the wallet journal, sealed, per identity.
-      journalDir: join(o.userData, WALLET_DIR),
+      journalDir: walletDir,
       // Lane P2-owed-viewer: closed sessions' tail authorisations, per identity.
       tailDir: join(o.userData, TAIL_DIR),
       ...(create ? { createWallet: true } : {}),
+      ...(seed === undefined ? {} : { seed }),
       ...(o.mintRequest === undefined ? {} : { mintRequest: o.mintRequest }),
       ...(o.now === undefined ? {} : { now: o.now }),
       // Issue #2: a PAY for an open play session is what an auto top-up follows (never a mere
@@ -392,6 +427,47 @@ export async function createHost(o: HostOptions): Promise<Host> {
       ...(o.signerCost === undefined ? {} : { cost: o.signerCost }),
     });
     signerFlow = flow;
+  }
+  // ADR 0016: the recovery phrase follows the signer flow (it reopens that flow's money plane).
+  let recovery: RecoveryService | undefined;
+  if (signerFlow !== undefined && bridge !== undefined) {
+    const flow = signerFlow;
+    recovery = new RecoveryService({
+      core: o.recoveryCore === undefined ? recoveryCore() : (o.recoveryCore ?? undefined),
+      dir: walletDir,
+      bridge,
+      signer: () => flow.signer(),
+      plane: () => flow.money(),
+      reopenMoney: (beforeOpen) => flow.reopenMoney(beforeOpen),
+      checkPassphrase: async (passphrase, pubkey) => {
+        const file = await flow.keyStore.read();
+        if (file === null) return false;
+        try {
+          const k = await signerMod.openKeyFile(file, passphrase);
+          signerMod.wipe(k.secretKey);
+          signerMod.wipe(k.walletKey);
+          return k.header.pubkey === pubkey;
+        } catch {
+          return false;
+        }
+      },
+      relays: {
+        pool,
+        write: () =>
+          settings
+            .get()
+            .relays.filter((r) => r.write)
+            .map((r) => r.url),
+        read: () =>
+          settings
+            .get()
+            .relays.filter((r) => r.read)
+            .map((r) => r.url),
+      },
+      log,
+      ...(o.now === undefined ? {} : { now: o.now }),
+    });
+    late.recovery = recovery;
   }
   const identity: IdentityProvider =
     signerFlow ??
@@ -536,6 +612,7 @@ export async function createHost(o: HostOptions): Promise<Host> {
     pool,
     identity,
     ...(signerFlow === undefined ? {} : { signerFlow }),
+    ...(recovery === undefined ? {} : { recovery }),
     wallet: walletProvider,
     money,
     ...(autoTopUp === undefined ? {} : { autoTopUp }),
@@ -557,6 +634,7 @@ export async function createHost(o: HostOptions): Promise<Host> {
     log,
     ...(bridge === undefined ? {} : { bridge }),
     ...(signerFlow === undefined ? {} : { signerFlow }),
+    ...(recovery === undefined ? {} : { recovery }),
   });
   late.adapter = adapter;
   late.post = host.post;

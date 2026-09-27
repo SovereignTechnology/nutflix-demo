@@ -13,7 +13,10 @@
  * protocol serves at `app://nutflix`. ADR 0013 adds main's trusted prompt window, served at its
  * own origin `app://prompt` from its own directory (`PROMPT_FILES`):
  *
- *   src/renderer/prompt/prompt.ts  → dist/prompt/prompt.js     ESM, plain DOM, nothing imported
+ *   src/renderer/prompt/prompt.ts  → dist/prompt/prompt.js     ESM, plain DOM; imports only
+ *                                   `@scure/bip39` (ADR 0016: its English wordlist and checksum
+ *                                   check, with the audited `@noble/hashes` / `@scure/base` they
+ *                                   need), bundled in — no new file at runtime
  *   static/prompt.html             → dist/prompt/prompt.html
  *   src/renderer/prompt/prompt.css → dist/prompt/prompt.css
  *   src/preload/prompt-preload.ts  → dist/prompt-preload.cjs   CJS, only itself + src/ipc
@@ -100,7 +103,18 @@ async function bundlePreload(): Promise<void> {
     fail(`preload bundle may only contain src/preload and src/ipc:\n  ${bad.join('\n  ')}`);
 }
 
-/** ADR 0013: the prompt page may contain nothing but itself (no UI kit, no core, no ipc code). */
+/**
+ * ADR 0016: the only npm code the prompt page may bundle — the BIP-39 library whose English list
+ * it shows words from and whose `validateMnemonic` checks a typed phrase, and the two audited
+ * packages that library is built on (wherever npm placed them).
+ */
+const PROMPT_NPM =
+  /[\\/]node_modules[\\/](?:@scure[\\/]bip39|@scure[\\/]base|@noble[\\/]hashes)[\\/]/;
+
+/**
+ * ADR 0013: the prompt page may contain nothing but itself (no UI kit, no core, no ipc code) —
+ * and, since ADR 0016, `PROMPT_NPM`.
+ */
 async function bundlePrompt(): Promise<void> {
   const r = await build({
     absWorkingDir: pkg,
@@ -118,9 +132,16 @@ async function bundlePrompt(): Promise<void> {
     logLevel: 'warning',
   });
   const own = join(pkg, 'src', 'renderer', 'prompt') + sep;
-  const bad = inputsOf(r.metafile).filter((p) => !p.startsWith(own));
+  const inputs = inputsOf(r.metafile);
+  const bad = inputs.filter((p) => !p.startsWith(own) && !PROMPT_NPM.test(p));
   if (bad.length > 0)
-    fail(`prompt bundle may only contain src/renderer/prompt:\n  ${bad.join('\n  ')}`);
+    fail(
+      `prompt bundle may only contain src/renderer/prompt and @scure/bip39:\n  ${bad.join('\n  ')}`,
+    );
+  // One wordlist only: the English one the host's phrases index into.
+  const lists = inputs.filter((p) => /[\\/]@scure[\\/]bip39[\\/]wordlists[\\/]/.test(p));
+  if (lists.length !== 1 || !/[\\/]english\.js$/.test(lists[0] ?? ''))
+    fail(`prompt bundle must carry exactly the English wordlist:\n  ${lists.join('\n  ')}`);
 }
 
 async function bundlePromptPreload(): Promise<void> {

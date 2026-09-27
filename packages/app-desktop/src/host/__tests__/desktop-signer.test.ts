@@ -175,6 +175,10 @@ function localScript(
       case 'remove-key':
       case 'bunker-auth':
       case 'top-up-first': // issue #2: the auto top-up's question, never part of this flow
+      case 'recovery-show': // ADR 0016: the recovery phrase's questions, never part of it either
+      case 'recovery-confirm':
+      case 'recovery-restore':
+      case 'recovery-reauth':
         return null;
     }
   };
@@ -748,5 +752,60 @@ describe('DesktopSigner — remote signer (NIP-46)', () => {
     await s.signer.connect({ kind: 'local' });
     expect(s.main.keychain.has('nip46')).toBe(false);
     expect(s.signer.signer()?.kind).toBe('local');
+  });
+});
+
+describe('DesktopSigner — reopenMoney (ADR 0016)', () => {
+  it('closes the plane, runs `beforeOpen` with no plane holding the wallet, reopens for the same signer, announces nothing', async () => {
+    const { main, signer, opened, swaps } = setup({});
+    main.script = localScript('passphrase', 'generate');
+    await signer.connect({ kind: 'local' });
+    const statuses: unknown[] = [];
+    signer.onStatus((st) => statuses.push(st));
+    const first = opened[0];
+    let during: { plane: unknown; closed: boolean | undefined } | undefined;
+    await signer.reopenMoney(() => {
+      during = { plane: signer.money(), closed: first?.closed };
+      return Promise.resolve();
+    });
+    expect(during).toEqual({ plane: undefined, closed: true });
+    expect(opened).toHaveLength(2);
+    expect(opened[1]).toMatchObject({ create: false, closed: false });
+    expect(opened[1]?.signer).toBe(first?.signer);
+    expect(signer.money()).toBeDefined();
+    expect(swaps.length).toBeGreaterThanOrEqual(2); // the worker restarts around it
+    expect(statuses).toEqual([]);
+  });
+
+  it('a failing `beforeOpen` is rethrown only after the plane is open again', async () => {
+    const { main, signer, opened } = setup({});
+    main.script = localScript('passphrase', 'generate');
+    await signer.connect({ kind: 'local' });
+    const err = await signer
+      .reopenMoney(() => Promise.reject(new Error('EIO: disk full')))
+      .catch((e: unknown) => e);
+    expect((err as Error).message).toBe('EIO: disk full');
+    expect(opened).toHaveLength(2);
+    expect(signer.money()).toBeDefined();
+  });
+
+  it('refused while a signer prompt is open (flows are exclusive); locked = nothing reopens', async () => {
+    const { main, signer, opened } = setup({});
+    main.script = localScript('passphrase', 'generate');
+    await signer.connect({ kind: 'local' });
+    main.hold = true;
+    const locking = signer.unlock().catch(() => undefined);
+    expect(await code(signer.reopenMoney())).toBe('rate-limited');
+    main.release();
+    await locking;
+    await signer.lock();
+    let ran = false;
+    await signer.reopenMoney(() => {
+      ran = true;
+      return Promise.resolve();
+    });
+    expect(ran).toBe(true);
+    expect(signer.money()).toBeUndefined();
+    expect(opened.at(-1)?.closed).toBe(true);
   });
 });

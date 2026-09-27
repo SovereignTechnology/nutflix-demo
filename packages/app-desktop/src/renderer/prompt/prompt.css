@@ -73,7 +73,8 @@ legend {
   margin: 0 0 12px;
 }
 input[type='password'],
-input[type='text'] {
+input[type='text'],
+textarea {
   background: var(--panel);
   color: var(--text);
   border: 1px solid var(--line);
@@ -81,7 +82,11 @@ input[type='text'] {
   padding: 8px 10px;
   font: inherit;
 }
+textarea {
+  resize: vertical;
+}
 input:focus-visible,
+textarea:focus-visible,
 button:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 2px;
@@ -156,4 +161,62 @@ button.link {
 .facts dd {
   margin: 0;
   overflow-wrap: anywhere;
+}
+/* ADR 0016: the recovery phrase — two columns of numbered words, never selectable or copyable. */
+.words {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  grid-auto-flow: column;
+  grid-template-rows: repeat(6, auto);
+  gap: 6px 16px;
+  margin: 0 0 12px;
+  padding: 10px 14px;
+  list-style: none;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+  user-select: none;
+  -webkit-user-select: none;
+}
+.words li {
+  display: flex;
+  gap: 8px;
+  font-size: 15px;
+}
+.words__n {
+  color: var(--muted);
+  min-width: 2.2em;
+  text-align: right;
+}
+.words__w {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-weight: 600;
+}
+.words-hidden {
+  padding: 10px 14px;
+  border: 1px dashed var(--line);
+  border-radius: 8px;
+  color: var(--muted);
+}
+.word-fields {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 6px 10px;
+  margin: 0 0 12px;
+}
+.word-field {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+.word-field label {
+  color: var(--muted);
+  min-width: 1.8em;
+  text-align: right;
+  font-size: 12px;
+}
+.word-field input {
+  width: 100%;
+  min-width: 0;
+  padding: 6px 8px;
 }

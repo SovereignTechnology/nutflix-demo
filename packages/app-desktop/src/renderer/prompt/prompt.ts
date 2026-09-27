@@ -8,7 +8,17 @@
  * Secrets are typed into password fields, sent once, and the fields are cleared at once (a JS
  * string cannot be wiped; clearing the DOM is what the page can do). Escape or closing the
  * window cancels.
+ *
+ * ADR 0016: the recovery phrase. The page bundles the BIP-39 English list (`@scure/bip39`'s
+ * wordlist data, and its `validateMnemonic` for the checksum — the only code this bundle takes
+ * from outside this directory): a phrase arrives as 12 INDICES and is shown through that list;
+ * a typed word leaves as its index. Main keeps the window out of screen captures while words
+ * show (macOS/Windows; on Linux the page says it cannot); the words hide after two minutes or
+ * when the window loses focus; nothing offers to copy them.
  */
+import { validateMnemonic } from '@scure/bip39';
+import { wordlist } from '@scure/bip39/wordlists/english.js';
+
 import type { WindowForm } from '../../ipc/protocol.js';
 
 interface PromptApi {
@@ -27,6 +37,133 @@ export const TOP_UP_PER_DAY_SATS = 50_000;
 /** Issue #2: the most one auto top-up moves — `LIMITS.maxAutoTopUpAmountSats`, pinned by a test. */
 export const TOP_UP_MAX_SATS = 10_000;
 
+// ---- ADR 0016: the page's own BIP-39 English list ------------------------------------------
+
+/** Words in a phrase (`RECOVERY_WORDS`, pinned by a test: the page bundle imports no ipc code). */
+export const PHRASE_WORDS = 12;
+/** How long the words stay on screen before they hide themselves. */
+export const WORDS_VISIBLE_MS = 120_000;
+/** The list itself (2048 words, `BIP39_LIST_SIZE`). */
+export const WORDS: readonly string[] = wordlist;
+const INDEX = new Map<string, number>(wordlist.map((w, i) => [w, i]));
+
+/**
+ * A typed word → its index in the list: the exact word, or a prefix of at least four letters
+ * that only one word starts with (BIP-39 English words are unique in their first four).
+ */
+export function wordIndex(typed: string): number | undefined {
+  const w = typed.trim().normalize('NFKD').toLowerCase();
+  if (w === '') return undefined;
+  const exact = INDEX.get(w);
+  if (exact !== undefined) return exact;
+  if (w.length < 4) return undefined;
+  let hit: number | undefined;
+  for (let i = 0; i < wordlist.length; i++)
+    if (wordlist[i]?.startsWith(w) === true) {
+      if (hit !== undefined) return undefined;
+      hit = i;
+    }
+  return hit;
+}
+
+/** Does this phrase (as indices) carry a valid BIP-39 checksum? (`@scure/bip39`.) */
+export function phraseValid(indices: readonly number[]): boolean {
+  if (indices.length !== PHRASE_WORDS) return false;
+  const words = indices.map((i) => wordlist[i]);
+  if (words.some((w) => w === undefined)) return false;
+  try {
+    return validateMnemonic(words.join(' '), wordlist);
+  } catch {
+    return false;
+  }
+}
+
+// ---- ADR 0016 §5.1: mint addresses typed in the restore window ------------------------------
+
+/** Mint addresses the restore window takes (`MAX_RESTORE_MINTS`, pinned by a test). */
+export const RESTORE_MINTS = 8;
+/** Longest mint address (`LIMITS.maxServerUrl`, pinned by a test). */
+export const MAX_MINT_URL = 512;
+// The IPC guards' `isMintUrl` grammar (src/ipc/guards.ts `HTTPS_SERVER_RE`), copied because the
+// page bundle imports no ipc code; a test checks the two agree. Main and the host check again.
+const LABEL = '[A-Za-z0-9_](?:[A-Za-z0-9_-]{0,61}[A-Za-z0-9_])?';
+const HOST = `(?:${LABEL}(?:\\.${LABEL})*|\\[[0-9A-Fa-f:.]{2,45}\\])`;
+const PCHAR = "[A-Za-z0-9\\-._~!$&'()*+,;=:@%]";
+const PATH = `(?:/[A-Za-z0-9\\-._~!$&'()*+,;=:@%/]*${PCHAR})?`;
+const MINT_URL_RE = new RegExp(`^https://${HOST}(?::[0-9]{1,5})?${PATH}$`);
+
+/**
+ * A typed mint address → its normalised https URL (typed with `https://`; no user-info, no
+ * query, no fragment, no trailing slash, an ASCII host), or `undefined`. Never `http:` — a
+ * restore sends the phrase's blinded outputs to that mint (ADR 0016 §6: https only) — and never
+ * a bare word, so a phrase typed into the wrong box is not taken for a list of hosts.
+ */
+export function mintAddress(typed: string): string | undefined {
+  const t = typed.trim();
+  if (t.length > MAX_MINT_URL || !/^https:\/\//i.test(t)) return undefined;
+  let u: URL;
+  try {
+    u = new URL(t);
+  } catch {
+    return undefined;
+  }
+  if (u.protocol !== 'https:' || u.username !== '' || u.password !== '' || u.search !== '')
+    return undefined;
+  u.hash = '';
+  let out = u.toString();
+  while (out.endsWith('/')) out = out.slice(0, -1);
+  return out.length <= MAX_MINT_URL && MINT_URL_RE.test(out) ? out : undefined;
+}
+
+function isIndexList(x: unknown, n: number, max: number): x is readonly number[] {
+  return (
+    Array.isArray(x) &&
+    x.length === n &&
+    x.every((v) => typeof v === 'number' && Number.isInteger(v) && v >= 0 && v < max)
+  );
+}
+
+/** Linux has no way to keep a window out of screen captures (Electron's content protection). */
+function captureUnprotected(): boolean {
+  try {
+    return /Linux/i.test(navigator.userAgent) && !/Android/i.test(navigator.userAgent);
+  } catch {
+    return false;
+  }
+}
+
+function captureNote(): HTMLElement[] {
+  return captureUnprotected()
+    ? [
+        el(
+          'p',
+          { class: 'warning' },
+          'On Linux this window cannot be kept out of screenshots or screen sharing: make sure nothing is recording your screen.',
+        ),
+      ]
+    : [];
+}
+
+/** One `<datalist>` of the whole list, for the fields that take words. */
+function wordDatalist(id: string): HTMLDataListElement {
+  const list = el('datalist', { id });
+  for (const w of wordlist) list.append(el('option', { value: w }));
+  return list;
+}
+
+function wordField(id: string, label: string, list: string): HTMLInputElement {
+  return el('input', {
+    id,
+    type: 'text',
+    list,
+    autocomplete: 'off',
+    spellcheck: 'false',
+    autocapitalize: 'off',
+    maxlength: '16',
+    'aria-label': label,
+  });
+}
+
 type Answer =
   | {
       kind: 'local-setup';
@@ -40,6 +177,9 @@ type Answer =
   | { kind: 'bunker-auth'; open: boolean }
   | { kind: 'open-link'; open: boolean }
   | { kind: 'top-up-first'; confirm: boolean }
+  | { kind: 'recovery-show'; done: boolean }
+  | { kind: 'recovery-confirm'; words: number[] }
+  | { kind: 'recovery-restore'; words: number[]; mints?: string[] }
   | null;
 
 // ---- tiny DOM helpers --------------------------------------------------------------------
@@ -141,6 +281,8 @@ interface View {
   readonly danger?: boolean;
   /** A secondary action beside the buttons (e.g. "Forgot the passphrase?"). */
   readonly alt?: { readonly label: string; readonly answer: Answer };
+  /** Runs once the form is on screen; the returned function runs when the answer is sent. */
+  readonly onMount?: () => () => void;
 }
 
 function view(q: WindowForm): View {
@@ -415,6 +557,37 @@ function view(q: WindowForm): View {
         collect: () => ({ kind: 'top-up-first', confirm: true }),
       };
     }
+    case 'recovery-show':
+      return recoveryShow(q.words, q.again);
+    case 'recovery-confirm':
+      return recoveryConfirm(q.positions, q.retry);
+    case 'recovery-restore':
+      return recoveryRestore();
+    case 'recovery-reauth': {
+      const p = password('pass', 'Passphrase', 'current-password');
+      const body: (Node | string)[] = [];
+      if (q.retry)
+        body.push(el('p', { class: 'error', role: 'alert' }, 'Wrong passphrase. Try again.'));
+      body.push(
+        el(
+          'p',
+          {},
+          'Type the passphrase of the key on this device to continue with your recovery phrase.',
+        ),
+        p.row,
+      );
+      return {
+        title: 'Confirm it is you',
+        body,
+        submitLabel: 'Continue',
+        focus: p.input,
+        secrets: [p.input],
+        collect: () =>
+          p.input.value === ''
+            ? { error: 'Type your passphrase.' }
+            : { kind: 'secret', value: p.input.value },
+      };
+    }
     case 'create-wallet': {
       return {
         title: 'No wallet found',
@@ -435,9 +608,258 @@ function view(q: WindowForm): View {
   }
 }
 
-function isForm(x: unknown): x is WindowForm {
+/** ADR 0016: the words, shown from the page's own list; hidden after a while or on blur. */
+function recoveryShow(indices: readonly number[], again: boolean): View {
+  const grid = el('ol', { class: 'words', 'aria-label': 'Recovery phrase' });
+  const hidden = el('p', { class: 'words-hidden', hidden: true }, 'The words are hidden. ');
+  const reveal = el('button', { type: 'button', class: 'link' }, 'Show the words');
+  hidden.append(reveal);
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const hide = (): void => {
+    clearTimeout(timer);
+    timer = undefined;
+    // Out of the DOM, not merely out of sight.
+    grid.replaceChildren();
+    grid.hidden = true;
+    hidden.hidden = false;
+  };
+  const show = (): void => {
+    grid.replaceChildren(
+      ...indices.map((i, n) =>
+        el(
+          'li',
+          {},
+          el('span', { class: 'words__n' }, `${String(n + 1)}.`),
+          el('span', { class: 'words__w' }, wordlist[i] ?? '?'),
+        ),
+      ),
+    );
+    grid.hidden = false;
+    hidden.hidden = true;
+    clearTimeout(timer);
+    timer = setTimeout(hide, WORDS_VISIBLE_MS);
+  };
+  const block = (e: Event): void => {
+    e.preventDefault();
+  };
+  for (const ev of ['copy', 'cut', 'contextmenu', 'dragstart', 'selectstart'])
+    grid.addEventListener(ev, block);
+  reveal.addEventListener('click', show);
+  return {
+    title: again ? 'Your recovery phrase' : 'Write down your recovery phrase',
+    body: [
+      el(
+        'p',
+        {},
+        again
+          ? 'These 12 words restore the ecash of this device. Anyone who sees them can take it.'
+          : 'These 12 words can bring back your ecash if this device is lost. Write them on paper, in order, and keep them somewhere safe. Anyone who sees them can take your ecash.',
+      ),
+      ...captureNote(),
+      grid,
+      hidden,
+      el(
+        'p',
+        { class: 'hint' },
+        'Never type them into a website or share them. Nutflix only asks for them in this window.',
+      ),
+    ],
+    submitLabel: 'I wrote them down',
+    cancelLabel: again ? 'Close' : 'Cancel',
+    ...(again
+      ? {}
+      : { alt: { label: 'Later', answer: { kind: 'recovery-show', done: false } as const } }),
+    collect: () => ({ kind: 'recovery-show', done: true }),
+    onMount: () => {
+      show();
+      window.addEventListener('blur', hide);
+      return () => {
+        window.removeEventListener('blur', hide);
+        hide();
+      };
+    },
+  };
+}
+
+/** ADR 0016: three words, typed back and sent as indices. */
+function recoveryConfirm(positions: readonly number[], retry: boolean): View {
+  const fields = positions.map((p) =>
+    wordField(`w${String(p)}`, `Word ${String(p + 1)}`, 'nf-words'),
+  );
+  const body: (Node | string)[] = [];
+  if (retry)
+    body.push(
+      el(
+        'p',
+        { class: 'error', role: 'alert' },
+        'Those words do not match your phrase. Check what you wrote down and try again.',
+      ),
+    );
+  body.push(
+    el('p', {}, 'To check your copy, type these words from your recovery phrase.'),
+    ...captureNote(),
+    ...fields.map((f, k) =>
+      el(
+        'div',
+        { class: 'field' },
+        el('label', { for: f.id }, `Word ${String((positions[k] ?? 0) + 1)}`),
+        f,
+      ),
+    ),
+    wordDatalist('nf-words'),
+  );
+  return {
+    title: 'Confirm your recovery phrase',
+    body,
+    submitLabel: 'Confirm',
+    cancelLabel: 'Later',
+    ...(fields[0] === undefined ? {} : { focus: fields[0] }),
+    secrets: fields,
+    collect: () => {
+      const words = fields.map((f) => wordIndex(f.value));
+      if (words.some((w) => w === undefined))
+        return { error: 'Type each word as you wrote it down (a word from the list).' };
+      return { kind: 'recovery-confirm', words: words as number[] };
+    },
+  };
+}
+
+/** ADR 0016: an optional typed phrase — 12 words, checked here before they are sent. */
+function recoveryRestore(): View {
+  const fields = Array.from({ length: PHRASE_WORDS }, (_, n) =>
+    wordField(`r${String(n)}`, `Word ${String(n + 1)}`, 'nf-words'),
+  );
+  // Pasting a whole phrase into one field spreads it over the fields (a password manager).
+  fields.forEach((f, start) => {
+    f.addEventListener('paste', (e) => {
+      const text = e.clipboardData?.getData('text') ?? '';
+      const parts = text.trim().split(/\s+/);
+      if (parts.length < 2) return;
+      e.preventDefault();
+      parts.slice(0, PHRASE_WORDS - start).forEach((w, k) => {
+        const target = fields[start + k];
+        if (target !== undefined) target.value = w;
+      });
+    });
+  });
+  // ADR 0016 §5.1: the words alone do not say which mints a phrase was used at.
+  const mintBox = el('textarea', {
+    id: 'r-mints',
+    rows: '2',
+    autocomplete: 'off',
+    spellcheck: 'false',
+    autocapitalize: 'off',
+    maxlength: String(RESTORE_MINTS * (MAX_MINT_URL + 1)),
+    placeholder: 'https://mint.example',
+  });
+  const collectMints = (): string[] | { error: string } => {
+    const mints: string[] = [];
+    const parts = mintBox.value.split(/[\s,]+/).filter((x) => x !== '');
+    for (let n = 0; n < parts.length; n++) {
+      const m = mintAddress(parts[n] ?? '');
+      // The typed text is not repeated back (it could be anything the user pasted).
+      if (m === undefined)
+        return {
+          error: `Mint address ${String(n + 1)} is not an https address like https://mint.example (no http, no ? part).`,
+        };
+      if (!mints.includes(m)) mints.push(m);
+    }
+    if (mints.length > RESTORE_MINTS)
+      return { error: `Type at most ${String(RESTORE_MINTS)} mint addresses.` };
+    return mints;
+  };
+  return {
+    title: 'Restore from recovery phrases',
+    body: [
+      el(
+        'p',
+        {},
+        'Nutflix restores from the recovery phrase of this device and from every copy on your relays that your key can open. To restore from another phrase too — another device’s, or one from another Cashu wallet — type its 12 words.',
+      ),
+      el(
+        'p',
+        { class: 'hint' },
+        'Leave the fields empty to restore without a typed phrase. Each of your mints is asked about the phrase, which can take a while.',
+      ),
+      ...captureNote(),
+      el(
+        'div',
+        { class: 'word-fields' },
+        ...fields.map((f, n) =>
+          el('div', { class: 'word-field' }, el('label', { for: f.id }, `${String(n + 1)}.`), f),
+        ),
+      ),
+      wordDatalist('nf-words'),
+      el(
+        'div',
+        { class: 'field' },
+        el('label', { for: mintBox.id }, 'Other mints (optional)'),
+        mintBox,
+      ),
+      el(
+        'p',
+        { class: 'hint' },
+        `The words do not say which mints they were used at. If the phrase was used at a mint that is not in your list, type its address here (https only, up to ${String(RESTORE_MINTS)}).`,
+      ),
+    ],
+    submitLabel: 'Restore',
+    ...(fields[0] === undefined ? {} : { focus: fields[0] }),
+    secrets: fields,
+    collect: () => {
+      const mints = collectMints();
+      if (!Array.isArray(mints)) return mints;
+      const answer = (words: number[]): Answer =>
+        mints.length > 0
+          ? { kind: 'recovery-restore', words, mints }
+          : { kind: 'recovery-restore', words };
+      const typed = fields.map((f) => f.value.trim());
+      if (typed.every((t) => t === '')) return answer([]);
+      if (typed.some((t) => t === ''))
+        return { error: 'Type all 12 words, or leave every field empty.' };
+      const words: number[] = [];
+      for (let n = 0; n < typed.length; n++) {
+        const w = wordIndex(typed[n] ?? '');
+        if (w === undefined)
+          return { error: `Word ${String(n + 1)} is not a word from the recovery phrase list.` };
+        words.push(w);
+      }
+      if (!phraseValid(words))
+        return {
+          error: 'These words are not a valid recovery phrase: check their spelling and order.',
+        };
+      return answer(words);
+    },
+  };
+}
+
+/**
+ * The page's own check of the question main hands it (main already checked it against the IPC
+ * guards; this is the page refusing to render anything else). ADR 0016: a question with words
+ * carries exactly 12 indices into the page's list — never text — and a confirmation exactly
+ * three ascending positions.
+ */
+export function isForm(x: unknown): x is WindowForm {
   if (typeof x !== 'object' || x === null) return false;
-  const k = (x as { kind?: unknown }).kind;
+  const o = x as Record<string, unknown>;
+  const k = o['kind'];
+  const keys = Object.keys(o).sort().join(',');
+  if (k === 'recovery-show')
+    return (
+      keys === 'again,kind,words' &&
+      typeof o['again'] === 'boolean' &&
+      isIndexList(o['words'], PHRASE_WORDS, WORDS.length)
+    );
+  if (k === 'recovery-confirm') {
+    const p = o['positions'];
+    return (
+      keys === 'kind,positions,retry' &&
+      typeof o['retry'] === 'boolean' &&
+      isIndexList(p, 3, PHRASE_WORDS) &&
+      p.every((v, i) => i === 0 || v > (p[i - 1] ?? PHRASE_WORDS))
+    );
+  }
+  if (k === 'recovery-restore') return keys === 'kind';
+  if (k === 'recovery-reauth') return keys === 'kind,retry' && typeof o['retry'] === 'boolean';
   return (
     k === 'local-setup' ||
     k === 'unlock-passphrase' ||
@@ -475,12 +897,15 @@ export function mount(root: HTMLElement, api: PromptApi, q: WindowForm): void {
   const clear = (): void => {
     for (const s of v.secrets ?? []) s.value = '';
   };
+  /** The view's own cleanup (`onMount`'s return), run once the answer is sent. */
+  const mounted: { off?: (() => void) | undefined } = {};
   const send = (a: Answer): void => {
     if (sent) return;
     sent = true;
     for (const c of form.querySelectorAll<HTMLInputElement | HTMLButtonElement>('input, button'))
       c.disabled = true;
     clear();
+    mounted.off?.();
     void api.answer(a === null && v.safeNo !== undefined ? v.safeNo : a);
   };
   form.addEventListener('submit', (e) => {
@@ -506,6 +931,7 @@ export function mount(root: HTMLElement, api: PromptApi, q: WindowForm): void {
     if (e.key === 'Escape') send(null);
   });
   root.replaceChildren(form);
+  mounted.off = v.onMount?.();
   // A money-shaped, destructive or outward question defaults to its safe answer.
   (v.safeNo !== undefined ? cancel : (v.focus ?? submit)).focus();
 }

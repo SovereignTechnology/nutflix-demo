@@ -22,9 +22,20 @@
  *
  * Electron-free: `main.ts` passes a window factory; the tests pass fakes.
  */
-import { isAuthUrl, isExternalLink, promptAnswerFits } from '../ipc/guards.js';
+import {
+  isAuthUrl,
+  isExternalLink,
+  isMintUrl,
+  isWordIndex,
+  promptAnswerFits,
+} from '../ipc/guards.js';
 import type { OpenLinkForm, PromptAnswer, PromptForm, WindowForm } from '../ipc/protocol.js';
-import { MAX_SECRET_BYTES } from '../ipc/protocol.js';
+import {
+  MAX_RESTORE_MINTS,
+  MAX_SECRET_BYTES,
+  RECOVERY_CONFIRM_WORDS,
+  RECOVERY_WORDS,
+} from '../ipc/protocol.js';
 import type { LogEvent } from './log.js';
 import { APP_SCHEME, PROMPT_HOST } from './schemes.js';
 
@@ -39,6 +50,9 @@ export type PageAnswer =
       | { kind: 'remove-key' }
       | { kind: 'bunker-auth' }
       | { kind: 'top-up-first' }
+      | { kind: 'recovery-show' }
+      | { kind: 'recovery-confirm' }
+      | { kind: 'recovery-restore' }
     >
   | { readonly kind: 'secret'; readonly value: string }
   | { readonly kind: 'bunker'; readonly uri: string; readonly remember: boolean }
@@ -48,6 +62,13 @@ export type PageAnswer =
 export interface PromptWindowLike {
   readonly webContentsId: number;
   close(): void;
+  /**
+   * ADR 0016: keep the window out of screenshots and screen sharing
+   * (`BrowserWindow.setContentProtection`; macOS and Windows — Linux has none, and the page says
+   * so). Set before the page can fetch a question that carries words; a window without it is
+   * never given one (fail closed).
+   */
+  setContentProtection?(on: boolean): void;
   /** Called once when the window is gone (closed by the user or by `close()`). */
   onClosed(cb: () => void): void;
 }
@@ -71,21 +92,83 @@ export interface PromptServiceDeps {
    */
   openExternal?(url: string): void;
   readonly log?: (level: 'info' | 'warn', event: Extract<LogEvent, `prompt.${string}`>) => void;
+  /**
+   * ADR 0016: re-checks a typed recovery phrase's BIP-39 checksum from its indices
+   * (`phraseChecksumOk` over `node:crypto`'s SHA-256). Absent = every typed phrase is refused.
+   */
+  readonly checksumOk?: (words: readonly number[]) => boolean;
 }
 
 const MAX_QUEUED = 8;
 
+/** ADR 0016: the questions that put words on screen (or take them): content protection on. */
+export function showsWords(form: WindowForm): boolean {
+  return (
+    form.kind === 'recovery-show' ||
+    form.kind === 'recovery-confirm' ||
+    form.kind === 'recovery-restore'
+  );
+}
+
 function wipe(a: PromptAnswer | null): void {
   if (a?.kind === 'secret') a.value.fill(0);
   else if (a?.kind === 'bunker') a.uri.fill(0);
+  else if (a?.kind === 'recovery-confirm' || a?.kind === 'recovery-restore')
+    // Main's own copy (the host got a structured clone): numbers, zeroed as far as JS allows.
+    (a.words as number[]).fill(0);
+}
+
+/**
+ * ADR 0016: main's copy of a phrase question's word indices, zeroed once its window is gone (or
+ * the question was dropped) — numbers, zeroed as far as JS allows.
+ */
+function forget(form: WindowForm): void {
+  if (form.kind === 'recovery-show') (form.words as number[]).fill(0);
+}
+
+/** `n`..`max` word indices, copied into main's own array — numbers only, never a string. */
+function indices(x: unknown, lengths: readonly number[]): number[] | undefined {
+  if (!Array.isArray(x) || !lengths.includes(x.length)) return undefined;
+  const out: number[] = [];
+  for (const w of x as unknown[]) {
+    if (!isWordIndex(w)) return undefined;
+    out.push(w);
+  }
+  return out;
+}
+
+type RestoreMint = NonNullable<
+  Extract<PromptAnswer, { kind: 'recovery-restore' }>['mints']
+>[number];
+
+/**
+ * ADR 0016 §5.1: the mint addresses typed in the restore window — 1 to `MAX_RESTORE_MINTS`
+ * normalised https URLs (`isMintUrl`, the host's own guard), copied into main's own array; `null`
+ * when anything else.
+ */
+function mintList(x: unknown): RestoreMint[] | null {
+  if (!Array.isArray(x) || x.length < 1 || x.length > MAX_RESTORE_MINTS) return null;
+  const out: RestoreMint[] = [];
+  for (const m of x as unknown[]) {
+    if (!isMintUrl(m)) return null;
+    out.push(m);
+  }
+  return out;
 }
 
 function isOwnText(x: unknown, max: number): x is string {
   return typeof x === 'string' && x.length > 0 && x.length <= max && !x.includes('\u0000');
 }
 
-/** The page's answer → the host's, or `undefined` when it is not one. Pure; never throws. */
-export function toPromptAnswer(raw: unknown): PromptAnswer | null | undefined {
+/**
+ * The page's answer → the host's, or `undefined` when it is not one. Pure; never throws. A
+ * recovery answer carries word INDICES only; a typed phrase must also pass `opts.checksumOk`
+ * (absent = refused).
+ */
+export function toPromptAnswer(
+  raw: unknown,
+  opts: { readonly checksumOk?: ((words: readonly number[]) => boolean) | undefined } = {},
+): PromptAnswer | null | undefined {
   try {
     if (raw === null) return null;
     if (typeof raw !== 'object') return undefined;
@@ -121,6 +204,28 @@ export function toPromptAnswer(raw: unknown): PromptAnswer | null | undefined {
       case 'top-up-first':
         if (keys !== 'confirm,kind' || typeof o['confirm'] !== 'boolean') return undefined;
         return { kind: 'top-up-first', confirm: o['confirm'] };
+      case 'recovery-show':
+        if (keys !== 'done,kind' || typeof o['done'] !== 'boolean') return undefined;
+        return { kind: 'recovery-show', done: o['done'] };
+      case 'recovery-confirm': {
+        if (keys !== 'kind,words') return undefined;
+        const words = indices(o['words'], [RECOVERY_CONFIRM_WORDS]);
+        return words === undefined ? undefined : { kind: 'recovery-confirm', words };
+      }
+      case 'recovery-restore': {
+        if (keys !== 'kind,words' && keys !== 'kind,mints,words') return undefined;
+        const mints = keys === 'kind,words' ? undefined : mintList(o['mints']);
+        if (mints === null) return undefined;
+        const words = indices(o['words'], [0, RECOVERY_WORDS]);
+        if (words === undefined) return undefined;
+        if (words.length > 0 && opts.checksumOk?.(words) !== true) {
+          words.fill(0);
+          return undefined;
+        }
+        return mints === undefined
+          ? { kind: 'recovery-restore', words }
+          : { kind: 'recovery-restore', words, mints };
+      }
       case 'secret': {
         if (keys !== 'kind,value' || !isOwnText(o['value'], MAX_SECRET_BYTES)) return undefined;
         const value = enc(o['value']);
@@ -216,6 +321,7 @@ export class PromptService {
 
   /** The host no longer needs `req` (its deadline): close it without answering. */
   cancel(req: number): void {
+    for (const q of this.queue) if (q.req === req) forget(q.form);
     this.queue = this.queue.filter((q) => q.req !== req);
     const c = this.current;
     if (c?.req === req) {
@@ -226,6 +332,7 @@ export class PromptService {
 
   /** The host went away: close its questions, answer nothing (nobody is listening). Main's own stay. */
   cancelAll(): void {
+    for (const q of this.queue) if (q.local === undefined) forget(q.form);
     this.queue = this.queue.filter((q) => q.local !== undefined);
     const c = this.current;
     if (c !== null && c.local === undefined) {
@@ -258,7 +365,7 @@ export class PromptService {
       c.local(open === true);
       return true;
     }
-    const a = toPromptAnswer(raw);
+    const a = toPromptAnswer(raw, { checksumOk: this.d.checksumOk });
     if (a === undefined || (a !== null && !promptAnswerFits(c.form, a))) {
       wipe(a ?? null);
       this.d.log?.('warn', 'prompt.bad-answer');
@@ -309,11 +416,32 @@ export class PromptService {
       this.pump();
       return;
     }
+    if (showsWords(next.form)) {
+      try {
+        // Before the page can fetch the question: its words never render unprotected.
+        if (win.setContentProtection === undefined) throw new Error('no content protection');
+        win.setContentProtection(true);
+      } catch {
+        // Fail closed: no protection, no words.
+        this.d.log?.('warn', 'prompt.protection-failed');
+        forget(next.form);
+        try {
+          win.close();
+        } catch {
+          // already gone
+        }
+        if (next.local !== undefined) next.local(false);
+        else this.d.answer(next.req, null);
+        this.pump();
+        return;
+      }
+    }
     const cur: Current = { ...next, win, settled: false };
     this.current = cur;
     win.onClosed(() => {
       if (this.current !== cur) return;
       this.current = null;
+      forget(cur.form);
       if (!cur.settled) {
         if (cur.local !== undefined) cur.local(false);
         else this.d.answer(cur.req, null);

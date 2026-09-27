@@ -96,6 +96,11 @@ vi.mock('electron', () => {
     show(): void {
       return undefined;
     }
+    /** ADR 0016: recorded per window (webContents id → each call). */
+    setContentProtection(on: boolean): void {
+      const w = fx.windows[this.webContents.id - 1] as { protection?: boolean[] } | undefined;
+      if (w) (w.protection ??= []).push(on);
+    }
     loadURL(url: string): Promise<void> {
       const w = fx.windows.at(-1);
       if (w) w.url = url;
@@ -935,5 +940,88 @@ describe('main.ts wiring (fake electron)', () => {
     // A host message with a non-https link never even reaches the window (isHostOut).
     deliver({ kind: 'prompt', req: 10, form: { kind: 'bunker-auth', url: 'http://x.example/' } });
     expect(fx.windows).toHaveLength(2);
+  });
+
+  it('ADR 0016: a phrase question gets content protection before the page can read it; a typed phrase is checksum-checked by main', async () => {
+    await boot();
+    const child = fx.children[0];
+    const deliver = (m: unknown): void => {
+      for (const l of child?.listeners.get('message') ?? []) l(m);
+    };
+    // BIP-39's 0x7f × 16 vector as indices ("legal winner thank year wave sausage worth useful …").
+    const words = [1019, 2015, 1790, 2039, 1983, 1533, 2031, 1919, 1019, 2015, 1790, 2040];
+    // (A copy: main zeroes ITS copy of the indices once the window is gone.)
+    deliver({
+      kind: 'prompt',
+      req: 21,
+      form: { kind: 'recovery-show', words: [...words], again: false },
+    });
+    const pw = fx.windows[1] as { url?: string; protection?: boolean[] } | undefined;
+    expect(pw?.protection).toEqual([true]);
+    const init = fx.ipc.get('nf-prompt:init');
+    const answer = fx.ipc.get('nf-prompt:answer');
+    const ev = (id: number): unknown => ({
+      sender: { id },
+      senderFrame: { url: 'app://prompt/prompt.html', parent: null },
+    });
+    expect(await init?.(ev(2), undefined)).toEqual({ kind: 'recovery-show', words, again: false });
+    expect(await answer?.(ev(2), { kind: 'recovery-show', done: true })).toBe(true);
+    // A restore: a phrase whose checksum main's own re-check refuses is a cancel (null).
+    deliver({ kind: 'prompt', req: 22, form: { kind: 'recovery-restore' } });
+    expect((fx.windows[2] as { protection?: boolean[] }).protection).toEqual([true]);
+    const bad = [...words.slice(0, 11), 0];
+    expect(await answer?.(ev(3), { kind: 'recovery-restore', words: bad })).toBe(true);
+    deliver({ kind: 'prompt', req: 23, form: { kind: 'recovery-restore' } });
+    expect(await answer?.(ev(4), { kind: 'recovery-restore', words: [...words] })).toBe(true);
+    const answers = child?.posted.filter(
+      (m) => (m as { kind?: string }).kind === 'prompt-answer',
+    ) as { req: number; answer: unknown }[];
+    expect(answers.map((a) => [a.req, a.answer])).toEqual([
+      [21, { kind: 'recovery-show', done: true }],
+      [22, null],
+      [23, { kind: 'recovery-restore', words }],
+    ]);
+  });
+
+  it('ADR 0016: a host confirm is a native dialog built by main (Cancel the default); only the confirm button answers yes', async () => {
+    await boot();
+    const child = fx.children[0];
+    const deliver = (m: unknown): void => {
+      for (const l of child?.listeners.get('message') ?? []) l(m);
+    };
+    const form = {
+      kind: 'recovery-reissue',
+      plans: [{ mint: 'https://mint.example/cashu/api', amount: 1_000, inputs: 3, feeSats: 2 }],
+    };
+    fx.dialogAnswer = 0; // Cancel
+    deliver({ kind: 'confirm', req: 31, form });
+    await new Promise<void>((r) => {
+      setTimeout(r, 0);
+    });
+    expect(fx.dialogs[0]).toMatchObject({
+      type: 'question',
+      buttons: ['Cancel', 'Move it (fee 2 sats)'],
+      defaultId: 0,
+      cancelId: 0,
+      message: 'Move 1,000 sats under your recovery phrase? The mints charge 2 sats in fees.',
+    });
+    expect(JSON.stringify(fx.dialogs[0])).not.toMatch(/cashu\/api/);
+    fx.dialogAnswer = 1; // confirm
+    deliver({ kind: 'confirm', req: 32, form: { kind: 'recovery-reveal' } });
+    await new Promise<void>((r) => {
+      setTimeout(r, 0);
+    });
+    // A malformed question never reaches a dialog (isHostOut).
+    deliver({ kind: 'confirm', req: 33, form: { kind: 'recovery-reissue', plans: [] } });
+    await new Promise<void>((r) => {
+      setTimeout(r, 0);
+    });
+    expect(fx.dialogs).toHaveLength(2);
+    expect(child?.posted.filter((m) => (m as { kind?: string }).kind === 'confirm-result')).toEqual(
+      [
+        { kind: 'confirm-result', req: 31, ok: false },
+        { kind: 'confirm-result', req: 32, ok: true },
+      ],
+    );
   });
 });

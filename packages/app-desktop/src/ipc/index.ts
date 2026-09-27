@@ -12,3 +12,4 @@ export * from './framing.js';
 export * from './worker-protocol.js';
 export * from './worker-guards.js';
 export * from './deadlines.js';
+export * from './recovery-checksum.js';

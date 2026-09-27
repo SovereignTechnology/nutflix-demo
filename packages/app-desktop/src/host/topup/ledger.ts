@@ -270,7 +270,7 @@ export class TopUpLedger {
       await this.file.save({ v: FILE_V, allowed: [], entries: [marker], melts: [] });
     } catch {
       this.hardClosed = true;
-      this.log.error('the auto top-up ledger cannot be replaced: auto top-ups stay off this run');
+      this.log.error('the auto top-up ledger cannot be replaced (auto top-ups stay off this run)');
     }
   }
 

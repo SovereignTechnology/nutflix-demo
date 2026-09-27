@@ -77,8 +77,9 @@ describe('validateArgs — coverage', () => {
   it('has a guard for every method, and every guard has valid samples', () => {
     expect(new Set(METHODS)).toEqual(new Set(methods));
     // 49 + the five `desktop.signer.*` shell methods (ADR 0013) + `setProfilePicture` (v6, ADR 0015)
-    // + `wallet.inputFeePpk` (v6: mint fees shown in the price).
-    expect(METHODS.length).toBe(56);
+    // + `wallet.inputFeePpk` (v6: mint fees shown in the price) + the four
+    // `desktop.wallet.recovery.*` shell methods (ADR 0016).
+    expect(METHODS.length).toBe(60);
   });
 
   it('D3: wallet.send / wallet.receive (and the engine-internal wallet calls) are not methods', () => {

@@ -8,7 +8,17 @@ export type { HomeProps, HomeTab } from './Home/index.js';
 export { Channel } from './Channel/index.js';
 export type { ChannelProps, ChannelTab } from './Channel/index.js';
 export { SETTINGS_SECTIONS, Settings } from './Settings/index.js';
-export type { SettingsProps, SettingsSectionId } from './Settings/index.js';
+export type {
+  RecoveryControls,
+  RecoveryProgressView,
+  RecoveryRestoreOutcome,
+  RecoveryRestoreView,
+  RecoverySetupView,
+  RecoveryState,
+  RecoveryStatusView,
+  SettingsProps,
+  SettingsSectionId,
+} from './Settings/index.js';
 export { Library } from './Library/index.js';
 export type { LibraryProps, LibraryTab } from './Library/index.js';
 export { Watch } from './Watch/index.js';

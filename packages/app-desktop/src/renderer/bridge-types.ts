@@ -128,5 +128,18 @@ export interface NutflixBridge {
       signOut: Call<'desktop.signer.signOut'>;
       onStatus: Listen<TopicPayload['signer.status']>;
     };
+    /**
+     * ADR 0016: the recovery phrase — an ACTION only; words are shown and typed in main's
+     * prompt window, the reissue fee confirmed in main's native dialog.
+     */
+    readonly wallet: {
+      readonly recovery: {
+        status: Call<'desktop.wallet.recovery.status'>;
+        setup: Call<'desktop.wallet.recovery.setup'>;
+        show: Call<'desktop.wallet.recovery.show'>;
+        restore: Call<'desktop.wallet.recovery.restore'>;
+        onProgress: Listen<TopicPayload['recovery.progress']>;
+      };
+    };
   };
 }

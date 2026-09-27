@@ -45,6 +45,7 @@ import type {
   WalletChangeEvent,
   WalletHistoryEntry,
   media,
+  wallet as walletTypes,
 } from '@sovit/core';
 
 // ---- versions, channels, limits ---------------------------------------------------------
@@ -295,7 +296,30 @@ export type PromptForm =
       readonly target: MintUrl;
       readonly source: MintUrl;
       readonly amount: Sats;
-    };
+    }
+  /**
+   * ADR 0016: show the recovery phrase — `RECOVERY_WORDS` indices into the BIP-39 English list,
+   * never words: the page maps them through its own bundled list, so nothing upstream can put
+   * text in this window. `again`: an existing phrase shown after re-authentication (else a new
+   * one, which "Later" saves unconfirmed and a cancel discards).
+   */
+  | { readonly kind: 'recovery-show'; readonly words: readonly number[]; readonly again: boolean }
+  /**
+   * ADR 0016: confirm the backup — type the words at these `RECOVERY_CONFIRM_WORDS` positions
+   * (0-based, ascending). The page answers their indices; the host compares them.
+   */
+  | {
+      readonly kind: 'recovery-confirm';
+      readonly positions: readonly number[];
+      readonly retry: boolean;
+    }
+  /**
+   * ADR 0016: restore — optionally type a phrase (12 fields completing from the page's list;
+   * checksum checked in the page, main and the host). Answered with 0 or 12 indices.
+   */
+  | { readonly kind: 'recovery-restore' }
+  /** ADR 0016: re-authenticate before the phrase is shown again: the local key's passphrase. */
+  | { readonly kind: 'recovery-reauth'; readonly retry: boolean };
 export type PromptKind = PromptForm['kind'];
 
 /**
@@ -322,7 +346,122 @@ export type PromptAnswer =
   | { readonly kind: 'create-wallet'; readonly create: boolean }
   | { readonly kind: 'remove-key'; readonly confirm: boolean }
   | { readonly kind: 'bunker-auth'; readonly open: boolean }
-  | { readonly kind: 'top-up-first'; readonly confirm: boolean };
+  | { readonly kind: 'top-up-first'; readonly confirm: boolean }
+  /** ADR 0016: `done` = "I wrote them down"; `false` = "Later" (saved, not confirmed). */
+  | { readonly kind: 'recovery-show'; readonly done: boolean }
+  /** ADR 0016: the indices typed at the asked positions, in the same order. */
+  | { readonly kind: 'recovery-confirm'; readonly words: readonly number[] }
+  /**
+   * ADR 0016: a typed phrase as `RECOVERY_WORDS` indices, or none (`[]`); `mints`: https mint
+   * addresses typed there too (§5.1: the words alone do not say which mints were used), 1 to
+   * `MAX_RESTORE_MINTS`, absent when none.
+   */
+  | {
+      readonly kind: 'recovery-restore';
+      readonly words: readonly number[];
+      readonly mints?: readonly MintUrl[];
+    };
+
+// ---- the recovery phrase (Stage 3, ADR 0016) ----------------------------------------------
+
+/** Words in a recovery phrase (NUT-13: 12 BIP-39 English words, 128 bits). */
+export const RECOVERY_WORDS = 12;
+/** The BIP-39 English list: a word crosses every hop as its index, 0 … `BIP39_LIST_SIZE - 1`. */
+export const BIP39_LIST_SIZE = 2048;
+/** Words the confirmation step asks for. */
+export const RECOVERY_CONFIRM_WORDS = 3;
+/** Mints one reissue confirm may list (at most the wallet's keyset bound, ADR 0016 §5). */
+export const MAX_REISSUE_PLANS = 32;
+/** Mint addresses the restore window takes (ADR 0016 §5.1), besides the wallet's own mints. */
+export const MAX_RESTORE_MINTS = 8;
+
+/**
+ * `desktop.wallet.recovery.status`:
+ *   `covered`        this device's phrase is here, and the user confirmed writing it down;
+ *   `not-confirmed`  the phrase is here, the backup was not confirmed;
+ *   `not-on-device`  no phrase here: new ecash from this device is not covered;
+ *   `unreadable`     a phrase file is here but did not open (signer offline, damaged file) —
+ *                    it is kept, and new ecash is not covered until it opens;
+ *   `unavailable`    no unlocked signer with a wallet, or this build has no phrase support.
+ */
+export type RecoveryState =
+  'covered' | 'not-confirmed' | 'not-on-device' | 'unreadable' | 'unavailable';
+export const RECOVERY_STATES = [
+  'covered',
+  'not-confirmed',
+  'not-on-device',
+  'unreadable',
+  'unavailable',
+] as const satisfies readonly RecoveryState[];
+
+export interface RecoveryStatusWire {
+  readonly state: RecoveryState;
+  /** The balance held before the phrase is not all under it yet (ADR 0016 D5). */
+  readonly reissuePending: boolean;
+  /** The encrypted copy reached at least one of the user's relays (ADR 0016 D2). */
+  readonly relayCopy: boolean;
+}
+
+/** `desktop.wallet.recovery.setup`'s result. Amounts only, never a word. */
+export interface RecoverySetupWire {
+  readonly status: RecoveryStatusWire;
+  readonly reissuedSats: Sats;
+  readonly feeSats: Sats;
+  /** Mints whose reissue did not run or failed (the balance there stays uncovered). */
+  readonly reissueFailed: number;
+}
+
+export type RestoreOutcomeWire = walletTypes.RestoreOutcome;
+export const RESTORE_OUTCOMES = [
+  'restored',
+  'nothing',
+  'unsupported',
+  'unreachable',
+  'refused',
+] as const satisfies readonly RestoreOutcomeWire[];
+
+/** `desktop.wallet.recovery.restore`'s result: one row per mint, over every phrase scanned. */
+export interface RecoveryRestoreWire {
+  /** Phrases scanned: this device's, the relay copies the identity decrypts, the typed one. */
+  readonly phrases: number;
+  readonly reports: readonly {
+    readonly mint: MintUrl;
+    readonly outcome: RestoreOutcomeWire;
+    readonly restoredSats: Sats;
+  }[];
+}
+
+/** Topic `recovery.progress`: where a restore is (numbers and the user's own mint URL). */
+export interface RecoveryProgressWire {
+  /** 1-based index of the phrase being scanned, of `phrases`. */
+  readonly phrase: number;
+  readonly phrases: number;
+  readonly mint: MintUrl;
+  readonly keysetsDone: number;
+  readonly keysets: number;
+}
+
+/** One mint's reissue as main's native confirm shows it (core's `ReissuePlan`). */
+export interface ReissuePlanWire {
+  readonly mint: MintUrl;
+  readonly amount: Sats;
+  readonly inputs: number;
+  readonly feeSats: Sats;
+}
+
+/**
+ * A question the HOST asks main to put in a native dialog (ADR 0016) — data only: main builds
+ * every word (`host-confirm.ts`), Cancel is the default.
+ *   `recovery-reissue`  move the balance at these mints under the recovery phrase, for this fee;
+ *   `recovery-reveal`   show the phrase again (the re-authentication of a signer without a local
+ *                       passphrase: NIP-46);
+ *   `recovery-rotate`   replace the phrase with a new one (the same re-authentication, worded for
+ *                       what it does: independent review IR8).
+ */
+export type ConfirmForm =
+  | { readonly kind: 'recovery-reissue'; readonly plans: readonly ReissuePlanWire[] }
+  | { readonly kind: 'recovery-reveal' }
+  | { readonly kind: 'recovery-rotate' };
 
 /** What main's keychain holds, one sealed file each. */
 export type KeychainSlot = 'passphrase' | 'nip46';
@@ -455,6 +594,15 @@ export interface MethodTable {
   'desktop.signer.lock': [args: [], result: undefined];
   /** Main confirms first: forgets the signer and everything the keychain holds for it. */
   'desktop.signer.signOut': [args: [], result: undefined];
+  /**
+   * Stage 3 (ADR 0016): the recovery phrase. The renderer names an ACTION only; every word is
+   * shown and typed in main's prompt window, the reissue fee confirmed in a native dialog.
+   * Progress of a restore arrives on `recovery.progress`.
+   */
+  'desktop.wallet.recovery.status': [args: [], result: RecoveryStatusWire];
+  'desktop.wallet.recovery.setup': [args: [], result: RecoverySetupWire];
+  'desktop.wallet.recovery.show': [args: [], result: undefined];
+  'desktop.wallet.recovery.restore': [args: [], result: RecoveryRestoreWire];
 }
 export type Method = keyof MethodTable;
 export type ArgsOf<M extends Method> = MethodTable[M][0];
@@ -484,6 +632,7 @@ export type TopicMethod = keyof typeof TOPIC_METHODS;
 /** Shell-only listeners on the bridge (not adapter members) → their topic (ADR 0013). */
 export const SHELL_TOPIC_METHODS = {
   'desktop.signer.onStatus': 'signer.status',
+  'desktop.wallet.recovery.onProgress': 'recovery.progress',
 } as const satisfies Record<string, Topic['t']>;
 
 /** Methods that exist only on the wire (PlaySession methods and shell extras). */
@@ -499,7 +648,9 @@ export type Topic =
   | { readonly t: 'session.spend'; readonly sid: SessionId }
   | { readonly t: 'upload.progress'; readonly uploadId: UploadId }
   /** Shell-only (ADR 0013): the signer connected, locked, unlocked or signed out. */
-  | { readonly t: 'signer.status' };
+  | { readonly t: 'signer.status' }
+  /** Shell-only (ADR 0016): a restore's progress. */
+  | { readonly t: 'recovery.progress' };
 export type TopicName = Topic['t'];
 export const TOPIC_NAMES = [
   'seeder.status',
@@ -509,6 +660,7 @@ export const TOPIC_NAMES = [
   'session.spend',
   'upload.progress',
   'signer.status',
+  'recovery.progress',
 ] as const satisfies readonly TopicName[];
 
 /** `EventMsg.payload` per topic. */
@@ -520,6 +672,7 @@ export interface TopicPayload {
   'session.spend': { readonly total: Sats; readonly ratePerMin: Sats };
   'upload.progress': UploadProgressWire;
   'signer.status': SignerStatus;
+  'recovery.progress': RecoveryProgressWire;
 }
 
 // ---- errors -----------------------------------------------------------------------------
@@ -632,7 +785,9 @@ export type HostIn =
       readonly req: number;
       readonly ok: boolean;
       readonly value: Uint8Array | null;
-    };
+    }
+  /** ADR 0016: the user's answer to `confirm` `req` (`ok` only for the confirm button). */
+  | { readonly kind: 'confirm-result'; readonly req: number; readonly ok: boolean };
 
 /** Host → main. */
 export type HostOut =
@@ -665,7 +820,9 @@ export type HostOut =
       readonly op: 'get' | 'put' | 'forget';
       readonly slot: KeychainSlot;
       readonly value?: Uint8Array;
-    };
+    }
+  /** ADR 0016: ask the user in main's native dialog (data only); answered by `confirm-result`. */
+  | { readonly kind: 'confirm'; readonly req: number; readonly form: ConfirmForm };
 
 // ---- guard type -------------------------------------------------------------------------
 
@@ -773,6 +930,14 @@ interface Checks {
   topUpPerDay: Mutual<
     (typeof LIMITS)['maxAutoTopUpSatsPerDay'],
     typeof AUTO_TOP_UP_MAX_SATS_PER_DAY
+  >;
+  /** ADR 0016: the recovery wire shapes are exactly the seam's (`wallet/recovery-api.ts`). */
+  restoreOutcomes: Mutual<(typeof RESTORE_OUTCOMES)[number], walletTypes.RestoreOutcome>;
+  reissuePlan: Mutual<ReissuePlanWire, walletTypes.ReissuePlan>;
+  restoreReport: Mutual<RecoveryRestoreWire['reports'][number], walletTypes.RestoreReport>;
+  restoreProgress: Mutual<
+    Omit<RecoveryProgressWire, 'phrase' | 'phrases'>,
+    walletTypes.RestoreProgress
   >;
 }
 /** Arguments: identical to the contract's parameters (except `studio.upload`, SE-1). */

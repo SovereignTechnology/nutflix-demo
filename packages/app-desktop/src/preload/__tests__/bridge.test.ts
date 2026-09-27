@@ -143,6 +143,38 @@ describe('preload surface (key tree allowlist)', () => {
     expect(Object.keys(b)).not.toContain('ipcRenderer');
   });
 
+  it('ADR 0016: desktop.wallet.recovery.* name an action only (no arguments cross), progress is a topic', async () => {
+    const { b, calls, subs } = bridge({
+      'desktop.wallet.recovery.status': {
+        state: 'covered',
+        reissuePending: false,
+        relayCopy: true,
+      },
+    });
+    const r = b.desktop.wallet.recovery;
+    expect(await r.status()).toEqual({ state: 'covered', reissuePending: false, relayCopy: true });
+    // Whatever a compromised page passes, nothing but the method name goes on the wire.
+    const loose = r as unknown as Record<string, (...a: unknown[]) => Promise<unknown>>;
+    await loose['setup']?.(
+      'abandon ability able about above absent absorb abstract absurd abuse access accident',
+    );
+    await loose['show']?.({ words: [1, 2, 3] });
+    await loose['restore']?.([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
+    expect(calls).toEqual([
+      { method: 'desktop.wallet.recovery.status', args: [] },
+      { method: 'desktop.wallet.recovery.setup', args: [] },
+      { method: 'desktop.wallet.recovery.show', args: [] },
+      { method: 'desktop.wallet.recovery.restore', args: [] },
+    ]);
+    const seen: unknown[] = [];
+    const off = r.onProgress((p) => seen.push(p));
+    expect(subs.map((x) => x.topic)).toEqual([{ t: 'recovery.progress' }]);
+    subs[0]?.cb({ phrase: 1, phrases: 1, mint: 'https://m.example', keysetsDone: 0, keysets: 1 });
+    expect(seen).toHaveLength(1);
+    off();
+    expect(subs[0]?.unsubscribed).toBe(true);
+  });
+
   it('every leaf is a function except platform', () => {
     const { b } = bridge();
     expect(b.platform).toBe('desktop');

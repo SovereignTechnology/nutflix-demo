@@ -111,5 +111,10 @@ export function handlers(a: DesktopNetworkAdapter): HandlerTable {
     'desktop.signer.unlock': () => a.signerFlow().unlock(),
     'desktop.signer.lock': () => a.signerFlow().lock(),
     'desktop.signer.signOut': () => a.signerFlow().signOut(),
+    // ADR 0016: an action only; every word is shown and typed in main's prompt window.
+    'desktop.wallet.recovery.status': () => a.recoveryStatus(),
+    'desktop.wallet.recovery.setup': () => a.recovery().setup(),
+    'desktop.wallet.recovery.show': () => a.recovery().show(),
+    'desktop.wallet.recovery.restore': () => a.recovery().restore(),
   };
 }

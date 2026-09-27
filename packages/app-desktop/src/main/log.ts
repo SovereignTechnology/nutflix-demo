@@ -43,6 +43,10 @@ export type LogEvent =
   | 'prompt.bad-answer'
   | 'prompt.refused-sender'
   | 'prompt.open-failed'
+  // ADR 0016: the recovery phrase's content protection, and the host's native confirms.
+  | 'prompt.protection-failed'
+  | 'confirm.busy'
+  | 'confirm.failed'
   | 'link.refused'
   | 'link.busy'
   | 'link.throttled'

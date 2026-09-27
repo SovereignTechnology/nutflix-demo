@@ -14,7 +14,7 @@
  * the worker: it is unpacked beside the archive (`workerEntryFor`, packaging/stage.ts).
  */
 import { execFileSync } from 'node:child_process';
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { realpathSync } from 'node:fs';
 import * as fsp from 'node:fs/promises';
 import { lstat, readFile, realpath } from 'node:fs/promises';
@@ -40,9 +40,11 @@ import { appArchive } from '../ipc/asar-path.js';
 import { isPromptForm } from '../ipc/guards.js';
 import type { HostIn, HostOut, PromptAnswer } from '../ipc/protocol.js';
 import { CHANNEL } from '../ipc/protocol.js';
+import { phraseChecksumOk } from '../ipc/recovery-checksum.js';
 import { PROMPT_FILES, createAppProtocolHandler } from './app-protocol.js';
 import { HOST_ENTRY, devFlagIn, hostArgs, parseMainArgs, workerEntryFor } from './args.js';
 import { FileTokenRegistry } from './file-tokens.js';
+import { HostConfirms } from './host-confirm.js';
 import { HostLink } from './host-link.js';
 import { IpcGate } from './ipc-gate.js';
 import { createLogger } from './log.js';
@@ -176,8 +178,15 @@ const prompts = new PromptService({
       onClosed: (cb) => {
         win.once('closed', cb);
       },
+      // ADR 0016: while a recovery phrase is on screen (macOS/Windows; a no-op on Linux).
+      setContentProtection: (on) => {
+        if (!win.isDestroyed()) win.setContentProtection(on);
+      },
     };
   },
+  // ADR 0016: a typed recovery phrase's checksum, re-checked here from its indices.
+  checksumOk: (words) =>
+    phraseChecksumOk(words, (data) => new Uint8Array(createHash('sha256').update(data).digest())),
   openExternal: (url) => {
     void shell.openExternal(url).catch(() => {
       log('warn', 'prompt.open-failed');
@@ -228,6 +237,10 @@ function summarizeAnswer(a: PromptAnswer | null): { kind: string; bytes: number 
   if (a.kind === 'remove-key') return { kind: `remove-key:${String(a.confirm)}`, bytes: 0 };
   if (a.kind === 'bunker-auth') return { kind: `bunker-auth:${String(a.open)}`, bytes: 0 };
   if (a.kind === 'top-up-first') return { kind: `top-up-first:${String(a.confirm)}`, bytes: 0 };
+  // ADR 0016: how many words came back, never which.
+  if (a.kind === 'recovery-show') return { kind: `recovery-show:${String(a.done)}`, bytes: 0 };
+  if (a.kind === 'recovery-confirm' || a.kind === 'recovery-restore')
+    return { kind: a.kind, bytes: a.words.length };
   return { kind: `local-setup:${a.method}:${a.flow}`, bytes: 0 };
 }
 
@@ -263,7 +276,22 @@ function promptSender(e: Electron.IpcMainInvokeEvent): PromptSender {
  */
 async function askUser(wcId: number, p: ConfirmPrompt): Promise<boolean> {
   const wc = allWebContents.fromId(wcId);
-  const win = wc === undefined ? null : BrowserWindow.fromWebContents(wc);
+  return showConfirm(wc === undefined ? null : BrowserWindow.fromWebContents(wc), p);
+}
+
+/** ADR 0016: the host's native questions, modal to the app window (`host-confirm.ts`). */
+const hostConfirms = new HostConfirms({
+  ask: (p) =>
+    showConfirm(mainWindow !== undefined && !mainWindow.isDestroyed() ? mainWindow : null, p),
+  answer: (req, ok) => {
+    post({ kind: 'confirm-result', req, ok });
+  },
+  log: (level, event) => {
+    log(level, event);
+  },
+});
+
+async function showConfirm(win: BrowserWindow | null, p: ConfirmPrompt): Promise<boolean> {
   const box: MessageBoxOptions = {
     type: 'question',
     buttons: ['Cancel', p.confirmLabel],
@@ -321,6 +349,9 @@ function onHostOut(out: HostOut): void {
       return;
     case 'keychain':
       void onKeychain(out);
+      return;
+    case 'confirm':
+      hostConfirms.ask(out.req, out.form);
       return;
     case 'reply':
     case 'sub-reply':
@@ -437,6 +468,7 @@ function start(): void {
       links.clear();
       images.failAll();
       prompts.cancelAll();
+      hostConfirms.hostGone();
     },
     onRestart: () => {
       // Only app windows: a prompt window belongs to the host that is gone (closed on down).
