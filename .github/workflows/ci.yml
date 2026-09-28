@@ -1,6 +1,6 @@
-# CI for the public nutflix-demo repo (GitHub Actions — Cameron, 2026-09-27: the one sanctioned
-# exception to "tests run only in Kata on a CI host"; nothing runs tests on a dev machine).
-# Mirrors the gates in ci/gitlab-ci.yml, which stays for a future GitLab runner.
+# CI for the public nutflix-demo repo (GitHub Actions). Tests and CI never run on a developer
+# machine; this is where they run. Mirrors the gates in ci/gitlab-ci.yml, which stays for a
+# GitLab runner.
 #
 # Supply-chain policy (threat T12): actions pinned by commit SHA; `npm ci --ignore-scripts`
 # (lockfile-only, exact pins, no lifecycle scripts); lockfile drift and non-registry
