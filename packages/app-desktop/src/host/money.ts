@@ -615,11 +615,10 @@ export class MoneyPlane {
 
   /**
    * W8a: how many journal entries are at `mint` — operations whose outcome the mint has not
-   * decided yet. The recovery service's reissue rule reads it (fix round 9): a balance worth
-   * moving is not moved while there is one; a mint with nothing worth moving and an entry blocks
-   * the backup while the entry is young (`youngPendingAt`) and the mint answers, and counts done
-   * but watched once every entry is overdue; a replaced phrase's relay copy stays while one is at a
-   * mint the new phrase did not record.
+   * decided yet. The recovery service's reissue rule reads it (fix round 9): nothing moves at that
+   * mint while there is one; the reissue stays pending while one is young (`youngPendingAt`) and
+   * the mint answers, and the mint counts done but watched once every one is overdue; a replaced
+   * phrase's relay copy stays while one is at a mint the new phrase did not record.
    */
   async pendingAt(mint: MintUrl): Promise<number> {
     this.open();
