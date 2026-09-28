@@ -33,11 +33,10 @@
  *            `RESTORE_ROUNDS` calls per phrase and mint per restore; one still unfinished keeps its
  *            cursor in this process, so the next restore goes on from there.
  *
- * Lane W8a also: nothing moves at a mint while an operation is journaled there, and such a mint
- * keeps the reissue pending until it settles; a mint with nothing worth moving (dust, or nothing
- * spendable) and an operation journaled there keeps it pending while the operation is young and
- * the mint answers, and counts done once every entry there is overdue or the mint cannot be asked —
- * as does any balance at a mint that cannot be asked — but WATCHED: remembered in the envelope
+ * Lane W8a also: nothing moves at a mint while an operation is journaled there, and such a mint —
+ * whatever is spendable there, dust or nothing included — keeps the reissue pending while the
+ * operation is young and the mint answers; once every entry there is overdue, it counts done — as
+ * does any balance at a mint that cannot be asked — but WATCHED: remembered in the envelope
  * (`watchedMints`), and the backup reopens once such a mint shows a spendable balance worth moving;
  * a replaced phrase's relay copy is retired only once nothing at all is left outside the new phrase
  * (the rule: `reissueAll`, `watchCheck`, `outsideLeft`; fix rounds 8 and 9); the relay copy is
@@ -697,19 +696,20 @@ export class RecoveryService {
    *     the backup (and the next rotation) pending for good (F56, round 9). A balance there still
    *     counts in `reissueFailed` (it is not covered). A plan the PAY/melt gate refused (a PAY
    *     there still building) is not that: it keeps the reissue pending, as before;
-   *   - a balance worth moving while an operation is journaled there, after the plan settled what
-   *     it could: NOT moved, and the reissue stays pending (`blocked`) until the entry settles —
-   *     a send or melt whose answer is unknown holds inputs the plan leaves out, and a pending
-   *     operation's change derives from the phrase it was made under. Moved now, the mint could
-   *     not be recorded, and every "Finish backup" would move it — and charge its fee — again: core
-   *     plans every proof held there, the seeded ones included (F55);
-   *   - nothing worth moving (nothing spendable, or dust: the mint's fee eats the whole balance),
-   *     after the plan: with no entry there, done — never asked, never recorded (F56); with an
-   *     entry, what it holds (a PENDING melt's inputs, a lost send's inputs or change) may come
-   *     back HERE, under the phrase it was made under (round 9: F56 counted it done, and nothing
-   *     ever moved what came back). A young entry keeps the reissue pending (`blocked`), as before
-   *     F56 — it settles within `PENDING_SETTLE_AFTER_S`, or the mint reports it still pending;
-   *     once every entry there is overdue, done but WATCHED;
+   *   - an operation journaled there, after the plan settled what it could: NOTHING moves there
+   *     (F55) — a send or melt whose answer is unknown holds inputs the plan leaves out, and a
+   *     pending operation's change derives from the phrase it was made under; moved now, the mint
+   *     could not be recorded, and every "Finish backup" would move it — and charge its fee —
+   *     again (core plans every proof held there, the seeded ones included). And what the entry
+   *     holds (a PENDING melt's inputs, a lost send's inputs or change) may come back HERE, under
+   *     the phrase it was made under, however little is spendable there now (round 9: F56 counted
+   *     dust and empty mints done, and nothing ever moved what came back). A YOUNG entry (under
+   *     `PENDING_SETTLE_AFTER_S`: it settles within that, or the mint reports it pending) keeps the
+   *     reissue pending (`blocked`); once every entry there is overdue — a melt the mint still
+   *     reports PENDING, a mint the settle cannot ask — done but WATCHED, and a balance worth
+   *     moving there still counts in `reissueFailed`;
+   *   - nothing journaled, nothing worth moving (nothing spendable, or dust: the mint's fee eats
+   *     the whole balance): done — never asked, never recorded (F56);
    *   - otherwise planned, asked, moved and recorded.
    * A watched mint keeps "Replace phrase" available and is remembered in the envelope
    * (`watchedMints`): the backup reopens once it shows a spendable balance worth moving
@@ -748,8 +748,11 @@ export class RecoveryService {
     let covered = 0;
     let blocked = 0;
     let dust = 0;
-    /** Watched mints holding a spendable balance (counted in `reissueFailed`, not in `complete`). */
-    let unreached = 0;
+    /**
+     * Watched mints whose balance stays where it is (a mint that cannot be asked, one worth moving
+     * with overdue entries): counted in `reissueFailed` — not covered — but not in `complete`.
+     */
+    let uncovered = 0;
     const watch: MintUrl[] = [];
     /**
      * The journal entries at `mint`, and how many of them are young (fix round 9). A read that
@@ -787,39 +790,37 @@ export class RecoveryService {
         // stays pending, as before — the next "Finish backup" asks it again.
         this.log.warn('no reissue plan at a mint', { reason: reasonOf(e) });
         if (e instanceof GateRefusal || !watched(mint)) failed++;
-        else if (amount > 0) unreached++;
+        else if (amount > 0) uncovered++;
         continue;
       }
       if (p.mint !== mint) continue;
-      // What is journaled here once the plan settled what it could.
+      // Worth moving: the fee below the amount. Otherwise nothing spendable, or dust whose fee
+      // would eat it all (never asked).
+      const worth = p.amount > 0 && p.feeSats < p.amount;
+      if (!worth && p.amount > 0) dust++;
+      // An operation still journaled here once the plan settled what it could: nothing moves until
+      // it settles (F55), and what it holds may come back here under the phrase it was made under
+      // (round 9). A young one keeps the reissue pending; every one overdue, done but watched — a
+      // balance worth moving there still counts as not covered.
       const j = await journal(mint);
-      if (p.amount > 0 && p.feeSats < p.amount) {
-        // An operation still journaled here: nothing moves until it settles (F55) — then the mint
-        // moves once, and is recorded.
-        if (j.entries > 0) {
-          blocked++;
-          continue;
-        }
-        // Each plan must be one main's dialog can show (an https mint, bounded inputs): one
-        // that is not — an http dev mint, say — is left out and counted, and never sinks the
-        // question for every other mint (independent review IR1).
-        const wire = { mint: p.mint, amount: p.amount, inputs: p.inputs, feeSats: p.feeSats };
-        if (isReissuePlanWire(wire)) plans.push(p);
-        else {
-          failed++;
-          this.log.warn(
-            'a reissue plan main’s dialog cannot show (not an https mint, or too many inputs): that balance stays uncovered',
-          );
-        }
+      if (j.entries > 0) {
+        if (j.young > 0 || !watched(mint)) blocked++;
+        else if (worth) uncovered++;
         continue;
       }
-      // Nothing worth moving: nothing spendable, or dust whose fee would eat it all (never asked).
-      if (p.amount > 0) dust++;
-      // With no entry here: done for the backup (F56).
-      if (j.entries === 0) continue;
-      // With one, what it holds may come back here (round 9): a young one keeps the reissue
-      // pending; every one overdue, done but watched.
-      if (j.young > 0 || !watched(mint)) blocked++;
+      // Nothing journaled: dust or nothing is done for the backup (F56)...
+      if (!worth) continue;
+      // ...and a balance worth moving is asked. Each plan must be one main's dialog can show (an
+      // https mint, bounded inputs): one that is not — an http dev mint, say — is left out and
+      // counted, and never sinks the question for every other mint (independent review IR1).
+      const wire = { mint: p.mint, amount: p.amount, inputs: p.inputs, feeSats: p.feeSats };
+      if (isReissuePlanWire(wire)) plans.push(p);
+      else {
+        failed++;
+        this.log.warn(
+          'a reissue plan main’s dialog cannot show (not an https mint, or too many inputs): that balance stays uncovered',
+        );
+      }
     }
     // No more than the envelope has room to record: a mint moved but not recorded would be
     // planned, and charged, again. What is left out is counted (asked on a later retry).
@@ -844,7 +845,7 @@ export class RecoveryService {
       return {
         sats: 0,
         fee: 0,
-        failed: failed + blocked + unreached,
+        failed: failed + blocked + uncovered,
         complete: failed === 0 && blocked === 0,
         watch,
       };
@@ -865,7 +866,7 @@ export class RecoveryService {
       return {
         sats: 0,
         fee: 0,
-        failed: failed + blocked + unreached + asked.length,
+        failed: failed + blocked + uncovered + asked.length,
         complete: false,
         watch,
       };
@@ -907,7 +908,7 @@ export class RecoveryService {
     return {
       sats,
       fee,
-      failed: failed + blocked + unreached,
+      failed: failed + blocked + uncovered,
       complete: failed === 0 && blocked === 0,
       watch,
     };

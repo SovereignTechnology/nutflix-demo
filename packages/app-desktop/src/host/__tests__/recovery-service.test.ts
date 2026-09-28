@@ -1804,6 +1804,61 @@ describe('fix round 9: watched mints, the reopen, the bounded wait', () => {
     expectNoPhrase(w, [rotated, pressed, finished]);
   });
 
+  it('an overdue entry at a mint with a balance worth moving: nothing moves there (F55), but it no longer keeps the backup pending for as long as the operation lasts — done but watched, counted as not covered; once the entry settled the backup reopens and "Finish backup" moves the mint once', async () => {
+    const w = await world();
+    w.core.phrases.queue.push(ENTROPY_1, ENTROPY_2);
+    userWhoWritesItDown(w);
+    w.confirm = () => true;
+    hold(w, MINT_A, 100);
+    w.core.wallet.plans.set(MINT_A, { inputs: 3, feeSats: 1 });
+    mirrorReissue(w);
+    await w.svc.setup(); // ENTROPY_1: 100 → 99 under it
+    const path = recoveryPath(w.dir, w.pubkey);
+    const first = await readEnvelope(path);
+    // A melt whose HTLC is stuck — journaled at mint A for hours (overdue) — when the user rotates.
+    w.pending.set(MINT_A, 1);
+    w.overdue.set(MINT_A, 1);
+    const rotated = await w.svc.setup(); // → ENTROPY_2
+    expect(rotated).toMatchObject({
+      status: { reissuePending: false },
+      reissuedSats: 0,
+      feeSats: 0,
+      reissueFailed: 1,
+    });
+    expect(w.core.wallet.reissued).toHaveLength(1); // ENTROPY_1's only: nothing moved while journaled
+    expect(w.confirms.filter((f) => f.kind === 'recovery-reissue')).toHaveLength(1);
+    expect(await readEnvelope(path)).toMatchObject({
+      reissued: true,
+      reissuedMints: [],
+      watchedMints: [MINT_A],
+      replaces: first?.device,
+    });
+    expect(blanks(w)).toBe(0); // ENTROPY_1's copy stays: the 99 sats are still its
+    // The melt failed and its 50 sats of inputs came back: the next retry reopens the backup...
+    w.pending.clear();
+    w.overdue.clear();
+    hold(w, MINT_A, 149);
+    expect(w.timers.armed).toHaveLength(1);
+    await w.timers.fire();
+    expect(await readEnvelope(path)).toMatchObject({ reissued: false, reissuedMints: [] });
+    // ...and "Finish backup" moves the mint once, under ENTROPY_2; ENTROPY_1's copy goes then.
+    const finished = await w.svc.setup();
+    expect(finished).toMatchObject({
+      status: { reissuePending: false },
+      reissuedSats: 148,
+      feeSats: 1,
+      reissueFailed: 0,
+    });
+    expect(w.core.wallet.reissued.map((p) => p.amount)).toEqual([100, 149]);
+    expect(await readEnvelope(path)).toMatchObject({
+      reissued: true,
+      reissuedMints: [MINT_A],
+      replaces: null,
+    });
+    expect(blanks(w)).toBe(1);
+    expectNoPhrase(w, [rotated, finished]);
+  });
+
   it('low: a balance at a mint that cannot be asked no longer keeps the backup pending for good — done but watched (still counted as not covered), each retry capped at WATCH_RETRY_MAX_MS; the backup reopens when the mint answers with it, and "Finish backup" moves only that mint', async () => {
     const w = await world();
     userWhoWritesItDown(w);
