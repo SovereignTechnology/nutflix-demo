@@ -159,9 +159,10 @@ reviewed by a four-lens panel (money plane, worker/P2P, packaging, test integrit
 | F51 | Medium | An `OWED` on a second link of the same seeder paid blocks still pending on the first: paid twice | **Fixed** (round 8) |
 | F52 | Medium | An owed range whose PAY failed transiently for 30 s was dropped from the durable record while the seeder kept counting it | **Fixed** (round 8) |
 | F53 | Medium | After a worker restart, an image read naming our own stored paid upload marked it free, and the node served the whole video free | **Fixed** (round 8): persisted core policies are consulted |
-| F54 | Medium | Saved core policies make the worker's HELLO price ceiling permanent: desktop viewers refuse seeders whose HELLO price is above the manifest's | **Open** (found by round 8's check) |
-| F55 | Medium | A mint blocked by a journal entry during a reissue is swapped but not recorded, so each later "Finish backup" charges its fee again | **Open** (found by round 8's check) |
-| F56 | Medium | Dust (or an entry at a zero-balance mint) keeps the reissue pending forever, which also hides "Replace phrase" | **Open** (found by round 8's check) |
+| F54 | Medium | Saved core policies make the worker's HELLO price ceiling permanent: desktop viewers refuse seeders whose HELLO price is above the manifest's | **Fixed, tests pending CI** (`stage-3/r8-p2p`): the ceiling follows the cores open in this run; the viewer pays the core's `PRICE` (per-core price segments; never a 0-sat PAY) |
+| F55 | Medium | A mint blocked by a journal entry during a reissue is swapped but not recorded, so each later "Finish backup" charges its fee again | **Fixed, tests pending CI** (`stage-3/r8-money`) |
+| F56 | Medium | Dust (or an entry at a zero-balance mint) keeps the reissue pending forever, which also hides "Replace phrase" | **Fixed, tests pending CI** (`stage-3/r8-money`, round 9): a young journal entry at a reachable mint keeps the reissue pending (the first fix counted it done, which would have left returning funds under a leaked phrase); an overdue or unreachable mint is done but watched, and the backup reopens when a balance worth moving appears |
+| F57 | High | Corestore 7's `replicate()` attaches any stored core a peer names by discovery key, outside `BlobStore`, so the seeder's upload gate never runs: after a restart a stored paid core could be fetched free and uncounted by any connected peer | **Fixed, tests pending CI** (`stage-3/r8-p2p`, confirmed by reading corestore/hypercore/protomux): a gated corestore refuses remote-initiated opens. Residual [Low]: a core opened locally with `store.get()` outside `BlobStore` would still be served ungated |
 
 ## 1. Summary
 
@@ -618,13 +619,13 @@ finding's section above plus its row in §0. **Filing waits for Cameron's go-ahe
 
 | Issue title |
 |---|
-| [Done] F33: one seeder per block, credit per seeder window (`stage-3/f33-one-peer`, ADR 0018); restart debts via pay/1 `OWED` (F45). Open [Medium]: F54 |
+| [Done] F33: one seeder per block, credit per seeder window (`stage-3/f33-one-peer`, ADR 0018); restart debts via pay/1 `OWED` (F45); F54 and F57 fixed, tests pending CI |
 | [Done] F5: DLEQ off the event loop (Node, and the desktop's Bare worker since `stage-3/residuals`) and batching on per-seeder credit (ADR 0011 §10–§11, ADR 0018) |
 | [Done] Seeder: an append-only pending-PAY journal and a cap that stops serving at `maxPendingPays` (daemon + gateway, ADR 0011 §12; the desktop worker too, cap 1024, `stage-3/worker-journal`) |
 | [Done] F37: the gateway's upstream fetches are paced (ADR 0011 §11) |
 | [Done] F10/F11/F12/F31 hooks in the desktop runtime — the worker's seeder engine persists seen secrets and pending PAYs and asks the host for `checkSpent` / `spentByUs` (ADR 0012) |
 | [Done] F31: a lost mint answer is restored (write-ahead journal + NUT-09, ADR 0014); the desktop journal is sealed and durable, melt change journaled (`stage-3/residuals`) |
-| [Done] NUT-13 seed backup (ADR 0016): a phrase per device, sealed + relay copy, reissue once, `@scure/bip39` in the locked `seed.ts`; restore follows core's resume; end to end on Nutshell and cdk (`stage-3/nut13-core`, `stage-3/nut13-desktop`, integration). Open [Medium]: F55, F56 |
+| [Done] NUT-13 seed backup (ADR 0016): a phrase per device, sealed + relay copy, reissue once, `@scure/bip39` in the locked `seed.ts`; restore follows core's resume; end to end on Nutshell and cdk (`stage-3/nut13-core`, `stage-3/nut13-desktop`, integration); F55/F56 fixed, tests pending CI |
 | [Done] Pear only (Cameron, 2026-09-24/25): Studio's third-party Blossom mirroring removed, our manifests name no Blossom server (contracts v6); the gateway's Blossom endpoints stay as a Nostr-signed HTTP face over its Pear seeder; per-pubkey quota default 2 GiB (`stage-3/pear-only`) |
 | [Done] F18: images hash-addressed only by default; thumbnails and avatars in the creator's profile core over Pear (ADR 0015); image reads ask only seeders that said `PRICE { free: true }` (F43) |
 | [Done] F15: per-pubkey upload quota (`blossom.maxBytesPerPubkey`) |
