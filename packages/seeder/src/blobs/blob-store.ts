@@ -16,21 +16,87 @@
  * first stayed open and replicating with no gate — served, uncounted, unannounced. Now a caller
  * joins the open in flight (by name, or by key), and an open that finds the core registered under
  * the other form meanwhile closes its own session and returns the registered one.
+ *
+ * Lane W8b-p2p, round 9 (F57): only a core this store has OPEN replicates to a remote that asks
+ * for it — see `GatedCorestore`.
  */
 import type { CoreKeyHex, HyperblobId, Sha256Hex } from '@sovit/core';
 import Corestore from 'corestore';
 import Hyperblobs from 'hyperblobs';
 import type { BlobReadStream, BlobWriteStream } from 'hyperblobs';
 import type Hypercore from 'hypercore';
+import type { ProtocolMuxer, ReplicationStream, ReplicationStreamOptions } from 'hypercore';
 
 import type { SeederCrypto } from '../adapters/crypto.js';
 import type { SeederFs } from '../adapters/fs.js';
 import type { Logger } from '../log/logger.js';
 import type { CasEntry, CasIndex } from '../store/cas-index.js';
 import type { DiskCap } from '../store/disk-cap.js';
-import { toHex } from '../util/hex.js';
+import { bytesEqual, toHex } from '../util/hex.js';
 
 export const DEFAULT_CORE_NAME = 'blobs' as const;
+
+/** The Protomux protocol Hypercore replicates on (hypercore 11.35.3 `lib/replicator.js`). */
+const HYPERCORE_PROTOCOL = 'hypercore/alpha';
+
+/**
+ * Lane W8b-p2p, round 9 (F57): the Corestore every seeder replicates — the desktop worker's
+ * `PeerNode`, the daemon's swarm and the gateway (WS bridge and swarm) all call `replicate` on it.
+ *
+ * Corestore 7.12.2's `replicate` pairs a catch-all `hypercore/alpha` handler on the connection's
+ * Protomux (`ondiscoverykey` → `_attachMaybe`): when a remote opens a channel for a discovery key
+ * no local core is attached for, it opens ANY core in storage under that key
+ * (`storage.hasCore`, `_openCore`) and attaches that core's replicator to the connection. Such a
+ * core has no Hypercore session, so no `upload` listener: `BlobStore.onCoreOpened` never ran, the
+ * seeder's upload gate never sees its blocks, no `PRICE` precedes them and nothing is counted —
+ * and Hypercore serves them anyway (`Peer.isActive()` checks only paused / removed / frozen, and a
+ * core with a peer attached is never idle). After a restart every sold core in storage was served
+ * that way, free, to any connected peer that knew its key.
+ *
+ * Here that catch-all is replaced on every stream, right after Corestore installs it (`pair` under
+ * the same key replaces the handler, protomux 3.11.0): a remote may open only a core this store
+ * has open through `BlobStore` — its session carries the gate — and gets it through Hypercore's
+ * public `replicate(muxer)`. Anything else is refused: the handler attaches nothing and Protomux
+ * rejects the channel. Opening that core later (a play, an upload) attaches it to every live
+ * stream through Corestore's own `ondownloading` path, gated.
+ *
+ * A core that is already open reached through the old path was never the problem: it is the same
+ * Hypercore `Core` object, and `upload` / `peer-add` are emitted to every session of it that
+ * listens (`core.monitors`) — the gate's session among them.
+ */
+class GatedCorestore extends Corestore {
+  constructor(
+    storage: string,
+    private readonly servedCore: (discoveryKey: Uint8Array) => Hypercore | null,
+  ) {
+    super(storage);
+  }
+
+  override replicate(
+    isInitiator: boolean | ReplicationStream,
+    opts?: ReplicationStreamOptions,
+  ): ReplicationStream {
+    const stream = super.replicate(isInitiator, opts);
+    const mux: unknown = stream.noiseStream.userData;
+    if (!isProtocolMuxer(mux)) {
+      // Fail closed: without the connection's muxer the catch-all cannot be replaced.
+      stream.destroy(new Error('replication stream without a protocol muxer'));
+      return stream;
+    }
+    mux.pair({ protocol: HYPERCORE_PROTOCOL }, (discoveryKey) => {
+      if (!(discoveryKey instanceof Uint8Array) || discoveryKey.byteLength !== 32) return;
+      const core = this.servedCore(discoveryKey);
+      if (core !== null) core.replicate(mux);
+    });
+    return stream;
+  }
+}
+
+function isProtocolMuxer(m: unknown): m is ProtocolMuxer {
+  if (typeof m !== 'object' || m === null) return false;
+  const x = m as { isProtomux?: unknown; pair?: unknown };
+  return x.isProtomux === true && typeof x.pair === 'function';
+}
 
 export interface SeedCore {
   readonly name: string;
@@ -83,6 +149,7 @@ export interface BlobStoreOptions {
 }
 
 export class BlobStore {
+  /** Gated (F57): a remote is served only the cores this store has open — `GatedCorestore`. */
   readonly store: Corestore;
   private readonly cores = new Map<string, SeedCore>();
   private readonly byKey = new Map<string, SeedCore>();
@@ -92,8 +159,22 @@ export class BlobStore {
   private closed = false;
 
   constructor(private readonly opts: BlobStoreOptions) {
-    this.store = new Corestore(opts.storageDir);
+    this.store = new GatedCorestore(opts.storageDir, (discoveryKey) =>
+      this.servedCore(discoveryKey),
+    );
     this.log = opts.logger.child({ component: 'blobs' });
+  }
+
+  /**
+   * F57: the session of the core a remote names by `discoveryKey`, when this store has it open
+   * (`openCore` / `openCoreByKey`, which hand it to `onCoreOpened` — the seeder's upload gate — in
+   * the same tick they register it), else `null`: that core is not served.
+   */
+  private servedCore(discoveryKey: Uint8Array): Hypercore | null {
+    if (this.closed) return null;
+    for (const sc of this.byKey.values())
+      if (!sc.core.closed && bytesEqual(sc.core.discoveryKey, discoveryKey)) return sc.core;
+    return null;
   }
 
   get blockSize(): number {

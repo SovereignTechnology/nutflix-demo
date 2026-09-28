@@ -166,6 +166,8 @@ export class PeerNode {
     conn.on('error', () => undefined);
     const session = seeder.sessions.admit(conn, info);
     if (session === null) return;
+    // Gated (round 9, F57): the peer is served only the cores the seeder has open — each behind
+    // its upload gate — never another core in storage it names by discovery key.
     seeder.blobs.store.replicate(conn);
     const pay = this.o.pay;
     if (pay === null || this.swarm === null) return;

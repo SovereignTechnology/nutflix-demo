@@ -89,8 +89,9 @@ export interface ServedPrices {
 
 /**
  * HELLO's ceiling (ADR 0012 §4): the highest per-block price among the cores this node serves
- * NOW — the cores open in this run (the seeder gates and prices exactly those), each at its own
- * policy. 0 before the seeder exists, or with nothing priced open.
+ * NOW — the cores open in this run (the seeder gates and prices exactly those; since round 9, F57,
+ * its store refuses a remote any other core in storage), each at its own policy. 0 before the
+ * seeder exists, or with nothing priced open.
  *
  * F54 (the round-8 verifier): it was the highest price in `corePolicyMap()`, which since lane
  * W8b-p2p also holds the policies of earlier runs (`core-policies.json`, up to 16 384 cores — kept
