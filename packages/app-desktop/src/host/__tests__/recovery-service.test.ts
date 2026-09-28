@@ -1468,6 +1468,53 @@ describe('fix round 8: F55, F56, the relay retry and the flows', () => {
     expectNoPhrase(w, [rotated, ...presses, done]);
   });
 
+  it('F55: a moved mint is recorded at once — an entry begun during the move, on the seeded wallet, does not leave it unrecorded, to be moved and charged again', async () => {
+    const w = await world();
+    userWhoWritesItDown(w);
+    w.confirm = () => true;
+    w.balances.set(MINT_A, 100);
+    w.core.wallet.balances.set(MINT_A, 100);
+    w.core.wallet.plans.set(MINT_A, { inputs: 3, feeSats: 1 });
+    // A receive at mint A is journaled while the reissue runs (after the plan was taken clean):
+    // its outputs derive from the phrase the wallet is seeded with — this one.
+    const reissue = w.core.wallet.reissue.bind(w.core.wallet);
+    w.core.wallet.reissue = async (p) => {
+      const moved = await reissue(p);
+      w.pending.set(p.mint, 1);
+      return moved;
+    };
+    const r = await w.svc.setup();
+    expect(r).toMatchObject({
+      status: { reissuePending: false },
+      reissuedSats: 99,
+      feeSats: 1,
+      reissueFailed: 0,
+    });
+    expect(await readEnvelope(recoveryPath(w.dir, w.pubkey))).toMatchObject({
+      reissued: true,
+      reissuedMints: [MINT_A],
+    });
+    expect(w.core.wallet.reissued.map((p) => p.mint)).toEqual([MINT_A]);
+    expectNoPhrase(w, [r]);
+  });
+
+  it('F56: dust with an operation journaled at the same mint is still done — nothing there is worth moving', async () => {
+    const w = await world();
+    userWhoWritesItDown(w);
+    w.confirm = () => true;
+    w.balances.set(MINT_A, 3);
+    w.core.wallet.balances.set(MINT_A, 3);
+    w.core.wallet.plans.set(MINT_A, { inputs: 3, feeSats: 3 });
+    w.pending.set(MINT_A, 1);
+    const r = await w.svc.setup();
+    expect(w.confirms).toEqual([]);
+    expect(r).toMatchObject({ status: { reissuePending: false }, reissueFailed: 0 });
+    expect(await readEnvelope(recoveryPath(w.dir, w.pubkey))).toMatchObject({
+      reissued: true,
+      reissuedMints: [],
+    });
+  });
+
   it('F56: dust counts as done — the backup is finished and "Replace phrase" rotates — but the replaced relay copy stays until the dust is spent', async () => {
     const w = await world();
     w.core.phrases.queue.push(ENTROPY_1, ENTROPY_2);
