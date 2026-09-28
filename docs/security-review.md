@@ -51,7 +51,7 @@ directories" for this list. Each fix carries a test that fails without it, excep
 | F26 | **Partly fixed** | Natural batching (F30) cuts dust PAYs; explicit batching open (F5) |
 | F27 | **Fixed** (real-mint lane) | Hit by the network-drop test: a new session binding a pubkey now cuts any older live session of it (no ban) — one pay/1 channel per pubkey, so the per-pubkey carry is unambiguous |
 | F28, F29, F32 | Info | Recorded, no change |
-| F33 | **Fixed** (`stage-3/f33-one-peer`, ADR 0018) | One seeder per block (`OnePeerRouter`: hypercore's hotswap racing replaced by single-peer failover, 4 s), credit per seeder window (`SeederCredit`): 48 of 48 delivered and paid (was 49–51), real mint 24 of 24. Cross-lane fixes: per-core PAY isolation (F46), tails paid at close and quit, a rendition switch no longer writes off the old tail (F47). In progress: debts across a restart or crash (the seeder's `OWED` report and the viewer paying what it can prove, F45) |
+| F33 | **Fixed** (`stage-3/f33-one-peer`, ADR 0018) | One seeder per block (`OnePeerRouter`: hypercore's hotswap racing replaced by single-peer failover, 4 s), credit per seeder window (`SeederCredit`): 48 of 48 delivered and paid (was 49–51), real mint 24 of 24. Cross-lane fixes: per-core PAY isolation (F46), tails paid at close and quit, a rendition switch no longer writes off the old tail (F47). Debts across a restart or crash: the seeder's `OWED` report and the viewer paying what it can prove (F45) |
 | F34 | **Fixed (new)** | See §0a |
 | F35 | **Fixed (new)** | See §0a |
 | F36 | **Fixed (new)** — seeder daemon and gateway | See §0b |
@@ -148,11 +148,20 @@ reviewed by a four-lens panel (money plane, worker/P2P, packaging, test integrit
 | F40 | High | cashu-ts's default fetch transport retries NUT-19 cached endpoints; a 429 answering the retry of a swap that had executed was taken as a refusal, the journal entry dropped and the proofs lost (reproduced on cdk-mintd) | **Fixed** (`stage-3/residuals` rounds 2–3): single-attempt transports everywhere (desktop `node:http`, core default over `fetch`), a 429 is ambiguous (held, then NUT-09/NUT-07), melts get 300 s |
 | F41 | High | A PAY queued behind a 300 s melt at its mint was built after the worker's `pay.build` deadline; its P2PK proofs were never delivered | **Fixed** (`stage-3/int-pay-melt-gate`, ADR 0012 amendment): a per-mint PAY/melt gate and a per-PAY start-by bound that counts journal settles |
 | F42 | High | An auto top-up whose funding melt ended unclear dropped the target quote; the melt later paid, the quote was never minted and a second top-up ran (Lightning paid twice) | **Fixed** (integration round 4): the quote is kept and sealed before the melt, minted exactly once, and blocks new top-ups into that target |
-| F43 | High | A thumbnail/avatar URL naming a paid video core made `image.fetch` download it unrouted and unpaid, so its honest seeders banned the viewer | **Fixed** (round 4: sold/attached cores refused, reads capped under each window); final form `PRICE.free` (Cameron, 2026-09-26) in progress |
+| F43 | High | A thumbnail/avatar URL naming a paid video core made `image.fetch` download it unrouted and unpaid, so its honest seeders banned the viewer | **Fixed**: sold/attached cores refused (round 4), and since `stage-3/owed-viewer` image reads ask a peer only after its `PRICE { free: true }` for the core (Cameron, 2026-09-26) — no probe, nothing counted; a stored paid core is never marked free after a restart (round 8) |
 | F44 | Medium | Packaged builds never found the DLEQ thread entry and checked PAYs inline on the worker's loop, silently | **Fixed** (`stage-3/int-dleq-packaging`): resolved from the worker root, staged and gated |
-| F45 | High | Blocks unpaid at a close, quit or crash stay counted by the seeder; the next run overruns it and is banned | Close and quit now pay the tail (round 4); crash and restart: pay/1 `OWED` + `ACK.outstanding`, the viewer pays what it can prove (Cameron, 2026-09-26) — in progress |
+| F45 | High | Blocks unpaid at a close, quit or crash stay counted by the seeder; the next run overruns it and is banned | **Fixed**: close and quit pay the tail (round 4); pay/1 `OWED` at session start and `ACK.outstanding` (`stage-3/owed-seeder`); the viewer starts credit from the report and pays only blocks its durable record proves it received, under a persisted host authorisation (`stage-3/owed-viewer`); never twice across links, never dropped on a transient failure (round 8) |
 | F46 | High | One core's failing PAY aborted paying every other core of that seeder | **Fixed** (round 4): per-core isolation, time-bounded retries, explicit unpaid settlement |
 | F47 | High | A rendition switch built the old tail's PAYs under the new session; the host refused them and they were written off, zeroing that seeder's credit | **Fixed** (round 5): sessions resolved by core and block range; a closing session drains only its own range |
+| F48 | High | Wiring NUT-13's core into the desktop: the desktop counters file refused the phrase binding core writes, so every seeded operation (reissue, top-up mint, a PAY's change) failed before reaching the mint | **Fixed** (`stage-3/int-fix-2`, round 8 for the probed-keyset case); NUT-13 end to end on Nutshell and cdk |
+| F49 | Medium | A phrase restore held the mint's lock outside the PAY/melt gate (the F41 class) | **Fixed** (round 8): restores, reissues and settles go through the gate |
+| F50 | Medium | macOS draws `<datalist>` suggestions in an OS popup outside the prompt window's content protection: typed recovery words could reach a screen capture | **Fixed** (round 8): in-page suggestions only |
+| F51 | Medium | An `OWED` on a second link of the same seeder paid blocks still pending on the first: paid twice | **Fixed** (round 8) |
+| F52 | Medium | An owed range whose PAY failed transiently for 30 s was dropped from the durable record while the seeder kept counting it | **Fixed** (round 8) |
+| F53 | Medium | After a worker restart, an image read naming our own stored paid upload marked it free, and the node served the whole video free | **Fixed** (round 8): persisted core policies are consulted |
+| F54 | Medium | Saved core policies make the worker's HELLO price ceiling permanent: desktop viewers refuse seeders whose HELLO price is above the manifest's | **Open** (found by round 8's check) |
+| F55 | Medium | A mint blocked by a journal entry during a reissue is swapped but not recorded, so each later "Finish backup" charges its fee again | **Open** (found by round 8's check) |
+| F56 | Medium | Dust (or an entry at a zero-balance mint) keeps the reissue pending forever, which also hides "Replace phrase" | **Open** (found by round 8's check) |
 
 ## 1. Summary
 
@@ -609,15 +618,15 @@ finding's section above plus its row in §0. **Filing waits for Cameron's go-ahe
 
 | Issue title |
 |---|
-| [Done] F33: one seeder per block, credit per seeder window (`stage-3/f33-one-peer`, ADR 0018); in progress: restart debts via pay/1 `OWED` (F45) |
+| [Done] F33: one seeder per block, credit per seeder window (`stage-3/f33-one-peer`, ADR 0018); restart debts via pay/1 `OWED` (F45). Open [Medium]: F54 |
 | [Done] F5: DLEQ off the event loop (Node, and the desktop's Bare worker since `stage-3/residuals`) and batching on per-seeder credit (ADR 0011 §10–§11, ADR 0018) |
 | [Done] Seeder: an append-only pending-PAY journal and a cap that stops serving at `maxPendingPays` (daemon + gateway, ADR 0011 §12; the desktop worker too, cap 1024, `stage-3/worker-journal`) |
 | [Done] F37: the gateway's upstream fetches are paced (ADR 0011 §11) |
 | [Done] F10/F11/F12/F31 hooks in the desktop runtime — the worker's seeder engine persists seen secrets and pending PAYs and asks the host for `checkSpent` / `spentByUs` (ADR 0012) |
 | [Done] F31: a lost mint answer is restored (write-ahead journal + NUT-09, ADR 0014); the desktop journal is sealed and durable, melt change journaled (`stage-3/residuals`) |
-| [In progress] NUT-13 seed backup (ADR 0016 accepted 2026-09-25: a phrase per device, sealed + relay copy, reissue once, `@scure/bip39`); lanes `stage-3/nut13-core`, `stage-3/nut13-desktop` |
+| [Done] NUT-13 seed backup (ADR 0016): a phrase per device, sealed + relay copy, reissue once, `@scure/bip39` in the locked `seed.ts`; restore follows core's resume; end to end on Nutshell and cdk (`stage-3/nut13-core`, `stage-3/nut13-desktop`, integration). Open [Medium]: F55, F56 |
 | [Done] Pear only (Cameron, 2026-09-24/25): Studio's third-party Blossom mirroring removed, our manifests name no Blossom server (contracts v6); the gateway's Blossom endpoints stay as a Nostr-signed HTTP face over its Pear seeder; per-pubkey quota default 2 GiB (`stage-3/pear-only`) |
-| [Done] F18: images hash-addressed only by default; thumbnails and avatars in the creator's profile core over Pear (ADR 0015); a thumbnail naming a paid core can no longer get the viewer banned (F43); in progress: `PRICE.free` so image reads ask only seeders that said free |
+| [Done] F18: images hash-addressed only by default; thumbnails and avatars in the creator's profile core over Pear (ADR 0015); image reads ask only seeders that said `PRICE { free: true }` (F43) |
 | [Done] F15: per-pubkey upload quota (`blossom.maxBytesPerPubkey`) |
 | [Done] F17: NUT-20 locked mint quotes; opaque quote handles over IPC. Residual [Low]: a signer-held wallet key (the seeder daemon) takes unlocked quotes — cashu-ts signs NUT-20 itself and needs the key as a string |
 | [Done] F4: auto top-ups execute — off by default, ≤ 10 000 sat per top-up, ≤ 50 000 per rolling 24 h (fees included), own mints only, first-time confirm in main's prompt window, every top-up in wallet history (`stage-3/auto-topup`) |
