@@ -615,11 +615,29 @@ export class MoneyPlane {
 
   /**
    * W8a: how many journal entries are at `mint` — operations whose outcome the mint has not
-   * decided yet (a reissue at that mint is complete only once there are none).
+   * decided yet. The recovery service's reissue rule reads it (fix round 9): nothing moves at that
+   * mint while there is one; the reissue stays pending while one is young (`youngPendingAt`) and
+   * the mint answers, and the mint counts done but watched once every one is overdue; a replaced
+   * phrase's relay copy stays while one is at a mint the new phrase did not record.
    */
   async pendingAt(mint: MintUrl): Promise<number> {
     this.open();
     return (await this.store.pending(mint)).length;
+  }
+
+  /**
+   * Fix round 9: how many of `mint`'s journal entries are still YOUNG — made less than
+   * `PENDING_SETTLE_AFTER_S` ago, so their request may still be in flight and what they hold may
+   * come back at any moment. An older one is overdue: a melt the mint still reports PENDING, or a
+   * mint that could not be asked (core's `settleSchedule` counts the same). Store reads only; the
+   * entries' `created` is the wallet's clock, which is this plane's `now`.
+   */
+  async youngPendingAt(mint: MintUrl): Promise<number> {
+    this.open();
+    const now = this.now();
+    return (await this.store.pending(mint)).filter(
+      (op) => now - op.created < walletMod.PENDING_SETTLE_AFTER_S,
+    ).length;
   }
 
   /**

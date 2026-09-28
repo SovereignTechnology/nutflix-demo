@@ -181,6 +181,50 @@ describe('the sealed phrase envelope', () => {
     expect(await readEnvelope(p)).toEqual(full);
   });
 
+  // Fix round 9: the mints a finished backup still watches (a mint counted done while an overdue
+  // entry there, or a mint that could not be asked, may give a balance back) — optional, present
+  // only while one is watched. Written, NOT run here (no test runner on this machine: CI runs it).
+  it('watchedMints: optional; distinct https mints, at most MAX_REISSUED_MINTS; an empty list reads as absent; the largest record with both lists fits the file', async () => {
+    const A = 'https://mint-a.files.test' as MintUrl;
+    const B = 'https://mint-b.files.test' as MintUrl;
+    expect(parseEnvelope({ ...ENV, watchedMints: [A, B] })).toEqual({
+      ...ENV,
+      watchedMints: [A, B],
+    });
+    const empty = parseEnvelope({ ...ENV, watchedMints: [] });
+    expect(empty).toEqual(ENV);
+    expect(Object.keys(empty ?? {})).not.toContain('watchedMints');
+    for (const bad of [
+      null,
+      'https://mint-a.files.test',
+      [A, A],
+      ['http://127.0.0.1:3399'],
+      ['https://mint-a.files.test/'],
+      [7],
+      Array.from({ length: MAX_REISSUED_MINTS + 1 }, (_, i) => `https://m${String(i)}.files.test`),
+    ])
+      expect(parseEnvelope({ ...ENV, watchedMints: bad }), JSON.stringify(bad)).toBeNull();
+    // No build wrote `watchedMints` without `reissuedMints`: that shape is refused.
+    const legacy = Object.fromEntries(Object.entries(ENV).filter(([k]) => k !== 'reissuedMints'));
+    expect(parseEnvelope({ ...legacy, watchedMints: [A] })).toBeNull();
+    // Both lists full of the longest mint URLs (512), beside the largest seal: written, read back.
+    const longest = (tag: string): MintUrl[] =>
+      Array.from({ length: MAX_REISSUED_MINTS }, (_, i) => {
+        const head = `https://${tag}${String(i).padStart(2, '0')}.files.test/`;
+        return `${head}${'p'.repeat(512 - head.length)}` as MintUrl;
+      });
+    const full: RecoveryEnvelope = {
+      ...ENV,
+      sealed: `A${'g'.repeat(4094)}==`,
+      reissuedMints: longest('r'),
+      watchedMints: longest('w'),
+    };
+    const d = await dir();
+    const p = recoveryPath(d, PK);
+    await writeEnvelope(d, p, full);
+    expect(await readEnvelope(p)).toEqual(full);
+  });
+
   it('parseEnvelope accepts exactly the shape', () => {
     expect(parseEnvelope(ENV)).toEqual(ENV);
     expect(parseEnvelope({ ...ENV, replaces: 'ef'.repeat(16) })).toMatchObject({

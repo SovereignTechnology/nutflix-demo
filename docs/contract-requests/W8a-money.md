@@ -35,14 +35,51 @@ retrying) or, simpler, the text for `false`: "The encrypted copy has not reached
 Nutflix keeps trying. Until then only your written words can bring this phrase back." And a
 status refresh when the section regains focus, so a landed retry shows.
 
-## 3. Dust keeps the backup "pending"
+## 3. What the backup leaves outside the phrase (revised in fix round 8)
 
-**Need.** A reissue now completes only when no journal entry and no dust (proofs the mint's input
-fee would eat) is left outside the phrase at a mint — so the replaced phrase's relay copy is
-retired only then (the round-8 finding's decision). A wallet with a few sats of dust keeps
-`reissuePending: true`, and "Finish backup" then moves nothing (no fee dialog: nothing sensible to
-move) until normal spending uses the dust.
+**Need.** Fix round 8 (F56) changed the rule this item first described. Dust (proofs the mint's
+input fee would eat whole) and a mint with nothing spendable — whatever is journaled there — now
+count as done for the backup: `reissuePending` turns `false` and "Replace phrase" is offered, so
+dust can no longer block a rotation for good. They keep a replaced phrase's relay copy instead
+(retired once no mint left out of the backup holds a balance or a journal entry). A mint with a
+balance worth moving and an operation in flight is not moved until the operation settles, and
+keeps `reissuePending: true` ("Finish backup" moves it then). The screen cannot say either:
+`reissueFailed` no longer counts dust, and nothing tells the user that a few sats stay outside the
+phrase, or that "Finish backup" is waiting for a payment to settle.
 
-**Proposal.** A `reissueBlocked` count (or reason: `in-flight` / `dust`) in `RecoverySetupWire`, so
-the screen can say "a few sats stay outside the phrase until they are spent" instead of offering
-"Finish backup" again.
+**Proposal.** In `RecoverySetupWire`, a `reissueWaiting` count (mints whose balance waits for an
+operation in flight: "a payment is still in flight at 1 mint: finish the backup once it settles")
+and a `dustLeft` count ("a few sats at 1 mint cost more in fees than they are worth: they stay
+outside the phrase"). The host has both counts already (`reissueAll`'s `blocked` and `dust`).
+
+**Revised in fix round 9.** A mint with an operation journaled there now keeps `reissuePending:
+true` only while the operation is young (under 10 min) and the mint answers, whatever is spendable
+there. Once every entry is overdue, the mint counts done but watched. So does a mint that cannot
+be asked, whatever it holds. The host reopens the backup (`reissuePending` turns `true` again) once
+a watched mint shows a balance worth moving. Two things the screen does not handle yet:
+
+- `reissueFailed` can be above 0 while `reissuePending` is `false`: a watched mint's balance is not
+  covered. The success line then says "finish the backup later", while the button reads "Replace
+  phrase". Proposal: a `reissueWatched` count, worded "the balance at 1 mint could not be moved yet
+  (the mint did not answer, or a payment is still settling): Nutflix offers "Finish backup" again
+  once it can be".
+- The status can flip back to `reissuePending: true` with no action from the user. A status refresh
+  when the section regains focus (item 2) covers that.
+
+## 4. Two different `rate-limited` refusals read as one (fix round 8, info item)
+
+**Need.** The screen's `flowError` renders every `rate-limited` as "Too many windows were closed in
+a row. Try again in a minute." The host sends that code for two things: the throttle (dismissed
+windows) and a second action while a recovery window is already open ("a recovery phrase window is
+already open"). Fix round 8 took the relay copy retry off that lock (a Settings action now waits
+for a retry instead of being refused), so only a real second window triggers it now — but the
+screen still names the wrong cause.
+
+**Proposal.** Show the host's own sentence for `rate-limited` (the part after the code, as for
+every other code), or tell the two apart by it: "A recovery window is already open: finish or
+close it first."
+
+**Fix round 9.** A flow waits for a running relay copy retry for at most 22.2 s. Past that it is
+refused with `remote-signer` (a NIP-46 signer that has not answered) or `relay-down`, with the
+host's sentence. The screen already shows that sentence for both codes, so nothing is needed there
+beyond the item above.
