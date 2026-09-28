@@ -33,11 +33,14 @@
  *            `RESTORE_ROUNDS` calls per phrase and mint per restore; one still unfinished keeps its
  *            cursor in this process, so the next restore goes on from there.
  *
- * Lane W8a also: a reissue is complete only when no journal entry and no dust is left under the
- * old phrase (or random) at a mint; the relay copy is retried, with a bounded backoff, until a
- * relay took it (`relayCopy` in the envelope is the persisted "pending" flag, and the status reads
- * it), and so is a replaced phrase's retirement; the play sessions are closed through the worker
- * before a reopen, so their tails carry what the worker reported unpaid.
+ * Lane W8a also: nothing moves at a mint while an operation is journaled there, and such a mint
+ * keeps the reissue pending until it settles; dust and a mint with nothing spendable never keep it
+ * pending, but a replaced phrase's relay copy is retired only once nothing at all is left outside
+ * the new phrase (the rule: `reissueAll`, `outsideLeft`; fix round 8, F55 and F56); the relay copy
+ * is retried, with a bounded backoff, until a relay took it (`relayCopy` in the envelope is the
+ * persisted "pending" flag, and the status reads it), and so is a replaced phrase's retirement —
+ * outside the flows' lock, which a flow waits for instead of being refused; the play sessions are
+ * closed through the worker before a reopen, so their tails carry what the worker reported unpaid.
  *
  * Secrets: the entropy exists as bytes (zeroed after use), inside the NIP-44 plaintext (a JS
  * string, which cannot be wiped: ADR 0016 §2 residual) and as word indices in the prompt form
@@ -267,6 +270,11 @@ export class RecoveryService {
   private readonly timers: RecoveryTimers;
   /** Lane W8a: the relay copy retry, if one is scheduled or running. */
   private retry: { pubkey: NostrPubkey; attempt: number; timer: unknown } | undefined;
+  /**
+   * Fix round 8 (info item): the relay copy retry running now, if one is. It never takes the flows'
+   * lock (`busy`): a flow started meanwhile waits for it (`exclusive`) instead of being refused.
+   */
+  private relayRun: Promise<unknown> | undefined;
   private stopped = false;
 
   constructor(o: RecoveryServiceOptions) {
@@ -431,7 +439,7 @@ export class RecoveryService {
     // A phrase whose reissue did not finish: finish it (nothing is revealed or replaced).
     if (old !== null && !old.reissued) return await this.finishReissue(pubkey, old);
     // A replaced phrase's relay copy whose retirement did not land yet: try again first (best
-    // effort, idempotent; the funds it could restore were already moved).
+    // effort, idempotent; only once nothing is left outside the current phrase — `outsideLeft`).
     if (old !== null && old.replaces !== null) old = await this.retireReplaced(pubkey, old);
     // Rotation replaces a working phrase: the user proves it is them first.
     if (old !== null) await this.reauth(signer, pubkey, 'rotate');
@@ -464,9 +472,10 @@ export class RecoveryService {
         // Every mint's balance is still to be moved under THIS phrase (a rotation included).
         reissuedMints: [],
         relayCopy: false,
-        // A replaced phrase's relay copy is retired once the reissue under this one completed.
-        // (`old` is a finished phrase here; should ITS replaced copy still be pending — the retry
-        // above did not land either — that older retirement is not retried again: a residual.)
+        // A replaced phrase's relay copy is retired once the reissue under this one completed and
+        // nothing is left outside it. (`old` is a finished phrase here; should ITS replaced copy
+        // still be pending — the retry above did not land, or dust or an entry still keeps it
+        // (F56) — that older copy is not tracked any more and stays on the relays: a residual.)
         replaces: old === null ? null : old.device,
         sealed,
       };
@@ -561,17 +570,25 @@ export class RecoveryService {
       await writeEnvelope(this.o.dir, recoveryPath(this.o.dir, pubkey), cur);
     });
     if (r.complete) {
-      // The replaced phrase restores nothing held any more: its relay copy goes (best effort,
-      // idempotent — a crash before the write below only repeats it), then ONE write records
-      // both. A retirement that did not land keeps `replaces`, so the next setup tries again
+      // Once the replaced phrase restores nothing held any more — nothing is left outside this
+      // one (F56: dust, or an entry at a mint with nothing spendable, finish the backup but keep
+      // the copy) — its relay copy goes (best effort, idempotent: a crash before the write below
+      // only repeats it), then ONE write records both. A copy kept, or a retirement that did not
+      // land, keeps `replaces`, so the next setup — and the relay copy retry — tries again
       // (independent review IR7).
-      const retired = cur.replaces === null || (await this.retireCopy(pubkey, cur.replaces));
+      const kept = cur.replaces !== null && (await this.outsideLeft(pubkey, cur));
+      if (kept)
+        this.log.info(
+          'the replaced phrase’s relay copy is kept: dust or an operation in flight is still outside the new phrase',
+        );
+      const retired =
+        cur.replaces === null || (!kept && (await this.retireCopy(pubkey, cur.replaces)));
       await writeEnvelope(this.o.dir, recoveryPath(this.o.dir, pubkey), {
         ...cur,
         reissued: true,
         replaces: retired ? null : cur.replaces,
       });
-      // W8a: a retirement that did not land is retried with the relay copy's backoff.
+      // W8a: a copy kept or not retired is retried with the relay copy's backoff.
       if (!retired) this.scheduleRelayRetry(pubkey, true);
     }
     return {
@@ -592,12 +609,38 @@ export class RecoveryService {
     return retired;
   }
 
+  /**
+   * Whether anything may still be outside `env`'s phrase (fix round 8, F56): a mint it did not
+   * record that holds a spendable balance (dust, or inputs an operation gave back) or a journal
+   * entry. A mint it recorded was clean when it moved (F55), so what is journaled there since was
+   * begun under this phrase. Store reads only, no mint asked; no plane of this identity, or a read
+   * that fails, counts as something left.
+   */
+  private async outsideLeft(pubkey: NostrPubkey, env: RecoveryEnvelope): Promise<boolean> {
+    const plane = this.o.plane();
+    if (plane?.pubkey !== pubkey) return true;
+    try {
+      for (const [mint, amount] of await plane.wallet.balances()) {
+        if (env.reissuedMints.includes(mint)) continue;
+        if (amount > 0 || (await plane.pendingAt(mint)) > 0) return true;
+      }
+      return false;
+    } catch {
+      return true;
+    }
+  }
+
   /** A finished phrase whose replaced copy is still to be retired: retry, record the outcome. */
   private async retireReplaced(
     pubkey: NostrPubkey,
     env: RecoveryEnvelope,
   ): Promise<RecoveryEnvelope> {
-    if (env.replaces === null || !(await this.retireCopy(pubkey, env.replaces))) return env;
+    if (
+      env.replaces === null ||
+      (await this.outsideLeft(pubkey, env)) ||
+      !(await this.retireCopy(pubkey, env.replaces))
+    )
+      return env;
     const done: RecoveryEnvelope = { ...env, replaces: null };
     await writeEnvelope(this.o.dir, recoveryPath(this.o.dir, pubkey), done);
     this.log.info('the replaced phrase’s relay copy was retired on a retry');
@@ -608,11 +651,21 @@ export class RecoveryService {
    * Plan and (after the native dialog) reissue every mint's balance not in `done` — the mints
    * already reissued under this phrase — calling `record` after each mint that moved.
    *
-   * Lane W8a: a mint counts as moved — recorded, and the reissue complete — only when nothing is
-   * left there outside this phrase: no journal entry (a send or melt whose answer is unknown holds
-   * inputs the plan left out, and a pending operation's change derives from the phrase it was made
-   * under) and no dust the fee would eat. Such a mint is counted in `blocked` and planned again by
-   * the next "Finish backup", so the replaced phrase's relay copy stays until then.
+   * The rule (lane W8a, fix round 8: F55, F56), for each mint of the wallet:
+   *   - recorded under this phrase: done, never planned again (fix round 7);
+   *   - nothing spendable: done, whatever is journaled there — nothing there can move, and an
+   *     entry at a dead mint never settles, so it must not keep the backup (and the next rotation)
+   *     pending for good (F56);
+   *   - dust, the mint's fee eating the whole balance: done — never asked, never recorded (F56);
+   *   - a balance worth moving while an operation is journaled there, after the plan settled what
+   *     it could: NOT moved, and the reissue stays pending (`blocked`) until the entry settles —
+   *     a send or melt whose answer is unknown holds inputs the plan leaves out, and a pending
+   *     operation's change derives from the phrase it was made under. Moved now, the mint could
+   *     not be recorded, and every "Finish backup" would move it — and charge its fee — again: core
+   *     plans every proof held there, the seeded ones included (F55);
+   *   - otherwise planned, asked, moved and recorded.
+   * What the backup leaves out — dust, an entry at a mint with nothing spendable, inputs such an
+   * entry gives back later — keeps a replaced phrase's relay copy instead (`outsideLeft`).
    */
   private async reissueAll(
     pubkey: NostrPubkey,
@@ -643,6 +696,7 @@ export class RecoveryService {
     }
     let covered = 0;
     let blocked = 0;
+    let dust = 0;
     /** Nothing journaled at `mint` (a read that fails counts as something). */
     const clean = async (mint: MintUrl): Promise<boolean> => {
       try {
@@ -653,23 +707,26 @@ export class RecoveryService {
     };
     for (const [mint, amount] of balances) {
       // Already under this phrase: its balance is seeded outputs now (fix round 7); it was
-      // recorded only once nothing else was left there (W8a).
+      // recorded as it moved, clean (F55).
       if (done.includes(mint)) {
         if (amount > 0) covered++;
         continue;
       }
-      if (amount <= 0) {
-        // Nothing spendable — but an operation still journaled there may bring proofs back that
-        // are not under this phrase (W8a).
-        if (!(await clean(mint))) blocked++;
-        continue;
-      }
+      // Nothing spendable: nothing to move, whatever is journaled there (F56; an entry there keeps
+      // a replaced relay copy, `outsideLeft`).
+      if (amount <= 0) continue;
       try {
         const p = await seeded.reissuePlan(mint);
         if (p.mint !== mint || p.amount <= 0) continue;
-        // Dust whose fee would eat it all stays as it is (nothing sensible to move) — and stays
-        // outside the phrase, so the reissue is not complete (W8a).
+        // Dust whose fee would eat it all stays as it is (nothing sensible to move): done for the
+        // backup, never asked; it keeps a replaced relay copy (F56).
         if (p.feeSats >= p.amount) {
+          dust++;
+          continue;
+        }
+        // An operation still journaled here once the plan settled what it could: nothing moves
+        // until it settles (F55) — then the mint moves once, and is recorded.
+        if (!(await clean(mint))) {
           blocked++;
           continue;
         }
@@ -696,9 +753,13 @@ export class RecoveryService {
     failed += plans.length - asked.length;
     if (blocked > 0)
       this.log.info(
-        'reissue not complete at some mints: an operation in flight or dust (Finish backup moves it later)',
+        'reissue not complete at some mints: an operation in flight there (Finish backup moves it once it settles)',
         { mints: blocked },
       );
+    if (dust > 0)
+      this.log.info('dust the mint fee would eat is left outside the recovery phrase', {
+        mints: dust,
+      });
     if (asked.length === 0)
       return { sats: 0, fee: 0, failed: failed + blocked, complete: failed === 0 && blocked === 0 };
     const ok = await this.confirm({
@@ -732,15 +793,12 @@ export class RecoveryService {
       }
       sats += moved.reissued;
       fee += moved.feeSats;
-      // W8a: an operation still journaled at this mint (its inputs held out of the plan, or its
-      // change made under another phrase): what was spendable moved, but the mint is planned
-      // again by the next "Finish backup" — not recorded, and the reissue not complete.
-      if (!(await clean(p.mint))) {
-        blocked++;
-        continue;
-      }
-      // The balance is under the phrase whatever happens next; a record that did not land only
-      // lets a later retry move this mint once more.
+      // Recorded at once, with no second look at the journal (F55: a mint moved and not recorded
+      // is moved, and charged, again). The plan was taken clean, and core's reissue refuses
+      // holdings that changed since the plan: an entry there now was begun since, without the
+      // planned proofs, on the seeded wallet — under this phrase. The balance is under the phrase
+      // whatever happens next; a record that did not land only lets a later retry move this mint
+      // once more.
       await record(p.mint).catch((e: unknown) => {
         this.log.warn('a reissued mint could not be recorded: a retry may move it again', {
           reason: reasonOf(e),
@@ -1028,7 +1086,10 @@ export class RecoveryService {
 
   // ---- the relay copy retry (W8a) ---------------------------------------------------------
 
-  /** A relay copy still to publish, or a replaced one still to retire (after the reissue). */
+  /**
+   * A relay copy still to publish, or a replaced one still to retire after the reissue (including
+   * one kept while dust or an entry is outside the new phrase: F56, looked at again each retry).
+   */
   private relayWorkLeft(env: RecoveryEnvelope): boolean {
     return !env.relayCopy || (env.replaces !== null && env.reissued);
   }
@@ -1062,19 +1123,25 @@ export class RecoveryService {
       this.retry = undefined;
       return;
     }
-    // A flow is writing the envelope now: try again after the next wait.
-    if (this.busy) {
+    // A flow is writing the envelope now (or another identity's retry still runs): try again after
+    // the next wait.
+    if (this.busy || this.relayRun !== undefined) {
       this.scheduleRelayRetry(r.pubkey, true, r.attempt + 1);
       return;
     }
-    this.busy = true;
+    // Not the flows' lock (fix round 8, info item): a Settings action started during this retry
+    // waits for it (`exclusive`) — its publishes are bounded by the relay timeouts — instead of
+    // being refused as if a phrase window were open. Set before anything is awaited, so no flow
+    // starts between the check above and this line.
+    const run = this.relayRetryOnce(signer, r.pubkey);
+    this.relayRun = run;
     let left = true;
     try {
-      left = await this.relayRetryOnce(signer, r.pubkey);
+      left = await run;
     } catch (e) {
       this.log.warn('the relay copy retry failed', { reason: reasonOf(e) });
     } finally {
-      this.busy = false;
+      if (this.relayRun === run) this.relayRun = undefined;
     }
     if (this.retry !== r) return;
     this.retry = undefined;
@@ -1100,7 +1167,14 @@ export class RecoveryService {
         this.log.info('the recovery phrase copy reached a relay on a retry');
       }
     }
-    if (next.replaces !== null && next.reissued && (await this.retireCopy(pubkey, next.replaces))) {
+    // A replaced copy goes only once nothing is left outside this phrase (F56: dust spent, entries
+    // settled); until then it stays, and is looked at again after the next wait.
+    if (
+      next.replaces !== null &&
+      next.reissued &&
+      !(await this.outsideLeft(pubkey, next)) &&
+      (await this.retireCopy(pubkey, next.replaces))
+    ) {
       next = { ...next, replaces: null };
       this.log.info('the replaced phrase’s relay copy was retired on a retry');
     }
@@ -1257,6 +1331,10 @@ export class RecoveryService {
     if (this.busy) fail('rate-limited', 'a recovery phrase window is already open');
     this.busy = true;
     try {
+      // Fix round 8 (info item): a relay copy retry writing the envelope now finishes first (a
+      // retry never takes `busy`, and never starts while it is set).
+      const running = this.relayRun;
+      if (running !== undefined) await running.catch(() => undefined);
       return await f();
     } finally {
       this.busy = false;
