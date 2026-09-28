@@ -195,10 +195,13 @@ function wordField(id: string, label: string): HTMLInputElement {
  * Enter takes the chosen word, Escape closes the list (the next Escape cancels, as everywhere
  * in this window). A click takes a word. The list closes when its field or the window loses
  * focus; `onMount` (the view's) watches the window, and its cleanup (the answer sent) empties
- * the list.
+ * the list. `close` is for a view that sets field values itself: no `input` event fires then,
+ * so the list (and its chosen word, which the next Enter would take) would outlive the text it
+ * was drawn for.
  */
 function wordSuggestions(fields: readonly HTMLInputElement[]): {
   readonly list: HTMLElement;
+  readonly close: () => void;
   readonly onMount: () => () => void;
 } {
   const list = el('ul', {
@@ -299,6 +302,7 @@ function wordSuggestions(fields: readonly HTMLInputElement[]): {
   });
   return {
     list,
+    close,
     onMount: () => {
       window.addEventListener('blur', close);
       return () => {
@@ -886,6 +890,10 @@ function recoveryRestore(): View {
         const target = fields[start + k];
         if (target !== undefined) target.value = w;
       });
+      // Round-8 verifier (low): no `input` event fires for these values, so a list left open
+      // under this field would keep its chosen word, and the next Enter would put that word
+      // over the pasted one instead of submitting.
+      suggest.close();
     });
   });
   // ADR 0016 §5.1: the words alone do not say which mints a phrase was used at.

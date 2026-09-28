@@ -255,3 +255,110 @@ answer clears the timer, so without the guard the output is the same in every re
 5. **The bridge tests' home.** They are in `src/main/__tests__/confirm-cancel.test.ts` with a
    runtime import, because of the lane allowlist. They belong in
    `src/host/__tests__/main-bridge.test.ts`.
+
+## Addendum — the round-8 verifier's low: a multi-word paste leaves the suggestion list open
+
+**Tests written, NOT run.** Cameron's rule of 2026-09-27: no test runner or CI on this machine.
+The new test runs later in CI (GitHub Actions). Until it has run there, the mutation checks
+below are reasoned against the code, and each is marked "not run".
+
+### The finding, verified by reading the code
+
+- **Finding.** `[low] prompt.ts:909` (lines 908-918 on the integration head; lines 882-898 on
+  this branch). A multi-word paste leaves the suggestion list open with its old chosen word, so
+  the next Enter puts that word over the pasted one instead of submitting.
+- **Code read.** The restore view's `paste` handler calls `preventDefault` and sets each
+  field's `value` directly. Setting `value` from script fires no `input` event, so
+  `wordSuggestions`' `input` listener (the only thing that re-renders or closes the list on a
+  change of text) never runs. `owner`, `items` and `active` keep their old values.
+- **Trace.** In word 1, type `wor` and press ↓, so `word` is chosen (`active = 0`). Then paste
+  the 12 words. The field reads `legal`, but the list still shows `word`…`worth` under it. On
+  Enter the keydown handler sees `open && active >= 0`, calls `preventDefault` and `take(0)`,
+  and word 1 becomes `word`.
+- **Consequence.** That matches the verifier's jsdom measurement (`le` / `leader` there). No
+  money is at risk: the changed phrase almost always fails the checksum in `collect`, and a
+  wrong phrase that passes restores nothing. But the typed phrase changes silently.
+- **Verdict.** Real (low).
+
+### What changed
+
+- **`src/renderer/prompt/prompt.ts`.**
+  - `wordSuggestions` now also returns its `close`. The doc comment says what it is for: a view
+    that sets field values itself.
+  - The restore view's paste handler calls `suggest.close()` after spreading the words. That
+    empties the list, hides it, resets `items`/`active`, sets `aria-expanded="false"` and
+    removes `aria-activedescendant` from the field.
+- Nothing else changed: no new IPC, storage, network, logging or import.
+- **Why close rather than re-dispatch `input`.** Dispatching `input` on the fields would redraw
+  the list under the last field for its word. Closing matches what the user just did (the
+  words are all in), and Enter then belongs to the form again.
+- **Single-word pastes.** A paste of one word (or only whitespace) still takes the default
+  path. The browser inserts it and fires `input`, which re-renders the list with nothing
+  chosen, so it needs no change.
+
+### Test (written, NOT run — pending CI)
+
+`src/renderer/__tests__/prompt-recovery-page.test.ts`, in "word suggestions": *pasting a whole
+phrase closes an open list: the next Enter is the form's, and the pasted words are what is sent*.
+
+The test:
+
+1. Types `wor` in word 1 and presses ↓ (`word` chosen; the order is already pinned by the
+   keyboard test).
+2. Pastes the 12 words into word 1 (`paste` event with a stub `clipboardData`, as in the
+   existing paste test).
+3. Asserts that:
+   - the paste was taken (`defaultPrevented`) and spread;
+   - no options are left and the listbox is hidden;
+   - word 1 has `aria-expanded="false"` and no `aria-activedescendant`;
+   - Enter is not prevented (it is left to the form);
+   - word 1 still reads `legal`;
+   - submitting sends exactly `{ kind: 'recovery-restore', words: PHRASE }`.
+
+Traced without the fix (reasoned, not run):
+
+- `options()` returns `word, work, world, worry, worth`, so the first new assertion fails.
+- Past it, Enter would be prevented and word 1 would become `word`.
+- The submit would then hit the checksum error, and `sent` would stay `[]`.
+
+The existing test *pasting a whole phrase into one field spreads it over the fields* is
+unchanged. With no list open, `close` only re-hides an already hidden empty list.
+
+### Mutation checks (reasoned against the code, NOT run)
+
+| Id | Mutation | Expected result (not run) |
+|---|---|---|
+| R1 | the paste handler does not call `suggest.close()` (the defect) | killed: `options()` is the five `wor` words; also Enter prevented, word 1 = `word`, nothing sent |
+| R2 | the paste handler only hides the list (`suggest.list.hidden = true`), keeping `items`/`active`/`owner` | killed: `options()` still finds the five `li` in the hidden list, and Enter still takes `word` |
+| R3 | `close()` called only for a paste into a later field (`start > 0`) | killed: the test pastes into word 1 (`start = 0`) |
+| R4 | `close()` called before the values are spread instead of after | equivalent, survives by design: setting `value` fires nothing either way, so the order cannot matter |
+
+### Static checks run here
+
+- `npx tsc -b` and `npx tsc -b --force`: clean (the renderer project includes the test file).
+- `npm run build`: clean.
+- `npx eslint` and `npx prettier --check` on both changed files: clean.
+- `npm run check:locked`: OK. `node scripts/electron-security-lint.mjs packages/app-desktop`:
+  OK (266 files, 0 violations).
+
+### Differential review and sharp edges
+
+- **Blast radius.**
+  - `wordSuggestions` is module-private, with two callers (`recoveryConfirm`,
+    `recoveryRestore`). Only the restore view's paste handler calls the new `close`.
+  - The confirm view spreads nothing, so it is untouched.
+- **Other places that set a word field's `value` from script:**
+  - `take()` closes the list itself;
+  - `mount`'s `clear()` on send is followed by the view's `onMount` cleanup, which closes it;
+  - the paste handler is now covered.
+- **Trusted window.** Behaviour changes only in the page's own list state. No text reaches the
+  page from outside, and no word is logged or sent anywhere new.
+- **Sharp edge.** Returning `close` makes it the caller's job to call it whenever the caller
+  writes to a field. The doc comment states that. Today the paste handler is the only such
+  caller.
+
+### Residuals
+
+- The test and the mutation table rest on reasoning until CI runs them.
+- The verifier's other findings in the same batch (F55, F56 and the relay-retry info, all in
+  `src/host/recovery/service.ts`) belong to another lane and are not touched here.

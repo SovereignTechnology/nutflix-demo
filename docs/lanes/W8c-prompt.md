@@ -103,3 +103,26 @@ See the review record's Residuals; in short:
 ## Proposed row for `docs/status.md`
 
 | Round 8 — prompt window and packaging (final panel) | `stage-3/r8-prompt` | DONE. Five findings fixed:<br>• the recovery word fields draw their own suggestions in the page (no `<datalist>`, whose popup is its own window, outside content protection on macOS);<br>• a host confirm nobody waits for is closed: `HostOut` `confirm-cancel` on the host's deadline and at shutdown, main aborts the dialog (also when the host goes away), drops the late answer and refuses nothing after;<br>• staging refuses a prompt bundle older than the installed `@scure/bip39` and its dependencies (resolved from the lockfile);<br>• the prompt bundle's npm allow-list checks the whole package chain from this package's or the repo's `node_modules`;<br>• `[hidden]` always hides in the prompt window.<br>Review `docs/reviews/2026-09-27-pre-push-r8-prompt.md` (35 mutation checks) |
+
+## Follow-up — the round-8 verifier's low (multi-word paste), tests written, NOT run
+
+- **Finding.** `[low] prompt.ts:909`: a multi-word paste into a restore field leaves the
+  suggestion list open with its old chosen word, so the next Enter puts that word over the
+  pasted one instead of submitting.
+- **Verdict.** Verified by reading the code: the paste handler sets `value` directly, so no
+  `input` event fires, and the list keeps `owner`, `items` and `active`.
+- **Fix.** `wordSuggestions` also returns `close`, and the restore view's paste handler calls
+  it after spreading the words. The change is limited to
+  `packages/app-desktop/src/renderer/prompt/prompt.ts`.
+- **Test.** `prompt-recovery-page.test.ts`, "word suggestions": *pasting a whole phrase closes
+  an open list…*. It types `wor`, presses ↓ and pastes. It then asserts the list is closed,
+  Enter is left to the form, word 1 keeps the pasted word, and submit sends exactly the pasted
+  phrase.
+- **Not run.** Under Cameron's rule of 2026-09-27 there is no test runner or CI on this
+  machine, so the test is **written but NOT run, pending CI** (GitHub Actions). The mutation
+  checks (R1–R4 in the review record's addendum) are reasoned against the code and marked
+  "not run": R1–R3 would be killed, and R4 is an equivalent mutant.
+- **Static checks run.** `npx tsc -b` (and `--force`), `npm run build`, eslint and prettier on
+  both files, `check:locked` and the Electron security lint: all clean.
+- The same verifier batch's F55, F56 and the relay-retry info (`src/host/recovery/service.ts`)
+  are another lane's, and are not touched here.

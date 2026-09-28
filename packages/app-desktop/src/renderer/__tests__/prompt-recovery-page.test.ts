@@ -529,4 +529,29 @@ describe('word suggestions: drawn in the page, never an OS popup', () => {
     expect(options()).toEqual([]);
     expect(root.textContent).not.toContain('legend');
   });
+
+  // Round-8 verifier (low): a whole phrase pasted into a field is spread by setting the values
+  // directly, so no `input` event fires. A list left open under that field kept its chosen word,
+  // and the next Enter put that word over the pasted one instead of leaving the form to submit.
+  it('pasting a whole phrase closes an open list: the next Enter is the form’s, and the pasted words are what is sent', () => {
+    const { sent } = show({ kind: 'recovery-restore' });
+    const f = words();
+    type(f[0]!, 'wor');
+    key(f[0]!, 'ArrowDown');
+    expect(selected()).toEqual(['word']);
+    const paste = new Event('paste', { bubbles: true, cancelable: true });
+    Object.defineProperty(paste, 'clipboardData', { value: { getData: () => TEXT.join(' ') } });
+    f[0]!.dispatchEvent(paste);
+    expect(paste.defaultPrevented).toBe(true);
+    expect(f.map((x) => x.value)).toEqual(TEXT);
+    expect(options()).toEqual([]);
+    expect(listbox().hidden).toBe(true);
+    expect(f[0]!.getAttribute('aria-expanded')).toBe('false');
+    expect(f[0]!.hasAttribute('aria-activedescendant')).toBe(false);
+    // Enter no longer takes a word: it is left to the form, and the pasted word stays.
+    expect(key(f[0]!, 'Enter').defaultPrevented).toBe(false);
+    expect(f[0]!.value).toBe(TEXT[0]);
+    submit();
+    expect(sent).toEqual([{ kind: 'recovery-restore', words: PHRASE }]);
+  });
 });
