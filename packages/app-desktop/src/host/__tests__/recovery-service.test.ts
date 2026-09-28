@@ -25,6 +25,7 @@ import type {
 import { MAX_REISSUE_PLANS } from '../../ipc/protocol.js';
 import { memoryLogger } from '../log.js';
 import type { MoneyPlane } from '../money.js';
+import { GateRefusal, PAY_STILL_BUILDING_HOLD } from '../pay-melt-gate.js';
 import { entropyHex } from '../recovery/core.js';
 import {
   MAX_REISSUED_MINTS,
@@ -38,8 +39,10 @@ import {
   CONFIRM_ATTEMPTS,
   RELAY_RETRY_FIRST_MS,
   RELAY_RETRY_MAX_MS,
+  RELAY_RUN_WAIT_MS,
   RESTORE_ROUNDS,
   RecoveryService,
+  WATCH_RETRY_MAX_MS,
   reasonOf,
 } from '../recovery/service.js';
 import { MainBridge } from '../signer/main-bridge.js';
@@ -72,6 +75,8 @@ interface FakePlane {
   };
   /** W8a: journal entries per mint (`World.pending`). */
   pendingAt(mint: MintUrl): Promise<number>;
+  /** Fix round 9: of those, the young ones (`World.pending` less `World.overdue`). */
+  youngPendingAt(mint: MintUrl): Promise<number>;
   close(): void;
 }
 
@@ -96,6 +101,11 @@ interface World {
   balances: Map<MintUrl, number>;
   /** W8a: journal entries the plane reports per mint (none by default). */
   pending: Map<MintUrl, number>;
+  /**
+   * Fix round 9: how many of a mint's entries are overdue (past `PENDING_SETTLE_AFTER_S`); the rest
+   * are young, as a fresh entry is (none overdue by default).
+   */
+  overdue: Map<MintUrl, number>;
   /** W8a: the relay copy retry's timers, fired by hand. */
   readonly timers: ManualTimers;
   /** W8a: `closeSessions` and reopens, in order. */
@@ -164,6 +174,7 @@ async function world(
   w.confirm = () => false;
   w.balances = new Map();
   w.pending = new Map();
+  w.overdue = new Map();
   const timers = manualTimers();
   const lifecycle: string[] = [];
   w.clock = 1_000_000;
@@ -204,6 +215,8 @@ async function world(
         mints: () => Promise.resolve([MINT_A, MINT_B]),
       },
       pendingAt: (mint) => Promise.resolve(w.pending.get(mint) ?? 0),
+      youngPendingAt: (mint) =>
+        Promise.resolve(Math.max(0, (w.pending.get(mint) ?? 0) - (w.overdue.get(mint) ?? 0))),
       close: () => {
         seed?.material.seed.wipe();
       },
@@ -1362,6 +1375,10 @@ describe('W8a: a reissue is complete only when nothing is left outside the phras
   // dead mint holding a melt never settles) kept the backup pending for good, and "Replace phrase"
   // with it. Nothing there can move: the backup is finished; what the entry may give back keeps a
   // replaced relay copy instead, until it settles.
+  // Fix round 9: this fake scripts no plan at mint A, so its `reissuePlan` throws — the mint cannot
+  // be asked, the "dead mint" of the comment above — and that is what still counts it done here
+  // (and watched: `watchedMints`, dropped by the retry below once the entry cleared). At a mint
+  // that answers, a young entry keeps the reissue pending ("F56, round 9" and "fix round 9" below).
   it('a mint whose whole balance is held (nothing spendable) does not keep the backup pending — it keeps a replaced relay copy until the entry settles', async () => {
     const w = await world();
     w.core.phrases.queue.push(ENTROPY_1, ENTROPY_2);
@@ -1498,7 +1515,15 @@ describe('fix round 8: F55, F56, the relay retry and the flows', () => {
     expectNoPhrase(w, [r]);
   });
 
-  it('F56: dust with an operation journaled at the same mint is still done — nothing there is worth moving', async () => {
+  // Fix round 9 (the static reviewer of the F55/F56 fix, [medium] service.ts:717): this was "F56:
+  // dust with an operation journaled at the same mint is still done — nothing there is worth
+  // moving", pinning `reissuePending: false` and `reissueFailed: 0` with the entry young. Its
+  // premise is false when the entry holds the balance: a PENDING melt's inputs, or a lost send's,
+  // come back to THIS mint under the phrase they were made under, and a mint counted done was never
+  // looked at again — so what came back stayed under the replaced, possibly leaked, phrase for good.
+  // A young entry at a mint that answers keeps the reissue pending again, as before F56; once every
+  // entry there is overdue the mint counts done but is watched (the reopen: "fix round 9" below).
+  it('F56, round 9: dust with a YOUNG operation journaled at the same mint keeps the reissue pending; once the entry is overdue the mint is done, but watched', async () => {
     const w = await world();
     userWhoWritesItDown(w);
     w.confirm = () => true;
@@ -1508,11 +1533,21 @@ describe('fix round 8: F55, F56, the relay retry and the flows', () => {
     w.pending.set(MINT_A, 1);
     const r = await w.svc.setup();
     expect(w.confirms).toEqual([]);
-    expect(r).toMatchObject({ status: { reissuePending: false }, reissueFailed: 0 });
-    expect(await readEnvelope(recoveryPath(w.dir, w.pubkey))).toMatchObject({
+    expect(r).toMatchObject({ status: { reissuePending: true }, reissueFailed: 1 });
+    const path = recoveryPath(w.dir, w.pubkey);
+    expect(await readEnvelope(path)).toMatchObject({ reissued: false, reissuedMints: [] });
+    // Ten minutes on the mint still reports the melt PENDING: the entry is overdue. "Finish backup":
+    w.overdue.set(MINT_A, 1);
+    const r2 = await w.svc.setup();
+    expect(w.confirms).toEqual([]);
+    expect(r2).toMatchObject({ status: { reissuePending: false }, reissueFailed: 0 });
+    expect(await readEnvelope(path)).toMatchObject({
       reissued: true,
       reissuedMints: [],
+      watchedMints: [MINT_A],
     });
+    expect(w.core.wallet.reissued).toEqual([]);
+    expectNoPhrase(w, [r, r2]);
   });
 
   it('F56: dust counts as done — the backup is finished and "Replace phrase" rotates — but the replaced relay copy stays until the dust is spent', async () => {
@@ -1643,6 +1678,284 @@ describe('fix round 8: F55, F56, the relay retry and the flows', () => {
     // The retry's write landed before the flow ran, and stands.
     expect((await readEnvelope(path))?.relayCopy).toBe(true);
     expect(w.timers.armed).toEqual([]);
+    expectNoPhrase(w);
+  });
+});
+
+/**
+ * Fix round 9 (the static reviewer of the F55/F56 fix): a mint whose balance an operation holds is
+ * never counted reissued for good — a young entry at a mint that answers blocks, an overdue one (or
+ * a mint that cannot be asked, whatever it holds) counts done but WATCHED, and the backup reopens
+ * once such a mint shows a spendable balance worth moving; a Settings action during a relay copy
+ * retry stuck on a NIP-46 signer answers. Written, NOT run here (no test runner on this machine:
+ * they run in CI); each one's reasoning against the code before its fix is in the review record's
+ * "Round 9" section.
+ */
+describe('fix round 9: watched mints, the reopen, the bounded wait', () => {
+  /** Mirrors what core's store holds after a reissue: the balance less the fee, seeded. */
+  const mirrorReissue = (w: World): void => {
+    const reissue = w.core.wallet.reissue.bind(w.core.wallet);
+    w.core.wallet.reissue = async (p) => {
+      const moved = await reissue(p);
+      w.balances.set(p.mint, moved.reissued);
+      w.core.wallet.balances.set(p.mint, moved.reissued);
+      return moved;
+    };
+  };
+  const blanks = (w: World): number =>
+    w.pool.published.filter(
+      (p) => p.event.kind === walletMod.RECOVERY_RELAY_KIND && p.event.content === '',
+    ).length;
+  const hold = (w: World, mint: MintUrl, sats: number): void => {
+    w.balances.set(mint, sats);
+    w.core.wallet.balances.set(mint, sats);
+  };
+
+  it('the reviewer’s scenario: a PENDING melt holds the only mint’s whole balance at "Replace phrase" — young, it blocks; overdue, the mint is done but watched ("Replace phrase" back); the melt fails, the inputs come back, the backup reopens and "Finish backup" moves them under the new phrase', async () => {
+    const w = await world();
+    w.core.phrases.queue.push(ENTROPY_1, ENTROPY_2);
+    userWhoWritesItDown(w);
+    w.confirm = () => true;
+    // (1) 5 000 sats at mint A, reissued under the first phrase (A): 4 999 of them are A's now.
+    hold(w, MINT_A, 5_000);
+    w.core.wallet.plans.set(MINT_A, { inputs: 4, feeSats: 1 });
+    mirrorReissue(w);
+    await w.svc.setup();
+    const path = recoveryPath(w.dir, w.pubkey);
+    const first = await readEnvelope(path);
+    expect(first).toMatchObject({ reissued: true, reissuedMints: [MINT_A], replaces: null });
+    // (2) Everything withdrawn over Lightning: the melt stays PENDING at the mint, its inputs held.
+    hold(w, MINT_A, 0);
+    w.pending.set(MINT_A, 1);
+    // (3) The words were photographed: "Replace phrase" (A → B). The melt is young, the mint
+    // answers: the mint is not counted done — the reviewer's step (4) wrote `reissued: true` here.
+    const rotated = await w.svc.setup();
+    expect(rotated).toMatchObject({
+      status: { reissuePending: true },
+      reissuedSats: 0,
+      feeSats: 0,
+      reissueFailed: 1,
+    });
+    expect(await readEnvelope(path)).toMatchObject({
+      reissued: false,
+      reissuedMints: [],
+      replaces: first?.device,
+    });
+    expect(blanks(w)).toBe(0); // A's copy stays
+    // Ten minutes on, the mint still reports the melt PENDING (overdue): "Finish backup" counts the
+    // mint done — "Replace phrase" is back — but watches it, and A's copy stays.
+    w.overdue.set(MINT_A, 1);
+    const pressed = await w.svc.setup();
+    expect(pressed).toMatchObject({
+      status: { reissuePending: false },
+      reissuedSats: 0,
+      feeSats: 0,
+      reissueFailed: 0,
+    });
+    expect(await readEnvelope(path)).toMatchObject({
+      reissued: true,
+      reissuedMints: [],
+      watchedMints: [MINT_A],
+      replaces: first?.device,
+    });
+    expect(blanks(w)).toBe(0);
+    // While the melt is still there a retry changes nothing and asks the mint nothing; the next
+    // wait follows the backoff.
+    const planned = w.core.wallet.planned.length;
+    expect(w.timers.armed.map((t) => t.ms)).toEqual([RELAY_RETRY_FIRST_MS]);
+    await w.timers.fire();
+    expect(await readEnvelope(path)).toMatchObject({ reissued: true, watchedMints: [MINT_A] });
+    expect(w.core.wallet.planned).toHaveLength(planned);
+    expect(w.timers.armed.map((t) => t.ms)).toEqual([2 * RELAY_RETRY_FIRST_MS]);
+    // (5) Hours later the melt comes back UNPAID: the settle returns the 4 999 sats of A-derived
+    // proofs to spendable at mint A. The next retry plans them (worth moving) and reopens the backup.
+    w.pending.clear();
+    w.overdue.clear();
+    hold(w, MINT_A, 4_999);
+    await w.timers.fire();
+    const reopened = await readEnvelope(path);
+    expect(reopened).toMatchObject({
+      reissued: false,
+      reissuedMints: [],
+      replaces: first?.device,
+    });
+    expect(reopened?.watchedMints).toBeUndefined();
+    expect(await w.svc.status()).toMatchObject({ reissuePending: true }); // "Finish backup" again
+    expect(blanks(w)).toBe(0);
+    expect(w.timers.armed).toEqual([]);
+    // "Finish backup" moves them under B, records the mint, and only then retires A's copy.
+    const finished = await w.svc.setup();
+    expect(finished).toMatchObject({
+      status: { reissuePending: false },
+      reissuedSats: 4_998,
+      feeSats: 1,
+      reissueFailed: 0,
+    });
+    const seed = w.core.materials.at(-1)?.seed as unknown as { entropyHex: string };
+    expect(seed.entropyHex).toBe(entropyHex(ENTROPY_2));
+    expect(w.core.wallet.reissued.map((p) => [p.amount, p.feeSats])).toEqual([
+      [5_000, 1],
+      [4_999, 1],
+    ]);
+    const done = await readEnvelope(path);
+    expect(done).toMatchObject({ reissued: true, reissuedMints: [MINT_A], replaces: null });
+    expect(done?.watchedMints).toBeUndefined();
+    expect(blanks(w)).toBe(1);
+    expectNoPhrase(w, [rotated, pressed, finished]);
+  });
+
+  it('low: a balance at a mint that cannot be asked no longer keeps the backup pending for good — done but watched (still counted as not covered), each retry capped at WATCH_RETRY_MAX_MS; the backup reopens when the mint answers with it, and "Finish backup" moves only that mint', async () => {
+    const w = await world();
+    userWhoWritesItDown(w);
+    w.confirm = () => true;
+    hold(w, MINT_A, 1_000);
+    w.core.wallet.plans.set(MINT_A, { inputs: 2, feeSats: 2 });
+    // Mint B holds 700 sats and does not answer (the fake scripts no plan: `reissuePlan` throws).
+    hold(w, MINT_B, 700);
+    const r = await w.svc.setup();
+    expect(r).toMatchObject({
+      status: { reissuePending: false },
+      reissuedSats: 998,
+      feeSats: 2,
+      reissueFailed: 1,
+    });
+    const path = recoveryPath(w.dir, w.pubkey);
+    expect(await readEnvelope(path)).toMatchObject({
+      reissued: true,
+      reissuedMints: [MINT_A],
+      watchedMints: [MINT_B],
+    });
+    // Still down: every retry asks it again and keeps it watched; the wait stops growing at the cap.
+    const waits: number[] = [];
+    for (let i = 0; i < 6; i++) {
+      await w.timers.fire();
+      waits.push(w.timers.armed[0]?.ms ?? -1);
+    }
+    expect(waits).toEqual([
+      2 * RELAY_RETRY_FIRST_MS,
+      4 * RELAY_RETRY_FIRST_MS,
+      8 * RELAY_RETRY_FIRST_MS,
+      16 * RELAY_RETRY_FIRST_MS,
+      WATCH_RETRY_MAX_MS,
+      WATCH_RETRY_MAX_MS,
+    ]);
+    expect(w.core.wallet.planned.filter((m) => m === MINT_B)).toHaveLength(1 + 6);
+    expect(await readEnvelope(path)).toMatchObject({ reissued: true, watchedMints: [MINT_B] });
+    // The mint answers again, the 700 sats worth moving: the backup reopens...
+    w.core.wallet.plans.set(MINT_B, { inputs: 2, feeSats: 1 });
+    await w.timers.fire();
+    const reopened = await readEnvelope(path);
+    expect(reopened).toMatchObject({ reissued: false, reissuedMints: [MINT_A] });
+    expect(reopened?.watchedMints).toBeUndefined();
+    expect((await w.svc.status()).reissuePending).toBe(true);
+    expect(w.timers.armed).toEqual([]);
+    // ...and "Finish backup" asks for mint B alone (mint A is recorded) and records it.
+    const r2 = await w.svc.setup();
+    expect(w.confirms.at(-1)).toEqual({
+      kind: 'recovery-reissue',
+      plans: [{ mint: MINT_B, amount: 700, inputs: 2, feeSats: 1 }],
+    });
+    expect(r2).toMatchObject({
+      status: { reissuePending: false },
+      reissuedSats: 699,
+      feeSats: 1,
+      reissueFailed: 0,
+    });
+    const done = await readEnvelope(path);
+    expect(done).toMatchObject({ reissued: true, reissuedMints: [MINT_A, MINT_B] });
+    expect(done?.watchedMints).toBeUndefined();
+    expect(w.core.wallet.reissued.map((p) => p.mint)).toEqual([MINT_A, MINT_B]);
+    expectNoPhrase(w, [r, r2]);
+  });
+
+  it('low: dust at a mint that cannot be asked is watched too, and dropped — done like any dust — once the mint answers', async () => {
+    const w = await world();
+    userWhoWritesItDown(w);
+    w.confirm = () => true;
+    hold(w, MINT_B, 2); // no plan scripted: mint B does not answer
+    const r = await w.svc.setup();
+    expect(w.confirms).toEqual([]);
+    expect(r).toMatchObject({ status: { reissuePending: false }, reissueFailed: 1 });
+    const path = recoveryPath(w.dir, w.pubkey);
+    expect(await readEnvelope(path)).toMatchObject({ reissued: true, watchedMints: [MINT_B] });
+    // Back, with an input fee that eats the 2 sats: nothing worth moving — no longer watched.
+    w.core.wallet.plans.set(MINT_B, { inputs: 2, feeSats: 2 });
+    expect(w.timers.armed).toHaveLength(1);
+    await w.timers.fire();
+    const env = await readEnvelope(path);
+    expect(env).toMatchObject({ reissued: true });
+    expect(env?.watchedMints).toBeUndefined();
+    expect(w.timers.armed).toEqual([]);
+    expect(w.confirms).toEqual([]);
+    expectNoPhrase(w, [r]);
+  });
+
+  it('low: a plan the PAY/melt gate refused (a PAY at that mint still building) is not “cannot be asked” — the reissue stays pending, nothing is watched', async () => {
+    const w = await world();
+    userWhoWritesItDown(w);
+    w.confirm = () => true;
+    hold(w, MINT_B, 700);
+    w.core.wallet.plans.set(MINT_B, { inputs: 2, feeSats: 1 });
+    w.core.wallet.reissuePlan = () => Promise.reject(new GateRefusal(PAY_STILL_BUILDING_HOLD));
+    const r = await w.svc.setup();
+    expect(w.confirms).toEqual([]);
+    expect(r).toMatchObject({ status: { reissuePending: true }, reissueFailed: 1 });
+    const env = await readEnvelope(recoveryPath(w.dir, w.pubkey));
+    expect(env).toMatchObject({ reissued: false, reissuedMints: [] });
+    expect(env?.watchedMints).toBeUndefined();
+    expectNoPhrase(w, [r]);
+  });
+
+  it('low: a Settings action during a relay copy retry stuck on a NIP-46 signer answers — refused `remote-signer` once the bound passes, never left hanging — and the next action answers too', async () => {
+    const w = await world({ kind: 'nip46' });
+    userWhoWritesItDown(w);
+    w.confirm = () => true;
+    let refuse = true;
+    const publish = w.pool.publish.bind(w.pool);
+    (w.pool as unknown as { publish: nostr.PoolLike['publish'] }).publish = (relays, ev) =>
+      refuse && ev.kind === walletMod.RECOVERY_RELAY_KIND
+        ? Promise.resolve(relays.map((url) => ({ url, ok: false, reason: 'down' })))
+        : publish(relays, ev);
+    await w.svc.setup();
+    const path = recoveryPath(w.dir, w.pubkey);
+    expect((await readEnvelope(path))?.relayCopy).toBe(false);
+    refuse = false;
+    // The bunker never answers the retry's signing request (a phone asleep, an approval waiting).
+    let signing = false;
+    (w.signer as { signEvent: Signer['signEvent'] }).signEvent = () => {
+      signing = true;
+      return new Promise<never>(() => undefined);
+    };
+    expect(w.timers.armed).toHaveLength(1);
+    await w.timers.fire(); // the retry starts; its signing hangs
+    await vi.waitFor(() => {
+      expect(signing).toBe(true);
+    });
+    w.confirms.length = 0;
+    // "Show phrase" meanwhile: it waits for the retry — bounded (one timer armed for the wait).
+    const shown = w.svc.show().then(
+      () => 'shown',
+      (e: unknown) => e,
+    );
+    await vi.waitFor(() => {
+      expect(w.timers.armed.map((t) => t.ms)).toEqual([RELAY_RUN_WAIT_MS]);
+    });
+    expect(w.confirms).toEqual([]);
+    await w.timers.fire(); // the bound passes
+    expect(await shown).toMatchObject({ code: 'remote-signer' });
+    expect(w.confirms).toEqual([]); // nothing asked, nothing shown
+    // The flows' lock was released: the next action waits and answers the same way — not refused
+    // at once as "a recovery phrase window is already open".
+    const restored = w.svc.restore().then(
+      () => 'restored',
+      (e: unknown) => e,
+    );
+    await vi.waitFor(() => {
+      expect(w.timers.armed.map((t) => t.ms)).toEqual([RELAY_RUN_WAIT_MS]);
+    });
+    await w.timers.fire();
+    expect(await restored).toMatchObject({ code: 'remote-signer' });
+    expect((await readEnvelope(path))?.relayCopy).toBe(false);
     expectNoPhrase(w);
   });
 });
