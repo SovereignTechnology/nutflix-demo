@@ -147,3 +147,45 @@ the review record's F54 addendum (five mutation checks, none run).
   and prettier on the changed files, `check:locked`, the electron security lint, and
   `npm run build`, all clean.
 - Residual: the host's one-line wiring of `priceCeiling` is covered by `tsc` alone.
+
+## Round 9 (the static reviewer of the F54 fix; 2026-09-28)
+
+**The tests are written but NOT run, pending CI** (GitHub Actions). Cameron's rule of 2026-09-27
+allows no test runner on this machine. What each test catches is reasoned against the code in the
+review record's Round 9 section (eleven mutation checks, none run; two survive, both explained
+there).
+
+| # | Finding | Outcome |
+|---|---|---|
+| F57 | Corestore 7.12.2's `replicate` opened any core in storage that a remote named by discovery key, and served it without the seeder's upload gate: no `PRICE`, nothing counted. After a restart, a sold core could be fetched free | **confirmed by reading `node_modules`, fixed**. BlobStore's Corestore (`GatedCorestore`) replaces that catch-all on every stream. A remote may open only a core BlobStore has open, which is the gated session. Anything else is refused. This covers the desktop worker, the daemon and the gateway, since all of them replicate through `blobs.store`. A core that is already open reached this way was always the gated one: it is the same `Core`, and `upload` goes to every listening session |
+| low (money) | `UpstreamPayer` kept one `PRICE` per core, so blocks pending below a second `PRICE` were asked at the HELLO's price (0 at a fresh desktop seeder). That built a 0-sat PAY, which the seeder refuses, and dropped the blocks from the viewer's record | **fixed**. Price segments per core: each `PRICE` applies from its `effectiveFromBlock`, and one from block 0 replaces the rest, as the seeder keeps them. There is never a 0-sat PAY for a core whose manifest price is above 0. Such blocks stay pending, and owed ones are given up on that connection only |
+| low | The host's `priceCeiling` closure had no test, only the helper | **fixed**. `hello-ceiling-host.test.ts` captures the closure `host.ts` passes to `realProviders` and checks it after a restart: 0, then 2, then 5 as videos open |
+| low (record) | The F54 addendum's claim that a lower ceiling cannot make a payer underpay | **corrected** in the review record, struck through with the reason |
+
+- Commit: `faa329a` (the fixes and their tests), then these notes.
+- New tests, written and not run:
+  - `packages/seeder/src/__tests__/stored-core-gate.integration.test.ts` covers
+    `Seeder.replicate` and `blobs.store.replicate`. A stored, sold core that is not open is not
+    served. Once opened, it is served with its `PRICE` first and counted.
+  - `packages/app-desktop/src/worker/__tests__/hello-ceiling-host.test.ts`.
+  - Four new tests in `packages/gateway/src/__tests__/upstream-payer.test.ts`.
+- Changed code:
+  - `packages/seeder/src/blobs/blob-store.ts` (the gate).
+  - `packages/seeder/src/types/holepunch.d.ts` (the muxer's type).
+  - `packages/gateway/src/upstream/payer.ts` (the segments and the zero guard).
+  - Comments only in `seeder.ts`, `peer-node.ts` and `real-providers.ts`.
+- Behaviour change: after a restart, a node serves a stored core only once it opens it again (the
+  next play or upload on the desktop; at start for the daemon's configured cores). Opening all of
+  storage again at start, gated, would be a feature of its own.
+- Residuals:
+  - R9-a (pre-existing, free image replicas only): a core closed by `closeCoreByKey` stays
+    attached to the connections it had while the peer keeps downloading, and for Hypercore's
+    20–40 s linger.
+  - R9-b (pre-existing): blocks sent before a connection's first `PRICE` are asked at the HELLO's
+    price. After round 9 that is never a 0-sat PAY.
+  - R9-c: the 64-segment bound per core.
+- Static gates only, all clean:
+  - `npx tsc -b`. Each new test file is proven to be type-checked by a deliberate error, which was
+    then removed.
+  - eslint and prettier on the changed files.
+  - `check:locked`, the electron security lint and `npm run build`.
