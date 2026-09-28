@@ -73,6 +73,15 @@ above the manifest, so no block is ever paid at the wrong price.
 is gone — every `Seeder` sends each core's `PRICE` (priced, or `{ free: true }`) before its first
 block to a `pay/1` peer, with no switch.
 
+*Amended 2026-09-27 (F54, the round-8 verifier of lane W8b-p2p):* the ceiling is the highest price
+among the cores open in this run (`servedPriceCeiling`). Since lane W8b-p2p the seeder keeps its
+per-core policies across restarts, and the ceiling had been read from all of them, so it never came
+down: one dear video, or one hostile manifest, fixed it for good. The kept policies still refuse
+free. The desktop viewer no longer compares the HELLO price with the manifest on its own: as this
+section says, `UpstreamPayer` compares the price asked for the blocks, the core's `PRICE` when one
+covers them, else the HELLO. The extra check had refused every core of a desktop seeder whose
+ceiling was above the video's price, even a core it priced within it.
+
 ## 5. Other changes
 
 - `WorkerInit.payments` (the user's public pubkey, wallet P2PK and mints) turns the real providers

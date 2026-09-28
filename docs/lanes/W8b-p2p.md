@@ -125,3 +125,25 @@ skipping there.
 ## Proposed row for `docs/status.md`
 
 | W8b-p2p — round-8 findings on pay/1 and the worker | `stage-3/r8-p2p` | DONE. Eleven findings of the final panel (3 medium, 2 low, 6 info), all fixed with tests that fail before the fix:<br>• an OWED on a second node of one seeder key never pays a block pending on the first (the reviewer's double pay);<br>• an owed range failing for now is never forgotten: retried on its backoff and paid on the same connection (separate streaks from fresh blocks);<br>• a PAY's blocks leave the unpaid record on disk before the PAY is sent;<br>• per-core prices kept across restarts: an attacker's thumbnail can no longer make our node serve a video it played or uploaded free; our own profile core is never priced;<br>• one Hypercore session per core under concurrent opens; our profile core free before its gate;<br>• free image requests share the seeder's window while in flight; one bounded answer for `free`;<br>• stated timeout reasons; `NUTFLIX_REQUIRE_BUILT=1` makes the real-Bare tests fail instead of skip.<br>Review `docs/reviews/2026-09-27-pre-push-p2p.md` (31 mutation checks) |
+
+## Addendum — F54 (the round-8 verifier, medium; 2026-09-27)
+
+**The tests are written but NOT run, pending CI** (GitHub Actions). Cameron's rule of 2026-09-27
+allows no test runner on this machine. What each test would catch is reasoned against the code in
+the review record's F54 addendum (five mutation checks, none run).
+
+| # | Finding | Outcome |
+|---|---|---|
+| F54 | Kept core policies made the worker's HELLO ceiling permanent, and desktop viewers refused any seeder whose HELLO was above the manifest price | **fixed**, in two places. The ceiling is `servedPriceCeiling`: the highest price among the cores open in this run, never a policy kept from an earlier one, while kept policies still refuse free. `ViewerPayer` no longer compares the HELLO with the manifest: `UpstreamPayer` compares the price asked for the blocks (the core's `PRICE`, else the HELLO), and the host still refuses terms above the manifest |
+| F54 (second half) | Incoming PAYs checked against a kept policy that may be stale | **deferred**. Read from the code, a kept policy prices only owed blocks from an earlier run, at the terms they were sold at. A mismatch needs two manifests naming one core, as within one run before. It needs its own decision (like D2) |
+
+- Commit: `e753de0` (the fix and its tests), then these notes.
+- New test file: `packages/app-desktop/src/worker/__tests__/hello-ceiling.test.ts`. It covers a
+  restart of a real `Seeder`: the ceiling is 0, then 2, while `setFreeCore` stays refused.
+- Two new tests in `viewer-payer.test.ts`: a HELLO ceiling above the manifest is paid at the
+  core's `PRICE`, and a `PRICE` above the manifest is not paid whatever the HELLO says.
+- ADR 0012 §4 has an F54 amendment note.
+- Static gates only: `npx tsc -b` (clean, and the new file is proven to be type-checked), eslint
+  and prettier on the changed files, `check:locked`, the electron security lint, and
+  `npm run build`, all clean.
+- Residual: the host's one-line wiring of `priceCeiling` is covered by `tsc` alone.
