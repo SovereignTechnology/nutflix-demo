@@ -523,8 +523,18 @@ The decisions stand. What the desktop now does (details: `docs/lanes/W8a-money.m
   host and reads "could not be reached" until the Settings screen has a "not finished" outcome
   (`docs/contract-requests/W8a-money.md`). Cameron's open decision on the bound (N1 item 7) stands:
   this is option 1 with the host doing the continuing.
-- **D5, a reissue is complete** only when no journal entry and no dust is left outside the phrase
-  at a mint; the replaced phrase's relay copy is retired only then.
+- **D5, when a reissue is complete** (the final rule, fix rounds 8 and 9). Nothing moves at a
+  mint while an operation is journaled there, whatever is spendable there. Such a mint keeps the
+  reissue pending while the operation is young (under `PENDING_SETTLE_AFTER_S`) and the mint
+  answers. Once every entry there is overdue, the mint counts as done but is **watched**, and so
+  does any balance at a mint that cannot be asked, dust included. With nothing journaled, dust
+  (the fee eats it) and an empty mint count as done, and a balance worth moving is moved and
+  recorded. A watched mint keeps "Replace phrase" available and is remembered in the envelope
+  (`watchedMints`). The backup reopens (`reissued: false`, "Finish backup" offered again) once a
+  watched mint has no entry left and shows a spendable balance worth moving, so inputs a failed
+  melt gives back never stay under a replaced, possibly leaked, phrase. The replaced phrase's
+  relay copy is retired only once no mint the new phrase did not record holds a spendable balance
+  or a journal entry.
 - **D2, the relay copy** is retried with a bounded backoff (30 s doubling to 1 h) until a relay
   takes it; the envelope's `relayCopy` is the persisted pending flag.
 - **§4, journal ids.** A `begin` whose id is still journaled (a counter handed out twice) is

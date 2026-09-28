@@ -52,6 +52,20 @@ operation in flight: "a payment is still in flight at 1 mint: finish the backup 
 and a `dustLeft` count ("a few sats at 1 mint cost more in fees than they are worth: they stay
 outside the phrase"). The host has both counts already (`reissueAll`'s `blocked` and `dust`).
 
+**Revised in fix round 9.** A mint with an operation journaled there now keeps `reissuePending:
+true` only while the operation is young (under 10 min) and the mint answers, whatever is spendable
+there. Once every entry is overdue, the mint counts done but watched. So does a mint that cannot
+be asked, whatever it holds. The host reopens the backup (`reissuePending` turns `true` again) once
+a watched mint shows a balance worth moving. Two things the screen does not handle yet:
+
+- `reissueFailed` can be above 0 while `reissuePending` is `false`: a watched mint's balance is not
+  covered. The success line then says "finish the backup later", while the button reads "Replace
+  phrase". Proposal: a `reissueWatched` count, worded "the balance at 1 mint could not be moved yet
+  (the mint did not answer, or a payment is still settling): Nutflix offers "Finish backup" again
+  once it can be".
+- The status can flip back to `reissuePending: true` with no action from the user. A status refresh
+  when the section regains focus (item 2) covers that.
+
 ## 4. Two different `rate-limited` refusals read as one (fix round 8, info item)
 
 **Need.** The screen's `flowError` renders every `rate-limited` as "Too many windows were closed in
@@ -64,3 +78,8 @@ screen still names the wrong cause.
 **Proposal.** Show the host's own sentence for `rate-limited` (the part after the code, as for
 every other code), or tell the two apart by it: "A recovery window is already open: finish or
 close it first."
+
+**Fix round 9.** A flow waits for a running relay copy retry for at most 22.2 s. Past that it is
+refused with `remote-signer` (a NIP-46 signer that has not answered) or `relay-down`, with the
+host's sentence. The screen already shows that sentence for both codes, so nothing is needed there
+beyond the item above.
