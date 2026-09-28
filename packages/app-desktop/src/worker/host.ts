@@ -218,6 +218,11 @@ export class WorkerHost {
   private readonly sessions = new Map<string, Session>();
   private readonly corePolicies = new Map<CoreKeyHex, PricePolicy>();
   /**
+   * Lane W8b-p2p: the key of our own profile core once it is open — never a video: a play open
+   * naming it is refused, so a hostile manifest cannot give it a price (kept across restarts now).
+   */
+  private profileKey: CoreKeyHex | null = null;
+  /**
    * ADR 0015: profile cores the image path uses — `opened` when that path opened them (a replica
    * read for display, closed again when this node may not serve it), `refs` = reads in flight.
    */
@@ -611,6 +616,11 @@ export class WorkerHost {
     if (hyper.blob.blockLength < 1 || hyper.blob.byteLength !== size)
       fail('invalid-argument', 'rendition size does not match its blob');
     const core = hyper.core;
+    // Lane W8b-p2p: our own profile core is always free (ADR 0015); a manifest naming it as a
+    // video would price it on our seeder — and since the seeder keeps its prices across restarts,
+    // it would stay sold, our avatar and thumbnails no longer served free.
+    if (core === this.profileKey)
+      fail('forbidden', 'that core is this node’s own profile core, not a video');
     // Fix round 4: an image read of this very core in flight (a thumbnail URL naming a video)
     // would go on under the paid route with blocks outside the video: refuse; a retry works.
     if ((this.imageCores.get(core)?.refs ?? 0) > 0)
@@ -808,11 +818,23 @@ export class WorkerHost {
     return this.seeding.enabled && this.seeding.serveImages !== false;
   }
 
-  /** Our own profile core: our avatar and our videos' thumbnails, always free while seeding. */
+  /**
+   * Our own profile core: our avatar and our videos' thumbnails, always free while seeding. Lane
+   * W8b-p2p (round-8 review, info): marked free the moment it is ready — before its upload gate
+   * is attached and its terms are said to a peer that paired while it opened — not after the
+   * open returns (P1's R9, which the image path already honoured, now for this core too).
+   */
   private async ownProfile(): Promise<SeedCore> {
     const net = this.requireNet();
-    const sc = await net.seeder.blobs.openCore(PROFILE_CORE_NAME);
-    net.seeder.setFreeCore(sc.keyHex, true);
+    const sc = await net.seeder.openCore(PROFILE_CORE_NAME, { free: true });
+    this.profileKey = sc.keyHex;
+    // A price an earlier run gave it (a hostile manifest played before this guard existed, or
+    // before the core was open) is dropped: it is never sold. No session of this run can hold it
+    // (`playOpen` refuses it once the key is known).
+    if (!this.corePolicies.has(sc.keyHex) && net.seeder.corePolicyMap().has(sc.keyHex)) {
+      net.seeder.setCorePolicy(sc.keyHex, null);
+      net.seeder.setFreeCore(sc.keyHex, true);
+    }
     net.node.join(sc.core.discoveryKey, { server: this.seeding.enabled, client: true });
     return sc;
   }
@@ -842,10 +864,14 @@ export class WorkerHost {
    * never read as an image. A thumbnail URL can name any core; downloading a paid one would be
    * counted by every honest seeder of it (and browsing never spends sats). Known sold: a manifest
    * policy here (a video played or opening), a core the router pays for, or one our own seeder
-   * prices (uploads, played cores). (The fix-round-4 memory of cores a seeder PRICEd on the image
-   * path went with the probe — ADR 0015 amendment: such a seeder is simply never asked, and
-   * remembering "sold somewhere" refused honest free images whenever a gateway that prices them
-   * answered first.)
+   * prices (uploads, played cores) — lane W8b-p2p (round-8 review, MEDIUM): in THIS run or an
+   * earlier one. The seeder keeps its per-core policies across restarts (`CorePolicyStore`), so
+   * after a restart an image URL naming a video we uploaded or played — its blocks still in our
+   * store — is refused here, and `setFreeCore` refuses it too; before, both maps were empty after
+   * a restart and the image path marked the video free on our seeder. (The fix-round-4 memory of
+   * cores a seeder PRICEd on the image path went with the probe — ADR 0015 amendment: such a
+   * seeder is simply never asked, and remembering "sold somewhere" refused honest free images
+   * whenever a gateway that prices them answered first.)
    */
   private soldCore(core: CoreKeyHex, net: Net): boolean {
     return (

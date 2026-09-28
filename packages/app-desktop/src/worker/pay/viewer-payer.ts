@@ -53,6 +53,17 @@
  *     durable ledger (see `unpaid-record.ts`).
  *   - **images** (ADR 0015 amendment): `attachImageCore` routes a core read for display — a
  *     seeder is asked for it only after its `PRICE { free: true }`; nothing is paid or recorded.
+ *   - **lane W8b-p2p (round-8 review)**:
+ *       - an `OWED` on one connection of a seeder never hands over a block that another LIVE
+ *         connection of the same seeder pubkey (another node behind one HELLO key) holds pending
+ *         or in flight — that one pays it; one block is never paid on two connections. What
+ *         such a connection drops unpaid stays in the record for the seeder's next report;
+ *       - a PAY's removal from the record is written AHEAD of the send (`removeNow`), so a crash
+ *         after the send cannot bring those blocks back to be paid twice;
+ *       - an owed range the host refuses for now (no balance, a mint down, the tail file) is never
+ *         dropped from the record: `UpstreamPayer` keeps it owed and retries it on its backoff;
+ *         only a final refusal, or terms it can never be paid at, removes it;
+ *       - owed blocks handed over are kept per CONNECTION (Noise key) and forgotten with it.
  */
 import type {
   BlockRange,
@@ -157,8 +168,14 @@ export class ViewerPayer {
   readonly seeders: SeederCredit;
   /** Noise key → the pubkey of its current connection's verified HELLO (the record's key). */
   private readonly pubkeys = new Map<string, string>();
-  /** Seeder pubkey → core → blocks handed to the payer as owed (paid under their session's id). */
+  /**
+   * Noise key (one connection) → core → blocks handed to its payer as owed (paid under their
+   * session's id). Lane W8b-p2p: per connection, forgotten with it — keyed by pubkey, a dropped
+   * connection's entries made the next connection of that seeder look as if it held them.
+   */
   private readonly owed = new Map<string, Map<string, Set<number>>>();
+  /** Noise key → its current connection (a detach of an older one leaves a newer one alone). */
+  private readonly conns = new Map<string, object>();
   private readonly counters = { owedReported: 0, owedRecorded: 0 };
 
   constructor(o: ViewerPayerOptions) {
@@ -174,8 +191,9 @@ export class ViewerPayer {
         // A refusal (`rate-limited:` included) goes back to UpstreamPayer, which retries it.
         const msg = await o.pay(range, seeder, policy, opts);
         // Built: never offered again from the record, even if its ACK never comes (a seeder that
-        // takes the PAY and drops must not be paid twice by reporting the blocks again).
-        o.record?.remove(seeder.pubkey, range.core, range.fromBlock, range.toBlock);
+        // takes the PAY and drops must not be paid twice by reporting the blocks again) — and
+        // written ahead of the send (lane W8b-p2p), so a crash after it cannot undo that.
+        this.forgetPaid(seeder.pubkey, range);
         this.paid(range, seeder.pubkey, msg);
         return msg;
       },
@@ -204,7 +222,7 @@ export class ViewerPayer {
       const pk = this.pubkeys.get(noiseHex);
       if (pk === undefined) return;
       o.record?.remove(pk, ack.core, ack.fromBlock, ack.toBlock);
-      this.forgetOwed(pk, ack.core, ack.fromBlock, ack.toBlock);
+      this.forgetOwed(noiseHex, ack.core, ack.fromBlock, ack.toBlock);
     });
     const payOwed = o.payOwed;
     this.upstream = new UpstreamPayer({
@@ -227,12 +245,14 @@ export class ViewerPayer {
       onUnpayable: (noiseHex, range, scope) => {
         this.settler.settleUnpaid(noiseHex, range);
         const pk = this.pubkeys.get(noiseHex);
-        if (pk !== undefined && this.isOwed(pk, range)) {
+        if (pk !== undefined && this.isOwed(noiseHex, range)) {
           if (scope !== 'connection')
             o.record?.remove(pk, range.core, range.fromBlock, range.toBlock);
-          this.forgetOwed(pk, range.core, range.fromBlock, range.toBlock);
+          this.forgetOwed(noiseHex, range.core, range.fromBlock, range.toBlock);
         }
       },
+      // Lane W8b-p2p (round-8 review, info): one bounded answer for `free` — the settler's.
+      servesFree: (noiseHex, core) => this.seeders.servesFree(noiseHex, core),
       boundRange: (range, noiseHex) => this.bound(range, noiseHex),
       ...(o.record !== undefined && payOwed !== undefined
         ? {
@@ -243,9 +263,10 @@ export class ViewerPayer {
                 const t = this.owedTerms(peer, range);
                 if (t === null) throw new Error('forbidden: those blocks are not in the record');
                 const msg = await payOwed(t.sid, range, seeder, policy, opts.carryIn);
-                // Built: out of the record at once (never paid twice, whatever becomes of its
-                // ACK). Not this session's spend (the host's wallet shows it): no `onPaid`.
-                o.record?.remove(seeder.pubkey, range.core, range.fromBlock, range.toBlock);
+                // Built: out of the record at once, written ahead of the send (never paid twice,
+                // whatever becomes of its ACK or of this process). Not this session's spend (the
+                // host's wallet shows it): no `onPaid`.
+                this.forgetPaid(seeder.pubkey, range);
                 return msg;
               },
             },
@@ -270,7 +291,10 @@ export class ViewerPayer {
     const settled = this.settler.attachPeer(noiseHex, protocol);
     const detachCredit = this.seeders.attachPeer(noiseHex, protocol);
     const detachUpstream = this.upstream.attachPeer(noiseHex, settled.protocol);
+    const conn = {};
+    this.conns.set(noiseHex, conn);
     this.pubkeys.delete(noiseHex);
+    this.owed.delete(noiseHex); // a new connection: nothing handed to it yet
     if (protocol.state === 'open' && protocol.peer !== null)
       this.pubkeys.set(noiseHex, protocol.peer.pubkey);
     const offOpen = protocol.on('open', (hello) => {
@@ -286,6 +310,13 @@ export class ViewerPayer {
       detachUpstream();
       detachCredit();
       settled.detach();
+      // What was handed to this connection as owed and not paid stays in the record; a newer
+      // connection under the same Noise key keeps its own.
+      if (this.conns.get(noiseHex) === conn) {
+        this.conns.delete(noiseHex);
+        this.owed.delete(noiseHex);
+        this.pubkeys.delete(noiseHex);
+      }
     };
   }
 
@@ -422,7 +453,11 @@ export class ViewerPayer {
 
   /**
    * An `OWED` from `noiseHex` (ADR 0018 amendment): hand the payer the reported blocks the record
-   * also holds for that seeder and core — nothing else is ever paid.
+   * also holds for that seeder and core — nothing else is ever paid. Lane W8b-p2p (round-8
+   * review, MEDIUM): never a block another live connection of the same seeder pubkey holds
+   * pending or in flight (`UpstreamPayer.holds`) — that connection pays it (its PAY takes it out
+   * of the record); handed over here too, it was paid on both. One that connection drops unpaid
+   * stays in the record, for the seeder's next report.
    */
   private onOwed(noiseHex: string, m: OwedMessage): void {
     const rec = this.o.record;
@@ -434,18 +469,20 @@ export class ViewerPayer {
     if (rec === undefined || this.o.payOwed === undefined || pk === undefined) return;
     const blocks = rec.recorded(pk, m.core, m.ranges);
     if (blocks.length === 0) return;
+    const others: string[] = [];
+    for (const [noise, p] of this.pubkeys) if (p === pk && noise !== noiseHex) others.push(noise);
+    const free = blocks
+      .map((b) => b.index)
+      .filter((i) => !others.some((n) => this.upstream.holds(n, m.core, i)));
+    if (free.length === 0) return;
     // Only the blocks the payer took are owed here: one it skipped (pending or paid on this link)
     // stays this link's, so a fresh range of it given up later stays in the record as a tail.
-    const taken = this.upstream.addOwedIndexes(
-      noiseHex,
-      m.core,
-      blocks.map((b) => b.index),
-    );
+    const taken = this.upstream.addOwedIndexes(noiseHex, m.core, free);
     if (taken.length === 0) return;
-    let byCore = this.owed.get(pk);
+    let byCore = this.owed.get(noiseHex);
     if (byCore === undefined) {
       byCore = new Map();
-      this.owed.set(pk, byCore);
+      this.owed.set(noiseHex, byCore);
     }
     let set = byCore.get(m.core);
     if (set === undefined) {
@@ -461,29 +498,43 @@ export class ViewerPayer {
     });
   }
 
-  /** Whether every block of `range` was handed to the payer as owed by `pk`. */
-  private isOwed(pk: string, range: BlockRange): boolean {
-    const set = this.owed.get(pk)?.get(range.core);
+  /** Whether every block of `range` was handed to the connection `noiseHex`'s payer as owed. */
+  private isOwed(noiseHex: string, range: BlockRange): boolean {
+    const set = this.owed.get(noiseHex)?.get(range.core);
     if (set === undefined) return false;
     for (let i = range.fromBlock; i <= range.toBlock; i++) if (!set.has(i)) return false;
     return true;
   }
 
-  private forgetOwed(pk: string, core: string, from: number, to: number): void {
-    const byCore = this.owed.get(pk);
+  private forgetOwed(noiseHex: string, core: string, from: number, to: number): void {
+    const byCore = this.owed.get(noiseHex);
     const set = byCore?.get(core);
     if (byCore === undefined || set === undefined) return;
     if (to - from < set.size) for (let i = from; i <= to; i++) set.delete(i);
     else for (const i of [...set]) if (i >= from && i <= to) set.delete(i);
     if (set.size === 0) byCore.delete(core);
-    if (byCore.size === 0) this.owed.delete(pk);
+    if (byCore.size === 0) this.owed.delete(noiseHex);
+  }
+
+  /**
+   * A PAY was built for `range` of `seeder`'s blocks: out of the record, written ahead of the send
+   * (lane W8b-p2p). A failed write is logged (counts only) — the PAY's proofs are built, so it
+   * goes out all the same; the record's next batch retries the write.
+   */
+  private forgetPaid(seeder: string, range: BlockRange): void {
+    const rec = this.o.record;
+    if (rec === undefined) return;
+    if (!rec.removeNow(seeder, range.core, range.fromBlock, range.toBlock))
+      this.log.warn('a paid range could not be written out of the unpaid record before its PAY', {
+        blocks: range.toBlock - range.fromBlock + 1,
+      });
   }
 
   /** The recorded terms of owed `range` from `peer`, when all of it shares them. */
   private owedTerms(peer: string, range: BlockRange): TailTerms | null {
     const pk = this.pubkeys.get(peer);
     const rec = this.o.record;
-    if (pk === undefined || rec === undefined || !this.isOwed(pk, range)) return null;
+    if (pk === undefined || rec === undefined || !this.isOwed(peer, range)) return null;
     const t = rec.termsOf(pk, range.core, range.fromBlock);
     if (t === null || range.fromBlock < t.first || range.toBlock > t.last) return null;
     for (let i = range.fromBlock + 1; i <= range.toBlock; i++)
@@ -501,7 +552,7 @@ export class ViewerPayer {
     if (
       pk !== undefined &&
       rec !== undefined &&
-      this.owed.get(pk)?.get(range.core)?.has(range.fromBlock) === true
+      this.owed.get(noiseHex)?.get(range.core)?.has(range.fromBlock) === true
     ) {
       const t = rec.termsOf(pk, range.core, range.fromBlock);
       if (t === null) return range;

@@ -29,6 +29,7 @@ import { PAY_RETRY_LATER_MAX_MS, PAY_RETRY_LATER_MS, ViewerPayer } from '../pay/
 import { CreditPool } from '../playback/credit.js';
 import type { TailTerms } from '../pay/unpaid-record.js';
 import { UnpaidRecord } from '../pay/unpaid-record.js';
+import type { StateFs } from '../runtime.js';
 import { nodeStateFs } from './helpers/harness.js';
 
 type Listeners = { [K in keyof PayProtocolEvents]: Set<PayProtocolEvents[K]> };
@@ -736,6 +737,12 @@ describe('ViewerPayer: the record of what is unpaid, and paying what a seeder re
     o: {
       refuseOwed?: () => string | null;
       refusePay?: () => string | null;
+      /** Lane W8b-p2p: a wire code to refuse an owed PAY with for now (`null`: built). */
+      failOwed?: () => 'no-balance' | 'internal' | null;
+      /** Lane W8b-p2p: the record's file system (default: node's). */
+      state?: StateFs;
+      /** Lane W8b-p2p: an owed PAY that is built only when this resolves. */
+      holdOwed?: () => Promise<void>;
       /** The manifest policy (default: 2 sats/block at 50/50, whose carry is always 0). */
       policy?: PricePolicy;
     } = {},
@@ -744,7 +751,7 @@ describe('ViewerPayer: the record of what is unpaid, and paying what a seeder re
     const dir = await mkdtemp(join(tmpdir(), 'nf-vp-tail-'));
     dirs.push(dir);
     const record = new UnpaidRecord({
-      state: nodeStateFs,
+      state: o.state ?? nodeStateFs,
       dir,
       join: (...p) => join(...p),
       pubkey: 'ee'.repeat(32),
@@ -754,6 +761,7 @@ describe('ViewerPayer: the record of what is unpaid, and paying what a seeder re
     const engine = new mocks.MockPaymentEngine();
     const credit = new CreditPool(2);
     const owedCalls: { sid: string; range: [number, number]; carryIn: number }[] = [];
+    let owedTries = 0;
     /** What each fresh PAY's function was handed as `opts.carryIn` (`undefined`: nothing). */
     const freshCarry: (number | undefined)[] = [];
     const termsOf = (sid: string): TailTerms => ({
@@ -778,9 +786,13 @@ describe('ViewerPayer: the record of what is unpaid, and paying what a seeder re
       policyFor: () => terms0,
       record,
       termsFor: () => termsOf(SID_A),
-      payOwed: (sid, range, sd, p, carryIn) => {
+      payOwed: async (sid, range, sd, p, carryIn) => {
+        owedTries++;
         const refusal = o.refuseOwed?.() ?? null;
-        if (refusal !== null) return Promise.reject(fromWireError(wireError('forbidden', refusal)));
+        if (refusal !== null) throw fromWireError(wireError('forbidden', refusal));
+        const later = o.failOwed?.() ?? null;
+        if (later !== null) throw fromWireError(wireError(later, 'not now'));
+        await o.holdOwed?.();
         owedCalls.push({ sid, range: [range.fromBlock, range.toBlock], carryIn });
         return engine.pay(range, sd, p, { carryIn });
       },
@@ -795,7 +807,47 @@ describe('ViewerPayer: the record of what is unpaid, and paying what a seeder re
       core.emit('download', i, 65_536, { remotePublicKey: peerKey });
     };
     const held = (): number[] => record.recorded(SEEDER_PK, CORE_1, [[0, 99]]).map((b) => b.index);
-    return { record, engine, payer, proto, download, owedCalls, freshCarry, termsOf, held };
+    /** Lane W8b-p2p: what the record's FILE lists (what a crash now would leave). */
+    const onDisk = (): number[] => {
+      const r = new UnpaidRecord({
+        state: nodeStateFs,
+        dir,
+        join: (...p) => join(...p),
+        pubkey: 'ee'.repeat(32),
+        logger: silentLogger,
+        flushMs: 60_000,
+      });
+      const got = r.recorded(SEEDER_PK, CORE_1, [[0, 99]]).map((b) => b.index);
+      r.abandon();
+      return got;
+    };
+    /** Lane W8b-p2p: another connection (Noise key) of the same seeder pubkey. */
+    const link = (noise: string): { proto: FakeProto; download: (i: number) => void } => {
+      const p = new FakeProto();
+      payer.attachPeer(noise, p);
+      const from = Uint8Array.from(Buffer.from(noise, 'hex'));
+      return {
+        proto: p,
+        download: (i: number): void => {
+          credit.tryAcquire(key, i);
+          core.emit('download', i, 65_536, { remotePublicKey: from });
+        },
+      };
+    };
+    return {
+      record,
+      engine,
+      payer,
+      proto,
+      download,
+      owedCalls,
+      owedTries: () => owedTries,
+      freshCarry,
+      termsOf,
+      held,
+      onDisk,
+      link,
+    };
   }
   const priced = { core: CORE_1, satsPerBlock: mocks.sats(2), effectiveFromBlock: 0 };
 
@@ -1017,5 +1069,183 @@ describe('ViewerPayer: the record of what is unpaid, and paying what a seeder re
     expect(r.held()).toEqual([]);
     expect(r.proto.sent).toHaveLength(0);
     expect(r.payer.stats().owed).toBe(0);
+  });
+
+  // Round-8 review (MEDIUM, the reviewer's scenario): one operator runs two nodes under one HELLO
+  // pubkey. Block 1 came from node A and waits in A's batch; node B says OWED for it. The record
+  // held it under the pubkey and B's payer did not have it, so B was paid for it as owed — and A
+  // was paid for it too, fresh. A malicious operator redeems both.
+  const rangesOf = (p: FakeProto): [number, number][] =>
+    p.sent.map((m) => [m.range.fromBlock, m.range.toBlock]);
+  const NOISE_B = 'bb'.repeat(32);
+
+  it('an OWED on a second connection of the same seeder pubkey never pays a block pending on the first: it is paid once, there', async () => {
+    const r = await tailRig();
+    r.proto.hello({ windowBlocks: 8 }); // batches of 4: block 1 waits on A
+    r.download(1);
+    await settle();
+    expect(r.proto.sent).toHaveLength(0);
+    expect(r.held()).toEqual([1]);
+    const b = r.link(NOISE_B);
+    b.proto.hello({ windowBlocks: 8 }); // the same HELLO pubkey: another node of that operator
+    b.proto.price(priced);
+    b.proto.owed(CORE_1, [[1, 1]]);
+    await settle();
+    expect(r.owedCalls).toEqual([]);
+    expect(b.proto.sent).toEqual([]);
+    await r.payer.flush();
+    expect(rangesOf(r.proto)).toEqual([[1, 1]]); // A's fresh PAY, the only one
+    expect(b.proto.sent).toEqual([]);
+    expect(r.payer.stats().owedRecorded).toBe(0);
+    expect(r.held()).toEqual([]);
+  });
+
+  it('nor a block another connection of that pubkey is paying as owed right now', async () => {
+    let release: () => void = () => undefined;
+    const gate = new Promise<void>((done) => {
+      release = done;
+    });
+    const r = await tailRig({ holdOwed: () => gate });
+    r.record.add(SEEDER_PK, CORE_1, 5, r.termsOf(SID_B)); // left by an earlier run
+    const b = r.link(NOISE_B);
+    b.proto.hello();
+    b.proto.price(priced);
+    b.proto.owed(CORE_1, [[5, 5]]);
+    await settle();
+    expect(r.owedTries()).toBe(1); // being built for B
+    const c = r.link('cc'.repeat(32));
+    c.proto.hello();
+    c.proto.price(priced);
+    c.proto.owed(CORE_1, [[5, 5]]);
+    await settle();
+    expect(r.owedTries()).toBe(1); // C was not handed it
+    release();
+    await r.payer.flush();
+    expect(r.owedCalls.map((x) => x.range)).toEqual([[5, 5]]);
+    expect(rangesOf(b.proto)).toEqual([[5, 5]]);
+    expect(c.proto.sent).toEqual([]);
+    expect(r.held()).toEqual([]);
+  });
+
+  it('a block the first connection drops unpaid stays in the record, and the seeder’s next report pays it', async () => {
+    const r = await tailRig();
+    r.proto.hello({ windowBlocks: 8 });
+    r.download(1);
+    const b = r.link(NOISE_B);
+    b.proto.hello({ windowBlocks: 8 });
+    b.proto.price(priced);
+    b.proto.owed(CORE_1, [[1, 1]]); // skipped: A holds it
+    await settle();
+    r.proto.close(); // A goes before paying it
+    expect(r.held()).toEqual([1]);
+    const again = r.link(NOISE_B); // B's next connection reports it again
+    again.proto.hello();
+    again.proto.price(priced);
+    again.proto.owed(CORE_1, [[1, 1]]);
+    await r.payer.flush();
+    expect(r.owedCalls).toEqual([{ sid: SID_A, range: [1, 1], carryIn: 0 }]);
+    expect(rangesOf(again.proto)).toEqual([[1, 1]]);
+    expect(rangesOf(r.proto)).toEqual([]);
+    expect(r.held()).toEqual([]);
+  });
+
+  // Round-8 review (MEDIUM + LOW, both reviewers): an owed PAY failing for now (no balance at the
+  // only shared mint, the mint unreachable, the tail file not written: 'internal') for
+  // PAY_GIVE_UP_MS was given up with no scope, and the record deleted the blocks for good — the
+  // seeder kept counting them, and with a full window this viewer never asked it again.
+  for (const code of ['no-balance', 'internal'] as const) {
+    it(`an owed PAY refused for now (${code}) for 45 s stays in the record and owed, and is paid on the same connection once the host can`, async () => {
+      vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'performance'] });
+      try {
+        let broke = true;
+        const r = await tailRig({ failOwed: () => (broke ? code : null) });
+        r.record.add(SEEDER_PK, CORE_1, 5, r.termsOf(SID_B));
+        r.proto.hello();
+        r.proto.price(priced);
+        r.proto.owed(CORE_1, [[5, 5]]);
+        await settle();
+        expect(r.owedTries()).toBe(1);
+        await vi.advanceTimersByTimeAsync(45_000);
+        await settle();
+        expect(r.held()).toEqual([5]);
+        expect(r.payer.stats()).toMatchObject({ unpayableBlocks: 0, owedPaid: 0, owedRecorded: 1 });
+        expect(r.proto.sent).toEqual([]);
+        // Asked on its backoff, never in a loop (≤ 4 s apart, then the deferred cadence).
+        expect(r.owedTries()).toBeGreaterThan(3);
+        expect(r.owedTries()).toBeLessThan(20);
+        broke = false;
+        await vi.advanceTimersByTimeAsync(PAY_RETRY_LATER_MAX_MS);
+        await settle();
+        expect(r.owedCalls).toEqual([{ sid: SID_B, range: [5, 5], carryIn: 0 }]);
+        expect(rangesOf(r.proto)).toEqual([[5, 5]]);
+        expect(r.held()).toEqual([]);
+        expect(r.payer.stats().unpayableBlocks).toBe(0);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+  }
+
+  it('an owed range the seeder stops pricing on this connection (it turns the core free) stays in the record for a later connection', async () => {
+    const r = await tailRig();
+    r.record.add(SEEDER_PK, CORE_1, 5, r.termsOf(SID_B));
+    r.proto.hello();
+    r.proto.price(priced);
+    r.download(1); // this connection's PAY for 1 goes out and waits for its ACK
+    await settle();
+    expect(rangesOf(r.proto)).toEqual([[1, 1]]);
+    r.proto.owed(CORE_1, [[5, 5]]); // taken: waits behind 1's PAY (one per core in flight)
+    r.proto.price({ core: CORE_1, satsPerBlock: mocks.sats(0), effectiveFromBlock: 0, free: true });
+    r.proto.ack(1, 1);
+    await r.payer.flush();
+    expect(r.owedCalls).toEqual([]); // never a 0-sat PAY, never at a price not said here
+    expect(r.held()).toEqual([5]);
+  });
+
+  // Round-8 review (LOW): a PAY's blocks left the record in memory only, written in the next 1 s
+  // batch — a crash after the PAY was sent brought them back, and a seeder that reports what it
+  // was already paid for was paid twice.
+  it('a PAY built for recorded blocks leaves the record’s FILE before it is sent (write-ahead) — owed or fresh', async () => {
+    const r = await tailRig();
+    const atSend: number[][] = [];
+    const send = r.proto.sendPay.bind(r.proto);
+    r.proto.sendPay = (m: PayMessage): void => {
+      atSend.push(r.onDisk());
+      send(m);
+    };
+    r.record.add(SEEDER_PK, CORE_1, 5, r.termsOf(SID_B));
+    r.proto.hello({ windowBlocks: 8 });
+    r.download(1); // this connection's block, waiting for its batch
+    r.record.flush();
+    expect(r.onDisk()).toEqual([1, 5]);
+    r.proto.price(priced);
+    r.proto.owed(CORE_1, [[5, 5]]);
+    await r.payer.flush();
+    r.proto.ack(5, 5);
+    await r.payer.flush();
+    expect(rangesOf(r.proto)).toEqual([
+      [5, 5],
+      [1, 1],
+    ]);
+    // What a crash at each send would have left: neither PAY's blocks.
+    expect(atSend).toEqual([[1], []]);
+  });
+
+  it('blocks received and paid within one batch never reached the file: their PAY costs no write', async () => {
+    let writes = 0;
+    const state: StateFs = {
+      ...nodeStateFs,
+      writeAtomic: (p, data) => {
+        writes++;
+        nodeStateFs.writeAtomic(p, data);
+      },
+    };
+    const r = await tailRig({ state });
+    r.proto.hello();
+    r.download(1);
+    await r.payer.flush();
+    expect(rangesOf(r.proto)).toEqual([[1, 1]]);
+    expect(writes).toBe(0);
+    expect(r.held()).toEqual([]);
   });
 });

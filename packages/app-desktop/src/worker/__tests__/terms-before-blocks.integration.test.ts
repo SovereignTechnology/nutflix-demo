@@ -25,6 +25,11 @@ import type { PayLink } from '../net/peer-node.js';
 import { PeerNode } from '../net/peer-node.js';
 import { sleep, tempDir, within } from './helpers/harness.js';
 
+// Round-8 review (test integrity): the stated reason. Two real hyperswarm nodes on a local DHT
+// testnet (connection, announce and lookup), then waits with deadlines of their own — block reads
+// of up to 10 s each and `poll()`s of 5–10 s — which must fire before vitest's timeout so a
+// failure names what never came; the default 5 s per test is shorter than one of them. Alone each
+// test takes under 0.4 s (measured 2026-09-27).
 vi.setConfig({ testTimeout: 60_000 });
 
 const BLOCK = DEFAULT_BLOCK_SIZE;

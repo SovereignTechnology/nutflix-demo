@@ -314,3 +314,67 @@ describe('UnpaidRecord as the SeederLedger: the write-ahead "full" word', () => 
     expect(c.rec.recorded(S1, CORE, [[0, 9]]).map((x) => x.index)).toEqual([1]);
   });
 });
+
+// Lane W8b-p2p (round-8 review, LOW): a PAY's blocks left the record in memory only, until the
+// next batch — a crash after the PAY was sent brought them back to be paid twice. `removeNow` is
+// the write-ahead: the file loses them before the PAY is sent, and only when it had them.
+describe('UnpaidRecord.removeNow: a PAY’s blocks leave the file before it is sent', () => {
+  function counting(fail: () => boolean = () => false) {
+    let writes = 0;
+    const state: StateFs = {
+      ...nodeStateFs,
+      writeAtomic: (p, data) => {
+        writes++;
+        if (fail()) throw new Error('disk full');
+        nodeStateFs.writeAtomic(p, data);
+      },
+    };
+    return { state, writes: () => writes };
+  }
+  const onDisk = async (dir: string): Promise<number[]> => {
+    const again = await rig({ dir });
+    return again.rec.recorded(S1, CORE, [[0, 99]]).map((b) => b.index);
+  };
+
+  it('written at once when a block it takes out is in the file; no write when none ever was', async () => {
+    const fs = counting();
+    const { rec, dir } = await rig({ state: fs.state });
+    for (const i of [1, 2, 3]) rec.add(S1, CORE, i, terms(SID_A));
+    expect(rec.flush()).toBe(true);
+    expect(fs.writes()).toBe(1);
+    rec.add(S1, CORE, 7, terms(SID_A)); // after the write: in memory only
+    expect(rec.removeNow(S1, CORE, 7, 7)).toBe(true);
+    expect(fs.writes()).toBe(1); // it never reached the file: nothing to write ahead
+    expect(rec.removeNow(S1, CORE, 1, 2)).toBe(true);
+    expect(fs.writes()).toBe(2); // 1 and 2 were in the file: written out now
+    expect(await onDisk(dir)).toEqual([3]);
+    expect(rec.removeNow(S1, CORE, 50, 60)).toBe(true); // nothing recorded there
+    expect(fs.writes()).toBe(2);
+  });
+
+  it('a block re-recorded under another session after a write counts as in the file', async () => {
+    const fs = counting();
+    const { rec, dir } = await rig({ state: fs.state });
+    rec.add(S1, CORE, 4, terms(SID_A));
+    rec.flush();
+    rec.add(S1, CORE, 4, terms(SID_B)); // the file still lists it (under SID_A)
+    expect(rec.removeNow(S1, CORE, 4, 4)).toBe(true);
+    expect(fs.writes()).toBe(2);
+    expect(await onDisk(dir)).toEqual([]);
+  });
+
+  it('a failed write says so (false), and the next batch writes what it could not', async () => {
+    let broken = true;
+    const fs = counting(() => broken);
+    const { rec, dir } = await rig({ state: fs.state });
+    broken = false;
+    rec.add(S1, CORE, 1, terms(SID_A));
+    rec.flush();
+    broken = true;
+    expect(rec.removeNow(S1, CORE, 1, 1)).toBe(false);
+    expect(rec.recorded(S1, CORE, [[0, 99]])).toEqual([]); // out of memory all the same
+    broken = false;
+    expect(rec.flush()).toBe(true);
+    expect(await onDisk(dir)).toEqual([]);
+  });
+});

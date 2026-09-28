@@ -21,7 +21,13 @@ export type { ResolvedSeederConfig, SeederConfig } from './config.js';
 
 // Blobs / CAS
 export { BlobStore, DEFAULT_CORE_NAME } from './blobs/blob-store.js';
-export type { PutError, PutOptions, PutResult, SeedCore } from './blobs/blob-store.js';
+export type {
+  OpenCoreOptions,
+  PutError,
+  PutOptions,
+  PutResult,
+  SeedCore,
+} from './blobs/blob-store.js';
 export { CasIndex, CAS_INDEX_FILE } from './store/cas-index.js';
 export type { CasEntry } from './store/cas-index.js';
 export { DiskCap } from './store/disk-cap.js';
@@ -55,6 +61,11 @@ export type {
 } from './net/one-peer.js';
 export type { SwarmConfig } from './net/swarm.js';
 export { BanList, BAN_FILE } from './store/ban-list.js';
+export {
+  CORE_POLICY_FILE,
+  CorePolicyStore,
+  MAX_REMEMBERED_CORE_POLICIES,
+} from './store/core-policies.js';
 export type { PersistedBan } from './store/ban-list.js';
 
 // Payment

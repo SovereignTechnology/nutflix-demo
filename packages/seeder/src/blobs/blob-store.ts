@@ -9,6 +9,13 @@
  * no second read stream exists, so a caller that unlinks the file right after the result
  * cannot leave an orphaned `createReadStream` behind to raise an uncaught ENOENT (found by
  * L3, docs/lanes/L3.md).
+ *
+ * Lane W8b-p2p (round-8 review, LOW): opens of one core share ONE Hypercore session. Two callers
+ * opening the same core at once (two thumbnails of one profile core) used to get two sessions:
+ * the seeder's upload gate moved to the second, `closeCoreByKey` closed only the second, and the
+ * first stayed open and replicating with no gate — served, uncounted, unannounced. Now a caller
+ * joins the open in flight (by name, or by key), and an open that finds the core registered under
+ * the other form meanwhile closes its own session and returns the registered one.
  */
 import type { CoreKeyHex, HyperblobId, Sha256Hex } from '@sovit/core';
 import Corestore from 'corestore';
@@ -47,6 +54,17 @@ export interface PutOptions {
   readonly mime?: string;
 }
 
+/** Options of one `openCore` call. */
+export interface OpenCoreOptions {
+  /**
+   * Called once, when THIS call opened the core: after it is ready and registered, before
+   * `onCoreOpened` (the seeder's upload gate, and the terms it says to peers already paired) —
+   * e.g. to mark it served free first. A caller that joins an open in flight gets that open's
+   * core without its own hook running.
+   */
+  readonly beforeOpened?: (c: SeedCore) => void;
+}
+
 export interface BlobStoreOptions {
   readonly storageDir: string;
   readonly blockSize: number;
@@ -68,6 +86,8 @@ export class BlobStore {
   readonly store: Corestore;
   private readonly cores = new Map<string, SeedCore>();
   private readonly byKey = new Map<string, SeedCore>();
+  /** Opens in flight, by name (`key:<hex>` for a key): concurrent callers share one (W8b-p2p). */
+  private readonly opening = new Map<string, Promise<SeedCore>>();
   private readonly log: Logger;
   private closed = false;
 
@@ -84,34 +104,84 @@ export class BlobStore {
     await this.store.ready();
   }
 
-  /** Open (or create) a named core and its Hyperblobs. Idempotent. */
-  async openCore(name: string = DEFAULT_CORE_NAME): Promise<SeedCore> {
+  /**
+   * Open (or create) a named core and its Hyperblobs. Idempotent; concurrent calls share one open
+   * (and one session). A core already open by key under that key takes the name (a core this
+   * store writes to is never closed as a replica).
+   */
+  openCore(name: string = DEFAULT_CORE_NAME, opts: OpenCoreOptions = {}): Promise<SeedCore> {
     const existing = this.cores.get(name);
-    if (existing) return existing;
-    const core = this.store.get({ name });
-    await core.ready();
-    const blobs = new Hyperblobs(core, { blockSize: this.opts.blockSize });
-    const sc: SeedCore = { name, core, blobs, keyHex: toHex(core.key) as CoreKeyHex };
-    this.cores.set(name, sc);
-    this.byKey.set(sc.keyHex, sc);
-    this.log.info('core opened', { name, core: sc.keyHex, length: core.length });
-    this.opts.onCoreOpened?.(sc);
-    return sc;
+    if (existing) return Promise.resolve(existing);
+    return this.shared(name, async () => {
+      const core = await this.whenReady(this.store.get({ name }));
+      const keyHex = toHex(core.key) as CoreKeyHex;
+      const raced = this.byKey.get(keyHex);
+      const sc: SeedCore =
+        raced === undefined
+          ? { name, core, blobs: new Hyperblobs(core, { blockSize: this.opts.blockSize }), keyHex }
+          : { ...raced, name };
+      if (raced !== undefined) {
+        // Opened by key meanwhile: that session stays the only one, now under its name.
+        await core.close().catch(() => undefined);
+        this.cores.delete(raced.name);
+        this.cores.set(name, sc);
+        this.byKey.set(keyHex, sc);
+        return sc;
+      }
+      this.cores.set(name, sc);
+      this.byKey.set(keyHex, sc);
+      this.log.info('core opened', { name, core: keyHex, length: core.length });
+      opts.beforeOpened?.(sc);
+      this.opts.onCoreOpened?.(sc);
+      return sc;
+    });
   }
 
-  /** Open a core by key (read-only replica, e.g. a gateway fetching upstream). */
-  async openCoreByKey(key: Uint8Array): Promise<SeedCore> {
+  /**
+   * Open a core by key (read-only replica, e.g. a gateway fetching upstream). Concurrent calls
+   * share one open (and one session); a core open by name already is returned as it is.
+   */
+  openCoreByKey(key: Uint8Array): Promise<SeedCore> {
     const hex = toHex(key);
     const existing = this.byKey.get(hex);
-    if (existing) return existing;
-    const core = this.store.get({ key });
-    await core.ready();
-    const blobs = new Hyperblobs(core, { blockSize: this.opts.blockSize });
-    const sc: SeedCore = { name: `key:${hex}`, core, blobs, keyHex: hex as CoreKeyHex };
-    this.cores.set(sc.name, sc);
-    this.byKey.set(hex, sc);
-    this.opts.onCoreOpened?.(sc);
-    return sc;
+    if (existing) return Promise.resolve(existing);
+    return this.shared(`key:${hex}`, async () => {
+      const core = await this.whenReady(this.store.get({ key }));
+      const raced = this.byKey.get(hex);
+      if (raced !== undefined) {
+        // Opened by name meanwhile: that session stays the only one.
+        await core.close().catch(() => undefined);
+        return raced;
+      }
+      const blobs = new Hyperblobs(core, { blockSize: this.opts.blockSize });
+      const sc: SeedCore = { name: `key:${hex}`, core, blobs, keyHex: hex as CoreKeyHex };
+      this.cores.set(sc.name, sc);
+      this.byKey.set(hex, sc);
+      this.opts.onCoreOpened?.(sc);
+      return sc;
+    });
+  }
+
+  /** The open of `id` in flight, or `open()` started as it (lane W8b-p2p). */
+  private shared(id: string, open: () => Promise<SeedCore>): Promise<SeedCore> {
+    const pending = this.opening.get(id);
+    if (pending !== undefined) return pending;
+    const p = open().finally(() => {
+      if (this.opening.get(id) === p) this.opening.delete(id);
+    });
+    this.opening.set(id, p);
+    return p;
+  }
+
+  /** `core` once ready; a session that fails to open is closed (a retry opens a fresh one). */
+  private async whenReady(core: Hypercore): Promise<Hypercore> {
+    try {
+      await core.ready();
+    } catch (err) {
+      await core.close().catch(() => undefined);
+      throw err;
+    }
+    return core;
   }
 
   coreByKey(keyHex: string): SeedCore | undefined {

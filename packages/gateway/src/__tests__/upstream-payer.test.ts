@@ -15,7 +15,9 @@ import { Seeder, nodeCrypto, nodeFs, toHex } from '@sovit/seeder';
 
 import {
   MAX_CLOCK_STEP_MS,
+  MAX_FREE_CORES_PER_SEEDER,
   MAX_PAY_FAILURES,
+  MAX_PRICED_CORES_PER_SEEDER,
   PAY_GIVE_UP_MS,
   PAY_RETRY_BASE_MS,
   PAY_RETRY_LATER_MAX_MS,
@@ -1507,24 +1509,51 @@ describe('UpstreamPayer — PRICE { free: true } is not a price (ADR 0015 amendm
 
 describe('UpstreamPayer — owed blocks from before (ADR 0018 amendment)', () => {
   const RECORDED = basePolicy(MANIFEST_PRICE);
-  function owedRig(o: { owed?: boolean; recorded?: PricePolicy | null } = {}) {
+  function owedRig(
+    o: {
+      owed?: boolean;
+      recorded?: PricePolicy | null;
+      /** Lane W8b-p2p: an outcome code to refuse an owed PAY with (`null`: built). */
+      failOwed?: () => string | null;
+      /** Lane W8b-p2p: an outcome code to refuse a fresh PAY with (`null`: built). */
+      failFresh?: () => string | null;
+      payEveryBlocks?: number;
+    } = {},
+  ) {
     const engine = new mocks.MockPaymentEngine({ mode: 'honest' });
     const owedCalls: { range: [number, number]; carryIn: number; peer: string }[] = [];
+    let owedTries = 0;
     const given: [number, number][] = [];
+    const scopes: (string | undefined)[] = [];
+    const refuse = (code: string): Error => Object.assign(new Error(`${code}: refused`), { code });
     const payer = new UpstreamPayer({
-      engine,
+      engine: {
+        pay: (range, seeder, policy, opts) => {
+          const code = o.failFresh?.() ?? null;
+          return code === null
+            ? engine.pay(range, seeder, policy, opts)
+            : Promise.reject(refuse(code));
+        },
+        spent: () => engine.spent(),
+      },
       logger: capturedLogger().logger,
-      payEveryBlocks: 4,
+      payEveryBlocks: o.payEveryBlocks ?? 4,
       tailMs: 0,
       ownMints: [MINT_A, MINT_B],
       policyFor: () => basePolicy(MANIFEST_PRICE),
-      onUnpayable: (_n, r) => given.push([r.fromBlock, r.toBlock]),
+      onUnpayable: (_n, r, scope) => {
+        given.push([r.fromBlock, r.toBlock]);
+        scopes.push(scope);
+      },
       ...(o.owed === false
         ? {}
         : {
             owed: {
               policyFor: () => (o.recorded === undefined ? RECORDED : o.recorded),
               pay: (range, seeder, policy, opts, peer) => {
+                owedTries++;
+                const code = o.failOwed?.() ?? null;
+                if (code !== null) return Promise.reject(refuse(code));
                 owedCalls.push({
                   range: [range.fromBlock, range.toBlock],
                   carryIn: opts.carryIn,
@@ -1537,7 +1566,7 @@ describe('UpstreamPayer — owed blocks from before (ADR 0018 amendment)', () =>
     });
     const protocol = new FakePayProtocol({ autoAck: true });
     payer.attachPeer(NOISE, protocol);
-    return { payer, protocol, owedCalls, given };
+    return { payer, protocol, owedCalls, given, scopes, owedTries: () => owedTries };
   }
   const priced = {
     type: 'PRICE',
@@ -1635,5 +1664,238 @@ describe('UpstreamPayer — owed blocks from before (ADR 0018 amendment)', () =>
     expect(dear.protocol.sentPays).toHaveLength(0);
     expect(dear.given).toEqual([[7, 7]]);
     expect(dear.payer.stats()).toMatchObject({ owedAccepted: 1, owedPaid: 0, unpayableBlocks: 1 });
+    // Terms it can never be paid at: out of the record for good (no scope).
+    expect(dear.scopes).toEqual([undefined]);
   });
+
+  // Round-8 review (MEDIUM + LOW): an owed range whose PAY kept failing for PAY_GIVE_UP_MS with a
+  // failure that may pass (no balance, the mint down, the tail file) was given up with no scope —
+  // the downloader then deleted it from its durable record, while the seeder kept counting it.
+  it('an owed range the host cannot pay for now is never given up: retried on its backoff, slowing to the deferred cadence, and paid on the same connection once the fault clears', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'performance'] });
+    try {
+      let broke = true;
+      const r = owedRig({ failOwed: () => (broke ? 'no-balance' : null) });
+      r.protocol.remoteHello(hello());
+      r.protocol.remotePrice(priced);
+      expect(r.payer.addOwed(NOISE, CORE_A, [7])).toBe(1);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(r.owedTries()).toBe(1);
+      await vi.advanceTimersByTimeAsync(PAY_GIVE_UP_MS);
+      await vi.advanceTimersByTimeAsync(0);
+      // Asked on the transient backoff until then (≤ 4 s apart), never written off.
+      const byGiveUp = r.owedTries();
+      expect(byGiveUp).toBeGreaterThanOrEqual(MAX_PAY_FAILURES);
+      expect(byGiveUp).toBeLessThanOrEqual(5 + Math.ceil(PAY_GIVE_UP_MS / PAY_RETRY_MAX_MS));
+      await vi.advanceTimersByTimeAsync(3 * PAY_RETRY_LATER_MAX_MS);
+      await vi.advanceTimersByTimeAsync(0);
+      // Past PAY_GIVE_UP_MS: on the deferred cadence — at least one ask per 30 s, never a loop.
+      const later = r.owedTries() - byGiveUp;
+      expect(later).toBeGreaterThanOrEqual(3);
+      expect(later).toBeLessThanOrEqual(6);
+      expect(r.given).toEqual([]);
+      expect(r.protocol.sentPays).toEqual([]);
+      expect(r.payer.stats()).toMatchObject({ unpayableBlocks: 0, owedPaid: 0 });
+      expect(r.payer.holds(NOISE, CORE_A, 7)).toBe(true); // still owed on this connection
+      broke = false;
+      await vi.advanceTimersByTimeAsync(PAY_RETRY_LATER_MAX_MS);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(r.owedCalls.map((c) => c.range)).toEqual([[7, 7]]);
+      expect(r.protocol.sentPays.map((p) => [p.range.fromBlock, p.range.toBlock])).toEqual([
+        [7, 7],
+      ]);
+      expect(r.payer.stats()).toMatchObject({ unpayableBlocks: 0, owedPaid: 1 });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('owed and fresh blocks back off apart: an owed range failing for now never holds this connection’s blocks of the core back, nor the reverse', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'performance'] });
+    try {
+      let owedBroke = true;
+      let freshBroke = false;
+      const r = owedRig({
+        payEveryBlocks: 1,
+        failOwed: () => (owedBroke ? 'no-balance' : null),
+        failFresh: () => (freshBroke ? 'mint-error' : null),
+      });
+      r.protocol.remoteHello(hello());
+      r.protocol.remotePrice(priced);
+      // Owed block 1 (lower: tried first in a pass) and this connection's block 5.
+      r.payer.onDownload(CORE_A, 5, NOISE);
+      expect(r.payer.addOwed(NOISE, CORE_A, [1])).toBe(1);
+      await vi.advanceTimersByTimeAsync(0);
+      // The owed PAY failed; block 5 was paid in the same pass.
+      expect(r.protocol.sentPays.map((p) => p.range.fromBlock)).toEqual([5]);
+      expect(r.payer.holds(NOISE, CORE_A, 1)).toBe(true);
+      // Now this connection's PAYs fail and the owed one is built: it goes out regardless.
+      freshBroke = true;
+      owedBroke = false;
+      r.payer.onDownload(CORE_A, 6, NOISE);
+      await vi.advanceTimersByTimeAsync(PAY_RETRY_MAX_MS);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(r.protocol.sentPays.map((p) => p.range.fromBlock)).toEqual([5, 1]);
+      expect(r.payer.holds(NOISE, CORE_A, 6)).toBe(true); // backing off, still owed
+      freshBroke = false;
+      await vi.advanceTimersByTimeAsync(PAY_RETRY_MAX_MS);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(r.protocol.sentPays.map((p) => p.range.fromBlock)).toEqual([5, 1, 6]);
+      expect(r.given).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // The pass goes on with the core after a failure: when one retry timer brings both kinds back at
+  // once (their backoffs end together), the owed range — lower in the core, tried first — fails
+  // again, and this connection's block must still be tried in that same pass. Ending the pass
+  // there (as before the streaks were split) left it for the next owed retry, which failed first
+  // again: this connection's blocks starved behind an owed range retried for ever.
+  it('one retry pass with both kinds due: the owed range fails again, this connection’s block is still paid in that pass', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'performance'] });
+    try {
+      let freshBroke = true;
+      const r = owedRig({
+        payEveryBlocks: 1,
+        failOwed: () => 'no-balance',
+        failFresh: () => (freshBroke ? 'mint-error' : null),
+      });
+      r.protocol.remoteHello(hello());
+      r.protocol.remotePrice(priced);
+      r.payer.onDownload(CORE_A, 5, NOISE); // fails: backs off PAY_RETRY_BASE_MS
+      expect(r.payer.addOwed(NOISE, CORE_A, [1])).toBe(1); // fails too, same backoff
+      await vi.advanceTimersByTimeAsync(0);
+      expect(r.protocol.sentPays).toEqual([]);
+      freshBroke = false;
+      // ONE timer ends both backoffs; nothing else happens (no block, no ACK, no flush).
+      await vi.advanceTimersByTimeAsync(PAY_RETRY_BASE_MS);
+      expect(r.protocol.sentPays.map((p) => p.range.fromBlock)).toEqual([5]);
+      expect(r.payer.holds(NOISE, CORE_A, 1)).toBe(true); // still owed, backing off
+      expect(r.given).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('an owed range the seeder no longer prices on this connection is dropped from this connection only (scope connection); a final refusal drops it for good', async () => {
+    const r = owedRig({ failOwed: () => null });
+    const unacked = new FakePayProtocol({ autoAck: false });
+    r.payer.attachPeer('cd'.repeat(32), unacked);
+    unacked.remoteHello(hello());
+    unacked.remotePrice(priced);
+    r.payer.onDownload(CORE_A, 1, 'cd'.repeat(32));
+    await r.payer.flush('cd'.repeat(32)); // block 1's PAY waits for its ACK: 7 stays pending
+    expect(r.payer.addOwed('cd'.repeat(32), CORE_A, [7])).toBe(1);
+    unacked.remotePrice({ ...priced, satsPerBlock: 0 as Sats, free: true });
+    unacked.remoteAck({ type: 'ACK', core: CORE_A, fromBlock: 1, toBlock: 1, ok: true });
+    await r.payer.flush('cd'.repeat(32));
+    expect(r.given).toEqual([[7, 7]]);
+    expect(r.scopes).toEqual(['connection']); // a later connection that prices it may pay it
+    const f = owedRig({ failOwed: () => 'forbidden' });
+    f.protocol.remoteHello(hello());
+    f.protocol.remotePrice(priced);
+    f.payer.addOwed(NOISE, CORE_A, [7]);
+    await f.payer.flush();
+    expect(f.given).toEqual([[7, 7]]);
+    expect(f.scopes).toEqual([undefined]); // refused for good
+  });
+
+  it('holds(peer, core, index): pending or in the PAY awaiting its ACK on a live connection, nothing else', async () => {
+    const r = owedRig();
+    const u = new FakePayProtocol({ autoAck: false });
+    const other = 'cd'.repeat(32);
+    r.payer.attachPeer(other, u);
+    u.remoteHello(hello());
+    r.payer.onDownload(CORE_A, 3, other);
+    expect(r.payer.holds(other, CORE_A, 3)).toBe(true); // pending
+    expect(r.payer.holds(other, CORE_B, 3)).toBe(false);
+    expect(r.payer.holds(NOISE, CORE_A, 3)).toBe(false); // another connection
+    await r.payer.flush(other);
+    expect(u.sentPays.map((p) => p.range.fromBlock)).toEqual([3]);
+    expect(r.payer.holds(other, CORE_A, 3)).toBe(true); // in flight, awaiting its ACK
+    u.remoteAck({ type: 'ACK', core: CORE_A, fromBlock: 3, toBlock: 3, ok: true });
+    expect(r.payer.holds(other, CORE_A, 3)).toBe(false); // settled
+    r.payer.onDownload(CORE_A, 4, other);
+    u.remoteClose('remote');
+    expect(r.payer.holds(other, CORE_A, 4)).toBe(false); // a closed connection pays nothing
+  });
+});
+
+// Round-8 review (info): the payer kept every core a seeder said free (and every priced core) for
+// the whole connection, unbounded, while the settler's answer is bounded at 256 — a seeder that
+// said free for more than that made them disagree (blocks the settler owes, never pended).
+describe('UpstreamPayer — one bounded answer for free; bounded prices (lane W8b-p2p)', () => {
+  const free = (core: CoreKeyHex) =>
+    ({ type: 'PRICE', core, satsPerBlock: 0 as Sats, effectiveFromBlock: 0, free: true }) as const;
+  const priced = (core: CoreKeyHex) =>
+    ({ type: 'PRICE', core, satsPerBlock: 3 as Sats, effectiveFromBlock: 0 }) as const;
+  const coreN = (n: number): CoreKeyHex => n.toString(16).padStart(64, '0') as CoreKeyHex;
+
+  it('with servesFree, that is the answer: a core the downloader no longer counts free is pended and paid', async () => {
+    let settlerSaysFree = true;
+    const { payer, protocol } = unit(1);
+    const withOption = new UpstreamPayer({
+      engine: new mocks.MockPaymentEngine({ mode: 'honest' }),
+      logger: capturedLogger().logger,
+      payEveryBlocks: 1,
+      tailMs: 0,
+      ownMints: [MINT_A, MINT_B],
+      policyFor: () => basePolicy(MANIFEST_PRICE),
+      servesFree: () => settlerSaysFree,
+    });
+    const p2 = new FakePayProtocol({ autoAck: true });
+    withOption.attachPeer(NOISE, p2);
+    for (const pr of [protocol, p2]) {
+      pr.remoteHello(hello());
+      pr.remotePrice(free(CORE_A));
+    }
+    payer.onDownload(CORE_A, 0, NOISE);
+    withOption.onDownload(CORE_A, 0, NOISE);
+    expect(payer.holds(NOISE, CORE_A, 0)).toBe(false);
+    expect(withOption.holds(NOISE, CORE_A, 0)).toBe(false);
+    // The settler forgot the word (its bound): the payer follows it, not its own set.
+    settlerSaysFree = false;
+    withOption.onDownload(CORE_A, 1, NOISE);
+    expect(withOption.holds(NOISE, CORE_A, 1)).toBe(true);
+    await withOption.flush();
+    expect(p2.sentPays.map((m) => m.range.fromBlock)).toEqual([1]);
+  });
+
+  it('its own set of free words is bounded like the settler’s (oldest first), and so is its price map', () => {
+    const { payer, protocol } = unit(1);
+    protocol.remoteHello(hello());
+    protocol.remotePrice(free(coreN(0)));
+    for (let i = 1; i <= MAX_FREE_CORES_PER_SEEDER; i++) protocol.remotePrice(free(coreN(i)));
+    // core 0 is the oldest word: forgotten, its blocks are owed again; core 1 is still free.
+    payer.onDownload(coreN(0), 0, NOISE);
+    payer.onDownload(coreN(1), 0, NOISE);
+    expect(payer.holds(NOISE, coreN(0), 0)).toBe(true);
+    expect(payer.holds(NOISE, coreN(1), 0)).toBe(false);
+    // Prices: the oldest priced core past the bound is forgotten (no owed blocks taken for it).
+    const r = owedRigLike();
+    r.protocol.remoteHello(hello());
+    for (let i = 0; i <= MAX_PRICED_CORES_PER_SEEDER; i++) r.protocol.remotePrice(priced(coreN(i)));
+    expect(r.payer.addOwed(NOISE, coreN(0), [1])).toBe(0);
+    expect(r.payer.addOwed(NOISE, coreN(1), [1])).toBe(1);
+  });
+
+  function owedRigLike() {
+    const engine = new mocks.MockPaymentEngine({ mode: 'honest' });
+    const payer = new UpstreamPayer({
+      engine,
+      logger: capturedLogger().logger,
+      payEveryBlocks: 4,
+      tailMs: 0,
+      ownMints: [MINT_A, MINT_B],
+      policyFor: () => basePolicy(MANIFEST_PRICE),
+      owed: {
+        policyFor: () => basePolicy(MANIFEST_PRICE),
+        pay: (r, s, p, o) => engine.pay(r, s, p, o),
+      },
+    });
+    const protocol = new FakePayProtocol({ autoAck: false });
+    payer.attachPeer(NOISE, protocol);
+    return { payer, protocol };
+  }
 });

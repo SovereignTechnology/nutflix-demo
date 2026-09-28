@@ -504,6 +504,109 @@ describe('Seeder façade', () => {
     expect(s.seeder.isFreeCore(profile)).toBe(false);
   });
 
+  // Lane W8b-p2p (round-8 review, MEDIUM): per-core prices lived in memory only. After a restart
+  // nothing priced a core this node had sold (an upload, a played video still in its store), so
+  // the desktop's image path could mark it free on our own seeder — an attacker's thumbnail URL
+  // naming our video, and every viewer downloaded it from us without paying.
+  it('per-core policies are kept across a restart: a core sold before it stays sold — never free, priced as before', async () => {
+    const policy: PricePolicy = {
+      satsPerBlock: 3 as never,
+      blockSize: BLOCK,
+      mints: [mocks.MINTS.a],
+      split: { seeder: 60, creator: 40 },
+      creatorP2pk: mocks.asP2pk('creator'),
+      minPaySats: 12 as never,
+    };
+    const sold = 'a1'.repeat(32) as never;
+    const other = 'a2'.repeat(32) as never;
+    const first = await make();
+    const dataDir = first.seeder.config.dataDir;
+    first.seeder.setCorePolicy(sold, policy);
+    first.seeder.setCorePolicy(other, { ...policy, satsPerBlock: 1 as never });
+    first.seeder.setCorePolicy(other, null); // forgotten: not kept either
+    await first.seeder.close();
+    const second = await make({ dataDir });
+    expect([...second.seeder.corePolicyMap()]).toEqual([[sold, policy]]);
+    expect(second.seeder.policyFor(sold)).toEqual(policy);
+    // The attacker's thumbnail after the restart: our video is never marked free.
+    expect(second.seeder.setFreeCore(sold, true)).toBe(false);
+    expect(second.seeder.isFreeCore(sold)).toBe(false);
+    expect(second.seeder.setFreeCore(other, true)).toBe(true); // no policy: may be free
+    // A new price is kept too, and a cleared one is gone after the next restart.
+    second.seeder.setCorePolicy(sold, null);
+    await second.seeder.close();
+    const third = await make({ dataDir });
+    expect(third.seeder.corePolicyMap().size).toBe(0);
+  });
+
+  it('the policy file is checked on load: malformed entries are dropped (warned), a file that does not parse starts empty (logged)', async () => {
+    const t = await tmpDir();
+    cleanups.push(t.rm);
+    const good = {
+      satsPerBlock: 2,
+      blockSize: BLOCK,
+      mints: [mocks.MINTS.a],
+      split: { seeder: 50, creator: 50 },
+      creatorP2pk: mocks.asP2pk('creator'),
+    };
+    await writeFile(
+      path.join(t.dir, 'core-policies.json'),
+      JSON.stringify({
+        version: 1,
+        cores: [
+          { core: 'b1'.repeat(32), policy: good },
+          { core: 'not-a-key', policy: good },
+          { core: 'b2'.repeat(32), policy: { ...good, satsPerBlock: -1 } },
+          { core: 'b3'.repeat(32), policy: { ...good, split: { seeder: 70, creator: 70 } } },
+          { core: 'b4'.repeat(32), policy: { ...good, mints: 'one' } },
+        ],
+      }),
+    );
+    const s = await make({ dataDir: t.dir });
+    expect([...s.seeder.corePolicyMap().keys()]).toEqual(['b1'.repeat(32)]);
+    expect(
+      s.log.records.some((r) => r.msg === 'malformed core policies on disk were dropped'),
+    ).toBe(true);
+    await s.seeder.close();
+    const u = await tmpDir();
+    cleanups.push(u.rm);
+    await writeFile(path.join(u.dir, 'core-policies.json'), '{ nope');
+    const s2 = await make({ dataDir: u.dir });
+    expect(s2.seeder.corePolicyMap().size).toBe(0);
+    expect(s2.log.records.filter((r) => r.level === 'error').map((r) => r.msg)).toEqual([
+      'core policies on disk were unreadable; starting with none',
+    ]);
+  });
+
+  // Lane W8b-p2p (round-8 review, info): the desktop's own profile core was marked free only after
+  // its open returned — after its upload gate was attached and its terms said to peers that paired
+  // while it opened (silence, then `free`). Opened `free`, it is free from the moment it is ready.
+  it('openCore(name, { free: true }): free before its upload gate is attached; never for a core with a price', async () => {
+    const s = await make();
+    const atGate: boolean[] = [];
+    const attach = s.seeder.sessions.attachUploadGate.bind(s.seeder.sessions);
+    s.seeder.sessions.attachUploadGate = (core) => {
+      atGate.push(s.seeder.isFreeCore(toHex(core.key) as never));
+      return attach(core);
+    };
+    const sc = await s.seeder.openCore('profile', { free: true });
+    expect(atGate).toEqual([true]);
+    expect(s.seeder.isFreeCore(sc.keyHex)).toBe(true);
+    // Idempotent; and a core that has a price is never made free by it.
+    expect(await s.seeder.openCore('profile', { free: true })).toBe(sc);
+    const video = await s.seeder.openCore('video');
+    expect(s.seeder.isFreeCore(video.keyHex)).toBe(false);
+    s.seeder.setCorePolicy(video.keyHex, {
+      satsPerBlock: 2 as never,
+      blockSize: BLOCK,
+      mints: [mocks.MINTS.a],
+      split: { seeder: 50, creator: 50 },
+      creatorP2pk: mocks.asP2pk('creator'),
+    });
+    await s.seeder.openCore('video', { free: true });
+    expect(s.seeder.isFreeCore(video.keyHex)).toBe(false);
+  });
+
   it('policy() throws until configured; close() is idempotent and flushes', async () => {
     const s = await make();
     expect(() => s.seeder.policy()).toThrow(/PricePolicy/);

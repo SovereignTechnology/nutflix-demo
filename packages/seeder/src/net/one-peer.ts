@@ -35,6 +35,12 @@
  *      outside payment (its `PRICE { free: true }`) is capped on that core by the budget alone:
  *      what it may count on its other cores does not hold that core back, and nothing asked of it
  *      there — in flight, cancelled or lost with a peer — is ever counted in `used` or `debt`.
+ *   6. (lane W8b-p2p, round-8 review) with the `room` option, the free requests out at a peer and
+ *      what it may count share its window while they are in flight: a free request fits under
+ *      `room − used − (free requests out)`, a counted one under `budget − used − (free requests
+ *      out)`. So a free core the peer turns sold mid-flight — it then counts those requests —
+ *      never takes it past its window (it would cut and ban us). Landed, cancelled or lost, a
+ *      free request is still never debt.
  *
  * A request has STALLED when it is at least `stallMs` old AND its peer has delivered no block on
  * that core for `stallMs` (measured from the later of the request and the peer's last block): a
@@ -143,6 +149,18 @@ export interface OnePeerRouterOptions {
    * again from then on, all of it (the safe side). A throw counts as `false` (counted).
    */
   readonly free?: (remote: string, core: string) => boolean;
+  /**
+   * Lane W8b-p2p (round-8 review): the most `remote` may still count against us over EVERY core
+   * right now — its window less what it already counts (blocks delivered unpaid, reported, lost).
+   * Given, requests on a core it serves `free` must fit under it too, together with what it may
+   * count (`used`), and a request on a core it counts must fit under its budget together with
+   * the free requests out there: a free core it turns SOLD while they are out would otherwise
+   * count them on top of a full window, and cut and ban an honest downloader. They share the
+   * window only while in flight — landed, cancelled or lost, a free request still leaves no debt.
+   * Absent: free requests are capped by `budget` alone. Anything but a finite number ≥ 0 (a throw
+   * too) is 0: no free request, and every counted one leaves room for those already out.
+   */
+  readonly room?: (remote: string) => number;
 }
 
 export interface OnePeerRouterStats {
@@ -809,18 +827,49 @@ export class OnePeerRouter {
     if (budget === UNCAPPED) return base;
     const credit =
       typeof budget === 'number' && Number.isFinite(budget) && budget >= 1 ? Math.floor(budget) : 0;
+    const room = this.roomOf(remote);
     if (this.isFree(remote, route.keyHex)) {
       // Served outside payment: only what is in flight on THIS core holds it back (lane
-      // P2-owed-viewer) — never what the peer may count on the cores it sells.
+      // P2-owed-viewer) — never what the peer may count on the cores it sells as DEBT. Lane
+      // W8b-p2p: with `room`, it also fits, with every free request out there, under what the
+      // peer may still count — so a turn to sold mid-flight cannot take it past its window.
       let free = Math.max(0, credit - peer.inflight - peer.dataProcessing);
+      if (room !== null)
+        free = Math.min(free, Math.max(0, room - this.used(remote) - this.freeLoad(remote)));
       if (this.stalled.has(remote))
         free = Math.min(free, Math.max(0, 1 - peer.inflight - peer.dataProcessing));
       return Math.min(base, peer.inflight + free);
     }
-    let free = Math.max(0, credit - this.used(remote));
+    // Lane W8b-p2p: with `room`, free requests out at this peer hold room in its window too.
+    const aside = room === null ? 0 : this.freeLoad(remote);
+    let free = Math.max(0, credit - this.used(remote) - aside);
     if (this.stalled.has(remote) || this.isSingle(remote))
       free = Math.min(free, Math.max(0, 1 - this.inflight(remote)));
     return Math.min(base, peer.inflight + free);
+  }
+
+  /** The `room` option (lane W8b-p2p): `null` when absent; junk or a throw is 0. */
+  private roomOf(remote: string): number | null {
+    const room = this.o.room;
+    if (room === undefined) return null;
+    let r: unknown;
+    try {
+      r = room(remote);
+    } catch {
+      return 0;
+    }
+    return typeof r === 'number' && Number.isFinite(r) && r >= 0 ? Math.floor(r) : 0;
+  }
+
+  /**
+   * Lane W8b-p2p: requests in flight to `remote` and blocks from it being verified on the cores it
+   * serves `free` — what it would count should one of them turn sold before they land.
+   */
+  private freeLoad(remote: string): number {
+    let n = 0;
+    for (const p of this.byRemote.get(remote) ?? [])
+      if (!this.counted(remote, p)) n += p.inflight + p.dataProcessing;
+    return n;
   }
 
   /** The `single` option (lane P2-owed-viewer); a throw is `true` (the narrower cap). */

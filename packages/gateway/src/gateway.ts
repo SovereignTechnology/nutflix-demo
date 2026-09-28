@@ -216,6 +216,8 @@ export class Gateway {
       onUnpayable: (noiseHex, range) => {
         this.settler.settleUnpaid(noiseHex, range);
       },
+      // Lane W8b-p2p (round-8 review): the settler's bounded answer, so payer and settler agree.
+      servesFree: (noiseHex, core) => this.seeders.servesFree(noiseHex, core),
     });
     this.bridge = new WsBridge({ seeder, limits: config.ws, logger: this.log });
     this.blossom = new BlossomHandler({

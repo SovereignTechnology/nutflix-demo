@@ -27,6 +27,11 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { BLOCK, cleanupRigs, rig, settle, tmpDir, until } from './helpers.js';
 
+// Round-8 review (test integrity): the stated reason. Each test waits on real replication streams
+// with deadlines of its own — block reads of up to 5 s each (several per test) and `until()`
+// polls of 5 s — which must fire before vitest's timeout so a failure says what never came; the
+// default 5 s per test is shorter than one of them. Alone each test takes under 0.4 s (measured
+// 2026-09-27).
 vi.setConfig({ testTimeout: 60_000 });
 
 /** The viewer's HELLO key: a fixture scalar, never a real key. */

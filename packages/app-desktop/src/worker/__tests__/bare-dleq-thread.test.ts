@@ -1,7 +1,8 @@
 /**
  * Issue #8 (d) under the REAL Bare runtime the desktop ships (bare-sidecar's prebuilt `bare`),
  * against the BUILT worker modules (`dist/worker/…`, the unbundled tsc output the host runs;
- * skipped when `dist/` lacks them — `npm run build` first, as CI does): `bareDleqThread` starts
+ * skipped when `dist/` lacks them — `npm run build` first, as CI does — and FAILED instead under
+ * `NUTFLIX_REQUIRE_BUILT=1`, round-8 review): `bareDleqThread` starts
  * `dist/worker/pay/dleq-thread-entry.mjs` on a `Bare.Thread`, and the worker's event loop is
  * measured while a maximal PAY (2 sets × 64 proofs) is checked — inline on the loop (the engine's
  * behaviour before), on the thread, and on the chunked fallback — with the same verdicts each way
@@ -38,6 +39,15 @@ const built =
   existsSync(ENTRY) &&
   existsSync(join(DIST, 'pay', 'dleq-thread.js')) &&
   existsSync(join(DIST, 'adapters', 'bare.js'));
+/**
+ * Round-8 review (test integrity): with `NUTFLIX_REQUIRE_BUILT=1` a `dist/` without the built
+ * modules FAILS this file instead of skipping it, so the real-Bare checks of the DLEQ thread can never pass by being skipped.
+ * A gate that builds first sets it (`NUTFLIX_REQUIRE_BUILT=1 npx vitest run` after `npm run
+ * build`); a plain `vitest run` without a build still skips, as before.
+ */
+const REQUIRE_BUILT = process.env['NUTFLIX_REQUIRE_BUILT'] === '1';
+/** Why the file cannot run (the assertion's message under `NUTFLIX_REQUIRE_BUILT=1`). */
+const NOT_BUILT = 'dist/worker lacks the built worker modules: run `npm run build` first';
 const MINT = 'https://mint.bare-dleq.test' as MintUrl;
 
 /** The program Bare runs: measure, compare, report one JSON line over IPC. */
@@ -227,10 +237,11 @@ interface Report {
 }
 
 describe('DLEQ off the Bare worker’s event loop (issue #8 d, F5)', () => {
-  it.skipIf(!built)(
+  it.skipIf(!built && !REQUIRE_BUILT)(
     'a maximal PAY (128 proofs) is checked on a Bare.Thread with the same verdicts, and the loop keeps turning',
     { timeout: 120_000 },
     async () => {
+      expect(built, NOT_BUILT).toBe(true);
       const cs = checks(payment.MAX_PROOFS_PER_SET * 2);
       const want = cs.map((c) => payment.proofDleqOk(c.proof, c.keyset));
       expect(want.filter((x) => !x)).toHaveLength(16);

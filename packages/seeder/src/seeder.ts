@@ -8,6 +8,7 @@
  *   SwarmManager (hyperswarm, ban-list firewall, join per core)
  *   FlushScheduler (PaymentEngine.flush every N blocks / T ms)
  *   BanList (Noise + Nostr, persisted)
+ *   CorePolicyStore (per-core prices, persisted — lane W8b-p2p)
  *   Logger (redacting; the only output path)
  */
 import { payment } from '@sovit/core';
@@ -47,6 +48,7 @@ import { BanList } from './store/ban-list.js';
 import type { PersistedBan } from './store/ban-list.js';
 import { CasIndex } from './store/cas-index.js';
 import type { CasEntry } from './store/cas-index.js';
+import { CorePolicyStore } from './store/core-policies.js';
 import { DiskCap } from './store/disk-cap.js';
 
 export interface SeederDeps {
@@ -128,7 +130,14 @@ export class Seeder {
   private readonly protocols = new Map<PeerSession, PayProtocol>();
   private readonly unsubs: (() => void)[] = [];
   private policyOverride: PricePolicy | null;
+  /**
+   * Per-core policies (`setCorePolicy`). Lane W8b-p2p (round-8 review, MEDIUM): loaded back from
+   * `corePolicyStore` at start, so a core this node sold before a restart — an upload, a played
+   * video still in its store — is still sold after it: never marked free (`setFreeCore`), and
+   * priced as before.
+   */
   private readonly corePolicies = new Map<CoreKeyHex, PricePolicy>();
+  private readonly corePolicyStore: CorePolicyStore;
   /** ADR 0015: cores served outside payment. */
   private readonly freeCores = new Set<CoreKeyHex>();
   /**
@@ -154,7 +163,11 @@ export class Seeder {
   private constructor(
     config: ResolvedSeederConfig,
     deps: SeederDeps,
-    loaded: { readonly banList: BanList; readonly index: CasIndex },
+    loaded: {
+      readonly banList: BanList;
+      readonly index: CasIndex;
+      readonly corePolicies: CorePolicyStore;
+    },
   ) {
     this.config = config;
     this.engine = deps.engine;
@@ -163,6 +176,8 @@ export class Seeder {
     this.policyOverride = config.policy;
     this.banList = loaded.banList;
     this.index = loaded.index;
+    this.corePolicyStore = loaded.corePolicies;
+    for (const [core, policy] of loaded.corePolicies.entries()) this.corePolicies.set(core, policy);
     this.diskCap = new DiskCap(config.diskCapBytes, this.index.totalBytes());
     this.rateLimiter = new RateLimiter(config.rateLimits, deps.now ?? Date.now);
     this.sessions = new SessionRegistry({
@@ -246,14 +261,24 @@ export class Seeder {
       dataDir: config.dataDir,
       now: nowSec,
     });
+    const corePolicies = new CorePolicyStore({
+      fs: deps.fs,
+      crypto: deps.crypto,
+      dataDir: config.dataDir,
+    });
     await banList.load();
     await index.load();
+    await corePolicies.load();
     if (banList.corruptOnLoad)
       log.error('ban list on disk was unreadable; starting with an empty list');
     if (index.corruptOnLoad)
       log.error('CAS index on disk was unreadable; starting with an empty index');
+    if (corePolicies.corruptOnLoad)
+      log.error('core policies on disk were unreadable; starting with none');
+    if (corePolicies.dropped > 0)
+      log.warn('malformed core policies on disk were dropped', { dropped: corePolicies.dropped });
 
-    const seeder = new Seeder(config, deps, { banList, index });
+    const seeder = new Seeder(config, deps, { banList, index, corePolicies });
     await seeder.blobs.ready();
     seeder.wireEvents();
     seeder.log.info('seeder created', {
@@ -262,6 +287,7 @@ export class Seeder {
       usedBytes: seeder.diskCap.usedBytes,
       capBytes: config.diskCapBytes,
       bans: banList.entries().length,
+      corePolicies: corePolicies.entries().size,
     });
     return seeder;
   }
@@ -292,7 +318,13 @@ export class Seeder {
     this.gates.clear();
     if (this.swarm) await this.swarm.destroy();
     await this.blobs.close();
-    await Promise.all([this.banList.flushed(), this.index.flushed()]);
+    await Promise.all([
+      this.banList.flushed(),
+      this.index.flushed(),
+      this.corePolicyStore.flushed(),
+    ]);
+    if (this.corePolicyStore.lastPersistError !== null)
+      this.log.warn('core policies could not be written: they are unpriced after a restart');
     this.log.info('seeder closed');
   }
 
@@ -314,8 +346,23 @@ export class Seeder {
 
   // ------------------------------------------------------------------ blobs
 
-  openCore(name?: string): Promise<SeedCore> {
-    return this.blobs.openCore(name);
+  /**
+   * Open (or create) a named core. Lane W8b-p2p (round-8 review, info): with `free`, the core is
+   * served outside payment from the moment it is ready — marked before its upload gate is
+   * attached and before its terms are said to a peer that paired while it opened (they hear
+   * `free`, never silence first) — unless it has a price of its own (`setFreeCore`'s rule). The
+   * desktop's own profile core opens this way.
+   */
+  async openCore(name?: string, opts: { readonly free?: boolean } = {}): Promise<SeedCore> {
+    if (opts.free !== true) return this.blobs.openCore(name);
+    const sc = await this.blobs.openCore(name, {
+      beforeOpened: (c) => {
+        if (!this.corePolicies.has(c.keyHex)) this.freeCores.add(c.keyHex);
+      },
+    });
+    // Already open (the hook did not run), or opened by a concurrent caller without `free`.
+    this.setFreeCore(sc.keyHex, true);
+    return sc;
   }
 
   putBytes(bytes: Uint8Array, opts?: PutOptions): Promise<PutResult> {
@@ -602,6 +649,9 @@ export class Seeder {
       // A core with a price is sold, never served free (fix round 4).
       this.freeCores.delete(core);
     }
+    // Lane W8b-p2p: kept across restarts (written in the background; `close` waits for it).
+    if (!this.corePolicyStore.set(core, policy))
+      this.log.warn('a core policy of an unexpected shape is not kept across restarts');
     const next = this.corePolicies.get(core) ?? this.policyOverride;
     if (!(opts.announce ?? true)) return;
     if (prev !== null && next !== null && prev.satsPerBlock !== next.satsPerBlock)
@@ -609,7 +659,10 @@ export class Seeder {
     this.tellPaired(core);
   }
 
-  /** Per-core policies currently set (does not include the default). */
+  /**
+   * Per-core policies currently set (does not include the default) — those set in earlier runs
+   * included (lane W8b-p2p: loaded back at start).
+   */
   corePolicyMap(): ReadonlyMap<CoreKeyHex, PricePolicy> {
     return this.corePolicies;
   }
@@ -620,7 +673,9 @@ export class Seeder {
    * with its own price policy is never marked free (`false` is returned and nothing changes), and
    * `setCorePolicy` clears the mark — so a caller that names a paid core by mistake (an image URL
    * pointing at a video) cannot give that video away. A change reaches every peer that has the
-   * core open now, unprompted (rule 1): `{ free: true }`, or back to its price.
+   * core open now, unprompted (rule 1): `{ free: true }`, or back to its price. Lane W8b-p2p: a
+   * policy set in an EARLIER run counts too (they are kept across restarts), so an image URL
+   * naming a video this node sold before a restart cannot give it away either.
    */
   setFreeCore(core: CoreKeyHex, free: boolean): boolean {
     if (!free) {
