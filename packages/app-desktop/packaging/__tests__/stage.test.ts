@@ -34,8 +34,9 @@ import {
   PROMPT_FILES,
   RENDERER_FILES,
 } from '../identity.ts';
-import { runtimeClosure, type Lockfile } from '../closure.ts';
+import { nameAt, runtimeClosure, type Lockfile } from '../closure.ts';
 import { NOT_SHIPPED } from '../identity.ts';
+import { PROMPT_NPM } from '../prompt-npm.ts';
 import {
   BUNDLE_CONFIG,
   BUNDLE_CONFIG_ROOT,
@@ -50,6 +51,7 @@ import {
   copyPackage,
   normalizeModes,
   npmFilter,
+  promptNpmDirs,
   stageApp,
   workspaceFilter,
   type StageReport,
@@ -378,9 +380,23 @@ describe('the build the stage copies must be current (cross-lane review, round 4
 
   // Lane R6-reconcile (the round-5 verifier): the freshness rule watches the bundle's own
   // configuration too. Every tsconfig the script's builds name is watched, and so is every file
-  // those configs extend, followed to the end of the chain.
-  it('BUNDLE_CONFIG covers scripts/bundle.ts, every tsconfig it names and everything they extend', () => {
+  // those configs extend, followed to the end of the chain. Round 8: and every module the script
+  // imports by a relative path (the prompt page's npm allow-list), followed to the end too.
+  it('BUNDLE_CONFIG covers scripts/bundle.ts, the modules it imports, every tsconfig it names and everything they extend', () => {
     const script = readFileSync(join(PKG_DIR, 'scripts', 'bundle.ts'), 'utf8');
+    const modules: string[] = [];
+    for (let queue = [join(PKG_DIR, 'scripts', 'bundle.ts')]; queue.length > 0;) {
+      const from = queue.shift() ?? '';
+      const text = readFileSync(from, 'utf8');
+      for (const m of text.matchAll(/^import\s[^;]*?from\s+'(\.{1,2}\/[^']+)'/gm)) {
+        const dep = resolve(dirname(from), m[1] ?? '');
+        if (!modules.includes(dep)) {
+          modules.push(dep);
+          queue.push(dep);
+        }
+      }
+    }
+    expect(modules).toEqual([join(PKG_DIR, 'packaging', 'prompt-npm.ts')]);
     const named = [
       ...new Set([...script.matchAll(/tsconfig:\s*'([^']+)'/g)].map((m) => m[1] ?? '')),
     ];
@@ -402,11 +418,12 @@ describe('the build the stage copies must be current (cross-lane review, round 4
         next = resolve(dirname(next), ext as string);
       }
     }
-    for (const f of chain) expect(watched.has(f), relative(REPO_ROOT, f)).toBe(true);
+    for (const f of [...chain, ...modules])
+      expect(watched.has(f), relative(REPO_ROOT, f)).toBe(true);
     expect(chain).toContain(join(REPO_ROOT, 'tsconfig.base.json'));
     // Nothing watched that the bundle does not read.
     expect([...watched].sort()).toEqual(
-      [...new Set([join(PKG_DIR, 'scripts', 'bundle.ts'), ...chain])].sort(),
+      [...new Set([join(PKG_DIR, 'scripts', 'bundle.ts'), ...modules, ...chain])].sort(),
     );
   });
 
@@ -456,6 +473,48 @@ describe('the build the stage copies must be current (cross-lane review, round 4
     );
     expect(css).toBe(join(uiDist, 'ui.css'));
     expect(covered(css)).toBe(true);
+  });
+
+  // Round 8 (final panel, packaging): the prompt page inlines @scure/bip39 and the two packages
+  // it is built on, and rule 3 did not watch them (this file's other pins filter node_modules
+  // out on purpose). The watched directories are pinned against what the real prompt bundle
+  // reads: every npm input lies in one of them, at no deeper node_modules, and each is read.
+  it('promptNpmDirs covers every npm file the real prompt bundle reads, and nothing it does not', async () => {
+    const script = readFileSync(join(PKG_DIR, 'scripts', 'bundle.ts'), 'utf8');
+    const prompt = /async function bundlePrompt\(\)[\s\S]*?\n\}\n/.exec(script)?.[0] ?? '';
+    expect(prompt).toContain("entryPoints: ['src/renderer/prompt/prompt.ts']");
+    expect(prompt).toContain("platform: 'browser'");
+    expect(prompt).toContain("tsconfig: 'tsconfig.renderer.json'");
+    const r = await build({
+      absWorkingDir: PKG_DIR,
+      entryPoints: ['src/renderer/prompt/prompt.ts'],
+      bundle: true,
+      write: false,
+      format: 'esm',
+      platform: 'browser',
+      tsconfig: 'tsconfig.renderer.json',
+      metafile: true,
+      logLevel: 'silent',
+    });
+    const lock = JSON.parse(readFileSync(join(REPO_ROOT, 'package-lock.json'), 'utf8')) as Lockfile;
+    const dirs = promptNpmDirs(lock, 'packages/app-desktop');
+    expect(dirs.map(nameAt).sort()).toEqual([...PROMPT_NPM].sort());
+    const abs = dirs.map((d) => join(REPO_ROOT, d) + sep);
+    const npm = Object.keys(r.metafile.inputs)
+      .map((p) => resolve(PKG_DIR, p))
+      .filter((p) => p.split(sep).includes('node_modules'));
+    expect(npm.length).toBeGreaterThan(0);
+    const read = new Set<string>();
+    for (const p of npm) {
+      // The deepest watched directory holding it, with no node_modules below that.
+      const home = abs.filter((d) => p.startsWith(d)).sort((x, y) => y.length - x.length)[0];
+      expect(home, relative(REPO_ROOT, p)).toBeDefined();
+      expect(p.slice(home?.length ?? 0).split(sep), relative(REPO_ROOT, p)).not.toContain(
+        'node_modules',
+      );
+      read.add(home ?? '');
+    }
+    expect([...read].sort()).toEqual([...abs].sort());
   });
 });
 

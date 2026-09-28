@@ -816,6 +816,7 @@ export const isHostOut: Guard<HostOut> = safe(
         value: isSecretBytes,
       })(x),
     obj({ kind: literal('confirm'), req: isMsgId, form: isConfirmForm }),
+    obj({ kind: literal('confirm-cancel'), req: isMsgId }),
   ),
 );
 

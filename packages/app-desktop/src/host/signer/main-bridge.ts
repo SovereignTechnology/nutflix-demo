@@ -1,7 +1,8 @@
 /**
  * The host's side of main's trusted prompt window and OS-keychain store (ADR 0013): `HostOut`
  * `prompt` / `prompt-cancel` / `keychain` out, `HostIn` `prompt-answer` / `keychain-result` in,
- * matched by request id. ADR 0016 adds main's native dialog: `confirm` out, `confirm-result` in.
+ * matched by request id. ADR 0016 adds main's native dialog: `confirm` / `confirm-cancel` out,
+ * `confirm-result` in.
  *
  * An answer must fit the question: the wrong kind, an unlock method or flow the question did not
  * offer, or a keychain value nobody asked for is treated as a cancel and any secret in it is wiped.
@@ -122,14 +123,18 @@ export class MainBridge {
 
   /**
    * ADR 0016: ask in main's native dialog (Cancel the default). `true` only for the confirm
-   * button; a timeout, a host shutdown or a dialog that could not open is `false`.
+   * button; a timeout, a host shutdown or a dialog that could not open is `false`. A timeout
+   * tells main to close the dialog (`confirm-cancel`, round-8 review): left open, a later click
+   * would answer nobody while main refused every other confirm.
    */
   confirm(form: ConfirmForm): Promise<boolean> {
     if (this.closed) return Promise.resolve(false);
     const req = this.id();
     return new Promise((resolve) => {
       const timer = this.timers.setTimeout(() => {
-        if (this.confirms.delete(req)) resolve(false);
+        if (!this.confirms.delete(req)) return;
+        this.o.post({ kind: 'confirm-cancel', req });
+        resolve(false);
       }, this.o.confirmTimeoutMs ?? CONFIRM_TIMEOUT_MS);
       this.confirms.set(req, { resolve, timer });
       this.o.post({ kind: 'confirm', req, form });
@@ -204,7 +209,7 @@ export class MainBridge {
     k.resolve({ ok, value: ok ? value : null });
   }
 
-  /** Host shutdown: close every prompt, settle everything as cancelled / failed. */
+  /** Host shutdown: close every prompt and dialog, settle everything as cancelled / failed. */
   cancelAll(): void {
     this.closed = true;
     for (const [req, p] of this.prompts) {
@@ -218,8 +223,9 @@ export class MainBridge {
       k.resolve({ ok: false, value: null });
     }
     this.keychainReqs.clear();
-    for (const [, c] of this.confirms) {
+    for (const [req, c] of this.confirms) {
       this.timers.clearTimeout(c.timer);
+      this.o.post({ kind: 'confirm-cancel', req });
       c.resolve(false);
     }
     this.confirms.clear();

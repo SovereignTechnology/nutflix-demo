@@ -258,7 +258,8 @@ which may not persist counters.
 - **Shown again** only through the prompt window after re-authentication (the passphrase for a
   local key, main's native confirm otherwise), so a compromised renderer cannot reveal it.
 - **Restored** by typing it in the prompt window (`recovery-restore`):
-  - 12 fields autocomplete from the page's wordlist;
+  - 12 fields autocomplete from the page's wordlist, the matches drawn inside the page (never a
+    native `<datalist>` popup, which is its own window and outside content protection; round 8);
   - the checksum is checked in the page, in main and in the host;
   - the renderer can only name the action, throttled like connect (ADR 0013 §7).
 
@@ -373,7 +374,7 @@ which may not persist counters.
 | The renderer sees the phrase or the seed | Never sent there. Shown and typed only in main's prompt window (own origin, devTools off). Words travel as indices, mapped by the page's own wordlist. The renderer only names an action, throttled. |
 | The phrase in logs | Nothing on the phrase path logs a value; errors are codes. The desktop `redact()` misses word phrases (Related findings 3): add a rule and a canary test. |
 | The phrase or seed in backups | The sealed file is NIP-44 to self: useless without the nsec. The counters file holds no secret. No relay copy (D2a). |
-| Screenshots, screen sharing | `setContentProtection(true)` on the prompt window while the words show (macOS/Windows; Linux has none, and the window says so). No copy button. Words hide after 2 minutes or on blur. |
+| Screenshots, screen sharing | `setContentProtection(true)` on the prompt window while the words show (macOS/Windows; Linux has none, and the window says so). No copy button. Words hide after 2 minutes or on blur. Typed-word suggestions are the page's own DOM: protection is per window, and Chromium draws a `<datalist>` popup as a window of its own (round 8). |
 | Clipboard | No copy in "show". Paste is allowed in "restore" (password managers). |
 | Memory | The seed is in a secure buffer. The phrase strings cannot be wiped (residual). |
 | Wiping the seed under a running operation | Close waits for the Spender's locks before wiping; `reserve` throws after close. |
@@ -530,3 +531,21 @@ The decisions stand. What the desktop now does (details: `docs/lanes/W8a-money.m
 - **§4, journal ids.** A `begin` whose id is still journaled (a counter handed out twice) is
   refused before anything changes, never a silent replace.
 - **§5, a typed all-zero phrase** ("abandon … about") is refused by name at restore.
+
+## Implementation notes (lane W8c-prompt, desktop, 2026-09-27)
+
+From the round-8 cross-lane panel (packaging review):
+
+- **§1, restore and confirm.** The word fields no longer use a `<datalist>`. The page draws up to
+  six matches from its own list under the field being typed in (a keyboard-accessible combobox);
+  the list empties when the answer is sent. Content protection covers only the prompt window
+  itself, and on macOS Chromium draws datalist suggestions in a separate popup window.
+- **§7, main's native confirm.** `HostOut` gains `confirm-cancel { req }`. The host sends it when
+  its confirm deadline passes (5 minutes) and at shutdown. Main then closes the dialog (Electron's
+  `signal`), and also closes it when the host goes away. No answer follows, and the next question
+  is not refused as busy. On macOS a dialog with no parent window runs synchronously and cannot be
+  closed that way; its late answer is dropped by the host (an unknown request).
+- **Packaging.** Staging refuses a prompt bundle older than the installed `@scure/bip39` and the
+  packages it resolves (`packaging/stage.ts` `promptNpmDirs`). The bundle's allow-list admits a
+  file only when every package on its `node_modules` path is one of the three
+  (`packaging/prompt-npm.ts`).

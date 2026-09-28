@@ -5,7 +5,8 @@
  *     answers carry indices only, a typed phrase must pass main's own checksum re-check, and
  *     main's copy of the indices is zeroed once handed over;
  *   - the host's native confirms (`host-confirm.ts`): every word built by main from guarded data,
- *     Cancel the default, one dialog at a time, an old host's answer dropped.
+ *     Cancel the default, one dialog at a time, an old host's answer dropped; a dialog the host
+ *     stopped waiting for (its deadline, a host gone) is closed and its late answer dropped.
  */
 import { createHash } from 'node:crypto';
 
@@ -388,5 +389,116 @@ describe('the host’s native confirms (host-confirm.ts)', () => {
     resolveAsk(true);
     await new Promise((r) => setTimeout(r, 0));
     expect(answers).toEqual([[1, true]]);
+  });
+
+  // Round 8 (final panel, packaging): the host's confirm deadline passed, and main's dialog
+  // stayed up. A later "Move it" answered a question nobody was asking any more, and until it
+  // was dismissed every other host confirm was refused ('confirm.busy').
+  describe('a confirm the host stopped waiting for (confirm-cancel, host gone)', () => {
+    interface Shown {
+      readonly signal: AbortSignal;
+      readonly answer: (v: unknown) => void;
+    }
+    function rig(): {
+      c: HostConfirms;
+      shown: Shown[];
+      answers: [number, boolean][];
+      logs: string[];
+    } {
+      const shown: Shown[] = [];
+      const answers: [number, boolean][] = [];
+      const logs: string[] = [];
+      const c = new HostConfirms({
+        // Like Electron's dialog: open until answered; an aborted `signal` closes it as a cancel.
+        ask: (_p, signal) =>
+          new Promise((resolve) => {
+            shown.push({ signal, answer: resolve });
+            signal.addEventListener('abort', () => {
+              resolve(false);
+            });
+          }),
+        answer: (req, ok) => answers.push([req, ok]),
+        log: (_l, e) => logs.push(e),
+      });
+      return { c, shown, answers, logs };
+    }
+    const settle = (): Promise<void> =>
+      new Promise((r) => {
+        setTimeout(r, 0);
+      });
+
+    it('confirm-cancel closes the dialog (its signal aborts) and sends no answer', async () => {
+      const { c, shown, answers } = rig();
+      c.ask(7, { kind: 'recovery-reveal' });
+      await settle();
+      expect(shown).toHaveLength(1);
+      expect(shown[0]?.signal.aborted).toBe(false);
+      c.cancel(7);
+      expect(shown[0]?.signal.aborted).toBe(true);
+      await settle();
+      expect(answers).toEqual([]);
+    });
+
+    it('a dialog that could not be closed: its late answer is dropped, and the next confirm is not refused', async () => {
+      const shown: ((v: unknown) => void)[] = [];
+      const answers: [number, boolean][] = [];
+      const logs: string[] = [];
+      // A dialog that ignores its signal (macOS runs a parentless message box synchronously).
+      const c = new HostConfirms({
+        ask: () =>
+          new Promise((resolve) => {
+            shown.push(resolve);
+          }),
+        answer: (req, ok) => answers.push([req, ok]),
+        log: (_l, e) => logs.push(e),
+      });
+      c.ask(7, REISSUE);
+      await settle();
+      c.cancel(7);
+      c.ask(8, { kind: 'recovery-reveal' });
+      await settle();
+      expect(logs).not.toContain('confirm.busy');
+      expect(shown).toHaveLength(2);
+      shown[0]?.(true); // "Move it", clicked after the host gave up
+      await settle();
+      expect(answers).toEqual([]);
+      shown[1]?.(true);
+      await settle();
+      expect(answers).toEqual([[8, true]]);
+    });
+
+    it('a cancel for another request (or none open) changes nothing', async () => {
+      const { c, shown, answers } = rig();
+      c.cancel(1);
+      c.ask(2, { kind: 'recovery-reveal' });
+      await settle();
+      c.cancel(1);
+      c.cancel(3);
+      expect(shown[0]?.signal.aborted).toBe(false);
+      shown[0]?.answer(true);
+      await settle();
+      expect(answers).toEqual([[2, true]]);
+      c.cancel(2); // already answered
+      await settle();
+      expect(answers).toEqual([[2, true]]);
+    });
+
+    it('the host going away closes its dialog, and a restarted host’s confirm gets one at once', async () => {
+      const { c, shown, answers, logs } = rig();
+      c.ask(1, { kind: 'recovery-reveal' });
+      await settle();
+      c.hostGone();
+      expect(shown[0]?.signal.aborted).toBe(true);
+      // The new host numbers its requests from 1 again; asked before the old dialog settles.
+      c.ask(1, { kind: 'recovery-rotate' });
+      expect(logs).not.toContain('confirm.busy');
+      expect(answers).toEqual([]);
+      await settle();
+      expect(shown).toHaveLength(2);
+      expect(shown[1]?.signal.aborted).toBe(false);
+      shown[1]?.answer(true);
+      await settle();
+      expect(answers).toEqual([[1, true]]);
+    });
   });
 });

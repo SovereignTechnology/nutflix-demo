@@ -88,6 +88,31 @@ describe('scripts/bundle.ts', () => {
     expect(readdirSync(join(out, 'prompt')).sort()).toEqual([...PROMPT_FILES].sort());
   });
 
+  // Round 8 (final panel): `.words { display: grid }` beat the user-agent `[hidden]` rule, so
+  // the emptied words panel stayed on screen as a bordered box. jsdom does not apply that cascade
+  // (it reports `none` either way), so the rule is pinned on the stylesheet that ships: an
+  // `!important` `[hidden] { display: none }` wins over every author `display` that is not
+  // itself important, whatever its specificity.
+  it('prompt.css (as shipped): `hidden` always hides — [hidden] is display:none !important, no other display is important', () => {
+    const css = readFileSync(join(out, 'prompt', 'prompt.css'), 'utf8');
+    expect(css).toBe(readFileSync(join(pkg, 'src', 'renderer', 'prompt', 'prompt.css'), 'utf8'));
+    const rules = [...css.replace(/\/\*[\s\S]*?\*\//g, '').matchAll(/([^{}]+)\{([^{}]*)\}/g)].map(
+      (m) => ({ selectors: (m[1] ?? '').split(',').map((x) => x.trim()), body: m[2] ?? '' }),
+    );
+    const hidden = rules.filter((r) => r.selectors.includes('[hidden]'));
+    expect(hidden).toHaveLength(1);
+    expect(hidden[0]?.body).toMatch(/(?:^|;)\s*display:\s*none\s*!important\s*(?:;|$)/);
+    for (const r of rules)
+      if (r !== hidden[0])
+        expect(r.body, r.selectors.join(', ')).not.toMatch(/display:[^;]*!important/);
+    // What the page hides that the stylesheet also gives a display: the words panel (the case
+    // that showed) and the word-suggestion list.
+    const displayOf = (sel: string): string | undefined =>
+      /display:\s*([^;]+)/.exec(rules.find((r) => r.selectors.includes(sel))?.body ?? '')?.[1];
+    expect(displayOf('.words')).toBe('grid');
+    expect(displayOf('.suggest')).toBe('block');
+  });
+
   it('the renderer bundle is a browser ESM bundle with production React and no Node/core runtime', () => {
     const js = readFileSync(join(out, 'renderer', 'app.js'), 'utf8');
     expect(js).not.toMatch(/\brequire\(/);

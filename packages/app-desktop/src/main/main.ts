@@ -281,8 +281,12 @@ async function askUser(wcId: number, p: ConfirmPrompt): Promise<boolean> {
 
 /** ADR 0016: the host's native questions, modal to the app window (`host-confirm.ts`). */
 const hostConfirms = new HostConfirms({
-  ask: (p) =>
-    showConfirm(mainWindow !== undefined && !mainWindow.isDestroyed() ? mainWindow : null, p),
+  ask: (p, signal) =>
+    showConfirm(
+      mainWindow !== undefined && !mainWindow.isDestroyed() ? mainWindow : null,
+      p,
+      signal,
+    ),
   answer: (req, ok) => {
     post({ kind: 'confirm-result', req, ok });
   },
@@ -291,7 +295,12 @@ const hostConfirms = new HostConfirms({
   },
 });
 
-async function showConfirm(win: BrowserWindow | null, p: ConfirmPrompt): Promise<boolean> {
+/** `signal` closes the dialog as a Cancel (round 8: a host confirm nobody waits for any more). */
+async function showConfirm(
+  win: BrowserWindow | null,
+  p: ConfirmPrompt,
+  signal?: AbortSignal,
+): Promise<boolean> {
   const box: MessageBoxOptions = {
     type: 'question',
     buttons: ['Cancel', p.confirmLabel],
@@ -301,6 +310,7 @@ async function showConfirm(win: BrowserWindow | null, p: ConfirmPrompt): Promise
     title: p.title,
     message: p.message,
     detail: p.detail,
+    ...(signal === undefined ? {} : { signal }),
   };
   const r = win === null ? await dialog.showMessageBox(box) : await dialog.showMessageBox(win, box);
   return r.response === 1;
@@ -352,6 +362,9 @@ function onHostOut(out: HostOut): void {
       return;
     case 'confirm':
       hostConfirms.ask(out.req, out.form);
+      return;
+    case 'confirm-cancel':
+      hostConfirms.cancel(out.req);
       return;
     case 'reply':
     case 'sub-reply':

@@ -9,6 +9,14 @@
  * default button and the Escape answer. One dialog at a time: a second question while one is
  * open is answered "no" at once. A host that went away gets no answer (a new host never asked).
  *
+ * Round 8 (final panel): a dialog the host stopped waiting for — its `confirm-cancel` (the
+ * host's deadline passed, or it shut down) or the host gone — is CLOSED (Electron's `signal`
+ * option; the dialog behaves as if cancelled) and its answer dropped. Before, it stayed on
+ * screen: a later "Move it" answered nobody, and until it was dismissed every other host confirm,
+ * a restarted host's included, was refused as busy. Where the dialog cannot be closed (macOS runs
+ * a message box with no parent window synchronously, so main handles nothing until it is
+ * answered), its answer is still dropped, and the next question is not refused.
+ *
  * Electron-free: `main.ts` passes the dialog (`dialog.showMessageBox`); the tests pass a fake.
  */
 import type { ConfirmForm } from '../ipc/protocol.js';
@@ -69,18 +77,26 @@ export function describeHostConfirm(form: ConfirmForm): ConfirmPrompt {
 }
 
 export interface HostConfirmsDeps {
-  /** Show `prompt` natively; resolve `true` only for the confirm button. */
-  ask(prompt: ConfirmPrompt): Promise<unknown>;
+  /**
+   * Show `prompt` natively; resolve `true` only for the confirm button. When `signal` aborts,
+   * close the dialog (Electron's `showMessageBox` `signal`).
+   */
+  ask(prompt: ConfirmPrompt, signal: AbortSignal): Promise<unknown>;
   /** Deliver `confirm-result` to the host (`false` when the host is not running). */
   answer(req: number, ok: boolean): void;
   readonly log?: (level: 'warn', event: Extract<LogEvent, `confirm.${string}`>) => void;
 }
 
+/** The dialog on screen: whose question it answers, and how to close it. */
+interface OpenDialog {
+  readonly req: number;
+  readonly abort: AbortController;
+}
+
 export class HostConfirms {
   private readonly d: HostConfirmsDeps;
-  private open = false;
-  /** Bumped when the host goes away: an answer for the old host is dropped. */
-  private gen = 0;
+  /** The one dialog a host is waiting on; `undefined` once answered, cancelled or orphaned. */
+  private current: OpenDialog | undefined;
 
   constructor(deps: HostConfirmsDeps) {
     this.d = deps;
@@ -88,24 +104,23 @@ export class HostConfirms {
 
   /** The host asks (`HostOut` `confirm`, already `isHostOut`-checked). Never throws. */
   ask(req: number, form: ConfirmForm): void {
-    if (this.open) {
+    if (this.current !== undefined) {
       this.d.log?.('warn', 'confirm.busy');
       this.d.answer(req, false);
       return;
     }
-    this.open = true;
-    const gen = this.gen;
     let prompt: ConfirmPrompt;
     try {
       prompt = describeHostConfirm(form);
     } catch {
-      this.open = false;
       this.d.log?.('warn', 'confirm.failed');
       this.d.answer(req, false);
       return;
     }
+    const open: OpenDialog = { req, abort: new AbortController() };
+    this.current = open;
     void Promise.resolve()
-      .then(() => this.d.ask(prompt))
+      .then(() => this.d.ask(prompt, open.abort.signal))
       .then(
         (r) => r === true,
         () => {
@@ -114,13 +129,25 @@ export class HostConfirms {
         },
       )
       .then((ok) => {
-        this.open = false;
-        if (gen === this.gen) this.d.answer(req, ok);
+        if (this.current === open) this.current = undefined;
+        // Closed because nobody waits for it (cancelled, host gone): the answer goes nowhere.
+        if (!open.abort.signal.aborted) this.d.answer(req, ok);
       });
   }
 
-  /** The host went away: nobody is waiting for an open dialog's answer. */
+  /** `HostOut` `confirm-cancel`: the host stopped waiting for `req` — close its dialog. */
+  cancel(req: number): void {
+    if (this.current?.req === req) this.close(this.current);
+  }
+
+  /** The host went away: nobody is waiting for an open dialog's answer — close it. */
   hostGone(): void {
-    this.gen++;
+    if (this.current !== undefined) this.close(this.current);
+  }
+
+  /** Close `open`, drop its answer, and free the slot for the next question at once. */
+  private close(open: OpenDialog): void {
+    this.current = undefined;
+    open.abort.abort();
   }
 }

@@ -12,7 +12,8 @@
  *   - bare-sidecar (loaded at runtime, invisible to the bundler) must be shipped;
  *   - the build the stage copies must be current (cross-lane review, round 4): no workspace
  *     package tsc would rebuild, no UI stylesheet older than its sources, no bundle output
- *     older than what the bundles read (round 5: that includes @sovit/ui's dist/).
+ *     older than what the bundles read (round 5: that includes @sovit/ui's dist/; round 8: the
+ *     npm code the prompt page inlines, @scure/bip39 and its dependencies).
  *
  * (stage.test.ts stages the REAL app; this file breaks one rule per case.)
  */
@@ -71,7 +72,32 @@ interface Fixture {
   ui?: boolean;
   /** Round 4: `@sovit/core` as a shipped workspace, with test doubles like the real one's. */
   core?: boolean;
+  /**
+   * Round 8: break the prompt page's npm code (`@scure/bip39` + deps, present by default):
+   * `unlisted` leaves bip39 out of the lockfile, `uninstalled` leaves `@scure/base` off disk.
+   */
+  promptNpm?: 'unlisted' | 'uninstalled';
 }
+
+/**
+ * Round 8: the prompt page's npm code as npm placed it in this repo — `@scure/bip39` hoisted,
+ * one of its dependencies nested under it, the other hoisted — repo-relative dir → files.
+ */
+const PROMPT_NPM_TREE: Record<string, Record<string, string>> = {
+  'node_modules/@scure/bip39': {
+    'package.json': '{"name":"@scure/bip39","version":"2.0.1"}',
+    'index.js': 'export const validateMnemonic = () => true;\n',
+    'wordlists/english.js': "export const wordlist = ['abandon'];\n",
+  },
+  'node_modules/@scure/bip39/node_modules/@noble/hashes': {
+    'package.json': '{"name":"@noble/hashes","version":"2.0.1"}',
+    'sha2.js': 'export const sha256 = () => 0;\n',
+  },
+  'node_modules/@scure/base': {
+    'package.json': '{"name":"@scure/base","version":"2.0.0"}',
+    'index.js': 'export const utils = {};\n',
+  },
+};
 
 /** A tiny composite tsc project at `dir` (its sources are written by the caller). */
 function tscProject(dir: string): void {
@@ -137,6 +163,11 @@ function fixture(f: Fixture = {}): { pkg: string; root: string } {
   // repo's base config they extend — written before the outputs, like the sources.
   for (const c of BUNDLE_CONFIG) put(join(pkg, c), '// bundle config\n');
   for (const c of BUNDLE_CONFIG_ROOT) put(join(root, c), '{}\n');
+  // Round 8: the npm code the prompt bundle inlines — installed before the build, like sources.
+  for (const [dir, files] of Object.entries(PROMPT_NPM_TREE)) {
+    if (f.promptNpm === 'uninstalled' && dir === 'node_modules/@scure/base') continue;
+    for (const [name, content] of Object.entries(files)) put(join(root, dir, name), content);
+  }
   // The bundle outputs are written AFTER the sources, as `npm run build` leaves them (round 4:
   // staging refuses a bundle output older than the bundles' sources).
   for (const n of RENDERER_FILES) put(join(pkg, 'dist', 'renderer', n), n);
@@ -152,6 +183,19 @@ function fixture(f: Fixture = {}): { pkg: string; root: string } {
     'node_modules/electron': { version: '44.2.0', dev: true },
     'node_modules/bare-encoding': { version: '1.0.0' },
   };
+  if (f.promptNpm !== 'unlisted') {
+    // A dev dependency of the app, as the real one is (not shipped: only inlined).
+    packages['node_modules/@scure/bip39'] = {
+      version: '2.0.1',
+      dev: true,
+      dependencies: { '@noble/hashes': '2.0.1', '@scure/base': '2.0.0' },
+    };
+    packages['node_modules/@scure/bip39/node_modules/@noble/hashes'] = {
+      version: '2.0.1',
+      dev: true,
+    };
+    packages['node_modules/@scure/base'] = { version: '2.0.0', dev: true };
+  }
   deps['bare-encoding'] = '1';
   put(join(root, 'node_modules', 'bare-encoding', 'package.json'), '{"name":"bare-encoding"}');
   put(join(root, 'node_modules', 'bare-encoding', 'global.js'), 'globalThis.x = 1\n');
@@ -482,6 +526,63 @@ describe(
       mkdirSync(join(r2.root, 'tsconfig.base.json'));
       await expect(restage(r2.pkg, r2.root, join(root, 'out-dircfg'))).rejects.toThrow(
         /tsconfig\.base\.json is not a regular file: cannot tell whether the bundle is current/,
+      );
+    });
+
+    // Round 8 (final panel, packaging): the prompt page inlines @scure/bip39 (and @scure/base,
+    // @noble/hashes), which rule 3 did not watch — a dependency bump installed after the build
+    // staged the old bip39 inside prompt/prompt.js. Each installed file of those packages, and
+    // each package directory itself, is now an input the bundle outputs must be newer than.
+    it.each([
+      'node_modules/@scure/bip39/package.json',
+      'node_modules/@scure/bip39/index.js',
+      'node_modules/@scure/bip39/node_modules/@noble/hashes/sha2.js',
+      'node_modules/@scure/base/index.js',
+      'node_modules/@scure/bip39',
+    ])(
+      'a bundle output older than the prompt page’s npm code (%s) is refused; rebundled, it stages',
+      async (at) => {
+        const { pkg, root: repoRoot } = fixture();
+        const out = join(root, 'out-prompt-npm');
+        await restage(pkg, repoRoot, out);
+        const path = join(repoRoot, at);
+        // A bump: new content (for a file), and in any case a newer mtime than the bundle.
+        if (at.endsWith('package.json'))
+          writeFileSync(path, '{"name":"@scure/bip39","version":"2.0.2"}');
+        touch(path, 60);
+        await expect(restage(pkg, repoRoot, out)).rejects.toThrow(
+          new RegExp(
+            `dist/\\S+ is older than ${at.replace(/[./@]/g, '\\$&')}: run \`npm run build\``,
+          ),
+        );
+        expect(existsSync(join(out, 'package.json'))).toBe(true);
+        for (const f of [
+          ...RENDERER_FILES.map((n) => join('renderer', n)),
+          ...PROMPT_FILES.map((n) => join('prompt', n)),
+          ...PRELOAD_FILES,
+        ])
+          touch(join(pkg, 'dist', f), 61);
+        await expect(restage(pkg, repoRoot, out)).resolves.toBeDefined();
+      },
+    );
+
+    it('only the prompt page’s npm code is watched: another installed package touched after the build still stages', async () => {
+      const { pkg, root: repoRoot } = fixture();
+      touch(join(repoRoot, 'node_modules', 'bare-encoding', 'global.js'), 60);
+      touch(join(repoRoot, 'node_modules', 'electron', 'package.json'), 60);
+      await expect(restage(pkg, repoRoot, join(root, 'out-other-npm'))).resolves.toBeDefined();
+    });
+
+    it('the prompt page’s npm code missing from the lockfile, or not installed, is refused: the rule could not be checked', async () => {
+      const a = fixture({ promptNpm: 'unlisted' });
+      await expect(restage(a.pkg, a.root, join(root, 'out-unlisted'))).rejects.toThrow(
+        /@scure\/bip39 \(bundled into the prompt page\) is not in the lockfile: cannot tell whether the bundle is current/,
+      );
+      rmSync(root, { recursive: true, force: true });
+      mkdirSync(root, { recursive: true });
+      const b = fixture({ promptNpm: 'uninstalled' });
+      await expect(restage(b.pkg, b.root, join(root, 'out-uninstalled'))).rejects.toThrow(
+        /node_modules\/@scure\/base is in the lockfile but not installed: cannot tell whether the bundle is current/,
       );
     });
 
