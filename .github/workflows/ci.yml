@@ -1,0 +1,119 @@
+# CI for the public nutflix-demo repo (GitHub Actions — Cameron, 2026-09-27: the one sanctioned
+# exception to "tests run only in Kata on a CI host"; nothing runs tests on a dev machine).
+# Mirrors the gates in ci/gitlab-ci.yml, which stays for a future GitLab runner.
+#
+# Supply-chain policy (threat T12): actions pinned by commit SHA; `npm ci --ignore-scripts`
+# (lockfile-only, exact pins, no lifecycle scripts); lockfile drift and non-registry
+# resolutions fail; registry signatures and provenance verified; the native-module inventory
+# is frozen; least-privilege token.
+name: ci
+
+on:
+  push:
+    branches: [main, 'stage-*/**']
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # The reviewed inventory is a linux-x64 list and the runner is linux-x64: mismatches fail.
+  NATIVE_INVENTORY_STRICT: '1'
+  # Never let the runner's environment inject loaders into anything we execute here.
+  NODE_OPTIONS: ''
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0 # check-contracts-version diffs against the default branch
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - name: lockfile drift
+        run: |
+          npm install --package-lock-only --ignore-scripts --no-audit --no-fund
+          git diff --exit-code --stat package-lock.json
+      - name: every dependency resolves to registry.npmjs.org
+        run: |
+          node -e '
+            const p = require("./package-lock.json").packages;
+            const bad = Object.entries(p).filter(([k, v]) => k.startsWith("node_modules/") && !v.link && v.resolved && !/^https:\/\/registry\.npmjs\.org\//.test(v.resolved));
+            if (bad.length) { console.error("non-registry resolutions:", bad.map(([k]) => k)); process.exit(1); }'
+      - name: registry signatures and provenance
+        run: npm audit signatures
+      - name: advisories (high and above)
+        run: npm audit --audit-level=high
+      - run: npm run lint
+      - run: npm run typecheck
+      - name: locked directories and the contracts version
+        run: |
+          bash scripts/check-locked-dirs.sh
+          bash scripts/check-contracts-version.sh "origin/${{ github.event.repository.default_branch }}"
+      - run: bash scripts/native-module-inventory.sh --check
+      - run: npm run lint:electron
+
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci --ignore-scripts
+      # The app-desktop suites read sibling packages from dist/ and the packaging tests stage
+      # the built app, so the build comes first.
+      - run: npm run build
+      - run: npm test
+
+  e2e:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '22'
+          cache: npm
+      - name: system packages (a virtual display, ffmpeg for the fixtures)
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends xvfb ffmpeg
+      - run: npm ci --ignore-scripts
+      # Lifecycle scripts are off, so Electron's binary is fetched explicitly.
+      - run: node node_modules/electron/install.js
+      # Chromium's sandbox stays on (never --no-sandbox): Ubuntu 24.04 restricts unprivileged
+      # user namespaces, so use the SUID helper, as e2e/support.ts `sandboxReady` accepts.
+      - name: SUID chrome-sandbox
+        run: |
+          sudo chown root:root node_modules/electron/dist/chrome-sandbox
+          sudo chmod 4755 node_modules/electron/dist/chrome-sandbox
+      - run: npm run build
+      - run: xvfb-run -a npm run -w packages/app-desktop test:e2e
+
+  package:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - run: npm run build
+      # Stages the packaged app (ADR 0017): the stale-build, bundle allow-list and layout gates
+      # run here; no installer is built and nothing is signed.
+      - run: npm run -w packages/app-desktop stage
