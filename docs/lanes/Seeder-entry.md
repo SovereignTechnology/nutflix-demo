@@ -216,7 +216,7 @@ electron lint OK. The built-entry block ran (not skipped): `dist/` is built befo
 - **Gateway under Node 22 + `--jitless` crashes at startup** (§4): a lane-L3 fix (load `http` via
   `createRequire`, plus `--no-experimental-websocket` in its unit and its `cli.test.ts` pin), or
   pin Node ≥ 24 on hosts. Until then `nutflix-gateway.service` does not stay up on Node 22.
-- `docs/status.md` follow-up 5 and an internal session handoff (not published) §3.4's seeder
+- `docs/status.md` follow-up 5 and the Stage 1 exit handoff's (an internal session note, not published) §3.4 seeder
   bullet can be struck. Replace them with "seeder entry exists and refuses (78) until Stage 2;
   Stage 2 must wire pay/1 + HELLO in the daemon (Seeder-entry §3)".
 - `packages/seeder/src/portable.ts`'s header says "`index.ts` is this module plus the Node

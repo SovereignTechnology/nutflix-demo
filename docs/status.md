@@ -2,8 +2,8 @@
 
 Kept current by the orchestrator after every merge (execution plan §5.1).
 
-**If you are an agent picking this up cold: read an internal session handoff (not published)
-first** — it is the resume point. **Stage 2 is DONE on branch `stage-2/2026-09-23` (2026-09-23),
+**If you are picking this up cold: read this file and `docs/security-review.md` first**
+(the session handoffs that used to be the resume point were internal notes and are not published). **Stage 2 is DONE on branch `stage-2/2026-09-23` (2026-09-23),
 awaiting Cameron's review before anything is pushed or merged:** contracts v5 (ADR 0010), the
 five audit-surface modules implemented over cashu-ts / nostr-tools / sodium, all 27
 Stage-2-gated tests running, and the PART B review (`docs/security-review.md`, 32 findings —
@@ -286,7 +286,7 @@ bump: reactions (`likes`/`dislikes`/`myReaction`, `unreact`). The list as record
 
 ### Follow-ups owed by the orchestrator
 
-1. **an internal session handoff (not published) §4.4 is stale** where it describes the flat
+1. **The wave-2 handoff (an internal session note, not published) §4.4 is stale** where it describes the flat
    `markupSatsPerBlock`; ADR 0005 supersedes it. (This file is correct.)
 2. **`types/holepunch.d.ts` exists in three diverged copies** (seeder, gateway, and since L6-C
    the desktop worker's `src/worker/types/holepunch.d.ts`, a superset of the other two) — the

@@ -5,7 +5,7 @@ Date: 2026-09-23
 ## Status
 
 Accepted (decision by Cameron, 2026-09-23, answering the open question in
-an internal session handoff (not published) §3.5).
+the Stage 1 exit handoff §3.5, an internal session note, not published).
 
 ## Context
 

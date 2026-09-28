@@ -449,10 +449,10 @@ positive control found 0 staging dirs, not 4).
   Until `stage-3/integration` merged this branch at 20:57:44, this worktree was the only one
   with the fixture. A script checked each dir without following symlinks, and removed only
   the ones that passed every check:
-  - It is a real directory owned by the developer, named `electron-installer--<pid>-<12 alnum>`,
+  - It is a real directory owned by the developer's user, named `electron-installer--<pid>-<12 alnum>`,
     and the pid that made it is no longer running.
   - It holds exactly one child, `nutflix_<0.1.0|0.1.0~rc.1>_<amd64|arm64>`. Every file in it
-    is owned by the developer, the only symlink is `usr/bin/nutflix -> ../lib/nutflix/nutflix`, and
+    is owned by the developer's user, the only symlink is `usr/bin/nutflix -> ../lib/nutflix/nutflix`, and
     the total is under 2 MB.
   - It carries the fixture's own bytes. `usr/lib/nutflix/nutflix` is `#!/bin/sh\n` (a real
     build stages an Electron ELF), `version` is `44.2.0`, and `resources/app/package.json`
@@ -462,7 +462,7 @@ positive control found 0 staging dirs, not 4).
   package.json with description `x`. One, from 20:08, stages an `i386` probe with the final
   package.json.
 - Mutation R44 made its own `/tmp/m3-<pid>`. It was checked by hand before removal: owned by
-  the developer, created by that run, holding only four `electron-installer--<that pid>-*` staging
+  the developer's user, created by that run, holding only four `electron-installer--<that pid>-*` staging
   dirs, with no symlink except each tree's `usr/bin/nutflix`.
 - **Left alone:** four `electron-installer--3346135-*` dirs, made at 21:02 by a `vitest run`
   in the `stage-3/integration` worktree, which has the round-2 version of this test. Each run
