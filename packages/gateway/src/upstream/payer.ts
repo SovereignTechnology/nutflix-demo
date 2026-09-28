@@ -91,6 +91,13 @@
  *     (`MAX_PRICED_CORES_PER_SEEDER`).
  *   - `holds(peer, core, index)`: whether a block is pending or in flight on a connection, so a
  *     downloader can keep a second connection of the same seeder from paying it as owed.
+ *
+ * Lane W8b-p2p, round 9:
+ *   - **Every priced `PRICE` applies from its `effectiveFromBlock`** — kept per core as segments,
+ *     as the seeder keeps them (F9). Only the latest was kept, so after a second `PRICE` the
+ *     blocks still pending below it were asked at the HELLO's price, which a desktop seeder's
+ *     ceiling may put at 0.
+ *   - **Never a 0-sat PAY for a core whose manifest price is above 0**, whatever the seeder asks.
  */
 import type {
   BlockRange,
@@ -178,6 +185,15 @@ export const MAX_CLOCK_STEP_MS = 2 * PAY_RETRY_MAX_MS;
  * such a core are then priced by its HELLO again; owed ones wait for a later connection).
  */
 export const MAX_PRICED_CORES_PER_SEEDER = 1024;
+/**
+ * Lane W8b-p2p, round 9: price segments one connection remembers per core (each priced `PRICE`
+ * applies from its `effectiveFromBlock`). A seeder says a new one only when the core's price
+ * changes, so this is never reached honestly; past it the lowest goes, and blocks below the next
+ * one are priced by the HELLO again (paid at most the manifest price, or refused).
+ */
+export const MAX_PRICE_SEGMENTS_PER_CORE = 64;
+/** `resolvePolicy`'s answer for a seeder asking 0 for a core priced above 0 (round 9). */
+const ZERO_ASK = 'zero-ask';
 
 /** The wait after the `n`th consecutive transient failure (n ≥ 1). */
 function retryDelay(n: number): number {
@@ -325,6 +341,7 @@ export interface UpstreamPayerOptions {
   readonly owed?: OwedPayment;
 }
 
+/** One priced `PRICE`: `satsPerBlock` for the core's blocks from `effectiveFromBlock` on. */
 interface PriceOverride {
   readonly satsPerBlock: Sats;
   readonly effectiveFromBlock: number;
@@ -355,10 +372,12 @@ interface PeerState {
   readonly protocol: PayProtocol;
   hello: HelloMessage | null;
   /**
-   * core → the latest priced `PRICE` for it (v5: prices are per core); least recently priced
-   * first, at most `MAX_PRICED_CORES_PER_SEEDER`.
+   * core → its priced `PRICE`s (v5: prices are per core), by `effectiveFromBlock` ascending: each
+   * applies from its block up to the next one's (round 9 — the latest alone priced the blocks
+   * below it at the HELLO's price, possibly 0). Never empty. Least recently priced core first, at
+   * most `MAX_PRICED_CORES_PER_SEEDER` cores and `MAX_PRICE_SEGMENTS_PER_CORE` segments each.
    */
-  readonly price: Map<CoreKeyHex, PriceOverride>;
+  readonly price: Map<CoreKeyHex, PriceOverride[]>;
   /**
    * Cores it serves outside payment on this connection (`PRICE { free: true }`, its last word);
    * least recently said first, at most `MAX_FREE_CORES_PER_SEEDER` (the `servesFree` option, when
@@ -630,13 +649,18 @@ export class UpstreamPayer {
           return;
         }
         state.free.delete(p.core);
+        // Round 9: a PRICE applies from its `effectiveFromBlock` on and leaves the segments below
+        // it standing — blocks sent before it stay at the price they were sent at (the seeder's
+        // F9 history), never at the HELLO's. One from block 0 replaces them all.
+        const segments = (state.price.get(p.core) ?? []).filter(
+          (x) => x.effectiveFromBlock < p.effectiveFromBlock,
+        );
+        segments.push({ satsPerBlock: p.satsPerBlock, effectiveFromBlock: p.effectiveFromBlock });
+        while (segments.length > MAX_PRICE_SEGMENTS_PER_CORE) segments.shift();
         // Least recently priced first, bounded (lane W8b-p2p): a flood of PRICEs for cores we
         // never opened cannot grow this connection's state without limit.
         state.price.delete(p.core);
-        state.price.set(p.core, {
-          satsPerBlock: p.satsPerBlock,
-          effectiveFromBlock: p.effectiveFromBlock,
-        });
+        state.price.set(p.core, segments);
         while (state.price.size > MAX_PRICED_CORES_PER_SEEDER) {
           const oldest = state.price.keys().next();
           if (oldest.done === true) break;
@@ -950,11 +974,18 @@ export class UpstreamPayer {
           continue;
         }
         const policy = this.resolvePolicy(state, core, hello, range, isOwed);
-        if (policy === null) {
+        if (policy === null || policy === ZERO_ASK) {
           if (isOwed) {
             // Not payable at the terms recorded (none recorded, or it asks more than them):
-            // respected, never paid.
-            this.giveUpOwed(state, core, set, range);
+            // respected, never paid. Round 9: asked 0 for them is this connection's word only —
+            // a later connection that prices the core may pay them (they stay in the record).
+            this.giveUpOwed(
+              state,
+              core,
+              set,
+              range,
+              policy === ZERO_ASK ? 'connection' : undefined,
+            );
             continue;
           }
           break;
@@ -1176,19 +1207,33 @@ export class UpstreamPayer {
     }
   }
 
+  /** `r` cut at the first price boundary inside it (one PAY is at one price). */
   private splitAtPrice(state: PeerState, r: BlockRange): BlockRange[] {
-    const p = state.price.get(r.core);
-    if (p === undefined || p.effectiveFromBlock <= r.fromBlock || p.effectiveFromBlock > r.toBlock)
-      return [r];
+    const cut = state.price
+      .get(r.core)
+      ?.find((x) => x.effectiveFromBlock > r.fromBlock && x.effectiveFromBlock <= r.toBlock);
+    if (cut === undefined) return [r];
     return [
-      { core: r.core, fromBlock: r.fromBlock, toBlock: p.effectiveFromBlock - 1 },
-      { core: r.core, fromBlock: p.effectiveFromBlock, toBlock: r.toBlock },
+      { core: r.core, fromBlock: r.fromBlock, toBlock: cut.effectiveFromBlock - 1 },
+      { core: r.core, fromBlock: cut.effectiveFromBlock, toBlock: r.toBlock },
     ];
   }
 
   /**
+   * What the seeder asks per block from `block` on: the priced `PRICE` in force there (the last
+   * segment starting at or below it), else its HELLO's price.
+   */
+  private askedPrice(state: PeerState, core: CoreKeyHex, hello: HelloMessage, block: number): Sats {
+    let asked = hello.satsPerBlock;
+    for (const x of state.price.get(core) ?? [])
+      if (x.effectiveFromBlock <= block) asked = x.satsPerBlock;
+    return asked;
+  }
+
+  /**
    * The policy to pay `range` under: the manifest's (`policyFor`), at the seeder's asking price
-   * for that range when it is not above the manifest price. `null` = do not pay (counted).
+   * for that range when it is not above the manifest price. `null` = do not pay (counted);
+   * `ZERO_ASK` = do not pay either — it asks 0 for a core priced above 0 (round 9).
    */
   private resolvePolicy(
     state: PeerState,
@@ -1196,7 +1241,7 @@ export class UpstreamPayer {
     hello: HelloMessage,
     range: BlockRange,
     owed = false,
-  ): PricePolicy | null {
+  ): PricePolicy | null | typeof ZERO_ASK {
     if (owed && !state.price.has(core)) return null; // contract rule 3: a priced PRICE here first
     const base =
       owed && this.owedPay !== undefined
@@ -1207,11 +1252,7 @@ export class UpstreamPayer {
       this.log.warn('no policy for upstream core — not paying', { peer: state.noiseHex, core });
       return null;
     }
-    const p = state.price.get(core);
-    const asked =
-      p !== undefined && range.fromBlock >= p.effectiveFromBlock
-        ? p.satsPerBlock
-        : hello.satsPerBlock;
+    const asked = this.askedPrice(state, core, hello, range.fromBlock);
     if (asked > base.satsPerBlock) {
       this.counters.skippedOverpriced++;
       this.log.warn('upstream asks more than the manifest price — not paying', {
@@ -1221,6 +1262,17 @@ export class UpstreamPayer {
         manifest: base.satsPerBlock,
       });
       return null;
+    }
+    if (asked === 0 && base.satsPerBlock > 0) {
+      // Round 9: never a 0-sat PAY for a priced video. It carries no proofs, the seeder refuses it
+      // (it counts those blocks at a price), and building it takes them out of the downloader's
+      // record for good. This connection's blocks stay pending instead, as any range it does not
+      // pay; owed ones are given up on this connection only (`payPending`).
+      this.log.warn('upstream asks 0 for a priced core — not paying', {
+        peer: state.noiseHex,
+        core,
+      });
+      return ZERO_ASK;
     }
     return asked === base.satsPerBlock ? base : { ...base, satsPerBlock: asked };
   }

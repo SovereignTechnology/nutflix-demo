@@ -418,7 +418,8 @@ export class Seeder {
    * `noiseStream` (hyperswarm connection) → attached as-is. The session is admitted once
    * the Noise handshake completes; a refused stream is destroyed. NOTE: without
    * `opts.keyPair` every fresh stream gets a NEW Noise identity (Corestore behaviour), so
-   * pass the node's stable key pair when bans are expected to stick.
+   * pass the node's stable key pair when bans are expected to stick. Like every stream of
+   * `blobs.store` (round 9, F57), it serves only the cores open in `blobs` — each gated.
    */
   replicate(
     isInitiator: boolean | ReplicationStream,

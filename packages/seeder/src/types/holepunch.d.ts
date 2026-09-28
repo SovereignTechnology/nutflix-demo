@@ -41,6 +41,21 @@ declare module 'hypercore' {
     pipe<T extends { pipe: unknown }>(dest: T): T;
   }
 
+  /**
+   * A connection's `Protomux` (`noiseStream.userData`, set by `Hypercore.createProtocolStream()`),
+   * as far as the seeder's gated Corestore uses it (lane W8b-p2p, round 9): `pair` (protomux
+   * 3.11.0) sets the handler of a remote's channel open for `protocol` and `id` (`null`: any id not
+   * paired on its own), REPLACING the handler set before under that key; the handler gets the
+   * remote's id (a discovery key for Hypercore, or `null`).
+   */
+  export interface ProtocolMuxer {
+    readonly isProtomux: true;
+    pair(
+      opts: { readonly protocol: string; readonly id?: Uint8Array | null },
+      notify: (id: Uint8Array | null) => unknown,
+    ): void;
+  }
+
   /** Forwarded to `NoiseSecretStream` when a boolean is passed (fresh stream). */
   export interface ReplicationStreamOptions {
     readonly keyPair?: { publicKey: Uint8Array; secretKey: Uint8Array };
@@ -77,6 +92,8 @@ declare module 'hypercore' {
     get(index: number, opts?: HypercoreGetOptions): Promise<Uint8Array | null>;
     append(block: Uint8Array | readonly Uint8Array[]): Promise<{ length: number }>;
     replicate(isInitiator: boolean | ReplicationStream): ReplicationStream;
+    /** A connection's muxer: this core's replicator is attached to it (`_attachToMuxer`). */
+    replicate(mux: ProtocolMuxer): ProtocolMuxer;
     on<K extends keyof HypercoreEvents>(event: K, cb: HypercoreEvents[K]): this;
     off<K extends keyof HypercoreEvents>(event: K, cb: HypercoreEvents[K]): this;
     once<K extends keyof HypercoreEvents>(event: K, cb: HypercoreEvents[K]): this;
@@ -87,7 +104,7 @@ declare module 'hypercore' {
 
 declare module 'corestore' {
   import type Hypercore from 'hypercore';
-  import type { ReplicationStream } from 'hypercore';
+  import type { ReplicationStream, ReplicationStreamOptions } from 'hypercore';
 
   export interface CorestoreGetOptions {
     readonly name?: string;

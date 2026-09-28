@@ -9,8 +9,9 @@
  *            P2-owed-viewer) is paid under the id of the session it was recorded for: the host
  *            checks that session while it is open, and its persisted tail authorisation after;
  *   HELLO    signed by the host over this connection's `pay/1` challenge (`pay.hello`); the price
- *            it states is a ceiling (the highest price among the cores we serve) and each core's
- *            own price follows as `PRICE` on its first block (always, contracts v6 amendment);
+ *            it states is a ceiling (the highest price among the cores we serve now:
+ *            `servedPriceCeiling`) and each core's own price follows as `PRICE` on its first block
+ *            (always, contracts v6 amendment);
  *   seeder   `RealPaymentEngine` runs HERE (its upload accounting is synchronous), with every
  *            money step asked of the host: keysets, redeem (swap into the NIP-60 wallet), NUT-07
  *            checks, nutzaps. Accepted-but-unflushed PAYs are kept in `<storage>/payments/
@@ -25,6 +26,7 @@
  */
 import type {
   BlockRange,
+  CoreKeyHex,
   MintKeyset,
   MintUrl,
   NostrEvent,
@@ -77,6 +79,36 @@ export interface RealProviderOptions {
   readonly maxPendingPays?: number;
   /** The runtime's DLEQ thread (issue #8 d); without one the checks run inline, chunked. */
   readonly dleqThread?: SpawnDleqThread;
+}
+
+/** What HELLO's ceiling is read from: the worker's `Seeder`. */
+export interface ServedPrices {
+  corePolicyMap(): ReadonlyMap<CoreKeyHex, PricePolicy>;
+  readonly blobs: { openCores(): readonly { readonly keyHex: CoreKeyHex }[] };
+}
+
+/**
+ * HELLO's ceiling (ADR 0012 §4): the highest per-block price among the cores this node serves
+ * NOW — the cores open in this run (the seeder gates and prices exactly those; since round 9, F57,
+ * its store refuses a remote any other core in storage), each at its own policy. 0 before the
+ * seeder exists, or with nothing priced open.
+ *
+ * F54 (the round-8 verifier): it was the highest price in `corePolicyMap()`, which since lane
+ * W8b-p2p also holds the policies of earlier runs (`core-policies.json`, up to 16 384 cores — kept
+ * so a core sold before a restart is never marked free). The ceiling then never came down: one
+ * 5-sat video played once, or one hostile manifest at any price, fixed it until 16 384 newer
+ * policies pushed it out. A kept policy still refuses free (`setFreeCore`); it only stops
+ * counting here while its core is not open.
+ */
+export function servedPriceCeiling(seeder: ServedPrices | null): Sats {
+  let max = 0;
+  if (seeder === null) return max as Sats;
+  const policies = seeder.corePolicyMap();
+  for (const sc of seeder.blobs.openCores()) {
+    const p = policies.get(sc.keyHex);
+    if (p !== undefined) max = Math.max(max, p.satsPerBlock);
+  }
+  return max as Sats;
 }
 
 /** What a failed redeem looks like to the engine: `code: 'spent'` marks a double-spend. */

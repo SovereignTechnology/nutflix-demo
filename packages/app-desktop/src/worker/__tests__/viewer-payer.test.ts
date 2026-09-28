@@ -286,6 +286,55 @@ describe('ViewerPayer', () => {
     expect(r.payer.stats().owed).toBe(0);
   });
 
+  // F54 (the round-8 verifier): a desktop seeder's HELLO states a CEILING — the highest price
+  // among every video it serves — and each core's own price comes as `PRICE` before its first
+  // block (ADR 0012 §4). This payer also compared the HELLO with the manifest price, so it refused
+  // every core of a seeder whose dearest video cost more than this one, even a core priced within
+  // it; the blocks stayed pending for good and filled that seeder's window. With per-core prices
+  // kept across restarts (lane W8b-p2p) that ceiling no longer came down at a restart either.
+  it('a seeder whose HELLO ceiling is above the manifest price is paid at its PRICE for the core when that is within the manifest price', async () => {
+    const r = rig();
+    r.proto.hello({ satsPerBlock: mocks.sats(5) });
+    r.proto.price({ core: CORE_1, satsPerBlock: mocks.sats(2), effectiveFromBlock: 0 });
+    r.download(0);
+    await settle();
+    expect(r.proto.sent.map((m) => [m.range.fromBlock, m.range.toBlock])).toEqual([[0, 0]]);
+    expect(r.paid).toEqual([
+      { core: r.key, seeder: mocks.asPubkey('seeder'), mint: mocks.MINTS.a, amount: 2, blocks: 1 },
+    ]);
+    // Before the fix: no PAY, `skippedNoPolicy` counted (this class answered no policy).
+    expect(r.payer.stats()).toMatchObject({ skippedNoPolicy: 0, skippedOverpriced: 0 });
+    // Below the manifest price: paid at the price asked, never more.
+    const low = rig();
+    low.proto.hello({ satsPerBlock: mocks.sats(5) });
+    low.proto.price({ core: CORE_1, satsPerBlock: mocks.sats(1), effectiveFromBlock: 0 });
+    low.download(0);
+    await settle();
+    expect(low.paid).toEqual([
+      {
+        core: low.key,
+        seeder: mocks.asPubkey('seeder'),
+        mint: mocks.MINTS.a,
+        amount: 1,
+        blocks: 1,
+      },
+    ]);
+  });
+
+  // F54: with the HELLO check gone from this class, the price asked for the blocks is what caps
+  // the payment (`UpstreamPayer`): a PRICE above the manifest is never paid, whatever the HELLO.
+  it('a PRICE above the manifest price is not paid even when the HELLO asks within it', async () => {
+    const r = rig();
+    r.proto.hello({ satsPerBlock: mocks.sats(2) });
+    r.proto.price({ core: CORE_1, satsPerBlock: mocks.sats(3), effectiveFromBlock: 0 });
+    r.download(0);
+    await settle();
+    expect(r.proto.sent).toHaveLength(0);
+    expect(r.paid).toEqual([]);
+    expect(r.payer.stats().skippedOverpriced).toBeGreaterThanOrEqual(1);
+    expect(r.credit.holds(r.key, 0)).toBe(true); // kept owed, never paid at the wrong price
+  });
+
   it('never pays at a mint the video does not accept (the host debits its wallet there)', async () => {
     // Our wallet has a: the seeder's first mint we share is a, which the video lists.
     const r = rig();

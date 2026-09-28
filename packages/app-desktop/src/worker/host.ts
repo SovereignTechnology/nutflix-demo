@@ -368,7 +368,7 @@ export class WorkerHost {
     } else if (a.payments !== undefined) {
       // Stage 3 (ADR 0012): the host's money plane is live — real engines, every money step
       // asked of the host.
-      const { realProviders } = await import('./pay/real-providers.js');
+      const { realProviders, servedPriceCeiling } = await import('./pay/real-providers.js');
       try {
         providers = realProviders({
           payments: a.payments,
@@ -382,12 +382,9 @@ export class WorkerHost {
           // paid). By core alone, a rendition switch's NEW session was named for the old one's
           // tail, the host refused it as outside its video, and the blocks were written off.
           sidsFor: (range) => sessionsCovering(range, this.sessions.values()),
-          priceCeiling: () => {
-            let max = 0;
-            for (const p of this.net?.seeder.corePolicyMap().values() ?? [])
-              max = Math.max(max, p.satsPerBlock);
-            return max as Sats;
-          },
+          // F54: the cores open in THIS run, never a policy kept from an earlier one (those
+          // still refuse free, but a kept ceiling would never come down).
+          priceCeiling: () => servedPriceCeiling(this.net?.seeder ?? null),
           logger: log,
         });
       } catch (err) {

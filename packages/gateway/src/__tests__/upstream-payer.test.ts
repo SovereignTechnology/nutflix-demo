@@ -1594,6 +1594,22 @@ describe('UpstreamPayer — owed blocks from before (ADR 0018 amendment)', () =>
     expect(gw.payer.stats()).toMatchObject({ owedAccepted: 0, owedPaid: 0 });
   });
 
+  // Lane W8b-p2p, round 9 (WRITTEN, NOT RUN — see the round-9 describe at the end of this file).
+  it('round 9: owed blocks the seeder prices at 0 here are never paid by a 0-sat PAY; given up on this connection only', async () => {
+    const r = owedRig();
+    r.protocol.remoteHello(hello());
+    r.protocol.remotePrice({ ...priced, satsPerBlock: 0 as Sats }); // priced, not `free`
+    expect(r.payer.addOwed(NOISE, CORE_A, [1, 2])).toBe(2);
+    await r.payer.flush();
+    // Before the fix: asked 0 is within the recorded 5, so a 0-sat PAY was built for [1, 2] (and
+    // the downloader dropped them from its record for good).
+    expect(r.owedCalls).toEqual([]);
+    expect(r.protocol.sentPays).toHaveLength(0);
+    // This connection's word only: a later one that prices the core may pay them.
+    expect(r.given).toEqual([[1, 2]]);
+    expect(r.scopes).toEqual(['connection']);
+  });
+
   it('paid at once and apart — never in one PAY with this connection’s blocks — on the connection’s carry chain, at the seeder’s asked price', async () => {
     const r = owedRig();
     r.protocol.remoteHello(hello());
@@ -1898,4 +1914,111 @@ describe('UpstreamPayer — one bounded answer for free; bounded prices (lane W8
     payer.attachPeer(NOISE, protocol);
     return { payer, protocol };
   }
+});
+
+// ---- lane W8b-p2p, round 9 -------------------------------------------------------------------
+// WRITTEN, NOT RUN (Cameron's rule of 2026-09-27: no test runner on this machine): these run in
+// CI; what each assertion catches is reasoned in the review record (round 9).
+
+describe('UpstreamPayer — round 9: every PRICE applies from its effectiveFromBlock; never a 0-sat PAY', () => {
+  /** A desktop seeder that served nothing priced when we connected: its HELLO ceiling is 0. */
+  const zeroHello = () =>
+    helloFrom(UP_PUBKEY, {
+      acceptedMints: [MINT_B, MINT_A],
+      satsPerBlock: 0 as Sats,
+      p2pk: UP_P2PK,
+    });
+  const payTotal = (p: PayMessage): number =>
+    [...p.seederProofs.proofs, ...p.creatorProofs.proofs].reduce((n, x) => n + x.amount, 0);
+
+  it('a second PRICE leaves the first standing below its boundary: pending blocks are paid at the earlier PRICE, never at the HELLO’s 0', async () => {
+    const { engine, payer, protocol } = unit(10, { tailMs: 0 });
+    protocol.remoteHello(zeroHello());
+    // The core's PRICE comes before its first block (contracts v6 amendment, rule 1).
+    protocol.remotePrice({
+      type: 'PRICE',
+      core: CORE_A,
+      satsPerBlock: 2 as Sats,
+      effectiveFromBlock: 0,
+    });
+    for (let i = 0; i < 4; i++) payer.onDownload(CORE_A, i, NOISE);
+    // The seeder plays the video again from a manifest at 3: 3 from its next block on (F9).
+    protocol.remotePrice({
+      type: 'PRICE',
+      core: CORE_A,
+      satsPerBlock: 3 as Sats,
+      effectiveFromBlock: 4,
+    });
+    for (let i = 4; i < 6; i++) payer.onDownload(CORE_A, i, NOISE);
+    await payer.flush();
+    expect(protocol.sentPays.map((p) => [p.range.fromBlock, p.range.toBlock])).toEqual([
+      [0, 3],
+      [4, 5],
+    ]);
+    // Before the fix only the latest PRICE was kept: blocks 0..3 were asked at the HELLO's 0 and
+    // paid by a 0-sat PAY (no proofs), which the seeder refuses as the wrong amount.
+    expect(protocol.sentPays.map(payTotal)).toEqual([4 * 2, 2 * 3]);
+    expect(engine.spent().perPeer.get(UP_PUBKEY)).toBe(4 * 2 + 2 * 3);
+  });
+
+  it('a PRICE from block 0 replaces every earlier segment: all pending blocks at its price, in one PAY', async () => {
+    const { payer, protocol } = unit(10, { tailMs: 0 });
+    protocol.remoteHello(zeroHello());
+    protocol.remotePrice({
+      type: 'PRICE',
+      core: CORE_A,
+      satsPerBlock: 2 as Sats,
+      effectiveFromBlock: 0,
+    });
+    protocol.remotePrice({
+      type: 'PRICE',
+      core: CORE_A,
+      satsPerBlock: 3 as Sats,
+      effectiveFromBlock: 4,
+    });
+    for (let i = 0; i < 6; i++) payer.onDownload(CORE_A, i, NOISE);
+    protocol.remotePrice({
+      type: 'PRICE',
+      core: CORE_A,
+      satsPerBlock: 1 as Sats,
+      effectiveFromBlock: 0,
+    });
+    await payer.flush();
+    // As the seeder prices them (F9: the last word from block 0 governs every block). Segments
+    // that outlived it would still cut the run at block 4.
+    expect(protocol.sentPays.map((p) => [p.range.fromBlock, p.range.toBlock])).toEqual([[0, 5]]);
+    expect(protocol.sentPays.map(payTotal)).toEqual([6 * 1]);
+  });
+
+  it('never a 0-sat PAY while the manifest price is above 0: the blocks stay pending until a PRICE prices them', async () => {
+    const { engine, payer, protocol } = unit(10, { tailMs: 0 });
+    protocol.remoteHello(zeroHello());
+    payer.onDownload(CORE_A, 0, NOISE);
+    payer.onDownload(CORE_A, 1, NOISE);
+    await payer.flush();
+    // Before the fix: one PAY of 0 sat for [0, 1], and both blocks out of the pending set.
+    expect(protocol.sentPays).toHaveLength(0);
+    expect(payer.holds(NOISE, CORE_A, 0)).toBe(true);
+    expect(payer.holds(NOISE, CORE_A, 1)).toBe(true);
+    // A priced PRICE of 0 (not `free`) is no better.
+    protocol.remotePrice({
+      type: 'PRICE',
+      core: CORE_A,
+      satsPerBlock: 0 as Sats,
+      effectiveFromBlock: 0,
+    });
+    await payer.flush();
+    expect(protocol.sentPays).toHaveLength(0);
+    expect(engine.spent().total).toBe(0);
+    // Priced at 2 from block 0: paid at 2, once.
+    protocol.remotePrice({
+      type: 'PRICE',
+      core: CORE_A,
+      satsPerBlock: 2 as Sats,
+      effectiveFromBlock: 0,
+    });
+    await payer.flush();
+    expect(protocol.sentPays.map((p) => [p.range.fromBlock, p.range.toBlock])).toEqual([[0, 1]]);
+    expect(protocol.sentPays.map(payTotal)).toEqual([2 * 2]);
+  });
 });

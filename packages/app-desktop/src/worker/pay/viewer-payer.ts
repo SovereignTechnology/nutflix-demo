@@ -18,10 +18,14 @@
  *   - **spend events**: one `onPaid` per PAY (amount = both proof sets, mint, blocks), which
  *     the host uses to debit its wallet (design §1) and the session uses for its totals.
  *   - **policy**: always the MANIFEST policy of the core (what the user was shown and agreed
- *     to: price, split, creator P2PK). A seeder whose HELLO asks more per block than the
- *     manifest is not paid (never pay more than the price shown); the HELLO's own split is
- *     ignored (a seeder cannot re-route the creator's share); the mint paid at must be one
- *     the video lists (the host's wallet is debited there).
+ *     to: price, split, creator P2PK). A seeder that asks more per block than the manifest is
+ *     not paid (never pay more than the price shown) — the price it asks for THOSE blocks, which
+ *     `UpstreamPayer` compares: the core's `PRICE` once one covers them, else the HELLO's. A HELLO
+ *     above the manifest is no refusal by itself (F54): a desktop seeder's HELLO states a ceiling
+ *     over every video it serves, and each core's own price comes as `PRICE` before its first
+ *     block (ADR 0012 §4). The HELLO's own split is ignored (a seeder cannot re-route the
+ *     creator's share); the mint paid at must be one the video lists (the host's wallet is
+ *     debited there).
  *   - **one seeder per block, credit per seeder** (security review F33, issue #8): every core it
  *     watches is routed by the shared `SeederCredit` — a block is asked of one seeder at a time
  *     (hypercore's racing "hotswap" is off; a stalled request moves to another seeder, never to
@@ -581,14 +585,11 @@ export class ViewerPayer {
       this.log.warn('no mint shared by seeder, wallet and video — not paying', { core });
       return null;
     }
-    if (hello.satsPerBlock > policy.satsPerBlock) {
-      this.log.warn('seeder asks more than the manifest price — not paying', {
-        core,
-        asked: hello.satsPerBlock,
-        manifest: policy.satsPerBlock,
-      });
-      return null;
-    }
+    // F54 (the round-8 verifier): no HELLO price check here. `UpstreamPayer` compares the price
+    // asked for the range — the core's `PRICE` when one covers it, else the HELLO's — with this
+    // manifest price and pays nothing above it. Comparing the HELLO as well refused every core of
+    // a desktop seeder whose ceiling (its dearest video) was above this video's price, even one
+    // it priced within it; those blocks stayed pending for good and filled its window.
     return policy;
   }
 }
