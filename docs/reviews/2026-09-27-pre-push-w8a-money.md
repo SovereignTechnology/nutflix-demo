@@ -273,3 +273,139 @@ Each mutation applied alone to the committed code, the named test run, the file 
     inside main's 9 s grace after the 7 s session close; if main ends the process there, only the
     watermark write is lost.
 12. **Untested wiring**: `host.ts`'s `closeSessions` closure and `recovery.stop()`.
+
+## Fix round 8 (2026-09-27): F55, F56 and the relay retry's lock — tests written, NOT run
+
+The round-8 verifier of this lane: two medium findings and an info item, all in
+`packages/app-desktop/src/host/recovery/service.ts`. Commits `79b7474` (the fix, with the tests)
+and `f8cf026` (two more tests). **The tests are written but NOT run**: since the local-run guard
+(noted under Gates above) no test runner runs on this machine, so every test below runs later in CI.
+Each one was reasoned through against the code instead; the "mutation checks" below are that
+reasoning — what the test asserts, and why it fails without the fix — and are marked **not run**.
+
+### The findings
+
+| # | Finding | Verified how | Outcome |
+|---|---|---|---|
+| F55 | [medium] `service.ts:738` a mint blocked by a journal entry is moved but not recorded, so every "Finish backup" swaps its seeded balance again and charges the fee again | **Confirmed by reading**: `reissueAll` asked and moved the mint, then `clean(p.mint)` failed, so it was counted `blocked` and not `record`ed; the next `setup()` goes to `finishReissue`, core's `reissuePlan` → `spendable()` takes every proof held there (the seeded ones too) and the dialog asks again. The verifier's temporary test measured [100, fee 1], [99, fee 1], [98, fee 1] | **fixed** |
+| F56 | [medium] `service.ts:672` dust, or an entry at a zero-balance mint, keeps `reissuePending` true for good, and "Replace phrase" with it | **Confirmed by reading**: dust and an unclean zero-balance mint were `blocked++`, `complete` stayed false, `setupNow` routes every `!reissued` envelope to `finishReissue`, and `RecoverySection.tsx` shows only "Finish backup" while `reissuePending` | **fixed**: the rule below |
+| info | `service.ts:1066` the relay copy retry takes `busy`, so a Settings action during a retry is refused "a recovery phrase window is already open" (the screen then says "Too many windows were closed in a row") | **Confirmed by reading** `relayRetryNow` / `exclusive`; the same as residual 7 above | **fixed**: the retry no longer takes `busy`; a flow waits for it |
+
+### The rule (decided here)
+
+For each mint of the wallet, `reissueAll`:
+
+1. **Recorded under this phrase** — done, never planned again (fix round 7).
+2. **Nothing spendable** — done, whatever is journaled there. Nothing there can move, and an entry
+   at a dead mint never settles: it must not keep the backup, and the next rotation, pending for
+   good.
+3. **Dust** (the plan's fee ≥ its amount) — done: never asked, never recorded. It is worth less
+   than the fee to move it (and about that to spend it there).
+4. **A balance worth moving while an operation is journaled there** (checked after the plan, which
+   settles what it can first) — **not moved**, and the reissue stays pending (`blocked`, counted in
+   `reissueFailed`) until the entry settles; "Finish backup" then moves it once. Bounded by the
+   operation: a PAY whose answer was lost settles within 600 s, a melt when Lightning settles it.
+5. **Otherwise** — planned, asked, moved and **recorded at once**, with no second look at the
+   journal: the plan was taken clean and core's `reissue` refuses holdings that changed since the
+   plan, so an entry there after the move was begun since, without the planned proofs, on the
+   seeded wallet — under this phrase.
+
+What rules 2 and 3 leave out keeps **a replaced phrase's relay copy**, not the backup: the copy is
+retired only once `outsideLeft` finds no mint the new phrase did not record holding a spendable
+balance (dust, or inputs an entry gave back) or a journal entry. Store reads only; no plane of the
+identity, or a read that fails, counts as something left. It is checked at completion
+(`finishReissue`), before a rotation (`retireReplaced`) and at every relay copy retry
+(`relayRetryOnce`), which keeps looking with its backoff (30 s doubling to 1 h) until the copy goes.
+This keeps the earlier decision's point (the old copy is not retired while the dust is restorable
+only by it) without letting dust block a rotation.
+
+The relay copy retry (info item): `relayRetryNow` no longer sets `busy`; it records its run in
+`relayRun`, and `exclusive` awaits that run (errors swallowed) after taking `busy` and before the
+flow. A retry never starts while `busy` or another retry's run is set, and `relayRun` is set before
+anything is awaited, so no flow starts between the check and the set. The envelope writes stay
+serialised; a Settings action is delayed by at most one retry's publishes instead of refused.
+
+### Tests (written, NOT run — pending CI)
+
+`packages/app-desktop/src/host/__tests__/recovery-service.test.ts`. Corrected, each with a comment
+citing its finding (they pinned the behaviour the findings describe; none weakened):
+
+- `guard rails` › "a reissue plan … whose fee eats the amount, is never asked": `reissuePending`
+  `true` → `false`, `reissueFailed` `1` → `0` (F56); added: the envelope is `reissued: true` with
+  `reissuedMints: []`, and nothing was reissued.
+- `W8a: a reissue is complete…` › "an operation still journaled at a mint…": the rotation's
+  `reissuedSats` `99` → `0` (F55); added: `feeSats` 0, one reissue dialog in all, one move under
+  the first phrase, then exactly one more (99 sats, fee 1) once the entry cleared. Title corrected.
+- same › "a mint whose whole balance is held…": was "… blocks it too" (`true` / `1`); now the backup
+  is finished (`false` / `0`), a rotation runs while the entry is there, the replaced copy is kept
+  (no NIP-09 deletion, the "relay copy is kept" log line), and the relay retry retires it once the
+  entry cleared (F56).
+
+New, `describe('fix round 8: F55, F56, the relay retry and the flows')`:
+
+| Test | Mutation check (reasoned, **not run**) |
+|---|---|
+| F55: never moved while journaled; presses ask nothing, charge nothing; moved once when clean | Round-8 code: the rotation moves 99 → 98 (the fake's reissue mirrored into the balances), each press again (98 → 97, 97 → 96): `reissuedSats` 98 ≠ 0, `reissued` 4 entries ≠ 1, 3 dialogs ≠ 1 — **killed**. Moving the clean check before the plan: equivalent here (the fake's `pendingAt` is static; with real core the plan's settle can clear the entry, which is why it comes after) |
+| F55: a moved mint is recorded at once despite an entry begun during the move | The fake's reissue journals an entry at the mint after moving. Round-8 code (or the post-move clean check restored): the mint is `blocked`, not recorded — `reissuePending` true, `reissuedMints` `[]` — **killed** |
+| F56: dust with an entry at the same mint is still done | Round-8 code: dust `blocked` → pending — **killed**; the clean check placed before the dust check: `blocked` → pending — **killed** |
+| F56: dust counts as done; "Replace phrase" rotates; the replaced copy stays until the dust is spent | Round-8 code: `r1` pending, and the second setup finishes the reissue instead of rotating (the verifier's probe) — **killed**. `outsideLeft` dropped from `finishReissue`: a blank is published at the rotation — **killed**. Dropped from `relayRetryOnce`: the first retry, dust still there, retires the copy — **killed**. `outsideLeft` reading entries only: the dust is not seen, the copy goes at the rotation — **killed** |
+| F56: a copy kept for dust is not retired by the next setup either | `outsideLeft` dropped from `retireReplaced`: the blank and deletion go before the passphrase prompt — **killed**. Round-8 code: the third setup is a "Finish backup" and resolves instead of asking the passphrase — **killed** |
+| info: a Settings action during a retry waits for it, never refused | The retry's publish is held open; `show()` is called. Round-8 code: refused `rate-limited` at once, so `shown` is the error, not `'shown'` — **killed**. `exclusive` not awaiting `relayRun`: the passphrase prompt is asked while the retry is held, `asked` is not `[]` after 30 ms — **killed** |
+
+Not covered by a test (reasoning only): the `relayRun` check in `relayRetryNow` (needs two
+identities' retries overlapping, one taking longer than the other's 30 s wait); `outsideLeft`'s
+fail-safe branches (no plane of the identity, a read that throws).
+
+### Static checks run here
+
+- `npx tsc -b`: clean (the host project includes the tests).
+- `npx eslint` and `npx prettier --check` on `service.ts` and `recovery-service.test.ts`: clean.
+- `npm run check:locked`: OK (no locked path touched).
+- `node scripts/electron-security-lint.mjs packages/app-desktop`: OK, 264 files, 0 violations.
+
+### Differential review and sharp edges (inline, on this round's diff)
+
+- **Blast radius**: `reissueAll` (called by `finishReissue` only), `finishReissue`,
+  `retireReplaced`, `relayRetryNow` / `relayRetryOnce`, `exclusive` (every renderer flow). No wire,
+  envelope or IPC change; nothing under `packages/core/src/contracts/`, `docs/status.md` or
+  `docs/security-review.md`.
+- **Money**: F55 removes a repeated charge; nothing now moves that did not before, except that a
+  mint recorded after a clean plan is no longer left unrecorded by an entry begun during the move
+  (rule 5 — the double move the post-move check could cause). Dust and zero-balance mints were
+  never moved before either; only their effect on completion changed.
+- **Fail-safe direction**: `outsideLeft` answers "something is left" on any doubt, so the only
+  failure mode is a replaced relay copy kept longer (sealed to self, restores only what the old
+  phrase covers) — never a copy retired while it may still restore funds.
+- **Secrets / logs**: two new log lines, constant sentences, one field `mints` (a count). Nothing
+  from the envelope, a mint URL or an amount is logged.
+- **Sharp edge — the flow now waits instead of failing fast**: `exclusive` awaits the running
+  retry, bounded only by the pool's publish timeouts (nostr-tools: about 7.4 s per publish, so at
+  most about 15 s for a publish then a retirement). A pool whose publish never settled would hold
+  every recovery flow; before this change the same retry held `busy` for good and refused them
+  all, so nothing gets worse, and the production pool settles every publish.
+- **Sharp edge — concurrency**: the retry's check-then-set of `relayRun` has no `await` between
+  them; `exclusive` sets `busy` before awaiting, so a retry firing while a flow waits reschedules.
+
+### Residuals of this round (supersede residuals 6 and 7 above)
+
+1. **A replaced copy kept for leftovers may stay long.** `outsideLeft` cannot tell the phrases'
+   proofs apart, so money that arrives later at a mint the new phrase did not record (a new mint,
+   or the dust mint itself) keeps the copy too, and the retry looks again hourly for as long as the
+   process runs. Harmless (the copy is NIP-44 to self), but not "retired once the dust is spent".
+2. **Inputs a zero-balance mint's entry gives back after the backup finished** stay under the
+   phrase (or random outputs) they were made under until the next rotation: the backup is not
+   reopened for them (the screen has no state for it). A replaced copy, if any, is kept while they
+   are there, so a restore still finds them; after a first setup there is no copy (random outputs,
+   as before any phrase).
+3. **A mint that keeps an operation pending keeps the backup pending**, and "Replace phrase" away,
+   for as long as the operation lasts — bounded by the operation (600 s for a lost PAY answer; a
+   stuck Lightning HTLC can take days), not forever; a hostile mint reporting PENDING for good
+   could hold it. A dead mint with a spendable balance still keeps it pending (its plan fails:
+   unchanged since fix round 7).
+4. **A second rotation drops the older copy's tracking** (unchanged; now also when dust kept it):
+   that copy stays on the relays.
+5. **A reissue whose outcome was unknown** (core throws, the entry is its own) is not recorded;
+   once settled, the next "Finish backup" moves that mint once more (one extra fee). Unchanged by
+   this round.
+6. **The screen** cannot say "waiting for a payment to settle" or "a few sats stay outside the
+   phrase", and reads every `rate-limited` as the throttle (contract requests 3 and 4, revised).

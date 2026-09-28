@@ -96,3 +96,36 @@ See the review record's Residuals; the main ones:
 ## Proposed row for `docs/status.md`
 
 | W8a-money — final review, money plane / NUT-13 | `stage-3/r8-money` | DONE. The round-8 panel's money findings, each with a test that failed before its fix:<br>• restores, reissues, plans and journal settles hold their mint in the PAY/melt gate (core `holdMint`); the PAY-behind-restore loss reproduced and closed;<br>• the PAY deadline model counts a seeded send (seeded belt 12.6 s); PAY sends bounded in core (`SendBound`: turn check, no collision re-run, one skip-ahead batch); the mint loaded and probed before the turn;<br>• restore follows core's `resume` (10 calls, cursor kept; a phrase past 20 000 counters restored whole);<br>• a reissue completes only with no journal entry or dust left; the relay copy retried with a bounded backoff;<br>• the plane runs the wallet's close (drain bounded, no late watermark write), the startup restore, one counters store per identity; the counters file takes core's probed-keyset entry;<br>• a repeated journal `begin` refused; play sessions closed before a reopen.<br>Nutshell and cdk real-mint suites green. Review `docs/reviews/2026-09-27-pre-push-w8a-money.md` (43 mutation checks) |
+
+## Fix round 8 (2026-09-27): F55, F56 and the relay retry's lock — tests written, NOT run
+
+The round-8 verifier's two medium findings and one info item on this lane's recovery service.
+Commits `79b7474` (fix and tests) and `f8cf026` (two more tests); the review record's "Fix round
+8" section has the verification, the rule, the reasoned mutation checks and the residuals.
+
+**The tests are written but NOT run**: no test runner runs on this machine (the local-run guard),
+so they run later in CI. Each was traced against the code; its mutation check is recorded as
+reasoning, marked "not run". Static checks run here: `npx tsc -b`, eslint and `prettier --check`
+on the changed files, `npm run check:locked`, the Electron security lint — all clean.
+
+| Finding | Outcome |
+|---|---|
+| [medium] F55 `service.ts:738` a journaled mint moved but not recorded, moved and charged again at every "Finish backup" | **fixed**: a mint with a balance worth moving and a journal entry (after the plan's settle) is not moved until the entry settles, and keeps the reissue pending; a mint that moved is recorded at once (core refuses holdings changed since the clean plan) |
+| [medium] F56 `service.ts:672` dust, or an entry at a zero-balance mint, keeps the backup pending and "Replace phrase" away for good | **fixed**: dust and a mint with nothing spendable count as done for the backup; they keep a replaced phrase's relay copy instead, retired once no unrecorded mint holds a balance or an entry (checked at completion, before a rotation and at every relay retry) |
+| [info] `service.ts:1066` the relay retry takes the flows' lock | **fixed**: the retry no longer takes `busy`; a flow started during a retry waits for it (bounded by the relay timeouts) instead of being refused |
+
+**The rule, stated**: recorded → done; nothing spendable → done (whatever is journaled there);
+dust (fee ≥ amount) → done, never asked; a balance worth moving with an operation in flight →
+not moved, pending until it settles; otherwise asked, moved, recorded. What the backup leaves out
+keeps the replaced relay copy, not the backup.
+
+Tests: three W8a tests corrected (each with a comment citing F55 or F56: they pinned the behaviour
+the findings describe), six new ones (`fix round 8: …`). Contract request 3 revised and 4 added
+(the screen's wording for what stays outside the phrase, and its one sentence for two different
+`rate-limited` refusals).
+
+Residual 4 above ("Dust keeps a backup pending") is superseded: dust no longer keeps the backup
+pending, only a replaced relay copy — which money arriving later at a mint the new phrase did not
+record keeps as well (the store cannot tell the phrases' proofs apart). A mint that keeps an
+operation pending keeps the backup pending for as long as the operation lasts (a lost PAY answer
+600 s, a stuck HTLC possibly days).
