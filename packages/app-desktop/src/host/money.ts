@@ -44,6 +44,13 @@
  *     have time for its worst case — which grows with the journal entries left at its mint (each
  *     P2PK send settles every one first) and shrinks once the mint is loaded
  *     (`payBuildStartByMs`, cross-lane review round 4).
+ *   - Lane W8a (final cross-lane review): the wallet's long operations at a mint — a NUT-13
+ *     restore, a reissue and its plan, the journal settle, the startup restore of this device's
+ *     unpublished range — go through the same gate (`holdMint` → `PayMeltGate.hold`): a PAY there
+ *     is refused at once while one runs. Before its turn, a PAY's mint is loaded and its keyset
+ *     probed (`CashuWallet.prepare`), and each of its sends is bounded (`SendBound`): asked again
+ *     at its own turn in core (`sendStartByMs`), never re-run after a NUT-13 counter collision.
+ *     The belt counts what a seeded send costs (`payBuildStartByMs(…, seeded)`).
  *   - `pay.hello` signs a kind-HELLO event over a `pay/1` challenge and nothing else.
  *   - `seller.*` act only at the wallet's own mints; `redeem` only takes proofs locked to the
  *     wallet key (the wallet refuses others); a nutzap goes only to a creator the host has seen in
@@ -53,6 +60,7 @@ import type {
   CashuP2pkPubkey,
   CoreKeyHex,
   HyperblobId,
+  LockedProofSet,
   MeltQuote,
   MintKeyset,
   MintUrl,
@@ -66,6 +74,7 @@ import type {
   Sats,
   Signer,
   UnixSeconds,
+  Wallet,
 } from '@sovit/core';
 import {
   DEFAULT_WINDOW_BLOCKS,
@@ -75,13 +84,14 @@ import {
   wallet as walletMod,
 } from '@sovit/core';
 
-import { payBuildStartByMs } from '../ipc/deadlines.js';
+import { PAY_BUILD_SENDS, payBuildStartByMs, sendStartByMs } from '../ipc/deadlines.js';
 import type { SessionId } from '../ipc/protocol.js';
 import type { HostMethodTable, RedeemResult } from '../ipc/worker-protocol.js';
 import { hostError } from './errors.js';
 import type { Logger } from './log.js';
 import { hostMintRequest } from './mint-transport.js';
-import { PayMeltGate } from './pay-melt-gate.js';
+import type { Arrival } from './pay-melt-gate.js';
+import { GateRefusal, PAY_TOO_LATE, PayMeltGate } from './pay-melt-gate.js';
 import type { PlaneSeed } from './recovery/service.js';
 import { TailBook } from './tails.js';
 import type { TopUpVault } from './topup/auto-topup.js';
@@ -185,6 +195,21 @@ export function sessionBudgetBlocks(blob: HyperblobId): number {
   return 2 * blob.blockLength + DEFAULT_WINDOW_BLOCKS;
 }
 
+/**
+ * Lane W8a: how long a swap (sign-out, lock, a recovery reopen, a quit) waits, at most, for a closed
+ * plane's wallet to drain — its running operations to end and its NUT-13 watermark to be written —
+ * before it moves on. After that the watermark write is skipped for good (`MoneyPlane.drained`):
+ * it could otherwise land after the next plane's counters file, or a rotation's. Nothing depends on
+ * that write (a stale watermark only restores more at the next start).
+ */
+export const PLANE_DRAIN_MS = 2_000;
+
+/** A PAY build in flight at a mint (W8a): when its request arrived, how many sends it started. */
+interface Building {
+  readonly arrived: Arrival;
+  sends: number;
+}
+
 export class MoneyPlane {
   readonly wallet: walletMod.CashuWallet;
   readonly pubkey: NostrPubkey;
@@ -193,12 +218,20 @@ export class MoneyPlane {
   /** How the wallet key is held (the UI must say which, build-plan §3). */
   readonly mode: 'signer' | 'memory';
   /** ADR 0016: the wallet's seeded view, when the plane opened with this device's phrase. */
-  readonly seeded: walletMod.SeededWallet | undefined;
+  readonly seeded: walletMod.CoreSeededWallet | undefined;
   /**
    * The startup settle of a journal a crash left entries in (ADR 0014 amendment): its counts, or
    * `null` when there was nothing to settle (or it failed; the next payment retries).
    */
   recovery: Promise<{ readonly recovered: number; readonly left: number } | null> =
+    Promise.resolve(null);
+  /**
+   * Lane W8a (ADR 0016 §3, core's contract request 4): after that settle, a seeded plane restores
+   * this device's own unpublished counter range at its mints (`CashuWallet.restoreUnpublished`,
+   * each mint inside the PAY/melt gate). What it found (counts), or `null`: not seeded, closed
+   * first, or failed (the next open scans again).
+   */
+  startupRestore: Promise<{ readonly restoredMints: number; readonly unfinished: number } | null> =
     Promise.resolve(null);
   /**
    * Settles the journal whenever an entry can be decided (issue #8 review, finding 1): held
@@ -225,6 +258,15 @@ export class MoneyPlane {
   private readonly closeSeed: () => void;
   private readonly closeCounters: () => void;
   private closed = false;
+  /** W8a: the PAY build in flight per mint (the gate lets one through per mint at a time). */
+  private readonly building = new Map<MintUrl, Building>();
+  /** W8a: the wallet's own close (`CashuWallet.close`), started by `close()`. */
+  private draining: Promise<void> = Promise.resolve();
+  /** W8a: the swap moved on (`drained` timed out): the close writes no watermark any more. */
+  private released = false;
+  /** W8a: the close's watermark write had started when the swap timed out: it is waited for. */
+  private flushing = false;
+  private drainedOnce: Promise<void> | undefined;
 
   private constructor(
     private readonly o: MoneyPlaneOptions,
@@ -280,7 +322,8 @@ export class MoneyPlane {
         flushEveryBlocks: 64,
         flushEveryMs: 60_000,
       },
-      wallet: this.wallet,
+      // W8a: the engine's sends are a PAY build's — each one bounded (`paySend`).
+      wallet: { send: (amount, opts) => this.paySend(amount, opts) },
       now: this.now,
     });
     this.keyset = walletMod.guardedKeyset((m, id) => this.wallet.keyset(m, id));
@@ -320,6 +363,7 @@ export class MoneyPlane {
       ...(o.now === undefined ? {} : { now: o.now }),
     });
     let journal: walletMod.SealedJournal | undefined;
+    let built: walletMod.CashuMintConnections | undefined;
     try {
       // Sealed to this identity; a file that does not open refuses the wallet (and is kept).
       if (o.journalDir !== null)
@@ -348,6 +392,7 @@ export class MoneyPlane {
         // counters from the counters file (core's option, recovery/core.ts WIRING POINT).
         ...(o.seed === undefined ? {} : o.seed.core.seedOption(o.seed.material)),
       });
+      built = conns;
       // Which mints have loaded (cached by `conns` from then on): a PAY's belt counts no load
       // round trip for them. Recorded by wrapping `conns.wallet` on this instance, so the wallet
       // is handed the connections object itself (ADR 0016: a seeded wallet finds its seed there).
@@ -365,6 +410,8 @@ export class MoneyPlane {
           key: nip60.key,
           configuredMints: [...new Set([...nip60.mints, ...o.defaultMints()])],
           ...(o.now === undefined ? {} : { now: o.now }),
+          // W8a: restores, reissues and the journal settle hold their mint in the gate.
+          holdMint: (mint, run) => gate.hold(mint, run),
         },
         gate,
       );
@@ -396,9 +443,11 @@ export class MoneyPlane {
           },
         );
       // From then on, entries settle by themselves when the mint can decide them (after the
-      // startup settle, so the two do not ask the mint twice).
-      void plane.recovery.then(() => {
+      // startup settle, so the two do not ask the mint twice). W8a (ADR 0016 §3): a seeded plane
+      // then restores this device's own unpublished range at its mints, each inside the gate.
+      plane.startupRestore = plane.recovery.then(async () => {
         plane.settles.start();
+        return await plane.restoreAtStart();
       });
       // Where the user takes nutzaps: creators' shares of their own videos (best effort).
       walletMod
@@ -418,8 +467,37 @@ export class MoneyPlane {
     } catch (err) {
       nip60.close();
       journal?.close();
+      // W8a: connections built before the failure hold a live counter source over this
+      // identity's counters store — closed, so the next open (a rotated phrase too) gets its own.
+      built?.seeding?.counters.close();
       o.seed?.material.seed.wipe();
       throw err;
+    }
+  }
+
+  /** The startup restore (`startupRestore`); never throws. */
+  private async restoreAtStart(): Promise<{
+    readonly restoredMints: number;
+    readonly unfinished: number;
+  } | null> {
+    if (this.seeded === undefined || this.closed) return null;
+    try {
+      const reports = await this.wallet.restoreUnpublished();
+      const restoredMints = reports.filter((r) => r.outcome === 'restored').length;
+      const unfinished = reports.filter(
+        (r) => r.resume !== undefined || (r.outcome !== 'restored' && r.outcome !== 'nothing'),
+      ).length;
+      if (reports.length > 0)
+        this.o.log.info('recovery phrase: this device’s unpublished outputs scanned at startup', {
+          restoredMints,
+          unfinished,
+        });
+      return { restoredMints, unfinished };
+    } catch {
+      this.o.log.warn(
+        'the startup restore of this device’s outputs did not run (retried at the next open)',
+      );
+      return null;
     }
   }
 
@@ -536,10 +614,19 @@ export class MoneyPlane {
   }
 
   /**
+   * W8a: how many journal entries are at `mint` — operations whose outcome the mint has not
+   * decided yet (a reissue at that mint is complete only once there are none).
+   */
+  async pendingAt(mint: MintUrl): Promise<number> {
+    this.open();
+    return (await this.store.pending(mint)).length;
+  }
+
+  /**
    * Wipe a wallet key held in memory and the journal key; later calls reject, and an operation
    * still in flight can journal nothing more (its entry, already on disk, is settled at the next
    * open). Lane P2-owed-viewer: the open sessions' tails are the tail book's last writes; the book
-   * is then closed (`tails.ts`).
+   * is then closed (`tails.ts`). Lane W8a: the wallet's own close starts too (`drained`).
    */
   close(): void {
     if (this.closed) return;
@@ -567,6 +654,50 @@ export class MoneyPlane {
     this.closeJournal();
     // The seam's contract: core refuses to derive from a wiped seed (never from zeros).
     this.closeSeed();
+    // W8a (core's contract request 4): the wallet's own close, with the plane's fences in place —
+    // new operations refused, the running and queued ones ended, then the NUT-13 watermark
+    // written, unless the swap already moved on (`drained`): that late write is what raced the
+    // next plane's counters file or a rotation (integration fix 2). The seed is wiped already.
+    this.draining = this.wallet
+      .close({
+        flush: () => {
+          if (this.released) return false;
+          this.flushing = true;
+          return true;
+        },
+      })
+      .catch(() => undefined);
+  }
+
+  /**
+   * W8a: resolves once the closed plane's wallet has drained (its operations ended, its watermark
+   * written) or `ms` passed — whichever is first. From then on this plane never writes the counters
+   * file again: past `ms` its watermark write is skipped, and one already started is waited for (a
+   * local disk write). The swap awaits it before a rotation moves the counters file, before the next
+   * plane opens, and before a quit ends. Idempotent (the first call's `ms` applies).
+   */
+  drained(ms: number = PLANE_DRAIN_MS): Promise<void> {
+    if (!this.closed) return Promise.reject(new Error('invalid-argument: the plane is open'));
+    this.drainedOnce ??= (async () => {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const late = await Promise.race([
+        this.draining.then(() => false),
+        new Promise<boolean>((resolve) => {
+          timer = setTimeout(
+            () => {
+              resolve(true);
+            },
+            Math.max(0, ms),
+          );
+          timer.unref();
+        }),
+      ]);
+      clearTimeout(timer);
+      if (!late) return;
+      this.released = true;
+      if (this.flushing) await this.draining;
+    })();
+    return this.drainedOnce;
   }
 
   // ---- viewer ----------------------------------------------------------------------------
@@ -613,12 +744,23 @@ export class MoneyPlane {
       }
     }
     try {
-      // Refused at once (`rate-limited:`, nothing spent) while a melt is pending or in flight at
-      // this mint, or once the PAY has waited too long for its turn there (the gate's rules):
-      // how long depends on the journal entries left at the mint, read at its turn (round 4).
+      // Refused at once (`rate-limited:`, nothing spent) while a melt, a restore, a reissue or a
+      // settle is pending or running at this mint, or once the PAY has waited too long for its
+      // turn there (the gate's rules): how long depends on the journal entries left at the mint,
+      // read at its turn (round 4), and on whether the wallet is seeded (W8a).
       const mint = a.seeder.mint;
+      const marked = this.gate.refusal(mint);
+      if (marked !== undefined) throw marked;
+      // W8a: the mint loaded and its keyset probed BEFORE the turn (spends nothing): neither
+      // round trip then falls inside the build, which the belt below leaves out. Its time counts
+      // against the belt all the same (the clock started when the request arrived).
+      await this.wallet.prepare(mint).catch((e: unknown) => {
+        this.open(); // closed meanwhile: said so, not as the closed wallet's refusal
+        throw e;
+      });
+      const seeded = this.seeded !== undefined;
       const startBy = async (): Promise<number> =>
-        payBuildStartByMs((await this.store.pending(mint)).length, this.loaded.has(mint));
+        payBuildStartByMs((await this.store.pending(mint)).length, this.loaded.has(mint), seeded);
       return await this.gate.pay(
         mint,
         arrived,
@@ -628,9 +770,11 @@ export class MoneyPlane {
           const still = tail === undefined ? this.sessions.get(a.sid) : this.tails.get(a.sid);
           if (still !== s)
             throw hostError('session-closed', 'the play session closed before the PAY was built');
+          this.building.set(mint, { arrived, sends: 0 });
           try {
             return await this.viewer.pay(a.range, a.seeder, p, { carryIn: a.carryIn });
           } finally {
+            this.building.delete(mint);
             // Issue #2: the mint the next PAY draws from (an auto top-up checks it; never awaited).
             this.paidAt(a.seeder.mint);
           }
@@ -647,6 +791,37 @@ export class MoneyPlane {
         throw hostError('no-balance', 'not enough sats at this mint to keep streaming');
       throw err;
     }
+  }
+
+  /**
+   * W8a: a send of the PAY build in flight at its mint (the viewer engine's only way to spend),
+   * bounded (`SendBound`): asked again when its turn at the mint comes in core — past what is left
+   * of the worker's deadline for this send and the ones after it, it is refused with nothing spent
+   * — and never run again after a NUT-13 counter collision. A send outside a PAY build is refused.
+   */
+  private paySend(amount: Sats, opts: Parameters<Wallet['send']>[1]): Promise<LockedProofSet> {
+    const b = this.building.get(opts.mint);
+    if (b === undefined)
+      return Promise.reject(hostError('forbidden', 'a payment outside a PAY build'));
+    return this.wallet.send(amount, {
+      ...opts,
+      bound: { onTurn: () => this.sendTurn(opts.mint, b) },
+    });
+  }
+
+  /** `SendBound.onTurn` of a PAY's send (see `paySend`): throws to refuse it. */
+  private async sendTurn(mint: MintUrl, b: Building): Promise<void> {
+    this.open();
+    const left = Math.max(1, PAY_BUILD_SENDS - b.sends);
+    b.sends++;
+    const limit = sendStartByMs(
+      (await this.store.pending(mint)).length,
+      this.loaded.has(mint),
+      this.seeded !== undefined,
+      left,
+    );
+    // `!(… <= limit)`: a NaN bound refuses.
+    if (!(this.gate.now() - b.arrived <= limit)) throw new GateRefusal(PAY_TOO_LATE);
   }
 
   /** Keep `s`'s tail (see `revokeSession`): at most what it had left. */

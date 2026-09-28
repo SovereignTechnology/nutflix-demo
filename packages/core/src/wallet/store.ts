@@ -168,7 +168,13 @@ export interface WalletTx {
     readonly amount: Sats;
     readonly memo?: string;
   };
-  /** Journal this operation (only on a store with `pending`). */
+  /**
+   * Journal this operation (only on a store with `pending`). Refused — the whole transition, with
+   * nothing changed (`JournalConflictError`) — when an operation with the same id is already
+   * journaled and this transition does not settle it: the id is the operation's first blinded
+   * message, which repeats only if a NUT-13 counter was handed out twice (a counters file rolled
+   * back), and replacing the older entry would forget that operation's change (lane W8a).
+   */
   readonly begin?: PendingOp;
   /** Drop these journaled operations (by id). */
   readonly settle?: readonly string[];
@@ -195,6 +201,24 @@ export interface ProofStore {
     readonly limit?: number;
     readonly mint?: MintUrl;
   }): Promise<readonly WalletHistoryEntry[]>;
+}
+
+/** A `begin` whose id is already journaled (see `WalletTx.begin`): nothing was changed. */
+export class JournalConflictError extends Error {
+  override readonly name = 'JournalConflictError';
+  constructor() {
+    super('journal-conflict: an operation with this id is already journaled (nothing was changed)');
+  }
+}
+
+/**
+ * Throws `JournalConflictError` when `tx.begin` names an operation `ops` still holds once `tx`'s
+ * own `settle` is applied (a store calls it before it changes anything).
+ */
+export function checkBegin(ops: ReadonlyMap<string, PendingOp>, tx: WalletTx): void {
+  const id = tx.begin?.id;
+  if (id !== undefined && ops.has(id) && !(tx.settle ?? []).includes(id))
+    throw new JournalConflictError();
 }
 
 /** A deep copy (plain JSON data; `structuredClone` is not in every runtime core runs in). */
@@ -232,6 +256,11 @@ export class MemoryProofStore implements ProofStore {
   }
 
   commit(tx: WalletTx): Promise<WalletHistoryEntry | null> {
+    try {
+      checkBegin(this.ops, tx);
+    } catch (e) {
+      return Promise.reject(e instanceof Error ? e : new Error(String(e)));
+    }
     let m = this.byMint.get(tx.mint);
     if (!m) {
       m = new Map();

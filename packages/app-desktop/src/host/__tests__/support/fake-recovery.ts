@@ -93,9 +93,18 @@ export interface RestoreCall {
   readonly mints: readonly MintUrl[];
   /** Was the seed still unwiped while the restore ran? */
   readonly liveDuringRestore: boolean;
+  /** W8a: where each mint's scan was asked to continue from (core's `RestoreOptions.resume`). */
+  readonly resume?: Readonly<Record<string, Readonly<Record<string, number>>>>;
 }
 
-export class FakeSeededWallet implements walletMod.SeededWallet {
+/** One scripted call's answer at a mint (W8a): a report, with `resume` while unfinished. */
+export interface ScriptedStep {
+  readonly outcome: walletMod.RestoreOutcome;
+  readonly restoredSats: number;
+  readonly resume?: Readonly<Record<string, number>>;
+}
+
+export class FakeSeededWallet implements walletMod.CoreSeededWallet {
   /** Per mint: the plan `reissuePlan` answers (absent = throws `unreachable`). */
   readonly plans = new Map<MintUrl, { inputs: number; feeSats: number }>();
   /** Per mint: `reissue` throws instead. */
@@ -105,6 +114,11 @@ export class FakeSeededWallet implements walletMod.SeededWallet {
     string,
     Partial<Record<MintUrl, { outcome: walletMod.RestoreOutcome; restoredSats: number }>>
   >();
+  /**
+   * W8a: per phrase (entropy hex) and mint, what successive calls answer, in order (each call takes
+   * the next; once they run out, `restores` answers).
+   */
+  readonly steps = new Map<string, Partial<Record<MintUrl, ScriptedStep[]>>>();
   /** Phrases whose restore throws. */
   readonly failRestore = new Set<string>();
   readonly reissued: walletMod.ReissuePlan[] = [];
@@ -140,22 +154,35 @@ export class FakeSeededWallet implements walletMod.SeededWallet {
     seed: walletMod.RecoverySeed,
     mints: readonly MintUrl[],
     onProgress?: (p: walletMod.RestoreProgress) => void,
-  ): Promise<readonly walletMod.RestoreReport[]> {
+    opts?: walletMod.RestoreOptions,
+  ): Promise<readonly walletMod.RestoreDetail[]> {
     const s = seed as FakeSeed;
+    const resume =
+      opts?.resume === undefined
+        ? undefined
+        : Object.fromEntries([...opts.resume].map(([m, r]) => [m, { ...r }]));
     this.restoreCalls.push({
       entropyHex: s.entropyHex,
       mints: [...mints],
       liveDuringRestore: !s.wiped,
+      ...(resume === undefined ? {} : { resume }),
     });
     if (this.failRestore.has(s.entropyHex)) throw new Error('backend-down: restore failed');
     const script = this.restores.get(s.entropyHex) ?? {};
-    const out: walletMod.RestoreReport[] = [];
+    const steps = this.steps.get(s.entropyHex) ?? {};
+    const out: walletMod.RestoreDetail[] = [];
     for (const mint of mints) {
       onProgress?.({ mint, keysetsDone: 0, keysets: 2 });
       await Promise.resolve();
       onProgress?.({ mint, keysetsDone: 2, keysets: 2 });
-      const r = script[mint] ?? { outcome: 'nothing' as const, restoredSats: 0 };
-      out.push({ mint, outcome: r.outcome, restoredSats: r.restoredSats as Sats });
+      const step = steps[mint]?.shift();
+      const r = step ?? script[mint] ?? { outcome: 'nothing' as const, restoredSats: 0 };
+      out.push({
+        mint,
+        outcome: r.outcome,
+        restoredSats: r.restoredSats as Sats,
+        ...(step?.resume === undefined ? {} : { resume: step.resume }),
+      });
     }
     return out;
   }
@@ -175,9 +202,15 @@ export class FakeRecoveryCore implements RecoveryCore {
     return { seed };
   }
 
-  seeded(): walletMod.SeededWallet | undefined {
+  seeded(): walletMod.CoreSeededWallet | undefined {
     const last = this.materials.at(-1);
     return this.takesSeed && last !== undefined && !last.seed.wiped ? this.wallet : undefined;
+  }
+
+  /** W8a: a stand-in phrase tag (tests only; the real one is core's keyed BLAKE2b). */
+  phraseTag(seed: walletMod.RecoverySeed): string {
+    const hex = (seed as FakeSeed).entropyHex;
+    return `fake-tag-${hex.slice(16)}${hex.slice(0, 16)}`;
   }
 }
 

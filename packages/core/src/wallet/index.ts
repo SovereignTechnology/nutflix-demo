@@ -16,6 +16,7 @@ export {
   type MintConnections,
   type RestoreDetail,
   type Seeding,
+  type SendBound,
   type SpendContext,
   type WalletErrorCode,
   type WalletKey,
@@ -31,6 +32,7 @@ export {
   RECOVERY_WORDS,
   RecoveryPhraseError,
   RecoverySeedError,
+  counterBinding,
   entropyFromBytes,
   entropyFromHex,
   entropyToHex,
@@ -43,6 +45,7 @@ export {
   type UnpublishedRange,
 } from './seed.js';
 export {
+  JournalConflictError,
   MemoryProofStore,
   PENDING_KINDS,
   heldSecrets,

@@ -341,6 +341,25 @@ block to a `pay/1` peer, with no switch.
     (`clock`, default `performance.now()`); the ledger, the release guard and an invoice's expiry
     stay on the wall clock they are compared with.
 
+- Addendum 2026-09-27 (lane W8a-money, final cross-lane review; the recovery phrase of ADR 0016):
+  - **The gate holds more than melts.** A NUT-13 restore (per mint), a reissue and its plan, the
+    journal settle and the startup restore of the device's unpublished range each mark their mint
+    like a melt (core's `CashuWalletOptions.holdMint` → `PayMeltGate.hold`): a PAY there is refused
+    at once (`rate-limited:`, nothing spent), and the hold waits for the PAY in flight first. A PAY
+    queued behind a restore scan was built after the worker's deadline (reproduced; closed).
+  - **The deadline model counts a seeded send** (`payBuildWorstMs(…, seeded)`): after a lost
+    answer a NUT-09 restore and a NUT-07 check, a probe of an unknown keyset, one capped collision
+    batch, and the counters-file saves (an allowance of 1 s each). A seeded PAY at a loaded mint
+    with no journal entries has 12.6 s to start; with any entry there, none. The plane loads the
+    mint and probes its keyset before the PAY's turn (`CashuWallet.prepare`, spends nothing).
+  - **A PAY's sends are bounded in core** (`SendBound`): each is asked again when its own turn at
+    the mint comes (`sendStartByMs`: what is left of the worker's deadline for it and the sends
+    after it) — an operation the gate does not see (a redeem, a top-up's settle) may hold the mint
+    — and a counter collision is reported, never run again, with a one-batch skip-ahead.
+  - **Closing drains.** `MoneyPlane.close` runs the wallet's own close; the swap awaits its drain
+    for at most `PLANE_DRAIN_MS` (2 s) before a rotation moves the counters file and before the
+    next plane opens, and skips the watermark write after that.
+
 ## Consequences
 
 - With a signer, the desktop pays and is paid for real: tested end to end — the worker (real

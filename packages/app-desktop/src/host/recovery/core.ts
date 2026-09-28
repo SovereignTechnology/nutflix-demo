@@ -42,8 +42,17 @@ export interface RecoveryCore {
    * over those connections then derives from the seed and draws counters from `seed.counters`.
    */
   seedOption(seed: walletMod.SeedMaterial): SeedConnectionsOption;
-  /** A wallet's seeded view (`CashuWallet.seeded`); `undefined` over unseeded connections. */
-  seeded(wallet: walletMod.CashuWallet): walletMod.SeededWallet | undefined;
+  /**
+   * A wallet's seeded view (`CashuWallet.seeded`); `undefined` over unseeded connections. Core's
+   * own type (W8a): its restore takes where to continue and says where a scan stopped (`resume`).
+   */
+  seeded(wallet: walletMod.CashuWallet): walletMod.CoreSeededWallet | undefined;
+  /**
+   * Which phrase a seed is, as a public tag (W8a: where an unfinished restore stopped is kept per
+   * phrase): core's counters-file binding, a keyed BLAKE2b of the seed — it can only confirm a
+   * guessed phrase. Never logged.
+   */
+  phraseTag(seed: walletMod.RecoverySeed): string;
 }
 
 /** WIRING POINT (see the box above): lane N1's implementation, filled at the merge (2026-09-27). */
@@ -52,6 +61,7 @@ export function recoveryCore(): RecoveryCore | undefined {
     phrases: walletMod.recoveryPhrases, // core wallet/seed.ts (locked)
     seedOption: (seed) => ({ seed }), // CashuMintConnections({ request, seed })
     seeded: (w) => w.seeded, // CashuWallet.seeded
+    phraseTag: (seed) => walletMod.counterBinding(seed), // core wallet/seed.ts (locked)
   };
 }
 

@@ -19,7 +19,7 @@ import { join } from 'node:path';
 
 import { afterEach, describe, expect, it } from 'vitest';
 
-import type { MintUrl, NostrEvent } from '@sovit/core';
+import type { MintUrl, NostrEvent, Sats } from '@sovit/core';
 import { mocks, nostr, wallet as walletMod } from '@sovit/core';
 
 import { isHostOut } from '../../ipc/guards.js';
@@ -254,4 +254,60 @@ describe('the recovery phrase through the host (ADR 0016, core’s real NUT-13 c
       expectClean(sink, phraseB, [PASS, KEY]);
     }
   }, 120_000);
+
+  // W8a (final cross-lane review [medium] service.ts:736): a lost heavy-use device's phrase has
+  // signed outputs from counter 0 to far past core's per-call cap (200 batches of 100 = 20 000);
+  // its newest — unspent — ecash sits at the top. The restore stopped at 20 000 and said
+  // "refused". It now follows core's resume, in one restore.
+  // 84 real top-ups and ~215 NUT-09 batches of 100 derived outputs against the in-process mint:
+  // 30 s alone, about 70 s beside another suite on a shared box — past vitest's default and the
+  // profile's 60 s reply wait, hence the explicit budgets (the restore's reply: 180 s).
+  it('a phrase whose outputs run past 20 000 counters is restored whole in one restore (core’s resume followed)', async () => {
+    const mint = new mocks.TestMint({ url: MINT, seed: new Uint8Array(32).fill(0x64) });
+    // Device X, heavy use: one signature every 250 counters from 0 to 20 750 — past the first
+    // call's 20 000 — never three empty batches in a row, each a 1-sat top-up, unspent.
+    const X = '3d'.repeat(16);
+    const seedX = await walletMod.recoveryPhrases.toSeed(walletMod.entropyFromHex(X));
+    const conns = new walletMod.CashuMintConnections({
+      request: () => mint.request,
+      seed: {
+        seed: seedX,
+        counters: new mocks.MemoryCounterStore({
+          v: 1,
+          next: { [mint.keysetId]: 0 },
+          published: {},
+        }),
+      },
+    });
+    const x = new walletMod.CashuWallet({ mints: conns, store: new walletMod.MemoryProofStore() });
+    let issued = 0;
+    for (let c = 0; c <= 20_750; c += 250) {
+      await conns.seeding!.counters.advanceToAtLeast(mint.keysetId, c);
+      const q = await x.mintQuote(MINT, 1 as Sats);
+      mint.payQuote(q.quoteId);
+      await x.pollQuote(q);
+      issued++;
+    }
+    await x.close();
+    expect(issued).toBe(84);
+    const words = walletMod.recoveryPhrases.toIndices(walletMod.entropyFromHex(X));
+
+    // Device B: its own phrase, then a restore with X's words typed in.
+    const b = await profile({
+      mintRequest: () => mint.request,
+      restoreAnswer: { kind: 'recovery-restore', words: [...words] },
+    });
+    await b.connect();
+    const setup = await b.invoke('desktop.wallet.recovery.setup');
+    expect(setup.ok && setup.result).toMatchObject({ status: { state: 'covered' } });
+    const restored = await b.invoke('desktop.wallet.recovery.restore', [], 180_000);
+    expect(restored.ok && restored.result).toEqual({
+      phrases: 2,
+      reports: [{ mint: MINT, outcome: 'restored', restoredSats: 84 }],
+    });
+    expect(await b.r.host.adapter.wallet.balance(MINT)).toBe(84);
+    // The top — the signatures from 20 000 to 20 750 — is past the first call's 200 batches.
+    expect(mint.calls.filter((c) => c === 'POST /v1/restore').length).toBeGreaterThan(200);
+    for (const sink of sinks(b)) expectClean(sink, words, [PASS]);
+  }, 240_000);
 });

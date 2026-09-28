@@ -50,6 +50,11 @@
  *     it afterwards.
  *   - **Closing** refuses new operations and waits until every per-mint lock is idle, so the
  *     wallet (`wallet.ts` `close`) wipes the seed only when nothing derives from it.
+ *   - **A deadline-bound send** (`SendBound`, a PAY build the worker waits a fixed time for; lane
+ *     W8a) asks its caller at its turn — after every operation queued ahead of it at the mint — and
+ *     is refused there with nothing spent; it is never run a second time after a counter
+ *     collision, and the skip-ahead past one is capped at one batch (a NUT-12 mint's 200 would be
+ *     200 more round trips). The caller retries it later, past the moved counters.
  *
  * No cryptography here: blinding, signatures, DLEQ, P2PK witnesses and NUT-13 derivation are
  * cashu-ts calls, and a witness is signed by the injected `WalletKey` (the signer's `signSecret`,
@@ -192,6 +197,21 @@ export interface WalletKey {
   withSecretHex?<T>(use: (hex: string) => Promise<T>): Promise<T>;
 }
 
+/**
+ * A send whose caller waits for it a fixed time and cannot cancel it (lane W8a: a PAY build; the
+ * worker gives up after `WORKER_HOST_REQUEST_TIMEOUT_MS`, and P2PK sets made after that are lost).
+ * With it, the send is bounded: `onTurn` is awaited when the send's turn at its mint comes —
+ * after every operation queued ahead of it there, before anything is selected, derived or asked —
+ * and a throw (or rejection) refuses the send with nothing spent and nothing journaled; a NUT-13
+ * counter collision is reported instead of run again with fresh counters; and the skip-ahead past
+ * a collision (its own, or one the journal settle finds) asks at most one batch, like a mint
+ * without NUT-12. The caller's retry then derives past the moved counters.
+ */
+export interface SendBound {
+  /** Awaited holding the mint's turn: it must answer at once (read local state, then decide). */
+  readonly onTurn: () => void | Promise<void>;
+}
+
 export interface SpendContext {
   readonly mints: MintConnections;
   readonly store: ProofStore;
@@ -310,6 +330,12 @@ export class Spender {
   private readonly locks = new Map<MintUrl, Promise<unknown>>();
   /** Operations started and not yet finished, queued ones included (`idle`). */
   private running = 0;
+  /**
+   * Mints where a bounded send (`SendBound`) holds the lock right now: a skip-ahead past a counter
+   * collision asks at most one batch there. Ops at one mint run one at a time, so the set names the
+   * running op's mint exactly.
+   */
+  private readonly bounded = new Set<MintUrl>();
   private isClosed = false;
   /** The last reissue plan per mint and the exact proofs it covered (ADR 0016 D5). */
   private readonly plans = new Map<
@@ -383,6 +409,37 @@ export class Spender {
   }
 
   /**
+   * Run `f` once (a bounded send, `SendBound`): a NUT-13 counter collision — its entry already
+   * dropped and the counters moved past it — is reported, never run again here: the caller's
+   * deadline does not cover a second attempt. Its retry derives past the moved counters.
+   */
+  private async once<T>(f: () => Promise<T>): Promise<T> {
+    try {
+      return await f();
+    } catch (e) {
+      if (e instanceof CounterCollision)
+        throw new WalletError(
+          'mint-error',
+          'NUT-13 counter collision: the counters moved past it, retry the payment later',
+        );
+      throw e;
+    }
+  }
+
+  /**
+   * Get `mint` ready for a bounded send (`SendBound`; lane W8a): its wallet loaded and, where this
+   * wallet derives NUT-13 outputs, the active keyset known to the counters — probed at this mint
+   * (one NUT-09 batch) when the counters file does not know it. Spends, derives and journals
+   * nothing. Not under the mint's lock: the counter source serialises the probe, and nothing
+   * derives under a keyset before it is probed.
+   */
+  async prepare(mint: MintUrl): Promise<void> {
+    if (this.isClosed) throw new WalletError('invalid-argument', 'the wallet is closed');
+    const w = await this.ctx.mints.wallet(mint);
+    await this.own(w);
+  }
+
+  /**
    * Whether this wallet's own new outputs at `w` are deterministic (ADR 0016 §4): seeded, and the
    * mint can restore them — NUT-09, and an output keyset NUT-13 derives for (hex, v1 or v2).
    */
@@ -434,6 +491,8 @@ export class Spender {
       readonly mint: MintUrl;
       readonly tags?: readonly (readonly string[])[];
       readonly memo?: string;
+      /** A deadline-bound send (a PAY build): see `SendBound`. */
+      readonly bound?: SendBound;
     },
   ): Promise<LockedProofSet> {
     checkAmount(amount);
@@ -441,6 +500,9 @@ export class Spender {
       return Promise.reject(
         new WalletError('invalid-argument', 'p2pk must be a 33-byte compressed key (hex)'),
       );
+    const bound = opts.bound;
+    if (bound !== undefined && typeof (bound as { onTurn?: unknown }).onTurn !== 'function')
+      return Promise.reject(new WalletError('invalid-argument', 'a send bound needs onTurn'));
     let tags: P2PKTag[];
     try {
       tags = checkTags(opts.tags);
@@ -448,8 +510,19 @@ export class Spender {
       return Promise.reject(e instanceof Error ? e : new Error(String(e)));
     }
     return this.exclusive(opts.mint, async () => {
-      const w = await this.ctx.mints.wallet(opts.mint);
-      return this.twice(() => this.sendOnce(w, amount, opts, tags));
+      if (bound === undefined) {
+        const w = await this.ctx.mints.wallet(opts.mint);
+        return this.twice(() => this.sendOnce(w, amount, opts, tags));
+      }
+      // The turn came: the caller's deadline decides before anything is selected or asked.
+      await bound.onTurn();
+      this.bounded.add(opts.mint);
+      try {
+        const w = await this.ctx.mints.wallet(opts.mint);
+        return await this.once(() => this.sendOnce(w, amount, opts, tags));
+      } finally {
+        this.bounded.delete(opts.mint);
+      }
     });
   }
 
@@ -494,7 +567,7 @@ export class Spender {
         result = await w.send(amount, selected, { includeFees: false }, outputs);
       } catch (e) {
         await this.reconcile(opts.mint, w, selected);
-        await this.collided(w, e);
+        await this.collided(w, e, opts.mint);
         throw new WalletError('mint-error', `P2PK swap failed (${errorName(e)})`);
       }
       await this.ctx.store.commit(sendTx(opts.mint, selected, result, amount, memo));
@@ -608,7 +681,7 @@ export class Spender {
         try {
           fresh = await w.receive(inputs, undefined, await this.own(w));
         } catch (e) {
-          await this.collided(w, e);
+          await this.collided(w, e, mint);
           throw receiveError(e);
         }
         return this.commitIn(mint, fresh, memo);
@@ -750,7 +823,7 @@ export class Spender {
         res = await w.meltProofsBolt11(q, selected, undefined, blanks);
       } catch (e) {
         await this.reconcile(quote.mint, w, selected);
-        await this.collided(w, e);
+        await this.collided(w, e, quote.mint);
         throw new WalletError('mint-error', `melt failed (${errorName(e)})`);
       }
     } else {
@@ -902,7 +975,7 @@ export class Spender {
     try {
       proofs = await w.completeMint(preview);
     } catch (e) {
-      if (op === undefined) await this.collided(w, e);
+      if (op === undefined) await this.collided(w, e, quote.mint);
       const r = op === undefined ? null : await this.afterFailure(w, op, e, memo);
       if (r !== null) return proofTotal(r.keep.map(fromCashu)) as Sats;
       throw new WalletError('mint-error', `minting failed (${errorName(e)})`);
@@ -1229,7 +1302,7 @@ export class Spender {
         keep = (await w.completeSwap(preview)).keep;
       } catch (e) {
         await this.reconcile(plan.mint, w, inputs);
-        await this.collided(w, e);
+        await this.collided(w, e, plan.mint);
         throw new WalletError('mint-error', `reissue failed (${errorName(e)})`);
       }
       await this.ctx.store.commit({
@@ -1746,6 +1819,7 @@ export class Spender {
     await this.advanceKeysets(
       w,
       op.keep.map((o) => o.blindedMessage.id),
+      this.bounded.has(op.mint),
     );
   }
 
@@ -1757,7 +1831,7 @@ export class Spender {
    * refused the request, so its inputs are unspent (the caller reconciled them). Returns for any
    * other failure.
    */
-  private async collided(w: CashuTsWallet, e: unknown): Promise<void> {
+  private async collided(w: CashuTsWallet, e: unknown, mint: MintUrl): Promise<void> {
     if (!this.seededAt(w) || !isOutputSigned(e)) return;
     let id: string;
     try {
@@ -1765,12 +1839,19 @@ export class Spender {
     } catch {
       return;
     }
-    await this.advanceKeysets(w, [id]);
+    await this.advanceKeysets(w, [id], this.bounded.has(mint));
     throw new CounterCollision();
   }
 
-  /** Move this device's counters for `ids` past whatever the mint signed beyond them. */
-  private async advanceKeysets(w: CashuTsWallet, ids: readonly string[]): Promise<void> {
+  /**
+   * Move this device's counters for `ids` past whatever the mint signed beyond them. `capped`
+   * (a bounded send holds the mint, `SendBound`): at most one batch, whatever the mint proves.
+   */
+  private async advanceKeysets(
+    w: CashuTsWallet,
+    ids: readonly string[],
+    capped: boolean,
+  ): Promise<void> {
     const s = this.ctx.mints.seeding;
     if (s === undefined) return;
     for (const id of new Set(ids)) {
@@ -1779,10 +1860,12 @@ export class Spender {
         const keyset = await w.keyChain.ensureKeysetKeys(id);
         const from = (await s.counters.snapshot())[id] ?? 0;
         // Without NUT-12 nothing a mint answers is proven: it may skip at most one batch (the
-        // probe's bound, under a restore's gap), never open a gap a later restore stops at.
-        const batches = supports(w, 12)
-          ? RESTORE_MAX_BATCHES
-          : Math.ceil(COUNTER_PROBE_SPAN / RESTORE_BATCH);
+        // probe's bound, under a restore's gap), never open a gap a later restore stops at. A
+        // bounded send asks one batch too: its caller's deadline does not cover 200 (lane W8a).
+        const batches =
+          supports(w, 12) && !capped
+            ? RESTORE_MAX_BATCHES
+            : Math.ceil(COUNTER_PROBE_SPAN / RESTORE_BATCH);
         const past = await signedPast(w, s.seed, keyset, from, batches);
         if (past > from) await s.counters.advanceToAtLeast(id, past);
       } catch {

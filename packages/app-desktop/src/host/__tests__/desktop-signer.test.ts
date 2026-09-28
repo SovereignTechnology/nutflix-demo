@@ -90,6 +90,8 @@ interface Opened {
   closed: boolean;
   /** Lane P2-owed-viewer: its tail writes land when this resolves (tests hold it). */
   tails: Promise<void>;
+  /** Lane W8a: its wallet has drained (`MoneyPlane.drained`) when this resolves (tests hold it). */
+  drained: Promise<void>;
 }
 
 let userData: string;
@@ -133,7 +135,13 @@ function setup(o: {
       if (!create && !walletExists)
         return Promise.reject(new Error('no-wallet: no NIP-60 wallet event was found'));
       walletExists = true;
-      const rec: Opened = { create, signer: s, closed: false, tails: Promise.resolve() };
+      const rec: Opened = {
+        create,
+        signer: s,
+        closed: false,
+        tails: Promise.resolve(),
+        drained: Promise.resolve(),
+      };
       opened.push(rec);
       return Promise.resolve({
         wallet: {},
@@ -142,6 +150,7 @@ function setup(o: {
           rec.closed = true;
         },
         flushTails: () => rec.tails,
+        drained: () => rec.drained,
       } as unknown as MoneyPlane);
     },
     swap: async (change) => {
@@ -787,6 +796,47 @@ describe('DesktopSigner — reopenMoney (ADR 0016)', () => {
     expect((err as Error).message).toBe('EIO: disk full');
     expect(opened).toHaveLength(2);
     expect(signer.money()).toBeDefined();
+  });
+
+  it('W8a: the closed plane’s wallet drains before `beforeOpen` moves anything and before the next plane opens; shutdown waits for it too', async () => {
+    const { main, signer, opened } = setup({});
+    main.script = localScript('passphrase', 'generate');
+    await signer.connect({ kind: 'local' });
+    const first = opened[0]!;
+    let drain!: () => void;
+    first.drained = new Promise<void>((r) => {
+      drain = r;
+    });
+    let ran = false;
+    const reopening = signer.reopenMoney(() => {
+      ran = true;
+      return Promise.resolve();
+    });
+    await new Promise((r) => setTimeout(r, 20));
+    expect(first.closed).toBe(true);
+    expect(ran).toBe(false); // a rotation would move the counters file here: not yet
+    expect(opened).toHaveLength(1);
+    drain();
+    await reopening;
+    expect(ran).toBe(true);
+    expect(opened).toHaveLength(2);
+    // Shutdown: the plane is dropped at once; `flushTails` waits for its drain.
+    const second = opened[1]!;
+    let drain2!: () => void;
+    second.drained = new Promise<void>((r) => {
+      drain2 = r;
+    });
+    const closing = signer.close();
+    let done = false;
+    const flushed = signer.flushTails().then(() => {
+      done = true;
+    });
+    await new Promise((r) => setTimeout(r, 10));
+    expect(done).toBe(false);
+    drain2();
+    await flushed;
+    await closing;
+    expect(done).toBe(true);
   });
 
   it('refused while a signer prompt is open (flows are exclusive); locked = nothing reopens', async () => {

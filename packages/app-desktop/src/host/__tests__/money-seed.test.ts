@@ -58,6 +58,7 @@ function spyCore(o: { loseOption?: boolean } = {}) {
       asked.push(w);
       return real.seeded(w);
     },
+    phraseTag: (seed) => real.phraseTag(seed),
   };
   return { core, materials, asked };
 }
@@ -142,11 +143,12 @@ describe('MoneyPlane with a recovery phrase (ADR 0016, core’s real NUT-13 code
     plane.close();
     expect(seed.wiped).toBe(true);
     // Integration fix 2: the wallet's counter source was closed with the plane — nothing is
-    // reserved through it any more (and nothing reaches the mint)…
+    // reserved through it any more (and nothing reaches the mint)… W8a: the plane's close now
+    // also runs the wallet's own close (core's contract request 4), so the operation is refused
+    // one step earlier — by the closed wallet, before it asks the counter source (the message this
+    // line pinned before, `the NUT-13 counters cannot be used`, came from that later refusal).
     const sent = mint.calls.length;
-    await expect(plane.wallet.pollQuote(late)).rejects.toThrow(
-      /the NUT-13 counters cannot be used \(CounterStateError\)/,
-    );
+    await expect(plane.wallet.pollQuote(late)).rejects.toThrow(/the wallet is closed/);
     expect(mint.calls.slice(sent)).not.toContain('POST /v1/mint/bolt11');
     // …so another phrase may use the same counters store object (core refuses that while a
     // source of this phrase is still open over it).

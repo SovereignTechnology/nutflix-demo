@@ -219,6 +219,8 @@ export class Host {
 
   stop(): void {
     this.bridge?.cancelAll();
+    // W8a: no relay copy retry after the stop.
+    this.recovery?.stop();
     void this.signerFlow?.close();
     this.worker.stop();
     this.adapter.onWorkerDown();
@@ -466,6 +468,21 @@ export async function createHost(o: HostOptions): Promise<Host> {
       },
       log,
       ...(o.now === undefined ? {} : { now: o.now }),
+      // W8a (final review, info): before the plane reopens, the play sessions close through the
+      // worker — it pays each tail and says what is left unpaid, which the tail then carries (not
+      // the session's whole remaining budget) — bounded like a quit's.
+      closeSessions: async () => {
+        const adapter = late.adapter;
+        if (adapter === undefined) return;
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        await Promise.race([
+          adapter.closeAllSessions().catch(() => undefined),
+          new Promise<void>((resolve) => {
+            timer = setTimeout(resolve, QUIT_FLUSH_MS);
+          }),
+        ]);
+        clearTimeout(timer);
+      },
     });
     late.recovery = recovery;
   }

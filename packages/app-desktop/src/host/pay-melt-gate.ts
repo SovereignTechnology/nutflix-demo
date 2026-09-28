@@ -23,6 +23,13 @@
  *     by the bound its caller computes at its turn (the money plane's `payBuildStartByMs`: less
  *     time with journal entries left at the mint; cross-lane review round 4).
  *
+ * A HOLD is marked like a melt (lane W8a, final cross-lane review): the wallet's long operations
+ * at a mint — a NUT-13 restore, a reissue and its plan, the journal settle (core's
+ * `CashuWalletOptions.holdMint`) — hold the mint's turn for many round trips (a restore is not
+ * bounded by the PAY model at all), so a PAY queued behind one would be built after the worker gave
+ * up on it. While one is pending or running there, PAY builds are refused at once like during a
+ * melt, and it waits for the PAY in flight first (at most `meltWaitMs`, then refused unrun).
+ *
  * Every refusal is a `GateRefusal` (nothing reached the wallet): the auto top-up counts a refused
  * melt as nothing moved. Nothing here logs.
  */
@@ -40,6 +47,12 @@ export const PAY_TOO_LATE =
 /** What a melt refused after waiting for a PAY in flight says. */
 export const PAY_STILL_BUILDING =
   'a payment at this mint is still being built: nothing was melted, try again';
+/** What a PAY refused because of a restore, reissue or settle at its mint says (W8a). */
+export const HOLD_AT_MINT =
+  'a wallet restore or reissue is running at this mint: the PAY is retried once it ends (nothing was spent)';
+/** What a hold refused after waiting for a PAY in flight says (W8a). */
+export const PAY_STILL_BUILDING_HOLD =
+  'a payment at this mint is still being built: the wallet operation did not start, try again';
 
 /** A refusal by the gate: nothing reached the wallet, nothing was spent. */
 export class GateRefusal extends IpcError {
@@ -105,8 +118,18 @@ interface AtMint {
   readonly waiting: Turn[];
   /** Melts pending or in flight. */
   melts: number;
-  /** Melts waiting for the PAY build in flight to finish. */
+  /** Holds (W8a: restores, reissues, settles) pending or running. */
+  holds: number;
+  /** Melts and holds waiting for the PAY build in flight to finish. */
   readonly idle: (() => void)[];
+}
+
+/** Why a PAY at `m` is refused at once, or `undefined` while nothing marks it. */
+function markedBy(m: AtMint | undefined): string | undefined {
+  if (m === undefined) return undefined;
+  if (m.melts > 0) return MELT_AT_MINT;
+  if (m.holds > 0) return HOLD_AT_MINT;
+  return undefined;
 }
 
 export class PayMeltGate {
@@ -134,6 +157,15 @@ export class PayMeltGate {
   }
 
   /**
+   * The refusal a PAY at `mint` meets right now — a melt or a hold marks it — or `undefined`
+   * (W8a: the money plane asks before it prepares the mint for a PAY).
+   */
+  refusal(mint: MintUrl): GateRefusal | undefined {
+    const why = markedBy(this.at.get(mint));
+    return why === undefined ? undefined : new GateRefusal(why);
+  }
+
+  /**
    * Run one PAY build at `mint` when its turn comes. Refused at once while a melt is pending or in
    * flight there, and — at its turn — once `startByMs` has passed since `arrived` (`now()` when
    * the request came in), or the bound `startBy` answers then, if sooner (read at the turn, the
@@ -147,7 +179,8 @@ export class PayMeltGate {
     startBy?: () => number | Promise<number>,
   ): Promise<T> {
     const m = this.mint(mint);
-    if (m.melts > 0) throw new GateRefusal(MELT_AT_MINT);
+    const marked = markedBy(m);
+    if (marked !== undefined) throw new GateRefusal(marked);
     if (m.busy)
       // `next` hands the turn over (busy stays set); a melt marking the mint refuses the wait.
       await new Promise<void>((start, refuse) => {
@@ -180,20 +213,36 @@ export class PayMeltGate {
    * settles, however it settles.
    */
   async melt<T>(mint: MintUrl, run: () => Promise<T>): Promise<T> {
+    return this.mark(mint, 'melts', run);
+  }
+
+  /**
+   * Run one of the wallet's long operations at `mint` (W8a: a NUT-13 restore, a reissue or its
+   * plan, the journal settle — core's `holdMint`), marked like a melt: PAY builds there refused at
+   * once, the one in flight waited for (at most `meltWaitMs`, then refused unrun with
+   * `PAY_STILL_BUILDING_HOLD`). The mark clears when `run` settles, however it settles.
+   */
+  async hold<T>(mint: MintUrl, run: () => Promise<T>): Promise<T> {
+    return this.mark(mint, 'holds', run);
+  }
+
+  private async mark<T>(mint: MintUrl, kind: 'melts' | 'holds', run: () => Promise<T>): Promise<T> {
     const m = this.mint(mint);
-    m.melts++;
+    m[kind]++;
     try {
-      for (const w of m.waiting.splice(0)) w.refuse(new GateRefusal(MELT_AT_MINT));
-      if (m.busy) await this.idle(m);
+      const why = markedBy(m) ?? MELT_AT_MINT;
+      for (const w of m.waiting.splice(0)) w.refuse(new GateRefusal(why));
+      if (m.busy)
+        await this.idle(m, kind === 'melts' ? PAY_STILL_BUILDING : PAY_STILL_BUILDING_HOLD);
       return await run();
     } finally {
-      m.melts--;
+      m[kind]--;
       this.next(mint, m);
     }
   }
 
   /** Resolves once no PAY build holds the turn; refused after `meltWaitMs`. */
-  private idle(m: AtMint): Promise<void> {
+  private idle(m: AtMint, why: string): Promise<void> {
     return new Promise((resolve, reject) => {
       let settled = false;
       const onIdle = (): void => {
@@ -207,7 +256,7 @@ export class PayMeltGate {
         settled = true;
         const i = m.idle.indexOf(onIdle);
         if (i >= 0) m.idle.splice(i, 1);
-        reject(new GateRefusal(PAY_STILL_BUILDING));
+        reject(new GateRefusal(why));
       }, this.meltWaitMs);
       m.idle.push(onIdle);
     });
@@ -215,21 +264,21 @@ export class PayMeltGate {
 
   /** The turn is free: the next PAY build takes it, or the melts waiting go ahead. */
   private next(mint: MintUrl, m: AtMint): void {
+    const marked = m.melts + m.holds > 0;
     if (!m.busy) {
-      const w = m.melts === 0 ? m.waiting.shift() : undefined;
+      const w = marked ? undefined : m.waiting.shift();
       if (w !== undefined) {
         m.busy = true;
         w.start();
       } else for (const go of m.idle.splice(0)) go();
     }
-    if (!m.busy && m.melts === 0 && m.waiting.length === 0 && m.idle.length === 0)
-      this.at.delete(mint);
+    if (!m.busy && !marked && m.waiting.length === 0 && m.idle.length === 0) this.at.delete(mint);
   }
 
   private mint(mint: MintUrl): AtMint {
     let m = this.at.get(mint);
     if (m === undefined) {
-      m = { busy: false, waiting: [], melts: 0, idle: [] };
+      m = { busy: false, waiting: [], melts: 0, holds: 0, idle: [] };
       this.at.set(mint, m);
     }
     return m;
