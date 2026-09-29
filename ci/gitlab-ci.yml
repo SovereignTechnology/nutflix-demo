@@ -1,6 +1,6 @@
 # CI pipeline (execution plan Stage 0 deliverable 1; hardened by lane L9, build-plan §7).
 #
-# NOT YET ACTIVE: no GitLab runner is registered for this project, so this
+# NOT YET ACTIVE: no GitLab runner is registered for this project (CI runs on GitHub Actions), so this
 # lives in ci/ rather than at the repo root. When a runner exists, `git mv ci/gitlab-ci.yml
 # .gitlab-ci.yml` and every MR gets the same gates that `npm run ci` runs locally, plus the
 # network-only checks (registry signatures / provenance, advisories, lockfile drift) that
