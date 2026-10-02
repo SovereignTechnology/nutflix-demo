@@ -82,6 +82,23 @@ async function isExecutable(p: string): Promise<boolean> {
   }
 }
 
+/**
+ * R9: a rename, or a file's creation, is durable only once the directory holding it is synced.
+ * Best effort, as in the Node twin (`@sovit/seeder`'s `runtime/files.ts`): some filesystems, and
+ * Windows, refuse to open or fsync a directory; the file's own bytes are already synced.
+ */
+function fsyncDir(dir: string): void {
+  let fd: number | undefined;
+  try {
+    fd = fs.openSync(dir, 'r');
+    fs.fsyncSync(fd);
+  } catch {
+    // refused here; the file itself is durable
+  } finally {
+    if (fd !== undefined) fs.closeSync(fd);
+  }
+}
+
 /** `StateFs` on bare-fs's synchronous calls (see `../runtime.ts`). */
 export const bareStateFs: StateFs = {
   readText: (p) => {
@@ -109,12 +126,24 @@ export const bareStateFs: StateFs = {
     } finally {
       fs.closeSync(fd);
     }
-    fs.renameSync(tmp, p);
+    try {
+      fs.renameSync(tmp, p);
+    } catch (err) {
+      try {
+        fs.unlinkSync(tmp);
+      } catch {
+        // nothing to clean up
+      }
+      throw err;
+    }
+    fsyncDir(path.dirname(p));
   },
   append: (p, data) => {
     fs.appendFileSync(p, data, { mode: 0o600 });
   },
   appendDurable: (p, data) => {
+    // One writer (the worker's thread), so this tells whether the open below creates the file.
+    const created = !fs.existsSync(p);
     const fd = fs.openSync(p, 'a', 0o600);
     try {
       const bytes = utf8.encode(data);
@@ -124,6 +153,8 @@ export const bareStateFs: StateFs = {
     } finally {
       fs.closeSync(fd);
     }
+    // A new file's directory entry, once; later appends need only the file's own fsync.
+    if (created) fsyncDir(path.dirname(p));
   },
   remove: (p) => {
     try {
