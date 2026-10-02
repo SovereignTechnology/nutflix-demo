@@ -19,10 +19,16 @@ import type { SpawnDleqThread } from './pay/dleq-thread.js';
 export interface StateFs {
   /** The file's text, or `null` when it does not exist (other errors throw). */
   readText(path: string): string | null;
-  /** `<path>.tmp` (created exclusively, a leftover removed first) + fsync + rename. */
+  /**
+   * `<path>.tmp` (created exclusively, a leftover removed first) + fsync + rename, then the
+   * directory's fsync (R9; best effort where a filesystem refuses one).
+   */
   writeAtomic(path: string, data: string): void;
   append(path: string, data: string): void;
-  /** Append, then fsync, before returning (the pending-PAY journal: written before the ACK). */
+  /**
+   * Append, then fsync, before returning (the pending-PAY journal: written before the ACK); a
+   * file this call creates also gets its directory's fsync (R9).
+   */
   appendDurable(path: string, data: string): void;
   /** Delete the file; a missing one is fine. */
   remove(path: string): void;
@@ -43,6 +49,12 @@ export interface WorkerRuntime {
   isExecutable(path: string): Promise<boolean>;
   readonly os: OsName;
   readonly stateFs: StateFs;
+  /**
+   * RR-1: a monotonic clock in ms for the payer's streaks, backoffs and give-up. Bare has no
+   * `performance`, so without this the payer fell back to a steadied wall clock, where a forward
+   * step of the system clock still counted toward a give-up.
+   */
+  readonly monotonicNow: () => number;
   /**
    * Start the DLEQ thread (issue #8 d: F5's checks off this event loop). Bare's is `Bare.Thread`
    * (`adapters/bare.ts`); absent, the checks run inline in small chunks.

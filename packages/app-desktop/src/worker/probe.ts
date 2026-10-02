@@ -88,6 +88,9 @@ export async function runProbe(deps: ProbeDeps): Promise<ProbeReport> {
   step('imports: @sovit/gateway/upstream', typeof UpstreamPayer === 'function');
 
   const { runtime, dir } = deps;
+  const c0 = runtime.monotonicNow();
+  const c1 = runtime.monotonicNow();
+  step('runtime: monotonic clock', Number.isFinite(c0) && c1 >= c0, String(c0));
   const fs = runtime.seederFs;
   const size = 3 * 65_536 + 1234;
   const bytes = filler(size);

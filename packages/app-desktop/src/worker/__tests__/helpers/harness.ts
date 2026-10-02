@@ -103,6 +103,7 @@ export function nodeRuntime(): WorkerRuntime {
     mediaFs: (tmpDir) => nodeFsAdapter({ tmpDir }),
     runner: nodeProcessRunner(),
     env: (name) => process.env[name],
+    monotonicNow: () => performance.now(),
     isExecutable: async (p) => {
       try {
         await access(p, constants.X_OK);

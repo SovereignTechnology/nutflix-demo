@@ -147,6 +147,8 @@ export interface ViewerPayerOptions {
   readonly payOwed?: PayOwedFn;
   /** How long a seeder's report may take (`SeederCredit`; tests shorten it). */
   readonly reportWaitMs?: number;
+  /** UpstreamPayer's monotonic clock (RR-1: the runtime's; its default otherwise). */
+  readonly clock?: () => number;
 }
 
 /** How often `drain` looks again while a tail settles. */
@@ -237,6 +239,7 @@ export class ViewerPayer {
       // blocks that credit keeps from coming (F5 batching).
       payEveryBlocks: 1,
       credit: o.credit,
+      ...(o.clock === undefined ? {} : { clock: o.clock }),
       seederBatch: (noiseHex) => this.seeders.seederBatch(noiseHex),
       ownMints: o.ownMints,
       policyFor: (core, hello) => this.resolvePolicy(core, hello),
