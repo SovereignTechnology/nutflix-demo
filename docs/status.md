@@ -524,6 +524,7 @@ Asked one by one, multiple choice; these supersede the open questions above.
 | 29 | R3/R4 end-of-report marker (2026-10-02) | **Yes, pay/1 v7** (additive, `docs/contract-requests/P2-owed-viewer.md`); older peers keep the 10 s wait |
 | 30 | R5-R1 auto top-up held with no clear (2026-10-02) | **A Resume action**: Settings shows the paused mint and why, and resuming goes through main's native confirm; the app never clears one by itself |
 | 31 | RR-3 `rate-limited` never given up (2026-10-02) | **Accepted residual**: nothing is spent, asks are spaced up to 30 s, the session's close ends it |
+| 32 | NUT-13 restore bound, revisited (2026-10-02) | **Keep the resumable restore; no checkpoints** — supersedes input 24. The design study found that a checkpoint saves nothing after the one-time reissue (it lands at counter ≈ 0), helps only restores with the nsec and relays (not the typed words alone), needs a recurring fee-paying reissue or new bookkeeping in the locked `spend.ts`, and cannot reuse `resume` (it would skip keysets added later). Today's restore runs 10 rounds (~12 h of heavy streaming history) per click, then offers to continue. Revisit after release if users hit it |
 
 Owed from Stage 2 (ADR 0010 Consequences, `docs/security-review.md` §0 and §6). The F1–F4 and
 F30 blockers were fixed on `stage-2/review-fixes` (2026-09-24); F6 verified on two real mints
