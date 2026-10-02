@@ -72,7 +72,13 @@
  * are out then counts them within its window, never past it (a ban). Landed or not, they still
  * leave no debt.
  */
-import { DEFAULT_WINDOW_BLOCKS, MAX_OWED_BLOCKS, MAX_OWED_RANGES, payment } from '@sovit/core';
+import {
+  DEFAULT_WINDOW_BLOCKS,
+  MAX_OWED_BLOCKS,
+  MAX_OWED_RANGES,
+  OWED_END_CORE,
+  payment,
+} from '@sovit/core';
 import type {
   AckMessage,
   CoreKeyHex,
@@ -335,7 +341,7 @@ export class SeederCredit {
     // ADR 0018 amendment: what it still counts from before this connection.
     const offOwed = protocol.on('owed', (m) => {
       if (seeder.conn !== conn) return;
-      this.onOwed(seeder, m);
+      this.onOwed(noiseHex, seeder, m);
     });
     const end = (): void => {
       if (seeder.conn !== conn || !seeder.live) return;
@@ -615,10 +621,22 @@ export class SeederCredit {
     s.report.timer = t;
   }
 
-  /** An `OWED` on `s`'s current connection (the first per core; later ones are ignored). */
-  private onOwed(s: Seeder, m: OwedMessage): void {
+  /**
+   * An `OWED` on `s`'s current connection (the first per core; later ones are ignored). v7 rule 5:
+   * the end marker completes the report at once — no `REPORT_WAIT_MS` toward a seeder that sends
+   * it; an older seeder sends none and keeps the bounded wait.
+   */
+  private onOwed(remote: string, s: Seeder, m: OwedMessage): void {
     const r = s.report;
-    if (r.done || typeof m.core !== 'string' || r.claimed.has(m.core)) return;
+    if (r.done || typeof m.core !== 'string') return;
+    if (m.core === OWED_END_CORE) {
+      if (Array.isArray(m.ranges) && m.ranges.length === 0) {
+        this.complete(remote, s);
+        this.changed();
+      }
+      return;
+    }
+    if (r.claimed.has(m.core)) return;
     const n = owedBlocks(m.ranges);
     if (n === null) {
       r.truncated = true; // malformed: it may count anything

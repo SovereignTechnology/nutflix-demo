@@ -11,7 +11,7 @@
  * The seeder here runs the mock engine (the reference model); the same paths run against the real
  * engine and a real replication stream in `pay1.integration.test.ts`.
  */
-import { MAX_OWED_BLOCKS, MAX_OWED_RANGES, mocks, payProtocol } from '@sovit/core';
+import { MAX_OWED_BLOCKS, MAX_OWED_RANGES, OWED_END_CORE, mocks, payProtocol } from '@sovit/core';
 import type { NostrPubkey, PricePolicy } from '@sovit/core';
 import type Hypercore from 'hypercore';
 import type { ReplicationPeer } from 'hypercore';
@@ -313,6 +313,9 @@ describe('rule 1, unprompted — a core’s terms as soon as the peer opens it (
   });
 });
 
+/** v7 rule 5: the end of the report, after its last OWED (and alone when nothing is owed). */
+const END = { type: 'OWED', core: OWED_END_CORE, ranges: [] } as const;
+
 describe('rules 2–3 — OWED when the channel opens, and paying it', () => {
   async function leaveUnpaid(s: Awaited<ReturnType<typeof make>>, who: NostrPubkey) {
     const first = s.connect();
@@ -357,6 +360,7 @@ describe('rules 2–3 — OWED when the channel opens, and paying it', () => {
       { type: 'PRICE', core: CORE_B, satsPerBlock: 2, effectiveFromBlock: 0 },
       { type: 'OWED', core: CORE_B, ranges: [[5, 6]] },
       { type: 'OWED', core: CORE_C, ranges: [[0, 0]] },
+      END,
     ]);
     // The owed ranges, paid on this connection at the terms just announced, from carry 0.
     again.protocol.remotePay(
@@ -381,7 +385,8 @@ describe('rules 2–3 — OWED when the channel opens, and paying it', () => {
       { type: 'ACK', core: CORE_B, fromBlock: 5, toBlock: 6, ok: true, outstanding: 0 },
     ]);
     expect(s.engine.unpaid(who)).toEqual([{ core: CORE_C, ranges: [[0, 0]] }]);
-    // Once per connection: a second `open` (a re-sent HELLO) reports nothing more, and the first
+    // Once per connection: a second `open` (a re-sent HELLO) reports nothing more (no second end
+    // marker either), and the first
     // block of an announced core is not re-announced.
     const before = again.protocol.sent.length;
     again.protocol.remoteHello(hello(who));
@@ -394,6 +399,7 @@ describe('rules 2–3 — OWED when the channel opens, and paying it', () => {
       { type: 'PRICE', core: CORE_A, satsPerBlock: 3, effectiveFromBlock: 0 },
       { type: 'OWED', core: CORE_A, ranges: [[2, 2]] },
       { type: 'OWED', core: CORE_C, ranges: [[0, 0]] },
+      END,
     ]);
   });
 
@@ -436,11 +442,11 @@ describe('rules 2–3 — OWED when the channel opens, and paying it', () => {
     ]);
   });
 
-  it('nothing owed: no OWED and no PRICE; a banned pubkey is cut at HELLO and gets no report; blocks sent before this HELLO are part of it', async () => {
+  it('nothing owed: only the end marker (v7), no PRICE; a banned pubkey is cut at HELLO and gets no report, not even the marker; blocks sent before this HELLO are part of it', async () => {
     const s = await make();
     const clean = s.connect();
     clean.protocol.remoteHello(hello(pubkey('never-downloaded')));
-    expect(clean.protocol.sent).toEqual([]);
+    expect(clean.protocol.sent).toEqual([END]);
     // Banned (a window cut on an earlier connection): the HELLO is refused, nothing is reported.
     const who = pubkey('owed-banned');
     await leaveUnpaid(s, who);
@@ -456,6 +462,7 @@ describe('rules 2–3 — OWED when the channel opens, and paying it', () => {
     pre.protocol.remoteHello(hello(pubkey('pre-hello')));
     expect(pre.protocol.sent.slice(sentBefore)).toEqual([
       { type: 'OWED', core: CORE_B, ranges: [[9, 9]] },
+      END,
     ]);
   });
 
@@ -470,7 +477,7 @@ describe('rules 2–3 — OWED when the channel opens, and paying it', () => {
     await first.stream.closed();
     const again = s.connect();
     again.protocol.remoteHello(hello(who));
-    expect(again.protocol.sent).toEqual([{ type: 'OWED', core: CORE_C, ranges: [[3, 3]] }]);
+    expect(again.protocol.sent).toEqual([{ type: 'OWED', core: CORE_C, ranges: [[3, 3]] }, END]);
   });
 
   it('the report is bounded by the OWED caps, oldest first, and every OWED it sends fits the wire grammar', async () => {
@@ -488,7 +495,8 @@ describe('rules 2–3 — OWED when the channel opens, and paying it', () => {
     const again = s.connect();
     again.protocol.remoteHello(hello(who));
     const owed = again.protocol.owed;
-    expect(owed.map((o) => o.core)).toEqual([CORE_A, CORE_B]);
+    // The end marker is outside the caps: it follows the capped report.
+    expect(owed.map((o) => o.core)).toEqual([CORE_A, CORE_B, OWED_END_CORE]);
     expect(owed[0]!.ranges).toHaveLength(200);
     expect(owed[1]!.ranges).toHaveLength(MAX_OWED_RANGES - 200);
     expect(owed[1]!.ranges[0]).toEqual([0, 0]);
@@ -504,6 +512,7 @@ describe('rules 2–3 — OWED when the channel opens, and paying it', () => {
     two.protocol.remoteHello(hello(who2));
     expect(two.protocol.owed).toEqual([
       { type: 'OWED', core: CORE_C, ranges: [[0, MAX_OWED_BLOCKS - 1]] },
+      END,
     ]);
     expect(() => payProtocol.payCodec.encode(two.protocol.owed[0]!)).not.toThrow();
   });
@@ -708,6 +717,8 @@ describe('fail closed', () => {
     };
     again.protocol.remoteHello(hello(who));
     expect(again.protocol.owed.map((o) => o.core)).toEqual([CORE_A]);
+    // v7: no end marker after a short report — the viewer is never told it is complete.
+    expect(again.protocol.owed.some((o) => o.core === OWED_END_CORE)).toBe(false);
     expect(again.session.cutReason).toBe('local');
     expect(again.stream.destroyed).toBe(true);
     expect(s.engine.isBanned(who)).toBe(false);
@@ -715,7 +726,7 @@ describe('fail closed', () => {
     // Still counted, so the next connection reports both cores again.
     const third = s.connect();
     third.protocol.remoteHello(hello(who));
-    expect(third.protocol.owed.map((o) => o.core)).toEqual([CORE_A, CORE_B]);
+    expect(third.protocol.owed.map((o) => o.core)).toEqual([CORE_A, CORE_B, OWED_END_CORE]);
   });
 
   it('on the seeder: a PRICE that cannot be sent cuts the session before the block; a seeder with no ledger is refused at create', async () => {

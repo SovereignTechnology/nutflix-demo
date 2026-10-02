@@ -25,6 +25,7 @@ import type {
 import {
   MAX_OWED_BLOCKS,
   MAX_OWED_RANGES,
+  OWED_END_CORE,
   PAY_PROTOCOL_NAME,
   PAY_PROTOCOL_VERSION,
 } from '../../contracts/index.js';
@@ -372,6 +373,26 @@ function priceFrame(sats: number, from: number, flags: number | null): Uint8Arra
   });
 }
 
+/** v7: an OWED frame with a zero core (the end marker's), this count and these ranges, then `extra`. */
+function endFrame(
+  ranges: readonly (readonly [number, number])[],
+  count = ranges.length,
+  extra = 0,
+) {
+  return frame((s, pre) => {
+    u8(s, pre, 5);
+    const zero = new Uint8Array(32);
+    if (pre) c.fixed32.preencode(s, zero);
+    else c.fixed32.encode(s, zero);
+    u(s, pre, count);
+    for (const [a, b] of ranges) {
+      u(s, pre, a);
+      u(s, pre, b);
+    }
+    for (let i = 0; i < extra; i++) u8(s, pre, 0);
+  });
+}
+
 /** `n` one-block ranges two apart (canonical), starting at 0. */
 const spaced = (n: number): [number, number][] =>
   Array.from({ length: n }, (_, i) => [2 * i, 2 * i] as [number, number]);
@@ -573,6 +594,33 @@ describe.skipIf(codec === undefined)(
       expect(k().decode(ackFrame(5, []))).toBeNull(); // the bit says a count follows
       expect(k().decode(ackFrame(8 | 1, []))).toBeNull();
       expect(k().decode(ackFrame(0x80 | 1, []))).toBeNull();
+    });
+  },
+);
+
+describe.skipIf(codec === undefined)(
+  'pay/1 v7 amendment grammar (the end of the OWED report)',
+  () => {
+    const k = (): PayProtocolCodec => codec!;
+    const END: OwedMessage = { type: 'OWED', core: OWED_END_CORE, ranges: [] };
+
+    it('the end marker round-trips: tag, 32 zero bytes, a count of 0 — and nothing else', () => {
+      const bytes = k().encode(END);
+      expect(bytes).toEqual(endFrame([]));
+      expect(bytes.byteLength).toBe(1 + 32 + 1);
+      expect(k().decode(bytes)).toEqual(END);
+    });
+
+    it('refuses, both ways, the end marker with ranges and an empty report for any other core', () => {
+      const withRange: OwedMessage = { type: 'OWED', core: OWED_END_CORE, ranges: [[0, 0]] };
+      expect(() => k().encode(withRange)).toThrow();
+      expect(k().decode(endFrame([[0, 0]]))).toBeNull();
+      expect(() => k().encode({ type: 'OWED', core: CORE, ranges: [] })).toThrow();
+      expect(k().decode(owedFrame([]))).toBeNull();
+      // A count of 0 with ranges after it, a count with none, trailing bytes: refused.
+      expect(k().decode(endFrame([[0, 0]], 0))).toBeNull();
+      expect(k().decode(endFrame([], 1))).toBeNull();
+      expect(k().decode(endFrame([], 0, 1))).toBeNull();
     });
   },
 );

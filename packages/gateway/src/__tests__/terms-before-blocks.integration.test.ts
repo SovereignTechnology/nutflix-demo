@@ -10,7 +10,7 @@
  *   - on a new connection (a new Noise key, the same HELLO pubkey) the blocks the first one left
  *     unpaid come back as OWED, after the core's PRICE, and a PAY for them clears them.
  */
-import { mocks, payProtocol } from '@sovit/core';
+import { OWED_END_CORE, mocks, payProtocol } from '@sovit/core';
 import type {
   AckMessage,
   CashuP2pkPubkey,
@@ -243,10 +243,12 @@ describe("contracts v6 amendment on the gateway's seeder (real replication strea
       chan.on('owed', (m) => got.push(m));
     });
     await c2.bound();
-    await until(() => got.length >= 2);
+    // v7 rule 5: the report ends with the end marker — all three frames, in order.
+    await until(() => got.length >= 3);
     expect(got).toEqual([
       { type: 'PRICE', core, satsPerBlock: w.r.gateway.price(), effectiveFromBlock: 0 },
       { type: 'OWED', core, ranges: [[1, 3]] },
+      { type: 'OWED', core: OWED_END_CORE, ranges: [] },
     ]);
     expect(await w.pay(c2.chan, core, 1, 3, 0)).toMatchObject({ ok: true, outstanding: 0 });
     expect(w.r.engine.window(VIEWER_PUBKEY)).toMatchObject({ uploaded: 4, paid: 4 });

@@ -5,7 +5,7 @@
  */
 import * as fc from 'fast-check';
 
-import { MAX_OWED_BLOCKS, MAX_OWED_RANGES } from '../../contracts/index.js';
+import { MAX_OWED_BLOCKS, MAX_OWED_RANGES, OWED_END_CORE } from '../../contracts/index.js';
 import type {
   AckMessage,
   CashuP2pkPubkey,
@@ -264,7 +264,14 @@ export const priceArb: fc.Arbitrary<PriceMessage> = fc
   .map(plain);
 
 /**
+ * The core of a report's OWED: never the end marker's (fast-check leans to all-zero bytes, and
+ * `OWED_END_CORE` with ranges is refused, v7 rule 5).
+ */
+const reportCoreArb: fc.Arbitrary<CoreKeyHex> = coreKeyArb.filter((k) => k !== OWED_END_CORE);
+
+/**
  * v6 amendment: OWED with canonical ranges (ascending, disjoint, not adjacent), within the caps.
+ * v7: or the end of the report (`OWED_END_CORE`, no ranges).
  * Built from a start and (gap, length) steps: every gap ≥ 1 keeps ranges apart; lengths ≤ 16 over
  * ≤ 64 steps keep the total ≤ 1024 = MAX_OWED_BLOCKS; a second shape is one long range.
  */
@@ -274,7 +281,7 @@ export const owedArb: fc.Arbitrary<OwedMessage> = fc
       weight: 4,
       arbitrary: fc
         .tuple(
-          coreKeyArb,
+          reportCoreArb,
           blockIndexArb,
           fc.array(
             fc.tuple(fc.integer({ min: 1, max: 2 ** 20 }), fc.integer({ min: 1, max: 16 })),
@@ -297,12 +304,16 @@ export const owedArb: fc.Arbitrary<OwedMessage> = fc
     {
       weight: 1,
       arbitrary: fc
-        .tuple(coreKeyArb, blockIndexArb, fc.integer({ min: 1, max: MAX_OWED_BLOCKS }))
+        .tuple(reportCoreArb, blockIndexArb, fc.integer({ min: 1, max: MAX_OWED_BLOCKS }))
         .map(([core, from, len]) => ({
           type: 'OWED' as const,
           core,
           ranges: [[from, from + len - 1] as const],
         })),
+    },
+    {
+      weight: 1,
+      arbitrary: fc.constant({ type: 'OWED' as const, core: OWED_END_CORE, ranges: [] }),
     },
   )
   .map(plain);
@@ -433,6 +444,9 @@ export function isPayProtocolMessage(x: unknown): x is PayProtocolMessage {
             (x['free'] === true && x['satsPerBlock'] === 0 && x['effectiveFromBlock'] === 0))
       );
     case 'OWED':
+      // v7 rule 5: the end of the report is OWED_END_CORE with no ranges, and only that.
+      if (x['core'] === OWED_END_CORE)
+        return Array.isArray(x['ranges']) && x['ranges'].length === 0;
       return isCoreKey(x['core']) && isOwedRanges(x['ranges']);
     default:
       return false;

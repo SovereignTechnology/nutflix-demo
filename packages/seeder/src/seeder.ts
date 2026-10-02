@@ -11,7 +11,7 @@
  *   CorePolicyStore (per-core prices, persisted — lane W8b-p2p)
  *   Logger (redacting; the only output path)
  */
-import { payment } from '@sovit/core';
+import { OWED_END_CORE, payment } from '@sovit/core';
 import type {
   BlockRange,
   CoreKeyHex,
@@ -608,7 +608,8 @@ export class Seeder {
    * — report, once, every core where this peer's pubkey still owes blocks, oldest first and within
    * the `OWED` caps, each after that core's priced `PRICE` (the terms an owed range is paid at). A
    * core served free now, or with no price at all, gets its `OWED` with no `PRICE`: counted, but
-   * not payable here now.
+   * not payable here now. v7 rule 5: the report then ends with the end marker — also when nothing
+   * is owed — so the viewer knows it is complete without waiting.
    */
   private announceOwed(session: PeerSession, protocol: PayProtocol): void {
     const peer = session.pubkey;
@@ -622,6 +623,7 @@ export class Seeder {
       protocol.sendOwed({ core, ranges });
       for (const [from, to] of ranges) blocks += to - from + 1;
     }
+    protocol.sendOwed({ core: OWED_END_CORE, ranges: [] });
     if (report.length > 0) this.log.debug('OWED sent', { cores: report.length, blocks });
   }
 

@@ -5,7 +5,7 @@
  */
 import { EventEmitter } from 'node:events';
 
-import { MAX_OWED_RANGES, mocks, payment } from '@sovit/core';
+import { MAX_OWED_RANGES, OWED_END_CORE, mocks, payment } from '@sovit/core';
 import type { CoreKeyHex, PricePolicy, Sats } from '@sovit/core';
 import type Hypercore from 'hypercore';
 import { silentLogger } from '@sovit/seeder';
@@ -617,6 +617,30 @@ describe("SeederCredit — the seeder's report (ADR 0018 amendment)", () => {
       outstanding: -1,
     });
     expect(r.credit.reportOf(A)).toMatchObject({ claimed: 1 });
+  });
+
+  // v7 rule 5 (R3/R4): the seeder says where its report ends, so nothing waits on a timer.
+  it('v7: the end marker completes the report at once — no REPORT_WAIT_MS; a malformed marker, or one after the report, changes nothing', () => {
+    const r = rig(); // the default 10 s bound: nothing below waits for it
+    const a = r.link(A);
+    const peer = peerOn(r, A);
+    a.proto.remoteHello(helloFrom(pubkey('a'), { windowBlocks: 4 }));
+    a.proto.remoteOwed(owed([[10, 11]]));
+    expect(r.credit.reportOf(A)).toEqual({ done: false, claimed: 2, truncated: false });
+    expect(peer.getMaxInflight()).toBe(1); // single, before the report is complete
+    a.proto.remoteOwed({ type: 'OWED', core: OWED_END_CORE, ranges: [] });
+    expect(r.credit.reportOf(A)).toEqual({ done: true, claimed: 2, truncated: false });
+    expect(r.credit.budget(A, CORE)).toBe(4 - 2);
+    expect(peer.getMaxInflight()).toBe(2); // pipelining by budget, at once
+    // Once done, a late OWED (or a second marker) is ignored.
+    a.proto.remoteOwed(owed([[30, 31]], CORE));
+    a.proto.remoteOwed({ type: 'OWED', core: OWED_END_CORE, ranges: [] });
+    expect(r.credit.reportOf(A)).toEqual({ done: true, claimed: 2, truncated: false });
+    // The zero core WITH ranges (refused by the codec; here past it) neither ends nor counts.
+    const b = r.link(B);
+    b.proto.remoteHello(helloFrom(pubkey('b'), { windowBlocks: 4 }));
+    b.proto.remoteOwed({ type: 'OWED', core: OWED_END_CORE, ranges: [[0, 3]] });
+    expect(r.credit.reportOf(B)).toEqual({ done: false, claimed: 0, truncated: false });
   });
 
   it('a report is complete REPORT_WAIT_MS after the channel opened even if nothing was answered', async () => {

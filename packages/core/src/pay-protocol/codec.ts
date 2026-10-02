@@ -27,10 +27,14 @@
  *   - OWED: `core`, a uint count n (1 … MAX_OWED_RANGES), then n × (fromBlock, toBlock) uints —
  *     canonical: each from ≤ to, ascending, disjoint and not adjacent, at most MAX_OWED_BLOCKS
  *     blocks in total. The count is checked before anything is read, the total as it is read.
+ *
+ * v7 amendment (2026-10-02, rule 5): OWED has one more form, the end of the report — `core` =
+ * `OWED_END_CORE` (32 zero bytes) with a count of 0 and nothing after it. A count of 0 for any other
+ * core, and `OWED_END_CORE` with any range, are refused both ways (one encoding per message).
  */
 import c, { type State } from 'compact-encoding';
 
-import { MAX_OWED_BLOCKS, MAX_OWED_RANGES } from '../contracts/index.js';
+import { MAX_OWED_BLOCKS, MAX_OWED_RANGES, OWED_END_CORE } from '../contracts/index.js';
 import type {
   AckMessage,
   CashuProof,
@@ -155,6 +159,17 @@ function owedStep(from: number, to: number, prevTo: number | null, total: number
   const len = to - from + 1;
   need(len <= MAX_OWED_BLOCKS - total, 'owed: more blocks than MAX_OWED_BLOCKS');
   return total + len;
+}
+
+/** v7 rule 5: the end marker is the only OWED with no ranges, and names no ranges itself. */
+function checkOwed(core: unknown, ranges: unknown): readonly OwedRange[] {
+  need(Array.isArray(ranges), 'owed.ranges: not an array');
+  if ((ranges as readonly unknown[]).length === 0) {
+    need(core === OWED_END_CORE, 'owed.ranges: none, for a core that is not the end marker');
+    return [];
+  }
+  need(core !== OWED_END_CORE, 'owed: the end marker with ranges');
+  return checkOwedRanges(ranges);
 }
 
 function checkOwedRanges(ranges: unknown): readonly OwedRange[] {
@@ -302,7 +317,7 @@ function messageWriters(m: PayProtocolMessage): Writer[] {
       break;
     }
     case 'OWED': {
-      const ranges = checkOwedRanges(m.ranges);
+      const ranges = checkOwed(m.core, m.ranges);
       out.push(w(c.uint8, TAG.OWED));
       out.push((s, pre) => {
         writeCore(s, m.core, pre);
@@ -441,6 +456,12 @@ function readMessage(state: State): PayProtocolMessage {
     case TAG.OWED: {
       const core = readCore(state);
       const n = readUint(state, 'owed.ranges');
+      if (core === OWED_END_CORE) {
+        // v7 rule 5: the end of the report — a count of 0 and nothing after it.
+        need(n === 0, 'owed: the end marker with ranges');
+        const end: OwedMessage = { type: 'OWED', core, ranges: [] };
+        return end;
+      }
       need(n >= 1 && n <= MAX_OWED_RANGES, 'owed.ranges: count out of bounds');
       const ranges: OwedRange[] = [];
       let prevTo: number | null = null;

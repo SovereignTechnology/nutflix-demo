@@ -285,3 +285,12 @@ orchestrator's decisions, as built:
   within one 1 s batch never had: no write). A crash after the send can no longer bring them back
   for an over-claiming seeder to be paid twice. A failed write is logged and the PAY still goes
   out: its proofs are built.
+
+### The end of the report (2026-10-02, Cameron; contracts v7)
+- Every seeder this repository builds ends its `OWED` report with an end marker (`pay-protocol.ts`
+  rule 5: `core` `OWED_END_CORE`, no ranges), also when nothing is owed, and never after a report
+  that failed part-way. A viewer's report is complete when the marker arrives: no
+  `REPORT_WAIT_MS` toward such a seeder, so the residuals "a report delayed past
+  `REPORT_WAIT_MS`" and the gateway's one-block risk after its own crash (R3, R4) are closed toward
+  it. A seeder that sends no marker keeps the bounded wait. The desktop's durable word is now a
+  hint for those seeders only. Review record: `docs/reviews/2026-10-02-pre-push-pay-v7.md`.

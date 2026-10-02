@@ -51,7 +51,8 @@ export const PAY_PROTOCOL_VERSION = 1 as const;
  *    whole report (every `OWED` of the connection together) is bounded by `MAX_OWED_RANGES` and
  *    `MAX_OWED_BLOCKS`; what is past the caps is left out, and a range crossing the block cap is
  *    cut short. What is left out is still counted: `ACK.outstanding` includes it. Nothing owed:
- *    no `OWED`. Once per connection; later blocks are reported by `ACK.outstanding` only.
+ *    no `OWED` for any core (v7: the report still ends with the end marker, below). Once per
+ *    connection; later blocks are reported by `ACK.outstanding` only.
  *    **Order:** the seeder handles the HELLO that opens the connection — binds the pubkey and
  *    writes every `OWED` of the report — before it handles any frame that follows that HELLO on
  *    the stream, and when its own HELLO goes out last, the report follows it directly. So a viewer
@@ -81,7 +82,26 @@ export const PAY_PROTOCOL_VERSION = 1 as const;
  * never paid the difference. An honest seeder sends one `OWED` per core per connection; a viewer
  * may ignore any later one for the same core. An `OWED` before the channel is `open` is a
  * protocol error (`PayProtocolEvents.owed`).
+ *
+ * v7 amendment (2026-10-02, Cameron; ADR 0018 amendment, R3/R4,
+ * `docs/contract-requests/P2-owed-viewer.md` option 1) — NORMATIVE for every seeder this
+ * repository builds:
+ *
+ * 5. **The report ends with an end marker.** Right after the last `OWED` of rule 2's report —
+ *    and when nothing is owed, right after the HELLO that opens the connection — the seeder sends
+ *    one `OWED` whose `core` is `OWED_END_CORE` and whose `ranges` is empty. Once per connection,
+ *    under rule 2's order, so it too precedes the first block the viewer asked for after `open`.
+ *    It names no blocks and is outside the report's caps. A viewer that has it knows the report
+ *    is complete and need not wait (a viewer of an older seeder, which sends none, keeps its
+ *    bounded wait). `PAY_PROTOCOL_VERSION` stays 1, as in v6: an older build's codec refuses the
+ *    marker and closes `pay/1` (no deployed base yet).
  */
+
+/**
+ * v7: the `core` of the end-of-report marker (rule 5): 32 zero bytes, which no Hypercore key is
+ * (a public key of all zeros is not a valid ed25519 point).
+ */
+export const OWED_END_CORE = '0'.repeat(64) as CoreKeyHex;
 
 /** Most ranges one `OWED` names (and one connection's whole report). */
 export const MAX_OWED_RANGES = 256 as const;
@@ -188,8 +208,10 @@ export type OwedRange = readonly [fromBlock: BlockIndex, toBlock: BlockIndex];
  * v6 amendment (ADR 0018), seeder → viewer: the blocks of `core` the seeder still counts unpaid for
  * this viewer's HELLO pubkey (rules 2 and 3 at the top). `ranges` is canonical: 1 …
  * `MAX_OWED_RANGES` ranges, each `fromBlock ≤ toBlock`, ascending, disjoint and not adjacent (one
- * encoding per set of blocks), `MAX_OWED_BLOCKS` blocks at most in total. The codec refuses
- * anything else, both ways.
+ * encoding per set of blocks), `MAX_OWED_BLOCKS` blocks at most in total. v7 (rule 5): the one
+ * other form is the end marker — `core` `OWED_END_CORE` with `ranges` empty; `OWED_END_CORE` with
+ * any range, or an empty `ranges` for any other core, is refused. The codec refuses anything else,
+ * both ways.
  */
 export interface OwedMessage {
   readonly type: 'OWED';

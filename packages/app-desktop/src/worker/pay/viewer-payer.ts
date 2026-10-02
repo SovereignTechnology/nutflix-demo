@@ -69,6 +69,7 @@
  *         only a final refusal, or terms it can never be paid at, removes it;
  *       - owed blocks handed over are kept per CONNECTION (Noise key) and forgotten with it.
  */
+import { OWED_END_CORE } from '@sovit/core';
 import type {
   BlockRange,
   CoreKeyHex,
@@ -467,6 +468,8 @@ export class ViewerPayer {
    * stays in the record, for the seeder's next report.
    */
   private onOwed(noiseHex: string, m: OwedMessage): void {
+    // v7 rule 5: the end of the report names no blocks (the credit side completes the report).
+    if (m.core === OWED_END_CORE) return;
     const rec = this.o.record;
     const pk = this.pubkeys.get(noiseHex);
     if (!Array.isArray(m.ranges)) return;
