@@ -169,7 +169,8 @@ void describe(
       const pass = 'an e2e passphrase';
       await page.fill('#pass', pass);
       await page.fill('#pass2', pass);
-      await page.click('button.primary');
+      // The answer closes the window mid-click; that is the expected effect (answerOf checks it).
+      await page.click('button.primary').catch(() => undefined);
       const { value } = await answerOf(app, req);
       assert.deepEqual(value, { kind: 'secret', bytes: Buffer.byteLength(pass) });
       await until('the prompt to close', async () => {

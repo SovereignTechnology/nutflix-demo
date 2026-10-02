@@ -1335,7 +1335,7 @@ export class RecoveryService {
         const p = await seeded.reissuePlan(mint);
         if (p.mint === mint && p.amount > 0 && p.feeSats < p.amount) {
           this.log.info(
-            'a balance worth moving is back at a mint the backup had counted done: the backup is open again (Finish backup moves it)',
+            'a balance worth moving is back at a mint the backup had counted as done: the backup is open again (Finish backup moves it)',
           );
           return withWatched({ ...env, reissued: false }, []);
         }
@@ -1529,7 +1529,7 @@ export class RecoveryService {
     ]);
     this.timers.clearTimeout(timer);
     if (!late) return;
-    this.log.warn('a recovery phrase action was refused: the relay copy retry has not finished');
+    this.log.warn('a recovery phrase action was refused, as the relay copy retry is still running');
     if (this.o.signer()?.kind === 'nip46')
       fail(
         'remote-signer',
