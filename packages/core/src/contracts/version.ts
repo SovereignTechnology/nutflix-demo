@@ -69,5 +69,10 @@
  *       v5 frame (its flags byte is written only with `free`), while an older build's codec
  *       refuses `OWED`, a `free` PRICE and an ACK carrying `outstanding`, and closes pay/1 (no
  *       deployed base yet).
+ *   7 — 2026-10-02 (Cameron, R3/R4; ADR 0018 amendment). Additive: `pay-protocol.ts` rule 5 —
+ *       the `OWED` report ends with an end marker (`core` `OWED_END_CORE`, no ranges), sent by
+ *       every seeder this repository builds, also when nothing is owed, so a viewer knows the
+ *       report is complete without waiting `REPORT_WAIT_MS`. `PAY_PROTOCOL_VERSION` stays 1: an
+ *       older build's codec refuses the marker and closes pay/1 (no deployed base yet), as in v6.
  */
-export const CONTRACTS_VERSION = 6 as const;
+export const CONTRACTS_VERSION = 7 as const;

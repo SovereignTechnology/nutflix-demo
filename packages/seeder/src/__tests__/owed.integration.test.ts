@@ -14,7 +14,14 @@
  * the owed-range PAY is made of real ecash from that mint, verified against its keyset, and the
  * seeder then redeems it there. Plain `npm test` stays offline.
  */
-import { mocks, payment, payProtocol, signer as signerMod, wallet as walletMod } from '@sovit/core';
+import {
+  OWED_END_CORE,
+  mocks,
+  payment,
+  payProtocol,
+  signer as signerMod,
+  wallet as walletMod,
+} from '@sovit/core';
 import type {
   AckMessage,
   CashuP2pkPubkey,
@@ -533,7 +540,8 @@ async function dropThenPayOwed(real?: MintUrl) {
   const firstNoise = c1.session.noiseKeyHex;
   await c1.drop();
 
-  // Connection 2: a new Noise key; the same signer's HELLO. PRICE, then OWED for blocks 2–3.
+  // Connection 2: a new Noise key; the same signer's HELLO. PRICE, then OWED for blocks 2–3, then
+  // (v7) the end of the report — through the real codec on the real stream.
   const got: (PriceMessage | OwedMessage | AckMessage)[] = [];
   const c2 = await r.connect(({ viewerChan }) => {
     viewerChan.on('price', (m) => got.push(m));
@@ -544,6 +552,7 @@ async function dropThenPayOwed(real?: MintUrl) {
   expect(got).toEqual([
     { type: 'PRICE', core, satsPerBlock: 2, effectiveFromBlock: 0 },
     { type: 'OWED', core, ranges: [[2, 3]] },
+    { type: 'OWED', core: OWED_END_CORE, ranges: [] },
   ]);
   // Paid on this connection, at the core's terms, from carry 0: cleared.
   await r.pay(c2.viewerChan, core, 2, 3, 0);

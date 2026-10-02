@@ -1,5 +1,8 @@
 # Contract request — lane P2-owed-viewer: an explicit end to a seeder's `OWED` report
 
+**Answered 2026-10-02 (Cameron): option 1, contracts v7** (`pay-protocol.ts` rule 5,
+`OWED_END_CORE`); review record `docs/reviews/2026-10-02-pre-push-pay-v7.md`.
+
 Date: 2026-09-27. Lane P2-owed-viewer (the viewer side of the ADR 0018 amendment). Contracts are
 frozen for this lane, so this is a request, and the lane's code does not depend on it. Lane
 P1-owed-seeder asked a related question (its Q2).
