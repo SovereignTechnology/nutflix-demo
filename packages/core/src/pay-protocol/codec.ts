@@ -7,6 +7,8 @@
  *     ≤ 64 mints, integers safe (≤ 2^53 − 1) and the carry < 100;
  *   - requires the frame to be consumed EXACTLY (no trailing bytes), unknown flag bits to be 0,
  *     and a known message tag and reject-reason index;
+ *   - requires every string to be strict UTF-8 and every uint (a string's length too) in its
+ *     minimal encoding (F58, found by the fuzz campaign), so one message has one frame;
  *   - returns fresh plain objects with absent optional fields ABSENT (not `undefined`).
  *
  * `encode` throws on a message outside that grammar, so a local bug can never put an undecodable
@@ -99,8 +101,13 @@ function need(ok: boolean, what: string): void {
 
 const utf8 = new TextEncoder();
 
+/** A lone UTF-16 surrogate: `TextEncoder` would write U+FFFD for it, not the string. */
+const LONE_SURROGATE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
+
 function checkString(s: unknown, what: string): string {
   need(typeof s === 'string', `${what}: not a string`);
+  // F58: only a well-formed string has an encoding that decodes back to it.
+  need(!LONE_SURROGATE.test(s as string), `${what}: not well-formed UTF-16`);
   need(utf8.encode(s as string).byteLength <= MAX_STRING_BYTES, `${what}: too long`);
   return s as string;
 }
@@ -122,19 +129,51 @@ function bytesToHex(b: Uint8Array): string {
   return s;
 }
 
-function readUint(state: State, what: string): number {
+/** Bytes compact-encoding writes for `n` (1, 3, 5 or 9). */
+function uintSize(n: number): number {
+  const st = { start: 0, end: 0, buffer: null } as unknown as State;
+  c.uint.preencode(st, n);
+  return st.end;
+}
+
+/**
+ * A uint in its MINIMAL encoding only (F58, the fuzz campaign): compact-encoding also reads 0
+ * written as `0xfd 0 0`, so one message would have many frames.
+ */
+function readMinimalUint(state: State, what: string): number {
+  const at = state.start;
   const n = c.uint.decode(state);
   need(Number.isSafeInteger(n) && n >= 0, `${what}: out of range`);
+  need(state.start - at === uintSize(n), `${what}: not in its minimal encoding`);
   return n;
+}
+
+function readUint(state: State, what: string): number {
+  return readMinimalUint(state, what);
 }
 
 function readString(state: State, what: string): string {
   // Peek the length prefix before letting compact-encoding allocate.
   const save = state.start;
-  const len = c.uint.decode(state);
+  const len = readMinimalUint(state, `${what} length`);
   need(len <= MAX_STRING_BYTES, `${what}: too long`);
+  const begin = state.start;
   state.start = save;
-  return c.string.decode(state);
+  const s = c.string.decode(state);
+  // F58 (the fuzz campaign): strict UTF-8. compact-encoding decodes invalid bytes to U+FFFD, so
+  // two different frames read as one message; only bytes that ARE the string's encoding pass.
+  const raw = state.buffer;
+  need(
+    raw !== null && sameBytes(utf8.encode(s), raw.subarray(begin, state.start)),
+    `${what}: not valid UTF-8`,
+  );
+  return s;
+}
+
+function sameBytes(a: Uint8Array, b: Uint8Array): boolean {
+  if (a.byteLength !== b.byteLength) return false;
+  for (let i = 0; i < a.byteLength; i++) if (a[i] !== b[i]) return false;
+  return true;
 }
 
 function readCore(state: State): CoreKeyHex {
