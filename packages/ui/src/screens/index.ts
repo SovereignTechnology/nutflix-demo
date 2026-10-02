@@ -18,6 +18,9 @@ export type {
   RecoveryStatusView,
   SettingsProps,
   SettingsSectionId,
+  TopUpHoldControls,
+  TopUpHoldReason,
+  TopUpHoldView,
 } from './Settings/index.js';
 export { Library } from './Library/index.js';
 export type { LibraryProps, LibraryTab } from './Library/index.js';

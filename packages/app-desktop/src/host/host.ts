@@ -15,7 +15,7 @@ import { mocks, nostr, signer as signerMod } from '@sovit/core';
 
 import { fromHex } from '../ipc/codec.js';
 import { toWireError, wireError } from '../ipc/errors.js';
-import { isHostIn, isMsgId, isWcId } from '../ipc/guards.js';
+import { isConfirmForm, isHostIn, isMsgId, isWcId } from '../ipc/guards.js';
 import type { AnyCallMsg, HostIn, HostOut, PromptAnswer, ReplyMsg } from '../ipc/protocol.js';
 import { IPC_V, LIMITS } from '../ipc/protocol.js';
 import { dehydrate } from '../ipc/wiremap.js';
@@ -542,6 +542,11 @@ export async function createHost(o: HostOptions): Promise<Host> {
                 askFirstFunding: async (q) => {
                   const a = await bridge.ask({ kind: 'top-up-first', ...q });
                   return a?.kind === 'top-up-first' && a.confirm;
+                },
+                // R5-R1: main's native dialog; a form main would refuse is never asked.
+                confirmResume: async (q) => {
+                  const form = { kind: 'topup-resume' as const, ...q };
+                  return isConfirmForm(form) && (await bridge.confirm(form));
                 },
               }),
           log,

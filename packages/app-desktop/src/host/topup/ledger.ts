@@ -111,6 +111,14 @@ export interface LedgerEntry {
    * holds back a new top-up.
    */
   readonly minted?: true;
+  /**
+   * R5-R1 (Cameron, 2026-10-02: waive, keep watching): the user resumed auto top-ups into this
+   * entry's target, in main's native confirm, while the open top-up was held. It no longer holds
+   * back a new top-up, but it stays open and is still finished like any other — minted when the
+   * target says PAID, released by the same rules — so a quote the target still owes is never
+   * forfeited. It keeps counting toward `MAX_OPEN_TOP_UPS`.
+   */
+  readonly waived?: true;
 }
 
 interface LedgerRequired {
@@ -166,6 +174,7 @@ const isEntry: Guard<LedgerEntry> = obj(
     owner: isOwner,
     open: isSealed,
     minted: literal(true),
+    waived: literal(true),
   },
 );
 
@@ -360,9 +369,26 @@ export class TopUpLedger {
     return this.entries.filter((e) => e.open !== undefined && e.owner === owner);
   }
 
-  /** Whether `owner` has an open top-up into `target` not minted yet. */
+  /** Whether `owner` has an open top-up into `target` not minted yet, and not waived (R5-R1). */
   hasOpen(owner: NostrPubkey, target: MintUrl): boolean {
-    return this.openEntries(owner).some((e) => e.target === target && e.minted !== true);
+    return this.openEntries(owner).some(
+      (e) => e.target === target && e.minted !== true && e.waived !== true,
+    );
+  }
+
+  /**
+   * R5-R1: `owner`'s open top-up `id` stops holding back its target (see `LedgerEntry.waived`).
+   * Only once that is on disk does it count here; rejects, and changes nothing, when it cannot be
+   * persisted or `id` is not one of `owner`'s open, unminted top-ups.
+   */
+  async waive(id: string, owner: NostrPubkey): Promise<void> {
+    if (this.hardClosed) throw new Error('ledger closed');
+    const e = this.entries.find((x) => x.id === id);
+    if (e?.open === undefined || e.owner !== owner || e.minted === true)
+      throw new Error('no such open top-up');
+    if (e.waived === true) return;
+    const entries = this.entries.map((x) => (x.id === id ? { ...x, waived: true as const } : x));
+    this.entries = await this.persist(this.allowed, entries);
   }
 
   /**
@@ -392,7 +418,7 @@ export class TopUpLedger {
       // fail closed for a day): the ceiling is already twice the daily cap.
       const want = patch.sats === undefined ? e.sats : Math.max(patch.sats, e.amount);
       const sats = Number.isSafeInteger(want) ? Math.min(want, MAX_ENTRY_SATS) : MAX_ENTRY_SATS;
-      const { open, minted, ...rest } = e;
+      const { open, minted, waived, ...rest } = e;
       const keep = !close && open !== undefined;
       return {
         ...rest,
@@ -401,6 +427,7 @@ export class TopUpLedger {
         ...(melt === undefined ? {} : { melt }),
         ...(keep ? { open } : {}),
         ...(keep && (minted === true || patch.minted === true) ? { minted: true as const } : {}),
+        ...(keep && waived === true ? { waived: true as const } : {}),
       };
     });
     try {

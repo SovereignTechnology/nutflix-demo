@@ -140,6 +140,11 @@ export interface NutflixBridge {
         restore: Call<'desktop.wallet.recovery.restore'>;
         onProgress: Listen<TopicPayload['recovery.progress']>;
       };
+      /** R5-R1: held auto top-ups; resuming one is confirmed in main's native dialog. */
+      readonly topUp: {
+        holds: Call<'desktop.wallet.topUp.holds'>;
+        resume: Call<'desktop.wallet.topUp.resume'>;
+      };
     };
   };
 }

@@ -116,5 +116,8 @@ export function handlers(a: DesktopNetworkAdapter): HandlerTable {
     'desktop.wallet.recovery.setup': () => a.recovery().setup(),
     'desktop.wallet.recovery.show': () => a.recovery().show(),
     'desktop.wallet.recovery.restore': () => a.recovery().restore(),
+    // R5-R1: an entry id only; the host asks main's native dialog before anything changes.
+    'desktop.wallet.topUp.holds': () => a.topUpHolds(),
+    'desktop.wallet.topUp.resume': (_c, [id]) => a.resumeTopUp(id),
   };
 }

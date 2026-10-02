@@ -28,6 +28,7 @@ import type { ScreenProps } from '../shared/route.js';
 import { AppearanceSection } from './AppearanceSection.js';
 import { PlaybackSection } from './PlaybackSection.js';
 import { RecoverySection, type RecoveryControls } from './RecoverySection.js';
+import type { TopUpHoldControls } from './TopUpHolds.js';
 import { RelaysSection } from './RelaysSection.js';
 import { SeedingSection, useSeederStatus } from './SeedingSection.js';
 import { SignerSection, useSigner } from './SignerSection.js';
@@ -66,6 +67,11 @@ export interface SettingsProps extends ScreenProps {
    */
   readonly recovery?: RecoveryControls | undefined;
   /**
+   * R5-R1: the shell's auto top-ups held back for a mint (desktop), each with a Resume confirmed
+   * outside this screen. Without it nothing about holds is shown.
+   */
+  readonly topUpHolds?: TopUpHoldControls | undefined;
+  /**
    * Called with the adapter-confirmed settings after every successful save — the shell
    * applies `theme` (and hands `hoverPreview` to Home) here. Also called for saves that
    * finish after the screen unmounted.
@@ -87,6 +93,7 @@ export function Settings({
   miniPlayer,
   onChangeSigner,
   recovery,
+  topUpHolds,
   onSettingsChange,
   onToast,
   inlineToasts = false,
@@ -261,6 +268,7 @@ export function Settings({
           signedOut={signer.signedOut}
           navigate={navigate}
           headingRef={refFor('mints')}
+          topUpHolds={topUpHolds}
         />
         <RecoverySection
           id={sectionId('recovery')}

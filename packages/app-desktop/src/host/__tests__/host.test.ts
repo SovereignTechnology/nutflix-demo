@@ -131,6 +131,20 @@ describe('HostIn → HostOut', () => {
     ).toHaveLength(10);
   });
 
+  it('R5-R1: where auto top-ups do not run (--dev-mocks), no hold is listed and resume is refused; a malformed id never reaches it', async () => {
+    r = await rig({ flags: { devMocks: true } });
+    await r.ready();
+    const holds = await invoke(r, 2, 'desktop.wallet.topUp.holds', []);
+    expect(holds.ok && holds.result).toEqual([]);
+    expect(errCode(await invoke(r, 2, 'desktop.wallet.topUp.resume', ['0123456789abcdef']))).toBe(
+      'forbidden',
+    );
+    for (const bad of [[], ['0123456789ABCDEF'], [{ id: '0123456789abcdef' }]])
+      expect(errCode(await invoke(r, 2, 'desktop.wallet.topUp.resume', bad))).toBe(
+        'invalid-argument',
+      );
+  });
+
   it('D3/D5: wallet.send / receive / p2pkPubkey / keyset are unreachable over IPC', async () => {
     r = await rig({ flags: { devMocks: true } });
     const table = handlers(r.host.adapter) as unknown as Record<string, unknown>;

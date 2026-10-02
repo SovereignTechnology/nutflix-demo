@@ -511,6 +511,9 @@ export const validateArgs: { readonly [M in Method]: Guard<MethodTable[M][0]> } 
   'desktop.wallet.recovery.setup': tuple([]),
   'desktop.wallet.recovery.show': tuple([]),
   'desktop.wallet.recovery.restore': tuple([]),
+  // R5-R1: the renderer names a held top-up's ledger entry, nothing else (main confirms).
+  'desktop.wallet.topUp.holds': tuple([]),
+  'desktop.wallet.topUp.resume': tuple([matches(/^[0-9a-f]{16}$/, 16)]),
 });
 
 function wrapAll<T extends Record<string, Guard<unknown>>>(table: T): T {
@@ -669,6 +672,12 @@ export const isConfirmForm: Guard<ConfirmForm> = safe(
       })(x) && new Set(x.plans.map((p) => p.mint)).size === x.plans.length,
     obj({ kind: literal('recovery-reveal') }),
     obj({ kind: literal('recovery-rotate') }),
+    obj({
+      kind: literal('topup-resume'),
+      target: isMintUrl,
+      amount: isPositiveSats,
+      reason: oneOf(['checking', 'unreadable', 'unreachable', 'owed', 'waiting'] as const),
+    }),
   ),
 );
 

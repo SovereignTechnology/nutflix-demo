@@ -143,6 +143,25 @@ describe('preload surface (key tree allowlist)', () => {
     expect(Object.keys(b)).not.toContain('ipcRenderer');
   });
 
+  it('R5-R1: desktop.wallet.topUp.* — holds takes nothing; resume forwards the entry id only', async () => {
+    const { b, calls } = bridge({
+      'desktop.wallet.topUp.holds': [],
+      'desktop.wallet.topUp.resume': true,
+    });
+    const t = b.desktop.wallet.topUp;
+    expect(await t.holds()).toEqual([]);
+    // Whatever else a compromised page passes, only the first argument crosses (main's gate
+    // then checks its form); the host asks main's native dialog before anything changes.
+    const loose = t as unknown as Record<string, (...a: unknown[]) => Promise<unknown>>;
+    await loose['holds']?.({ all: true });
+    await loose['resume']?.('0123456789abcdef', { confirmed: true });
+    expect(calls).toEqual([
+      { method: 'desktop.wallet.topUp.holds', args: [] },
+      { method: 'desktop.wallet.topUp.holds', args: [] },
+      { method: 'desktop.wallet.topUp.resume', args: ['0123456789abcdef'] },
+    ]);
+  });
+
   it('ADR 0016: desktop.wallet.recovery.* name an action only (no arguments cross), progress is a topic', async () => {
     const { b, calls, subs } = bridge({
       'desktop.wallet.recovery.status': {
