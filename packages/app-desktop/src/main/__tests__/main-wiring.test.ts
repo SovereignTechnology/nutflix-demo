@@ -20,6 +20,7 @@ const fx = vi.hoisted(() => {
   const state = {
     order: [] as string[],
     switches: new Set<string>(),
+    switchValues: new Map<string, string>(),
     appended: [] as string[],
     exitCode: undefined as number | undefined,
     appListeners: new Map<string, ((...a: unknown[]) => void)[]>(),
@@ -122,6 +123,7 @@ vi.mock('electron', () => {
       },
       commandLine: {
         hasSwitch: (s: string) => fx.switches.has(s),
+        getSwitchValue: (s: string) => fx.switchValues.get(s) ?? '',
         appendSwitch: (s: string) => {
           fx.appended.push(s);
         },
@@ -244,6 +246,7 @@ beforeEach(() => {
   vi.resetModules();
   fx.order.length = 0;
   fx.switches.clear();
+  fx.switchValues.clear();
   fx.appended.length = 0;
   fx.exitCode = undefined;
   fx.primary = true;
@@ -491,10 +494,55 @@ describe('main.ts wiring (fake electron)', () => {
     },
   );
 
+  // ADR 0017 open question 11 (Cameron, 2026-10-02): feature lists from the allow-list only.
+  it('a packaged build refuses a feature outside the allow-list (exit 78, nothing started); a dev build keeps it', async () => {
+    fx.packaged = true;
+    process.argv = [
+      argv[0] ?? 'node',
+      'dist/main/main.js',
+      '--disable-features=NetworkServiceSandbox',
+    ];
+    await expect(import('../main.js')).rejects.toThrow(/outside the allow-list/);
+    expect(fx.exitCode).toBe(78);
+    expect(fx.order).toEqual([]);
+    expect(fx.windows).toHaveLength(0);
+    expect(fx.forks).toHaveLength(0);
+    expect(logged.join('')).toMatch(/app\.feature-switch-refused/);
+    // The value Chromium reports is read as well as argv.
+    vi.resetModules();
+    logged = [];
+    fx.exitCode = undefined;
+    process.argv = [argv[0] ?? 'node', 'dist/main/main.js'];
+    fx.switches.add('enable-features');
+    fx.switchValues.set('enable-features', 'NetworkServiceInProcess');
+    await expect(import('../main.js')).rejects.toThrow(/outside the allow-list/);
+    expect(fx.exitCode).toBe(78);
+    // The dev build starts.
+    vi.resetModules();
+    fx.packaged = false;
+    fx.exitCode = undefined;
+    await boot();
+    expect(fx.exitCode).toBeUndefined();
+    expect(fx.forks).toHaveLength(1);
+  });
+
+  it('a packaged build starts with the Wayland features', async () => {
+    fx.packaged = true;
+    fx.switches.add('enable-features');
+    fx.switchValues.set('enable-features', 'UseOzonePlatform,WaylandWindowDecorations');
+    await boot([
+      '--enable-features=UseOzonePlatform,WaylandWindowDecorations',
+      '--ozone-platform=wayland',
+    ]);
+    expect(fx.exitCode).toBeUndefined();
+    expect(fx.forks).toHaveLength(1);
+  });
+
   // Round 4: the order of the before-ready refusals is Squirrel (pinned in its own describe),
-  // then the sandbox, the dev flags, the remote-debugging switches, the process switches. Each
+  // then the sandbox, the dev flags, the remote-debugging switches, the process switches, the
+  // feature lists (open question 11). Each
   // step below removes the one that fired and checks the next one takes over.
-  it('refusal order: sandbox, dev flags, remote debugging, process switches', async () => {
+  it('refusal order: sandbox, dev flags, remote debugging, process switches, feature lists', async () => {
     const steps: { drop: string | null; expect: RegExp; event: string }[] = [
       { drop: null, expect: /sandbox/, event: 'app.sandbox-bypass-refused' },
       {
@@ -507,6 +555,11 @@ describe('main.ts wiring (fake electron)', () => {
         drop: 'remote-debugging-port',
         expect: /process-wrapper/,
         event: 'app.process-switch-refused',
+      },
+      {
+        drop: 'utility-cmd-prefix',
+        expect: /outside the allow-list/,
+        event: 'app.feature-switch-refused',
       },
     ];
     const switches = new Set(['disable-seccomp-filter-sandbox', 'remote-debugging-port']);
@@ -521,7 +574,12 @@ describe('main.ts wiring (fake electron)', () => {
       fx.exitCode = undefined;
       fx.switches.clear();
       for (const sw of switches) fx.switches.add(sw);
-      process.argv = [argv[0] ?? 'node', 'dist/main/main.js', ...flags];
+      process.argv = [
+        argv[0] ?? 'node',
+        'dist/main/main.js',
+        ...flags,
+        '--disable-features=NetworkServiceSandbox',
+      ];
       await expect(import('../main.js'), step.event).rejects.toThrow(step.expect);
       expect(fx.exitCode).toBe(78);
       expect(logged, step.event).toHaveLength(1);
