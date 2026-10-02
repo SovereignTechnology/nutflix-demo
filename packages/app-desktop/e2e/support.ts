@@ -299,6 +299,30 @@ function teeLogs(app: ElectronApplication): void {
   }
 }
 
+/** The most of a launch's call log a failure keeps (its last lines: the hang is at the end). */
+const CALL_LOG_LINES = 60;
+
+/**
+ * A launch failure, readable in a CI log: the error's first line, plus the tail of Playwright's
+ * "Call log". That log holds Electron's own stdout/stderr (`[pid=…][err] …`, main's lines
+ * already redacted by its logger), which is what says WHY a launch hung (an intermittent 30 s
+ * `electron.launch` timeout on the CI runner: main run 12, SovereignTechnology/nutflix-demo#7).
+ */
+export function launchFailure(e: unknown): string {
+  if (!(e instanceof Error)) return String(e);
+  const [first = '', ...rest] = e.message.split('\n');
+  // eslint-disable-next-line no-control-regex -- Playwright dims the call log with ANSI codes
+  const log = rest.map((l) => l.replace(/\u001b\[[0-9;]*m/g, '')).filter((l) => l.trim() !== '');
+  if (log.length === 0) return first;
+  const tail = log.slice(-CALL_LOG_LINES);
+  const cut = log.length - tail.length;
+  return [
+    first,
+    ...(cut > 0 ? [`    … ${String(cut)} earlier lines`] : []),
+    ...tail.map((l) => `    ${l}`),
+  ].join('\n');
+}
+
 /**
  * Launches `script` (a main-process entry) with the display strategy until one shows a
  * window, WITH the Chromium sandbox (`chromiumSandbox: true`: never let playwright add
@@ -337,9 +361,7 @@ export async function launch(
       });
       return { app, page, display: d.name, sandbox };
     } catch (e: unknown) {
-      failures.push(
-        `${d.name}: ${e instanceof Error ? (e.message.split('\n')[0] ?? '') : String(e)}`,
-      );
+      failures.push(`${d.name}: ${launchFailure(e)}`);
       await app?.close().catch(() => undefined);
     }
   }
