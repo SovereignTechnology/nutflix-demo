@@ -294,6 +294,12 @@ export function createBridge(t: Transport, deps: BridgeDeps): NutflixBridge {
           restore: () => t.call('desktop.wallet.recovery.restore', []),
           onProgress: (cb) => t.subscribe({ t: 'recovery.progress' }, cb),
         },
+        // R5-R1: held auto top-ups, and resuming one by its ledger entry id (main's gate checks
+        // the id's form; the host asks main's native dialog before anything changes).
+        topUp: {
+          holds: () => t.call('desktop.wallet.topUp.holds', []),
+          resume: (id) => t.call('desktop.wallet.topUp.resume', [id]),
+        },
       },
     },
   };

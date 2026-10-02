@@ -8,6 +8,7 @@
 import { useEffect, useState, type SubmitEvent, type ReactElement } from 'react';
 import type { MintUrl, NetworkAdapter, Sats, Settings } from '@sovit/core';
 import { Button, IconButton, MintChip, SatsBadge, mintHost } from '../../components/index.js';
+import { TopUpHolds, type TopUpHoldControls } from './TopUpHolds.js';
 import type { Route } from '../shared/route.js';
 import {
   FieldError,
@@ -73,9 +74,12 @@ export function WalletSection({
   signedOut,
   navigate,
   headingRef,
+  topUpHolds,
 }: SectionProps & {
   readonly id: string;
   readonly wallet: WalletMints;
+  /** R5-R1: the shell's held auto top-ups (desktop); absent: nothing about holds is shown. */
+  readonly topUpHolds?: TopUpHoldControls | undefined;
   readonly signedIn: boolean;
   /** Explicitly signed out (vs. signer still loading or unreachable) — drives the note copy. */
   readonly signedOut: boolean;
@@ -467,6 +471,7 @@ export function WalletSection({
             </Note>
           </>
         ) : null}
+        <TopUpHolds id={`${id}-topup`} controls={topUpHolds} />
       </div>
 
       <div className="nf-settings__links">

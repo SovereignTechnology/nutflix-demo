@@ -52,7 +52,13 @@ import {
   applyTheme,
   isTextEntryTarget,
 } from '@sovit/ui';
-import type { FfmpegStatus, RecoveryControls, SearchFilterState, ToastItem } from '@sovit/ui';
+import type {
+  FfmpegStatus,
+  RecoveryControls,
+  SearchFilterState,
+  ToastItem,
+  TopUpHoldControls,
+} from '@sovit/ui';
 import type { PlaybackCoordinator } from './coordinator.js';
 import type { Router } from './router.js';
 import { Header } from './shell/Header.js';
@@ -102,6 +108,8 @@ export interface ShellProps {
   readonly signerFlow?: SignerFlow | undefined;
   /** ADR 0016: the recovery phrase flows; offered to Settings only with the signer flow. */
   readonly recovery?: RecoveryControls | undefined;
+  /** R5-R1: held auto top-ups (the host lists none where top-ups do not run). */
+  readonly topUpHolds?: TopUpHoldControls | undefined;
 }
 
 /** Studio's `resolveFile`: the File itself — the preload, never the page, turns it into a token. */
@@ -143,6 +151,7 @@ export function Shell({
   probeFfmpeg,
   signerFlow,
   recovery,
+  topUpHolds,
 }: ShellProps): ReactElement {
   const rs = useRouterState(router);
   const { route, extras } = rs.entry;
@@ -416,6 +425,7 @@ export function Shell({
           onSettingsChange={onSettingsChange}
           onToast={pushToast}
           {...(flowOn ? { onChangeSigner, recovery } : {})}
+          topUpHolds={topUpHolds}
         />
       );
       break;

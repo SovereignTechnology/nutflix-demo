@@ -74,6 +74,7 @@ import type {
   NostrPubkey,
   Sats,
   Settings,
+  UnixSeconds,
   Wallet,
   WalletChangeEvent,
   WalletHistoryEntry,
@@ -81,6 +82,7 @@ import type {
 import { AUTO_TOP_UP_MAX_SATS, wallet as walletMod } from '@sovit/core';
 
 import { MELT_REQUEST_TIMEOUT_MS, WORKER_HOST_REQUEST_TIMEOUT_MS } from '../../ipc/deadlines.js';
+import type { TopUpHoldReason, TopUpHoldWire } from '../../ipc/protocol.js';
 import type { Logger } from '../log.js';
 import { GateRefusal } from '../pay-melt-gate.js';
 import { autoTopUpDue } from '../settings/settings.js';
@@ -302,6 +304,15 @@ export interface AutoTopUpOptions {
    * so no mint is ever funded for the first time (fail closed).
    */
   readonly askFirstFunding?: (q: FirstFundingQuestion) => Promise<boolean>;
+  /**
+   * R5-R1: main's native confirm for resuming auto top-ups past a held one — `true` only for an
+   * explicit yes. Absent = a hold is never resumed (fail closed).
+   */
+  readonly confirmResume?: (q: {
+    readonly target: MintUrl;
+    readonly amount: Sats;
+    readonly reason: TopUpHoldReason;
+  }) => Promise<boolean>;
   readonly log: Logger;
   /** Wall-clock milliseconds. */
   readonly now?: () => number;
@@ -380,6 +391,8 @@ export class AutoTopUp {
   private readonly meltReturned = new Map<string, number>();
   /** An open top-up that could not be read was logged (once per run of the host). */
   private unreadableLogged = false;
+  /** R5-R1: why each open top-up held back its target at the last look (`holds`). */
+  private readonly holdReasons = new Map<string, TopUpHoldReason>();
   private readonly lastRefusalLog = new Map<TopUpOutcome, number>();
 
   constructor(o: AutoTopUpOptions) {
@@ -756,9 +769,15 @@ export class AutoTopUp {
   private async resolveOpen(w: Wallet, v: TopUpVault): Promise<void> {
     for (const e of this.o.ledger.openEntries(v.owner)) {
       if (this.o.wallet() !== w) return; // a sign-out or signer swap: its own wallet finishes it
+      const hold = (r: TopUpHoldReason): void => {
+        this.holdReasons.set(e.id, r);
+      };
       try {
         const open = await this.openRecord(w, v, e);
-        if (open === null) continue;
+        if (open === null) {
+          hold('unreadable');
+          continue;
+        }
         if (e.minted === true) {
           // Minted already: only the melt's history line is left to find, once it is settled.
           if (!(await v.meltPending(open.melt.mint, open.melt.quoteId)))
@@ -776,7 +795,10 @@ export class AutoTopUp {
           continue;
         }
         // UNPAID. A melt that paid (`done`) will reach the target: keep polling it.
-        if (r.state !== 'UNPAID' || e.state === 'done') continue;
+        if (r.state !== 'UNPAID' || e.state === 'done') {
+          hold(r.state === 'UNPAID' ? 'owed' : 'waiting');
+          continue;
+        }
         // Round 5 (R4-R2): a melt request the transport gave up on may still reach the source.
         // Lane R6-reconcile: without the melt's own time (an earlier run of the host), from the
         // later of the latest it can have returned and this host's start.
@@ -784,7 +806,10 @@ export class AutoTopUp {
         const returned =
           this.meltReturned.get(e.id) ??
           Math.max(e.at + TOP_UP_MELT_RETURNED_BY_MS, this.startedAt);
-        if (!(now >= returned + TOP_UP_RELEASE_AFTER_MS)) continue;
+        if (!(now >= returned + TOP_UP_RELEASE_AFTER_MS)) {
+          hold('waiting');
+          continue;
+        }
         // Round 5: the target still says UNPAID a day after the invoice expired — it can no
         // longer be paid, whatever the source answers short of PAID.
         const lapsed =
@@ -794,7 +819,10 @@ export class AutoTopUp {
         // Three states: true, false, or null — the journal could not be read (lane R6-reconcile
         // pins that null is never read as false).
         const pending = await orNull(() => v.meltPending(mint, quoteId));
-        if (pending === true && !lapsed) continue;
+        if (pending === true && !lapsed) {
+          hold('waiting');
+          continue;
+        }
         // null when the source could not be read: no answer at all (lane R6-reconcile).
         const source = await orNull(() => v.meltState(mint, quoteId));
         // Otherwise released only when the melt can no longer pay it: nothing journaled at the
@@ -803,7 +831,10 @@ export class AutoTopUp {
         // the source ANSWERS short of PAID (a read that failed keeps it: the melt may have paid).
         const unpaid = pending === false && source === 'UNPAID';
         const answered = source === 'UNPAID' || source === 'PENDING';
-        if (!unpaid && !(lapsed && answered)) continue;
+        if (!unpaid && !(lapsed && answered)) {
+          hold(source === 'PAID' ? 'owed' : 'waiting');
+          continue;
+        }
         // Still counted (the melt reached the mint; its inputs may have been lost there).
         await this.close(w, e.id, { state: e.state === 'failed' ? 'failed' : 'unknown' });
         this.log.info(
@@ -813,8 +844,57 @@ export class AutoTopUp {
         );
       } catch {
         // a mint, the signer or the ledger could not answer: next time
+        hold('unreachable');
       }
     }
+  }
+
+  /**
+   * R5-R1: the signed-in identity's held top-ups — open, not minted, not waived: each holds back
+   * new top-ups into its target — oldest first, with the reason seen at the last look.
+   */
+  holds(): readonly TopUpHoldWire[] {
+    const w = this.o.wallet();
+    const v = w === undefined ? undefined : this.o.vault(w);
+    if (v === undefined) return [];
+    const out: TopUpHoldWire[] = [];
+    for (const e of this.o.ledger.openEntries(v.owner)) {
+      if (e.minted === true || e.waived === true || e.target === undefined) continue;
+      out.push({
+        id: e.id,
+        target: e.target,
+        amount: e.amount as Sats,
+        since: Math.floor(e.at / 1000) as UnixSeconds,
+        reason: this.holdReasons.get(e.id) ?? 'checking',
+      });
+    }
+    return out;
+  }
+
+  /**
+   * R5-R1 (Cameron, 2026-10-02): resume auto top-ups into a held top-up's target, once main's
+   * native confirm says yes. The hold is WAIVED, never deleted (`TopUpLedger.waive`): its quote is
+   * still polled and minted if the target pays it. Re-checked after the dialog (a sign-out, a
+   * signer swap or the hold's own end meanwhile): `not-found` then, and nothing changes.
+   */
+  async resumeHold(id: string): Promise<'resumed' | 'cancelled' | 'not-found' | 'unavailable'> {
+    const w = this.o.wallet();
+    const held = (): TopUpHoldWire | undefined =>
+      this.o.wallet() === w ? this.holds().find((h) => h.id === id) : undefined;
+    const h = held();
+    if (w === undefined || h === undefined) return 'not-found';
+    const ask = this.o.confirmResume;
+    if (ask === undefined) return 'unavailable';
+    const yes = await ask({ target: h.target, amount: h.amount, reason: h.reason }).catch(
+      () => false,
+    );
+    if (!yes) return 'cancelled';
+    const v = this.o.vault(w);
+    if (held() === undefined || v === undefined) return 'not-found';
+    await this.o.ledger.waive(id, v.owner);
+    this.holdReasons.delete(id);
+    this.log.info('an auto top-up hold was waived by the user; its quote is still watched');
+    return 'resumed';
   }
 
   /**
@@ -841,6 +921,7 @@ export class AutoTopUp {
   ): Promise<void> {
     this.openedFor(w).delete(id);
     this.meltReturned.delete(id);
+    this.holdReasons.delete(id);
     await this.o.ledger.settle(id, { ...patch, open: null });
   }
 

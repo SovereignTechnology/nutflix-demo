@@ -199,6 +199,8 @@ export const VALID: Samples = {
   'desktop.wallet.recovery.setup': [[]],
   'desktop.wallet.recovery.show': [[]],
   'desktop.wallet.recovery.restore': [[]],
+  'desktop.wallet.topUp.holds': [[]],
+  'desktop.wallet.topUp.resume': [['0123456789abcdef']],
 };
 
 /** Hand-picked invalid argument lists per method (on top of the generic mutations). */
@@ -338,5 +340,15 @@ export const INVALID: Partial<Record<Method, readonly unknown[][]>> = {
     [[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]],
     [{ mints: [MINT] }],
     [MINT],
+  ],
+  // R5-R1: a ledger entry id only — never a mint, an amount, a quote or a yes.
+  'desktop.wallet.topUp.holds': [[{}], [true]],
+  'desktop.wallet.topUp.resume': [
+    [],
+    [MINT],
+    ['0123456789ABCDEF'],
+    ['0123456789abcde'],
+    [{ id: '0123456789abcdef', confirmed: true }],
+    ['0123456789abcdef', true],
   ],
 };

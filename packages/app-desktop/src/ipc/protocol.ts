@@ -461,7 +461,38 @@ export interface ReissuePlanWire {
 export type ConfirmForm =
   | { readonly kind: 'recovery-reissue'; readonly plans: readonly ReissuePlanWire[] }
   | { readonly kind: 'recovery-reveal' }
-  | { readonly kind: 'recovery-rotate' };
+  | { readonly kind: 'recovery-rotate' }
+  /** R5-R1: resume auto top-ups into `target`, past a held one (waived, still watched). */
+  | {
+      readonly kind: 'topup-resume';
+      readonly target: MintUrl;
+      readonly amount: Sats;
+      readonly reason: TopUpHoldReason;
+    };
+
+/**
+ * R5-R1: why an open auto top-up holds back its target (Settings shows it; main words it).
+ *   `checking`     not looked at since the host started;
+ *   `unreadable`   its sealed record did not open — a damaged record, or a signer that cannot
+ *                  answer now (a remote signer offline): the two look the same;
+ *   `unreachable`  the target mint could not be asked about the quote (or forgot it);
+ *   `owed`         the payment left the source mint (the melt paid, or the source says PAID) and the
+ *                  target has not credited it: it may still arrive;
+ *   `waiting`      the mints have not settled yet (a melt in flight, the release guard, a quote
+ *                  with no expiry, or a state that is neither UNPAID nor PAID).
+ */
+export type TopUpHoldReason = 'checking' | 'unreadable' | 'unreachable' | 'owed' | 'waiting';
+
+/** R5-R1: one held auto top-up of the signed-in identity (`desktop.wallet.topUp.holds`). */
+export interface TopUpHoldWire {
+  /** The ledger entry (16 hex): what `desktop.wallet.topUp.resume` names. */
+  readonly id: string;
+  readonly target: MintUrl;
+  readonly amount: Sats;
+  /** When the top-up started. */
+  readonly since: UnixSeconds;
+  readonly reason: TopUpHoldReason;
+}
 
 /** What main's keychain holds, one sealed file each. */
 export type KeychainSlot = 'passphrase' | 'nip46';
@@ -603,6 +634,14 @@ export interface MethodTable {
   'desktop.wallet.recovery.setup': [args: [], result: RecoverySetupWire];
   'desktop.wallet.recovery.show': [args: [], result: undefined];
   'desktop.wallet.recovery.restore': [args: [], result: RecoveryRestoreWire];
+  /**
+   * R5-R1 (Cameron, 2026-10-02): the auto top-ups held back for a mint, and resuming one. The
+   * renderer names an entry only; the host asks main's native confirm, and resolves `false` when
+   * it is not confirmed. A resumed hold is waived, never deleted: it is still finished if the
+   * mint pays it.
+   */
+  'desktop.wallet.topUp.holds': [args: [], result: readonly TopUpHoldWire[]];
+  'desktop.wallet.topUp.resume': [args: [id: string], result: boolean];
 }
 export type Method = keyof MethodTable;
 export type ArgsOf<M extends Method> = MethodTable[M][0];

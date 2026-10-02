@@ -60,6 +60,7 @@ import type {
   NfMediaImgUrl,
   RecoveryProgressWire,
   RecoveryStatusWire,
+  TopUpHoldWire,
   UploadId,
 } from '../ipc/protocol.js';
 import { IMAGE_MIMES } from '../ipc/protocol.js';
@@ -307,6 +308,21 @@ export class DesktopNetworkAdapter implements NetworkAdapter {
       this.o.recovery?.status() ??
       Promise.resolve({ state: 'unavailable', reissuePending: false, relayCopy: false })
     );
+  }
+
+  /** R5-R1: the signed-in identity's held auto top-ups (none where top-ups do not run). */
+  topUpHolds(): Promise<readonly TopUpHoldWire[]> {
+    return Promise.resolve(this.o.autoTopUp?.holds() ?? []);
+  }
+
+  /** R5-R1: resume past held top-up `id` once main's dialog confirms; `false` if it does not. */
+  async resumeTopUp(id: string): Promise<boolean> {
+    const top = this.o.autoTopUp;
+    if (top === undefined) fail('forbidden', 'auto top-ups do not run in this mode');
+    const r = await top.resumeHold(id);
+    if (r === 'not-found') fail('not-found', 'no such held auto top-up');
+    if (r === 'unavailable') fail('forbidden', 'nothing can be confirmed in this mode');
+    return r === 'resumed';
   }
 
   /** `recovery.progress` topic (ADR 0016). */

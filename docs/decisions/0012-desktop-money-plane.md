@@ -333,7 +333,11 @@ ceiling was above the video's price, even a core it priced within it.
     source mint must ANSWER short of PAID (UNPAID, or its payment stuck PENDING): round 5 also
     released when the source could not be read at all, but a failed read says nothing and the
     melt may have paid. A source gone for good therefore holds its target back again, with no
-    in-app clear (R5-R1).
+    in-app clear (R5-R1). **Since 2026-10-02 (Cameron: waive, keep watching):** Settings lists
+    each held top-up with its reason and a Resume that main's native dialog confirms; a resumed
+    hold is waived (`LedgerEntry.waived`), never deleted — it stops holding its target back and is
+    still minted if the target pays it. Review record
+    `docs/reviews/2026-10-02-pre-push-topup-resume.md`.
   - **The restart bound covers what comes before the melt request.** A melt now starts within
     `TOP_UP_MELT_START_BY_MS` = 5 min of its reservation or not at all (the entry settles
     `failed`: nothing moved) — between the two the run seals the record through the signer, and

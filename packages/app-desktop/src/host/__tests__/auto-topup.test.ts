@@ -95,6 +95,9 @@ interface Setup {
   /** The wallet the AutoTopUp sees now (a signer change swaps it). */
   current: Wallet | undefined;
   answer: boolean | Error | (() => boolean);
+  /** R5-R1: what main's resume dialog answers, and what it was asked. */
+  resumeAnswer: boolean | (() => Promise<boolean>);
+  readonly resumeAsked: { target: MintUrl; amount: Sats; reason: string }[];
   t: number;
   /** The money plane's startup settle, as the vault reports it. */
   recovery: Promise<unknown>;
@@ -125,6 +128,8 @@ async function setup(
     walletClock?: boolean;
     /** The expiry (unix seconds) of the target's invoices (round 5; default 2100-01-01). */
     targetQuoteExpiry?: number;
+    /** R5-R1: no resume dialog at all (a hold is never resumed). */
+    noResume?: boolean;
   } = {},
 ): Promise<Setup> {
   const lightning = new mocks.TestLightning();
@@ -181,6 +186,8 @@ async function setup(
     },
   };
   s.answer = true;
+  s.resumeAnswer = false;
+  const resumeAsked: Setup['resumeAsked'] = [];
   const w = o.wrap ? o.wrap(wallet) : wallet;
   s.current = w;
   s.recovery = Promise.resolve();
@@ -225,12 +232,22 @@ async function setup(
               return Promise.resolve(typeof a === 'function' ? a() : a);
             },
           }),
+      ...(o.noResume === true
+        ? {}
+        : {
+            confirmResume: (q: { target: MintUrl; amount: Sats; reason: string }) => {
+              resumeAsked.push({ ...q });
+              const a = s.resumeAnswer;
+              return typeof a === 'function' ? a() : Promise.resolve(a);
+            },
+          }),
       log,
       now,
       sleep: () => Promise.resolve(),
       pollAttempts: 3,
     });
   return Object.assign(s, {
+    resumeAsked,
     top: make(ledger),
     wallet,
     store,
@@ -2260,5 +2277,118 @@ describe('open-topup — round 4: the record read back strictly', () => {
         quote: { ...record.quote, bolt11: `lnbc${'q'.repeat(4096)}` },
       }),
     ).toThrow();
+  });
+});
+
+describe('AutoTopUp — R5-R1: resuming past a held top-up (Cameron, 2026-10-02: waive, keep watching)', () => {
+  /** A top-up whose melt paid while the target keeps saying UNPAID until `pays` is set. */
+  async function held(o: { noResume?: boolean } = {}) {
+    const gate = { pays: false };
+    const s = await setup({
+      fund: 20_000,
+      amountSats: 2_000,
+      ...o,
+      wrap: (w) =>
+        Object.assign(Object.create(w) as Wallet, {
+          pollQuote: (q: Parameters<Wallet['pollQuote']>[0]) =>
+            gate.pays ? w.pollQuote(q) : Promise.resolve({ state: 'UNPAID' as const }),
+        }),
+    });
+    expect(await s.top.check(TARGET)).toBe('failed'); // paid at the source, not minted yet
+    later(s, TOP_UP_MAX_BACKOFF_MS);
+    expect(await s.top.check(TARGET, 0 as Sats)).toBe('unresolved');
+    return { s, gate };
+  }
+
+  it('a held top-up is listed with its reason; Resume asks main — cancelled changes nothing; yes waives it: top-ups into that mint run again, and the waived quote is still minted when the target pays — never forfeited', async () => {
+    const { s, gate } = await held();
+    const holds = s.top.holds();
+    expect(holds).toEqual([
+      expect.objectContaining({ target: TARGET, amount: 2_000, reason: 'owed' }),
+    ]);
+    const id = holds[0]!.id;
+    // Cancelled in main's dialog: still held.
+    expect(await s.top.resumeHold(id)).toBe('cancelled');
+    expect(s.resumeAsked).toEqual([{ target: TARGET, amount: 2_000, reason: 'owed' }]);
+    expect(s.top.holds()).toHaveLength(1);
+    later(s, TOP_UP_MAX_BACKOFF_MS);
+    expect(await s.top.check(TARGET, 0 as Sats)).toBe('unresolved');
+    // Confirmed: waived on disk, the record kept (still open), nothing listed.
+    s.resumeAnswer = true;
+    expect(await s.top.resumeHold(id)).toBe('resumed');
+    expect(s.top.holds()).toEqual([]);
+    const entry = s.ledger.snapshot().entries.find((e) => e.id === id)!;
+    expect(entry).toMatchObject({ waived: true });
+    expect(entry.open).toBeDefined();
+    expect(s.log.lines.map((l) => l.msg)).toContain(
+      'an auto top-up hold was waived by the user; its quote is still watched',
+    );
+    // New top-ups into the mint run again (the target still says UNPAID: this one is paid too —
+    // the "topped up twice" the dialog warns of).
+    later(s, TOP_UP_MAX_BACKOFF_MS);
+    expect(await s.top.check(TARGET, 0 as Sats)).not.toBe('unresolved');
+    expect(s.lightning.paid).toHaveLength(2);
+    // The target pays at last: BOTH quotes are minted — the waived one included.
+    gate.pays = true;
+    later(s, TOP_UP_MAX_BACKOFF_MS);
+    await s.top.check(TARGET, 0 as Sats);
+    expect(await s.wallet.balance(TARGET)).toBe(4_000);
+    expect(s.ledger.snapshot().entries.filter((e) => e.open !== undefined)).toEqual([]);
+  });
+
+  it('fails closed: no dialog = never resumed; an unknown id, or a signer switch while the dialog was open, changes nothing', async () => {
+    const none = await held({ noResume: true });
+    const id0 = none.s.top.holds()[0]!.id;
+    expect(await none.s.top.resumeHold(id0)).toBe('unavailable');
+    expect(none.s.top.holds()).toHaveLength(1);
+
+    const { s } = await held();
+    expect(await s.top.resumeHold('0123456789abcdef')).toBe('not-found');
+    const id = s.top.holds()[0]!.id;
+    const paying = s.current;
+    s.resumeAnswer = true;
+    // The dialog answers yes only after another signer took over.
+    const stranger = new walletMod.CashuWallet({
+      mints: s.conns,
+      store: new walletMod.MemoryProofStore(),
+    });
+    const ask = s.resumeAsked.length;
+    const resumed = s.top.resumeHold(id);
+    s.current = stranger;
+    expect(await resumed).toBe('not-found');
+    expect(s.resumeAsked).toHaveLength(ask + 1);
+    s.current = paying;
+    expect(s.top.holds()).toHaveLength(1);
+    expect(s.ledger.snapshot().entries.find((e) => e.id === id)?.waived).toBeUndefined();
+  });
+
+  it('a hold that ends while the dialog is open (the target pays it meanwhile): a yes then changes nothing — not-found, never a waiver on a closed record', async () => {
+    const { s, gate } = await held();
+    const id = s.top.holds()[0]!.id;
+    s.resumeAnswer = async () => {
+      gate.pays = true;
+      later(s, TOP_UP_MAX_BACKOFF_MS);
+      await s.top.check(TARGET, 0 as Sats); // minted and closed while the dialog is up
+      return true;
+    };
+    expect(await s.top.resumeHold(id)).toBe('not-found');
+    expect(await s.wallet.balance(TARGET)).toBe(2_000);
+    expect(s.ledger.snapshot().entries.find((e) => e.id === id)?.open).toBeUndefined();
+  });
+
+  it('the waiver is on disk: it survives a restart, a settle keeps it, and only its owner can waive an open, unminted top-up', async () => {
+    const { s } = await held();
+    const id = s.top.holds()[0]!.id;
+    s.resumeAnswer = true;
+    expect(await s.top.resumeHold(id)).toBe('resumed');
+    const reopened = await TopUpLedger.open(s.dir, s.log, () => s.t);
+    const e = reopened.snapshot().entries.find((x) => x.id === id)!;
+    expect(e).toMatchObject({ waived: true });
+    expect(reopened.hasOpen(OWNER, TARGET)).toBe(false);
+    await reopened.settle(id, { state: 'done' });
+    expect(reopened.snapshot().entries.find((x) => x.id === id)).toMatchObject({ waived: true });
+    const other = 'c'.repeat(64) as NostrPubkey;
+    await expect(reopened.waive(id, other)).rejects.toThrow('no such open top-up');
+    await expect(reopened.waive('0123456789abcdef', OWNER)).rejects.toThrow('no such open top-up');
   });
 });

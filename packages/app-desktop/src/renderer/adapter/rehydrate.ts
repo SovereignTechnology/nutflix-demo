@@ -13,7 +13,7 @@
  * as the same `File` (SE-1: the preload, not the renderer, turns it into a token).
  */
 import type { NetworkAdapter, PlaySession, UploadInput, Wallet } from '@sovit/core';
-import type { RecoveryControls } from '@sovit/ui';
+import type { RecoveryControls, TopUpHoldControls } from '@sovit/ui';
 import type { IpcError } from '../../ipc/errors.js';
 import { INTERNAL_MESSAGE, fromWireError } from '../../ipc/errors.js';
 import { isErrorCode } from '../../ipc/guards.js';
@@ -181,5 +181,18 @@ export function recoveryFromBridge(
     show: () => settle(r.show()),
     restore: () => settle(r.restore()),
     onProgress: (cb) => r.onProgress(rehydrating(cb)),
+  };
+}
+
+/**
+ * R5-R1: the shell's held auto top-ups (`desktop.wallet.topUp.*`) for Settings, errors rebuilt like
+ * the adapter's. Resuming names a ledger entry only; the host asks main's native dialog.
+ */
+export function topUpHoldsFromBridge(
+  t: NutflixBridge['desktop']['wallet']['topUp'],
+): TopUpHoldControls {
+  return {
+    holds: () => settle(t.holds()),
+    resume: (id) => settle(t.resume(id)),
   };
 }

@@ -19,7 +19,7 @@
  *
  * Electron-free: `main.ts` passes the dialog (`dialog.showMessageBox`); the tests pass a fake.
  */
-import type { ConfirmForm } from '../ipc/protocol.js';
+import type { ConfirmForm, TopUpHoldReason } from '../ipc/protocol.js';
 import type { LogEvent } from './log.js';
 import type { ConfirmPrompt } from './money-gate.js';
 
@@ -73,8 +73,31 @@ export function describeHostConfirm(form: ConfirmForm): ConfirmPrompt {
           'Nutflix makes a new 12-word phrase for this device and shows it next: write it down. Your balance is then moved under the new phrase (the mints’ fee is shown first), and the old phrase stops covering new ecash.',
         confirmLabel: 'Replace phrase',
       };
+    case 'topup-resume': {
+      const mint = host(form.target);
+      return {
+        title: 'Auto top-up paused',
+        message: `Resume auto top-ups into ${mint}?`,
+        detail: [
+          `An earlier auto top-up of ${sats(form.amount)} into ${mint} is not finished. ${HOLD_WHY[form.reason]}`,
+          '',
+          'Resuming lets new auto top-ups into this mint run again. The earlier one is not cancelled: Nutflix keeps checking it, and if the mint pays it, the sats are added to your wallet.',
+        ].join('\n'),
+        confirmLabel: 'Resume top-ups',
+      };
+    }
   }
 }
+
+/** R5-R1: why a held top-up is held, in the words of the resume dialog. */
+const HOLD_WHY: Readonly<Record<TopUpHoldReason, string>> = {
+  checking: 'Nutflix has not checked it with the mint since it started.',
+  unreadable:
+    'Its record could not be opened. Your signer may simply be offline right now (a remote signer that is not answering): if so, waiting may clear this by itself.',
+  unreachable: 'The mint could not be asked about it, or no longer knows it.',
+  owed: 'The payment left your other mint, but this mint has not credited it yet. It may still arrive: if you resume, this mint could be topped up twice.',
+  waiting: 'The mints have not settled it yet.',
+};
 
 export interface HostConfirmsDeps {
   /**

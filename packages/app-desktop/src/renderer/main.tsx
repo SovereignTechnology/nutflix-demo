@@ -7,7 +7,11 @@
  */
 import { StrictMode } from 'react';
 import { createRoot } from 'react-dom/client';
-import { adapterFromBridge, recoveryFromBridge } from './adapter/rehydrate.js';
+import {
+  adapterFromBridge,
+  recoveryFromBridge,
+  topUpHoldsFromBridge,
+} from './adapter/rehydrate.js';
 import type { NutflixBridge } from './bridge-types.js';
 import { Shell, type SignerFlow } from './App.js';
 import { createShellModel } from './model.js';
@@ -40,6 +44,7 @@ function boot(root: HTMLElement): void {
         probeFfmpeg={(recheck) => bridge.desktop.ffmpeg({ recheck })}
         signerFlow={signerFlow}
         recovery={recoveryFromBridge(bridge.desktop.wallet.recovery)}
+        topUpHolds={topUpHoldsFromBridge(bridge.desktop.wallet.topUp)}
       />
     </StrictMode>,
   );
