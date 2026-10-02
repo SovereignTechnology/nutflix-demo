@@ -512,14 +512,20 @@ export class MoneyPlane {
     s: { readonly core: CoreKeyHex; readonly blob: HyperblobId; readonly policy: PricePolicy },
     creator?: NostrPubkey,
   ): void {
-    this.sessions.set(sid, {
+    const session: SessionBudget = {
       core: s.core,
       first: s.blob.blockOffset,
       last: s.blob.blockOffset + s.blob.blockLength - 1,
       policy: s.policy,
       budgetBlocks: sessionBudgetBlocks(s.blob),
       paidBlocks: 0,
-    });
+    };
+    this.sessions.set(sid, session);
+    // R2: what a crash of the whole app would leave payable for it (`tails.ts`).
+    if (!this.closed)
+      this.provisionalTail(sid, session).catch(() => {
+        this.o.log.warn('the crash tail of an open session could not be written');
+      });
     if (creator !== undefined) this.rememberCreator(s.policy.creatorP2pk, creator);
   }
 
@@ -760,6 +766,15 @@ export class MoneyPlane {
         s.paidBlocks -= blocks;
         throw hostError('internal', 'the tail authorisation could not be updated');
       }
+    } else {
+      // R2: so do an open session's, from its crash tail (the wallet's journal needs the disk
+      // for this PAY anyway: a write that fails refuses it, nothing spent).
+      try {
+        await this.provisionalTail(a.sid, s);
+      } catch {
+        s.paidBlocks -= blocks;
+        throw hostError('internal', 'the crash tail of the session could not be updated');
+      }
     }
     try {
       // Refused at once (`rate-limited:`, nothing spent) while a melt, a restore, a reissue or a
@@ -805,6 +820,10 @@ export class MoneyPlane {
       // waited for its turn: its book is then closed and writes nothing (fix round 7), so the
       // next plane's book, which owns the file by now, is never overwritten with this one.
       if (tail !== undefined) void this.tails.save().catch(() => undefined);
+      // R2: and to an open session's crash tail — only while it is still open (a closed one's
+      // entry is its ordinary tail now, or gone: never written back as provisional).
+      else if (this.sessions.get(a.sid) === s)
+        void this.provisionalTail(a.sid, s).catch(() => undefined);
       if (err instanceof walletMod.WalletError && err.code === 'insufficient-funds')
         throw hostError('no-balance', 'not enough sats at this mint to keep streaming');
       throw err;
@@ -842,7 +861,22 @@ export class MoneyPlane {
     if (!(this.gate.now() - b.arrived <= limit)) throw new GateRefusal(PAY_TOO_LATE);
   }
 
-  /** Keep `s`'s tail (see `revokeSession`): at most what it had left. */
+  /** R2: `sid`'s crash tail — at most what the open session `s` has left (`tails.ts`). */
+  private provisionalTail(sid: SessionId, s: SessionBudget): Promise<void> {
+    return this.tails.provisional({
+      sid,
+      core: s.core,
+      first: s.first,
+      last: s.last,
+      policy: s.policy,
+      budgetBlocks: s.budgetBlocks - s.paidBlocks,
+    });
+  }
+
+  /**
+   * Keep `s`'s tail (see `revokeSession`): at most what it had left. It replaces the session's
+   * crash tail (R2); nothing left unpaid drops that.
+   */
   private keepTail(sid: SessionId, s: SessionBudget, unpaid: number | null): Promise<void> {
     const left = s.budgetBlocks - s.paidBlocks;
     const want =
@@ -851,7 +885,10 @@ export class MoneyPlane {
         : Number.isSafeInteger(unpaid) && unpaid > 0
           ? Math.min(unpaid, left)
           : 0;
-    if (want < 1) return Promise.resolve();
+    if (want < 1)
+      return this.tails.drop(sid).catch(() => {
+        this.o.log.warn('the crash tail of a closed session could not be removed');
+      });
     return this.tails
       .add({
         sid,

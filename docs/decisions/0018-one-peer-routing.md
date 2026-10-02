@@ -258,7 +258,8 @@ The normative text is in `packages/core/src/contracts/pay-protocol.ts`; the choi
   authorise a closed session's tail. What its previous run left unpaid stays counted at the
   seeder, and the gateway stays under it, until that seeder forgets it (its own restart).
 - **Residuals** (lane record): a report delayed past `REPORT_WAIT_MS` for a seeder left at its
-  window. A full-app crash leaves no tail authorisation, since the task creates them at close or
+  window (closed by v7, below). A full-app crash leaves no tail authorisation (closed 2026-10-02,
+  "Crash tails" below), since the task creates them at close or
   quit, so that tail is respected and not paid. A compromised worker keeps its closed sessions'
   capped budgets as spending authority for 7 days. The gateway has no durable ledger, so it keeps
   the one-block risk after its own crash at a seeder's cap.
@@ -294,3 +295,14 @@ orchestrator's decisions, as built:
   `REPORT_WAIT_MS`" and the gateway's one-block risk after its own crash (R3, R4) are closed toward
   it. A seeder that sends no marker keeps the bounded wait. The desktop's durable word is now a
   hint for those seeders only. Review record: `docs/reviews/2026-10-02-pre-push-pay-v7.md`.
+
+### Crash tails (2026-10-02, Cameron: persist open-session budgets; R2)
+- Every OPEN session also has an entry in the tail book, a provisional tail: what a crash of the
+  whole app would leave payable for it — at most what the session has left, capped at
+  `MAX_TAIL_BLOCKS`. It is written when the session is authorised and lowered on disk before each
+  of its PAYs is built (a write that fails refuses the PAY: nothing spent), exactly as a closed
+  session's tail already was. It is never payable in the run that wrote it; the session's close
+  replaces it with the ordinary tail, or drops it when nothing is unpaid. Found on disk at the
+  next start, it is a crash's: an ordinary tail, expiring `TAIL_TTL_MS` after its last write.
+  The spending authority this adds is the one a clean close already leaves (same caps, same
+  checks); review record `docs/reviews/2026-10-02-pre-push-crash-tails.md`.
