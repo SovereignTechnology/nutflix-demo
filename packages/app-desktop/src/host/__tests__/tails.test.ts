@@ -545,3 +545,125 @@ describe('MoneyPlane: tail authorisations (ADR 0018 amendment)', () => {
     again.close();
   });
 });
+
+describe('R2: an open session’s crash tail (Cameron, 2026-10-02: persist open-session budgets)', () => {
+  it('TailBook: a provisional tail never pays in the run that wrote it; a re-opened book (after a crash) makes it an ordinary tail; drop forgets it', async () => {
+    const dir = await tmp();
+    const log = memoryLogger('info');
+    const book = await TailBook.open({ dir, pubkey: PK, log });
+    await book.provisional(tail({ budgetBlocks: 5 }));
+    await book.provisional(tail({ sid: SID2, budgetBlocks: 5 }));
+    expect(book.get(SID)).toBeUndefined();
+    expect(book.lookup(SID)).toBeUndefined();
+    await book.drop(SID2);
+    // Lowered to nothing: dropped too.
+    const s3 = 'ef'.repeat(16) as SessionId;
+    await book.provisional(tail({ sid: s3, budgetBlocks: 4 }));
+    await book.provisional(tail({ sid: s3, budgetBlocks: 0 }));
+    // The app crashed: a new run reads the file.
+    const again = await TailBook.open({ dir, pubkey: PK, log });
+    expect(again.get(SID)).toMatchObject({ budgetBlocks: 5, paidBlocks: 0 });
+    expect(again.get(SID)?.provisional).toBeUndefined();
+    expect(again.get(SID2)).toBeUndefined();
+    expect(again.get(s3)).toBeUndefined();
+    expect(log.lines.map((l) => l.msg)).toContain('play sessions open at a crash keep their tails');
+  });
+
+  it('a full-app crash with a session open: the next run pays its tail — what it had left, each PAY of the open session having lowered it on disk BEFORE it was built', async () => {
+    const dir = await tmp();
+    const { plane, open } = await planeRig({ dir, fund: 400 });
+    const h = plane.handlers();
+    const whole = sessionBudgetBlocks(BLOB);
+    plane.authorizeSession(SID, { core: CORE, blob: BLOB, policy: POLICY }, CREATOR);
+    await plane.flushTails();
+    const file = join(dir, `${plane.pubkey}.json`);
+    const onDisk = async (): Promise<number | undefined> =>
+      (
+        JSON.parse(await readFile(file, 'utf8')) as {
+          tails: { sid: string; budgetBlocks: number; provisional?: boolean }[];
+        }
+      ).tails.find((t) => t.sid === SID && t.provisional === true)?.budgetBlocks;
+    expect(await onDisk()).toBe(whole);
+    expect(await code(h['pay.build']!(build()))).toBe('resolved'); // 2 blocks, open session
+    expect(await onDisk()).toBe(whole - 2);
+    // The whole app dies here: the plane is never closed, the session never revoked.
+    const after = await open(false);
+    const h2 = after.handlers();
+    let paid = 0;
+    for (;;) {
+      const r = await code(
+        h2['pay.build']!(build({ range: { core: CORE, fromBlock: 10, toBlock: 10 } })),
+      );
+      if (r !== 'resolved') {
+        expect(r).toBe('forbidden');
+        break;
+      }
+      paid++;
+    }
+    expect(paid).toBe(whole - 2);
+    after.close();
+  }, 30_000);
+
+  it('a session closed with nothing unpaid leaves no crash tail: a crash after it pays nothing for it', async () => {
+    const dir = await tmp();
+    const { plane, open } = await planeRig({ dir, fund: 200 });
+    plane.authorizeSession(SID, { core: CORE, blob: BLOB, policy: POLICY }, CREATOR);
+    await plane.revokeSession(SID, 0);
+    await plane.flushTails();
+    const after = await open(false);
+    expect(await code(after.handlers()['pay.build']!(build()))).toBe('session-closed');
+    after.close();
+  });
+
+  it('a PAY of the open session that fails after the session closed gives nothing back to a crash tail: the closed session’s ordinary tail stays payable', async () => {
+    const dir = await tmp();
+    const gate: { hold: boolean; fail: (() => void) | null } = { hold: false, fail: null };
+    const wrap =
+      (inner: RequestFn): RequestFn =>
+      <T>(args: Parameters<RequestFn>[0]): Promise<T> => {
+        const path = `${(args.method ?? 'GET').toUpperCase()} ${new URL(args.endpoint).pathname}`;
+        if (!gate.hold || path !== 'POST /v1/swap') return inner<T>(args);
+        gate.hold = false;
+        return new Promise<T>((_resolve, reject) => {
+          gate.fail = () => {
+            reject(new Error('the mint went away'));
+          };
+        });
+      };
+    const { plane } = await planeRig({ dir, fund: 200, wrap });
+    const h = plane.handlers();
+    plane.authorizeSession(SID, { core: CORE, blob: BLOB, policy: POLICY }, CREATOR);
+    gate.hold = true;
+    const first = code(h['pay.build']!(build()));
+    for (let i = 0; i < 500 && gate.fail === null; i++) await new Promise((r) => setTimeout(r, 2));
+    if (gate.fail === null) throw new Error('the PAY never reached the mint');
+    // The session closes while its PAY is at the mint: an ordinary tail of 3 blocks.
+    await plane.revokeSession(SID, 3);
+    gate.fail();
+    expect(await first).not.toBe('resolved');
+    await plane.flushTails();
+    // Its ordinary tail is still a tail (not turned back into a provisional one): it pays.
+    expect(
+      await code(h['pay.build']!(build({ range: { core: CORE, fromBlock: 10, toBlock: 10 } }))),
+    ).toBe('resolved');
+    plane.close();
+  }, 30_000);
+
+  it('a crash tail that cannot be lowered on disk refuses the open session’s PAY: nothing spent', async () => {
+    const dir = await tmp();
+    const { plane } = await planeRig({ dir, fund: 200 });
+    plane.authorizeSession(SID, { core: CORE, blob: BLOB, policy: POLICY }, CREATOR);
+    await plane.flushTails();
+    const before = await plane.wallet.balance(MINT);
+    // The directory is gone and a file sits in its place: every write fails (even as root).
+    await rm(dir, { recursive: true, force: true });
+    await writeFile(dir, 'not a directory');
+    try {
+      expect(await code(plane.handlers()['pay.build']!(build()))).toBe('internal');
+      expect(await plane.wallet.balance(MINT)).toBe(before);
+    } finally {
+      await rm(dir, { force: true });
+    }
+    plane.close();
+  });
+});

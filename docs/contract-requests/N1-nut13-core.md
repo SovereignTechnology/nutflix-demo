@@ -144,6 +144,13 @@ only names the action). For a startup-restore report, "continue" means `restoreF
 device's own phrase with that `resume`, or `restoreUnpublished()` again. It must not use any other
 phrase.
 
+**Answered 2026-10-02 (Cameron): option 1 — keep 200 batches per call, resumable; no
+checkpoints.** First chosen as option 3, then revised after a design study (status.md inputs 24
+and 32): the first checkpoint would sit at counter ≈ 0 (the one-time reissue runs right after
+setup), it helps only restores that hold the nsec and relays, and it needs a recurring fee-paying
+reissue (or new bookkeeping) in the locked `spend.ts`; `resume` cannot carry it (a resumed mint
+scans only the keysets named). Revisit after release.
+
 **Decision for Cameron.** A hostile mint and an honest long history look the same to a scan from
 counter 0 (both keep returning signed outputs; a hostile mint can sign anything under its own keys,
 DLEQ included, and call it spent). So no rule can bound the first without bounding the second; the

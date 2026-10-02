@@ -23,6 +23,15 @@
  * anything malformed or expired is dropped. It names cores and session ids (viewing history, like
  * the worker's own storage) and no secret; nothing here logs either.
  *
+ * R2 (Cameron, 2026-10-02: persist open-session budgets): an OPEN session also has an entry, a
+ * PROVISIONAL tail — what a crash of the whole app would leave payable for it: at most what the
+ * session has left, capped like any tail. It is written when the session is authorised and lowered
+ * ON DISK before each of its PAYs is built (`MoneyPlane.payBuild`), so a crash can never leave more
+ * authorised than the session had left. It is never payable in the run that wrote it: the open
+ * session pays, and its close replaces it with the ordinary tail (or drops it, nothing unpaid). A
+ * provisional entry found on load is a crash's: it becomes an ordinary tail, expiring
+ * `TAIL_TTL_MS` after its last write.
+ *
  * One book owns the file at a time (fix round 7): each money plane opens its own, and a plane that
  * closes (signed out, locked, another signer, shutdown) `close`s its book — the writes it started
  * still land, and `flush` waits for them; nothing later writes the file. The next plane's book
@@ -36,7 +45,7 @@ import { join } from 'node:path';
 
 import type { CoreKeyHex, NostrPubkey, PricePolicy } from '@sovit/core';
 
-import { int, isCoreKey, isPricePolicy, isSessionId, obj } from '../ipc/guards.js';
+import { int, isCoreKey, isPricePolicy, isSessionId, literal, obj } from '../ipc/guards.js';
 import type { SessionId } from '../ipc/protocol.js';
 import type { Logger } from './log.js';
 import { ensurePrivateDir, readPrivateFile, writePrivateFile } from './signer/private-file.js';
@@ -75,18 +84,23 @@ export interface TailAuth {
   paidBlocks: number;
   /** Wall-clock ms after which it pays nothing. */
   readonly expiresAt: number;
+  /** R2: an open session's crash tail, written by this run (never payable while so). */
+  readonly provisional?: true;
 }
 
-const isEntry = obj({
-  sid: isSessionId,
-  core: isCoreKey,
-  first: int(0, Number.MAX_SAFE_INTEGER),
-  last: int(0, Number.MAX_SAFE_INTEGER),
-  policy: isPricePolicy,
-  budgetBlocks: int(1, MAX_TAIL_BLOCKS),
-  paidBlocks: int(0, Number.MAX_SAFE_INTEGER),
-  expiresAt: int(0, Number.MAX_SAFE_INTEGER),
-});
+const isEntry = obj(
+  {
+    sid: isSessionId,
+    core: isCoreKey,
+    first: int(0, Number.MAX_SAFE_INTEGER),
+    last: int(0, Number.MAX_SAFE_INTEGER),
+    policy: isPricePolicy,
+    budgetBlocks: int(1, MAX_TAIL_BLOCKS),
+    paidBlocks: int(0, Number.MAX_SAFE_INTEGER),
+    expiresAt: int(0, Number.MAX_SAFE_INTEGER),
+  },
+  { provisional: literal(true) },
+);
 
 export interface TailBookOptions {
   /** The directory (`<userData>/tails`); `null` keeps the book in memory (tests). */
@@ -135,7 +149,8 @@ export class TailBook {
   /** Like `get`, but says `'expired'` for one that just expired (dropped now). */
   lookup(sid: string): TailAuth | 'expired' | undefined {
     const t = this.tails.get(sid);
-    if (t === undefined) return undefined;
+    // R2: an open session's provisional tail pays nothing as a tail (the session itself pays).
+    if (t === undefined || t.provisional === true) return undefined;
     if (this.now() >= t.expiresAt) {
       this.tails.delete(sid);
       void this.save().catch(() => undefined);
@@ -156,6 +171,33 @@ export class TailBook {
       expiresAt: this.now() + TAIL_TTL_MS,
     });
     this.prune();
+    return this.save();
+  }
+
+  /**
+   * R2: set an OPEN session's provisional tail to `budgetBlocks` (what it has left; capped at
+   * `MAX_TAIL_BLOCKS`; below 1, it is dropped) and persist it, replacing any earlier entry of the
+   * session. Rejects when the write fails, and at once once the book is closed.
+   */
+  provisional(t: Omit<TailAuth, 'paidBlocks' | 'expiresAt' | 'provisional'>): Promise<void> {
+    if (this.closed) return Promise.reject(closedError());
+    if (!isSessionId(t.sid)) return Promise.resolve();
+    if (!(t.budgetBlocks >= 1)) return this.drop(t.sid);
+    this.tails.set(t.sid, {
+      ...t,
+      budgetBlocks: Math.min(MAX_TAIL_BLOCKS, Math.floor(t.budgetBlocks)),
+      paidBlocks: 0,
+      expiresAt: this.now() + TAIL_TTL_MS,
+      provisional: true,
+    });
+    this.prune();
+    return this.save();
+  }
+
+  /** R2: forget `sid`'s entry (its session closed leaving nothing unpaid), persisted. */
+  drop(sid: string): Promise<void> {
+    if (this.closed) return Promise.reject(closedError());
+    if (!this.tails.delete(sid)) return Promise.resolve();
     return this.save();
   }
 
@@ -234,16 +276,21 @@ export class TailBook {
     }
     const now = this.now();
     let dropped = 0;
+    let crashed = 0;
     for (const e of doc.tails as unknown[]) {
       if (!isEntry(e) || e.last < e.first || e.expiresAt > now + TAIL_TTL_MS + 60_000) {
         dropped++;
         continue;
       }
       if (now >= e.expiresAt || e.paidBlocks > e.budgetBlocks) continue;
-      this.tails.set(e.sid, { ...e });
+      // R2: a provisional entry on disk is a crash's — its session never closed: a tail now.
+      const { provisional, ...tail } = e;
+      if (provisional === true) crashed++;
+      this.tails.set(e.sid, tail);
     }
     this.prune();
     if (dropped > 0) this.log.warn('malformed tail authorisations dropped', { dropped });
+    if (crashed > 0) this.log.info('play sessions open at a crash keep their tails', { crashed });
   }
 }
 
