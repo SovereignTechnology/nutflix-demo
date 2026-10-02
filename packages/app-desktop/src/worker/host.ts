@@ -447,6 +447,7 @@ export class WorkerHost {
       ownMints: providers.viewerMints,
       credit,
       logger: log,
+      clock: runtime.monotonicNow,
       policyFor: (core) => this.corePolicies.get(core) ?? null,
       boundRange: (range) => boundToSessions(range, this.sessions.values()),
       onPaid: (e) => {

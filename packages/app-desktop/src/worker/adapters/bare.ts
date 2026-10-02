@@ -8,6 +8,7 @@
 import type { FsAdapter } from '@sovit/core';
 import type { FileStat, SeederFs } from '@sovit/seeder';
 import fs from 'bare-fs';
+import hrtime from 'bare-hrtime';
 import os from 'bare-os';
 import path from 'bare-path';
 import { spawn } from 'bare-subprocess';
@@ -225,6 +226,8 @@ export function bareRuntime(): WorkerRuntime {
     env: (name) => os.getEnv(name),
     isExecutable,
     os: osName(),
+    // Whole microseconds before Number(): exact for centuries of uptime.
+    monotonicNow: () => Number(hrtime.bigint() / 1000n) / 1000,
     ...(dleqThread === undefined ? {} : { dleqThread }),
   };
 }

@@ -663,6 +663,45 @@ describe('ViewerPayer: a PAY the host refuses for now (ADR 0012 amendment, lane 
       vi.useRealTimers();
     }
   });
+
+  // RR-1: the worker passes its runtime's monotonic clock (bare-hrtime under Bare, which has no
+  // `performance`). Here the injected clock stands still while the timers (and `performance`)
+  // run on: a failure lasting a fake minute is still not given up — the payer read OUR clock.
+  it('RR-1: the give-up reads the injected clock, not performance.now()', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'performance'] });
+    try {
+      const run = async (clock: (() => number) | undefined) => {
+        const credit = new CreditPool(2);
+        const payer = new ViewerPayer({
+          pay: () => Promise.reject(fromWireError(wireError('no-balance', 'refused'))),
+          ownMints: [mocks.MINTS.a],
+          credit,
+          logger: silentLogger,
+          policyFor: () => policy,
+          ...(clock === undefined ? {} : { clock }),
+        });
+        const core = fakeCore(1);
+        payer.attachCore(core);
+        const proto = new FakeProto();
+        payer.attachPeer(NOISE, proto);
+        proto.hello();
+        credit.tryAcquire(toHex(core.key), 0);
+        core.emit('download', 0, 65_536, { remotePublicKey: peerKey });
+        await settle();
+        await vi.advanceTimersByTimeAsync(2 * PAY_GIVE_UP_MS);
+        await settle();
+        const stats = payer.stats();
+        payer.close();
+        return stats;
+      };
+      // The default clock (performance.now, faked) moves: given up, as before.
+      expect(await run(undefined)).toMatchObject({ unpayableBlocks: 1, owed: 0 });
+      // A clock that stands still: still owed, still retried.
+      expect(await run(() => 1_000)).toMatchObject({ unpayableBlocks: 0, owed: 1 });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });
 
 // Fix round 5 (the verifier of fix round 4, MEDIUM): `drain` waited until NOTHING of the core was

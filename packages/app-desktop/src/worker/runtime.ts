@@ -50,6 +50,12 @@ export interface WorkerRuntime {
   readonly os: OsName;
   readonly stateFs: StateFs;
   /**
+   * RR-1: a monotonic clock in ms for the payer's streaks, backoffs and give-up. Bare has no
+   * `performance`, so without this the payer fell back to a steadied wall clock, where a forward
+   * step of the system clock still counted toward a give-up.
+   */
+  readonly monotonicNow: () => number;
+  /**
    * Start the DLEQ thread (issue #8 d: F5's checks off this event loop). Bare's is `Bare.Thread`
    * (`adapters/bare.ts`); absent, the checks run inline in small chunks.
    */

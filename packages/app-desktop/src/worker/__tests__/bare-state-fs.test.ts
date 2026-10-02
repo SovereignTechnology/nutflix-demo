@@ -49,6 +49,7 @@ vi.mock('bare-fs', () => ({
 }));
 vi.mock('bare-path', () => ({ default: posix }));
 vi.mock('bare-os', () => ({ default: {} }));
+vi.mock('bare-hrtime', () => ({ default: { bigint: () => 0n } }));
 vi.mock('bare-subprocess', () => ({ spawn: () => undefined }));
 
 const { bareStateFs } = await import('../adapters/bare.js');
