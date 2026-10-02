@@ -221,9 +221,21 @@ describe('quit on the signer flow’s money plane waits for its tail authorisati
     const played = await invoke(rr, 'play', [seeded!.video.id]);
     expect(played.ok).toBe(true);
     const tailFile = join(rr.userData, TAIL_DIR, `${pubkey}.json`);
-    expect(existsSync(tailFile)).toBe(false);
+    // R2: while it plays, the session has only its crash tail (provisional) on disk — no tail.
+    await eventually(() => existsSync(tailFile), 'the crash tail written');
+    expect((await rawTails(tailFile)).every((t) => t.provisional === true)).toBe(true);
     return { rr, pubkey, tailFile };
   }
+
+  /** The tail file as written (`TailBook.open` would turn a provisional entry into a tail). */
+  const rawTails = async (tailFile: string) =>
+    existsSync(tailFile)
+      ? (
+          JSON.parse(await readFile(tailFile, 'utf8')) as {
+            tails: { sid: string; provisional?: true }[];
+          }
+        ).tails
+      : [];
 
   /** The tails on disk (read on the rig's clock: the host's tails expire on it). */
   const bookOf = async (tailFile: string, pubkey: NostrPubkey) => {
@@ -247,6 +259,10 @@ describe('quit on the signer flow’s money plane waits for its tail authorisati
     await rr.host.shutdown(5000);
     // Checked synchronously: a write still in flight has not renamed its file into place yet.
     expect(existsSync(tailFile)).toBe(true);
+    // The quit's tail replaced the crash tail (R2): an ordinary one.
+    expect(
+      (await rawTails(tailFile)).find((t) => t.sid === session!.sid)?.provisional,
+    ).toBeUndefined();
     const book = await bookOf(tailFile, pubkey);
     expect(book.size()).toBe(1);
     expect(book.get(session!.sid)).toMatchObject({ budgetBlocks: 2, paidBlocks: 0 });
@@ -260,6 +276,9 @@ describe('quit on the signer flow’s money plane waits for its tail authorisati
     const [session] = rr.host.adapter.sessions.all();
     await rr.host.shutdown(50);
     expect(existsSync(tailFile)).toBe(true);
+    expect(
+      (await rawTails(tailFile)).find((t) => t.sid === session!.sid)?.provisional,
+    ).toBeUndefined();
     const book = await bookOf(tailFile, pubkey);
     expect(book.get(session!.sid)?.budgetBlocks).toBeGreaterThan(0);
     expect(book.get(session!.sid)?.budgetBlocks).toBeLessThanOrEqual(MAX_TAIL_BLOCKS);
