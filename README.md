@@ -73,7 +73,9 @@ CI runs on GitHub Actions ([`.github/workflows/ci.yml`](.github/workflows/ci.yml
 supply-chain gates (lockfile drift, registry-only resolutions, `npm audit signatures`,
 advisories), lint, typecheck, the audit-surface and contracts-version checks, the native-module
 inventory, the Electron security lint, the test suite, the Electron e2e (Chromium's sandbox on,
-under xvfb) and the packaging stage gates. [`ci/gitlab-ci.yml`](ci/gitlab-ci.yml) mirrors the
+under xvfb) and the packaging stage gates. A fuzz campaign over the pay/1 codec and the payment
+parsers runs on demand ([`.github/workflows/fuzz.yml`](.github/workflows/fuzz.yml), Actions tab →
+fuzz → Run workflow; its targets also run briefly in every CI run). [`ci/gitlab-ci.yml`](ci/gitlab-ci.yml) mirrors the
 same gates for a GitLab runner.
 
 `npm run ci` = lint → typecheck/build → test → locked-dir check → native-module inventory

@@ -624,3 +624,93 @@ describe.skipIf(codec === undefined)(
     });
   },
 );
+
+describe.skipIf(codec === undefined)(
+  'pay/1 strings are strict UTF-8 (F58, found by the fuzz campaign)',
+  () => {
+    const k = (): PayProtocolCodec => codec!;
+    const owedish = (mint: string): PayProtocolMessage =>
+      ({
+        type: 'HELLO',
+        version: 1,
+        pubkey: 'ab'.repeat(32),
+        challenge: 'pay/1:x',
+        createdAt: 1_757_000_000,
+        signature: 'cd'.repeat(64),
+        acceptedMints: [mint],
+        satsPerBlock: 1,
+        split: { seeder: 50, creator: 50 },
+        p2pk: `02${'ef'.repeat(32)}`,
+        windowBlocks: 4,
+      }) as unknown as PayProtocolMessage;
+
+    it('non-ASCII text round-trips (ü, an emoji)', () => {
+      for (const mint of ['https://mint.example/ü', 'https://mint.example/🥜']) {
+        const m = owedish(mint);
+        expect(k().decode(k().encode(m))).toEqual(m);
+      }
+    });
+
+    it('a frame whose string bytes are not UTF-8 is refused (two frames never read as one message)', () => {
+      const bytes = k().encode(owedish('https://mint.example/ü'));
+      const at = bytes.findIndex((b, i) => b === 0xc3 && bytes[i + 1] === 0xbc);
+      expect(at).toBeGreaterThan(0);
+      for (const bad of [
+        [0xc3, 0x28], // a lead byte without its continuation
+        [0xff, 0xfe], // never valid
+        [0xb0, 0x75], // a continuation byte alone (the fuzzer's case)
+      ]) {
+        const b = Uint8Array.from(bytes);
+        b[at] = bad[0]!;
+        b[at + 1] = bad[1]!;
+        expect(k().decode(b)).toBeNull();
+      }
+    });
+
+    it('encode refuses a string with a lone surrogate (TextEncoder would write U+FFFD, not it)', () => {
+      expect(() => k().encode(owedish('https://mint.example/\uD800'))).toThrow();
+      expect(() => k().encode(owedish('https://mint.example/\uDC00x'))).toThrow();
+    });
+  },
+);
+
+describe.skipIf(codec === undefined)(
+  'pay/1 uints are minimal (F58, found by the fuzz campaign)',
+  () => {
+    const k = (): PayProtocolCodec => codec!;
+    const CORE32 = new Uint8Array(32).fill(0xab);
+    /** PRICE: tag 4, core, satsPerBlock, effectiveFromBlock — the uints as raw byte runs. */
+    const price = (sats: number[], from: number[]): Uint8Array =>
+      Uint8Array.from([4, ...CORE32, ...sats, ...from]);
+
+    it('the minimal form decodes; 0 written in 3, 5 or 9 bytes does not', () => {
+      expect(k().decode(price([0], [3]))).toMatchObject({ type: 'PRICE', satsPerBlock: 0 });
+      expect(k().decode(price([0xfd, 0, 0], [3]))).toBeNull(); // the fuzzer's case
+      expect(k().decode(price([0xfe, 0, 0, 0, 0], [3]))).toBeNull();
+      expect(k().decode(price([0], [0xfd, 3, 0]))).toBeNull();
+      expect(k().decode(price([0xfd, 0xfc, 0], [0]))).toBeNull(); // 252 fits in one byte
+      expect(k().decode(price([0xfd, 0xfd, 0], [0]))).toMatchObject({ satsPerBlock: 253 });
+    });
+
+    it('a string length written non-minimally is refused too', () => {
+      const m = k().encode({
+        type: 'HELLO',
+        version: 1,
+        pubkey: 'ab'.repeat(32),
+        challenge: 'pay/1:x',
+        createdAt: 1_757_000_000,
+        signature: 'cd'.repeat(64),
+        acceptedMints: [],
+        satsPerBlock: 1,
+        split: { seeder: 50, creator: 50 },
+        p2pk: `02${'ef'.repeat(32)}`,
+        windowBlocks: 4,
+      } as unknown as PayProtocolMessage);
+      // tag 1, version 1 (one byte), then pubkey's length 64 (one byte): widen it to 0xfd 64 0.
+      expect(Array.from(m.slice(0, 3))).toEqual([1, 1, 64]);
+      const wide = Uint8Array.from([1, 1, 0xfd, 64, 0, ...m.slice(3)]);
+      expect(k().decode(m)).not.toBeNull();
+      expect(k().decode(wide)).toBeNull();
+    });
+  },
+);
