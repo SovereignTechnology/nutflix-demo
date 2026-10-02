@@ -23,6 +23,8 @@ export type LogEvent =
   | 'app.debug-switch-refused'
   // Cross-lane review (round 4): and the process-wrapper / V8 / isolation switches.
   | 'app.process-switch-refused'
+  // ADR 0017 open question 11: a feature named outside the allow-list (packaged builds).
+  | 'app.feature-switch-refused'
   | 'app.squirrel-event'
   | 'app.squirrel-update-failed'
   | 'window.created'

@@ -18,6 +18,8 @@ import {
   allowPermissionRequest,
   hardenWebContents,
   installSessionPolicy,
+  PACKAGED_ALLOWED_FEATURES,
+  packagedRefusedFeature,
   packagedRefusedSwitch,
   remoteDebuggingSwitch,
   sandboxBypassSwitch,
@@ -351,5 +353,80 @@ describe('no DevTools protocol in a packaged build (issue #6, independent review
     for (const s of REMOTE_DEBUGGING_SWITCHES)
       expect(remoteDebuggingSwitch({ hasSwitch: (n) => n === s })).toBe(s);
     expect(remoteDebuggingSwitch({ hasSwitch: () => false })).toBeUndefined();
+  });
+});
+
+describe('feature lists in a packaged build: the allow-list only (ADR 0017 open question 11)', () => {
+  /** A fake `app.commandLine`: the value Chromium reports for each switch present. */
+  const cl = (v: Record<string, string> = {}) => ({
+    hasSwitch: (n: string) => n in v,
+    getSwitchValue: (n: string) => v[n] ?? '',
+  });
+
+  it('allows exactly the Wayland features, on either switch, with or without spaces', () => {
+    expect([...PACKAGED_ALLOWED_FEATURES]).toEqual([
+      'UseOzonePlatform',
+      'WaylandWindowDecorations',
+    ]);
+    const wayland = 'UseOzonePlatform,WaylandWindowDecorations';
+    expect(packagedRefusedFeature(cl({ 'enable-features': wayland }), [])).toBeUndefined();
+    expect(
+      packagedRefusedFeature(cl(), [
+        `--enable-features=${wayland}`,
+        '--disable-features=UseOzonePlatform',
+      ]),
+    ).toBeUndefined();
+    expect(
+      packagedRefusedFeature(cl(), [
+        '--enable-features= UseOzonePlatform , WaylandWindowDecorations',
+      ]),
+    ).toBeUndefined();
+    expect(
+      packagedRefusedFeature(cl(), ['--ozone-platform=wayland', 'some-file.mp4']),
+    ).toBeUndefined();
+  });
+
+  it.each([
+    [
+      'a sandbox layer turned off',
+      ['--disable-features=NetworkServiceSandbox'],
+      'NetworkServiceSandbox',
+    ],
+    [
+      'the network service in process',
+      ['--enable-features=NetworkServiceInProcess'],
+      'NetworkServiceInProcess',
+    ],
+    ['one bad name among good ones', ['--enable-features=UseOzonePlatform,Evil'], 'Evil'],
+    [
+      'a field-trial suffix',
+      ['--enable-features=UseOzonePlatform<Trial'],
+      'UseOzonePlatform<Trial',
+    ],
+    ['field-trial params', ['--enable-features=UseOzonePlatform:p/1'], 'UseOzonePlatform:p/1'],
+    ['a default override', ['--enable-features=*UseOzonePlatform'], '*UseOzonePlatform'],
+    ['another case', ['--enable-features=useozoneplatform'], 'useozoneplatform'],
+    ['an empty list', ['--enable-features='], '(empty)'],
+    ['no value at all', ['--disable-features'], '(empty)'],
+    ['an empty entry', ['--enable-features=UseOzonePlatform,,WaylandWindowDecorations'], '(empty)'],
+    ['one dash', ['-disable-features=NetworkServiceSandbox'], 'NetworkServiceSandbox'],
+    ['a Windows slash', ['/disable-features=NetworkServiceSandbox'], 'NetworkServiceSandbox'],
+    ['an upper-case switch', ['--DISABLE-FEATURES=NetworkServiceSandbox'], 'NetworkServiceSandbox'],
+  ])('refuses %s', (_why, argv, refused) => {
+    expect(packagedRefusedFeature(cl(), argv)).toBe(refused);
+  });
+
+  it('a repeated switch: every occurrence is read, whichever one Chromium keeps', () => {
+    // The last occurrence is clean, the first is not: refused.
+    expect(
+      packagedRefusedFeature(cl({ 'enable-features': 'UseOzonePlatform' }), [
+        '--enable-features=NetworkServiceInProcess',
+        '--enable-features=UseOzonePlatform',
+      ]),
+    ).toBe('NetworkServiceInProcess');
+    // What Chromium reports is read too, even with nothing matching in argv.
+    expect(packagedRefusedFeature(cl({ 'disable-features': 'NetworkServiceSandbox' }), [])).toBe(
+      'NetworkServiceSandbox',
+    );
   });
 });

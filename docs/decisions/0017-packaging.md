@@ -564,3 +564,18 @@ lane's allowlist. Enabling it takes one `include:` line, proposed in `docs/lanes
     feature names is specific to each Chromium version and cannot be checked here without
     launching Electron. Refuse named features (which list?), refuse the switches outright, or
     leave them?
+
+    **Answered 2026-10-02 (Cameron): an allow-list.** A packaged build accepts the two switches
+    only when every feature they name is in `PACKAGED_ALLOWED_FEATURES` (`src/main/security.ts`:
+    `UseOzonePlatform`, `WaylandWindowDecorations`); anything else is refused in main (exit 78,
+    `app.feature-switch-refused`), after the process switches. Fails closed: each comma-separated
+    entry must be exactly an allowed name (a field-trial suffix, a `*` override or an empty entry
+    is refused), and every occurrence in argv is read as well as the value Chromium reports, so a
+    repeated switch cannot slip a name past. A dev build keeps them all. The list is reviewed with
+    each Electron bump; a Wayland user who needs another feature asks for it to be added.
+12. **Other ways to switch a Chromium feature** (raised with question 11's answer, 2026-10-02).
+    Not covered by the allow-list: `--enable-blink-features` / `--disable-blink-features` (web
+    platform features, not process or sandbox layers) and `--force-fieldtrials` /
+    `--force-fieldtrial-params` (whether a forced trial can turn a feature on in a packaged
+    Electron build without `--enable-features` was not checked here: no Electron is launched).
+    Refuse them in a packaged build as well, or leave them?

@@ -64,6 +64,7 @@ import { ExternalLinks } from './external-links.js';
 import {
   hardenWebContents,
   installSessionPolicy,
+  packagedRefusedFeature,
   packagedRefusedSwitch,
   remoteDebuggingSwitch,
   sandboxBypassSwitch,
@@ -127,6 +128,16 @@ if (app.isPackaged && packagedRefusedSwitch(app.commandLine) !== undefined) {
   log('error', 'app.process-switch-refused');
   app.exit(78);
   throw new Error('process-wrapper and engine switches are refused in a packaged build');
+}
+// ADR 0017 open question 11 (Cameron, 2026-10-02): feature lists only from the allow-list
+// (security.ts PACKAGED_ALLOWED_FEATURES: the Wayland ones). The dev build keeps them all.
+if (
+  app.isPackaged &&
+  packagedRefusedFeature(app.commandLine, process.argv.slice(1)) !== undefined
+) {
+  log('error', 'app.feature-switch-refused');
+  app.exit(78);
+  throw new Error('a Chromium feature outside the allow-list is refused in a packaged build');
 }
 app.enableSandbox();
 if (opts.userDataDir !== undefined) app.setPath('userData', opts.userDataDir);

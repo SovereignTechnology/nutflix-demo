@@ -184,7 +184,8 @@ export function remoteDebuggingSwitch(commandLine: {
  *
  * Left out on purpose: debug pauses (`*-startup-dialog`, `wait-for-debugger*`) pause a process
  * and widen nothing; `--enable-features`/`--disable-features` carry a list, and refusing them
- * outright breaks Wayland users (ADR 0017, open question 11).
+ * outright breaks Wayland users: they are checked name by name instead (below, ADR 0017 open
+ * question 11).
  */
 export const PACKAGED_REFUSED_SWITCHES = [
   'renderer-cmd-prefix', // a program around every renderer
@@ -201,4 +202,46 @@ export function packagedRefusedSwitch(commandLine: {
   hasSwitch(name: string): boolean;
 }): string | undefined {
   return PACKAGED_REFUSED_SWITCHES.find((s) => commandLine.hasSwitch(s));
+}
+
+/**
+ * ADR 0017 open question 11 (Cameron, 2026-10-02: an allow-list). Some Chromium features are
+ * sandbox layers (the network service's sandbox, for one), so `--enable-features=…` or
+ * `--disable-features=…` on an edited `.desktop` line could weaken a packaged build, while
+ * Wayland users need `--enable-features=UseOzonePlatform,WaylandWindowDecorations`. A PACKAGED
+ * build accepts the two switches only when every feature they name is one of these; anything
+ * else refuses the launch (exit 78). A dev build keeps them all.
+ */
+export const PACKAGED_ALLOWED_FEATURES = ['UseOzonePlatform', 'WaylandWindowDecorations'] as const;
+
+export const FEATURE_LIST_SWITCHES = ['enable-features', 'disable-features'] as const;
+
+/** One switch as it may appear in argv: `--name=value`, `-name=value`, `/name=value` (Windows). */
+const FEATURE_ARG = /^(?:--?|\/)(enable-features|disable-features)(?:=([\s\S]*))?$/i;
+
+/**
+ * The first feature entry a packaged build refuses, or `undefined`. Fails closed: each
+ * comma-separated entry must be exactly an allowed name, so a field-trial suffix
+ * (`Feature<Trial:param/value`), a `*` default override, an empty name, or any other spelling is
+ * refused. Every occurrence in argv is read, as well as the value Chromium reports, so a repeated
+ * switch cannot slip a name past whichever occurrence wins.
+ */
+export function packagedRefusedFeature(
+  commandLine: { hasSwitch(name: string): boolean; getSwitchValue(name: string): string },
+  argv: readonly string[],
+): string | undefined {
+  const values: string[] = [];
+  for (const sw of FEATURE_LIST_SWITCHES)
+    if (commandLine.hasSwitch(sw)) values.push(commandLine.getSwitchValue(sw));
+  for (const a of argv) {
+    const m = FEATURE_ARG.exec(a);
+    if (m !== null) values.push(m[2] ?? '');
+  }
+  const allowed: readonly string[] = PACKAGED_ALLOWED_FEATURES;
+  for (const v of values)
+    for (const entry of v.split(',')) {
+      const name = entry.trim();
+      if (!allowed.includes(name)) return name === '' ? '(empty)' : name;
+    }
+  return undefined;
 }
