@@ -537,6 +537,7 @@ Asked one by one, multiple choice; these supersede the open questions above.
 | 40 | AppImage on Ubuntu ≥ 24.04 (ADR 0017 Q4, 2026-10-02) | **Marked "not for Ubuntu ≥ 24.04"**; those users get the `.deb` |
 | 41 | Unpacked-file digests (ADR 0017 Q5, revised 2026-10-03) | **Deferred until OS code signing**: unsigned, the list in `app.asar` is no harder to rewrite than the files it covers, so the check would only catch corruption (0.2–0.5 s per launch) |
 | 42 | AppImage runtime pin (ADR 0017 Q7, 2026-10-02) | **Checked**: the `20251108` downloads hash to the pinned digests; the `.sig` files were not checked |
+| 43 | Blink-feature and field-trial switches (ADR 0017 Q12, 2026-10-03) | **Refused in a packaged build** (exit 78, like the other process switches); a dev build keeps them |
 
 Owed from Stage 2 (ADR 0010 Consequences, `docs/security-review.md` §0 and §6). The F1–F4 and
 F30 blockers were fixed on `stage-2/review-fixes` (2026-09-24); F6 verified on two real mints

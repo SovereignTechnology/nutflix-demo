@@ -196,6 +196,12 @@ export const PACKAGED_REFUSED_SWITCHES = [
   'js-flags', // V8 flags for main's isolate and every renderer's
   'disable-site-isolation-trials', // the prompt and app windows could share a renderer process
   'disable-web-security', // Chromium's same-origin-policy switch
+  // ADR 0017 Q12 (Cameron, 2026-10-03): the other ways to switch Chromium features, refused
+  // outright (no packaged user needs them; ask, and an allow-list follows, as for Q11).
+  'enable-blink-features', // web-platform features on…
+  'disable-blink-features', // … or off
+  'force-fieldtrials', // a forced field trial can turn a feature on without --enable-features
+  'force-fieldtrial-params', // … and set its parameters
 ] as const;
 
 export function packagedRefusedSwitch(commandLine: {
