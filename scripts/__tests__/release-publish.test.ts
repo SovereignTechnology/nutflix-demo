@@ -9,7 +9,6 @@
  */
 import { writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { signer as coreSigner } from '@sovit/core';
 import { finalizeEvent, generateSecretKey, getPublicKey } from 'nostr-tools/pure';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { WebSocketServer } from 'ws';
@@ -54,6 +53,17 @@ interface ManifestLib {
     o: { version: string; commit?: string; createdAt: number },
   ): Promise<{ event: Ev; manifest: { artifacts: Artifact[] } }>;
 }
+
+/**
+ * @sovit/core's NIP-46 adapter, loaded by name: CI lints before it builds, so core's types
+ * (dist/*.d.ts) may not exist when this file is type-checked. Only `adopt` is used.
+ */
+interface CoreSigner {
+  Nip46Signer: { adopt(b: Bunker, relays: readonly string[]): Promise<unknown> };
+}
+const CORE = '@sovit/core';
+const coreSigner = async (): Promise<CoreSigner> =>
+  ((await import(/* @vite-ignore */ CORE)) as { signer: CoreSigner }).signer;
 
 const lib = async <T>(file: string): Promise<T> =>
   (await import(/* @vite-ignore */ join(scriptsDir, file))) as T;
@@ -100,7 +110,7 @@ function opts(over: Record<string, unknown> = {}): Record<string, unknown> {
       calls.push(`connect:${uri === URI ? 'uri' : 'other'}`);
       return Promise.resolve({ bunker: bunker(), relays: ['wss://bunker.example'] });
     },
-    adopt: (b: Bunker, relays: string[]) => coreSigner.Nip46Signer.adopt(b, relays),
+    adopt: async (b: Bunker, relays: string[]) => (await coreSigner()).Nip46Signer.adopt(b, relays),
     confirm: () => {
       calls.push('confirm');
       return Promise.resolve(true);
