@@ -80,6 +80,22 @@ export default tseslint.config(
     ...tseslint.configs.disableTypeChecked,
   },
   {
+    // The e2e preload (`-r`, packages/app-desktop/e2e/hold-ready.cjs): plain CommonJS that the
+    // Electron main process loads before the app, so no TS project and no type-aware rules.
+    files: ['packages/app-desktop/e2e/**/*.cjs'],
+    ...tseslint.configs.disableTypeChecked,
+    languageOptions: {
+      ...tseslint.configs.disableTypeChecked.languageOptions,
+      sourceType: 'commonjs',
+      globals: { require: 'readonly' },
+    },
+    // `-r` loads CommonJS: `require('electron')` is the only way in.
+    rules: {
+      ...tseslint.configs.disableTypeChecked.rules,
+      '@typescript-eslint/no-require-imports': 'off',
+    },
+  },
+  {
     // Zero-dependency Node CLIs in scripts/ (lane L9): plain ESM with JSDoc, no TS
     // annotations to require, and Node's Buffer global.
     files: ['scripts/**/*.{js,mjs}'],

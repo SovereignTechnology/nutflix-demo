@@ -18,6 +18,9 @@ import { _electron, type ElectronApplication, type Page } from 'playwright-core'
 export const E2E = process.env['NUTFLIX_E2E'] === '1';
 export const PKG = dirname(dirname(fileURLToPath(import.meta.url)));
 
+/** Holds main's `ready` until Playwright has attached (see the file: a launch race). */
+const HOLD_READY = join(PKG, 'e2e', 'hold-ready.cjs');
+
 /** The Electron binary `node node_modules/electron/install.js` extracted. */
 export function electronBinary(): string {
   const req = createRequire(import.meta.url);
@@ -305,8 +308,8 @@ const CALL_LOG_LINES = 60;
 /**
  * A launch failure, readable in a CI log: the error's first line, plus the tail of Playwright's
  * "Call log". That log holds Electron's own stdout/stderr (`[pid=…][err] …`, main's lines
- * already redacted by its logger), which is what says WHY a launch hung (an intermittent 30 s
- * `electron.launch` timeout on the CI runner: main run 12, SovereignTechnology/nutflix-demo#7).
+ * already redacted by its logger): what says WHY a launch failed. It is how the intermittent 30 s
+ * `electron.launch` timeout was traced to an attach race (fixed by `hold-ready.cjs`).
  */
 export function launchFailure(e: unknown): string {
   if (!(e instanceof Error)) return String(e);
@@ -347,7 +350,7 @@ export async function launch(
     try {
       app = await _electron.launch({
         executablePath: binary,
-        args: [...d.switches, script, ...args],
+        args: ['-r', HOLD_READY, ...d.switches, script, ...args],
         env: { ...(process.env as Record<string, string>), ...d.env, ...env },
         chromiumSandbox: true,
         timeout: 30_000,
