@@ -174,7 +174,10 @@ export class MakerAppImage extends MakerBase<MakerAppImageConfig> {
       copyFileSync(c.icon, join(appDir, `${c.executableName}.png`));
       symlinkSync(`${c.executableName}.png`, join(appDir, '.DirIcon'));
     }
-    await run('mksquashfs', mksquashfsArgs(appDir, image, process.env['SOURCE_DATE_EPOCH']));
+    // The times go as flags only: mksquashfs >= 4.6 also reads SOURCE_DATE_EPOCH and refuses it
+    // together with -mkfs-time/-all-time; older ones ignore it. Same image either way.
+    const { SOURCE_DATE_EPOCH: epoch, ...env } = process.env;
+    await run('mksquashfs', mksquashfsArgs(appDir, image, epoch), { env });
     writeFileSync(outFile, Buffer.concat([runtime, readFileSync(image)]));
     chmodSync(outFile, 0o755);
     rmSync(appDir, { recursive: true, force: true });

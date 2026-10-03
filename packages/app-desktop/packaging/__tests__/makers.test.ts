@@ -19,7 +19,7 @@ import {
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { MakerOptions } from '@electron-forge/maker-base';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import {
   APPIMAGE_RUNTIMES,
@@ -106,45 +106,82 @@ describe('desktopEntry / mksquashfsArgs', () => {
   });
 });
 
+/** A packaged-app fixture made into an AppImage with a fixture runtime (real mksquashfs). */
+async function makeFixtureAppImage(): Promise<{ out: string; runtime: Buffer; makeDir: string }> {
+  const runtime = Buffer.from('#fixture-runtime#'.repeat(64));
+  writeFileSync(join(root, 'rt'), runtime);
+  const app = join(root, 'Nutflix-linux-x64');
+  mkdirSync(join(app, 'resources', 'app.asar.unpacked', 'worker'), { recursive: true });
+  writeFileSync(join(app, 'nutflix'), '#!/bin/sh\n');
+  chmodSync(join(app, 'nutflix'), 0o755);
+  writeFileSync(join(app, 'resources', 'app.asar'), 'asar');
+  writeFileSync(join(app, 'resources', 'app.asar.unpacked', 'worker', 'boot.mjs'), 'x');
+  const maker = new MakerAppImage({
+    runtimeDir: root,
+    executableName: 'nutflix',
+    productName: 'Nutflix',
+    comment: 'P2P video',
+    categories: ['AudioVideo'],
+    runtimes: {
+      x64: { asset: 'rt', sha256: createHash('sha256').update(runtime).digest('hex') },
+    },
+  });
+  await maker.prepareConfig('x64');
+  const makeDir = join(root, 'make');
+  const [out] = await maker.make({
+    dir: app,
+    makeDir,
+    appName: 'Nutflix',
+    targetPlatform: 'linux',
+    targetArch: 'x64',
+    forgeConfig: {} as MakerOptions['forgeConfig'],
+    packageJSON: { version: '0.1.0' },
+  });
+  if (out === undefined) throw new Error('the maker returned no artifact');
+  return { out, runtime, makeDir };
+}
+
+const realSquashfs = process.platform === 'linux' && has('mksquashfs') && has('unsquashfs');
+
 describe('MakerAppImage.make (fixture runtime, real mksquashfs)', () => {
-  it.runIf(process.platform === 'linux' && has('mksquashfs') && has('unsquashfs'))(
+  // The release build exports SOURCE_DATE_EPOCH (fixed squashfs times). mksquashfs >= 4.6 reads
+  // it too, and refuses it together with -mkfs-time/-all-time: the maker must pass the times as
+  // flags only (found by the first real Linux make, 2026-10-03).
+  it.runIf(realSquashfs)(
+    'with SOURCE_DATE_EPOCH set, every entry and the image carry that time',
+    async () => {
+      vi.stubEnv('SOURCE_DATE_EPOCH', '1700000000');
+      try {
+        const { out, runtime } = await makeFixtureAppImage();
+        const stat = spawnSync('unsquashfs', ['-o', String(runtime.length), '-s', out], {
+          encoding: 'utf8',
+        });
+        expect(stat.status, stat.stderr).toBe(0);
+        expect(stat.stdout).toMatch(/Creation or last append time Tue Nov 14 22:13:20 2023/);
+        const list = spawnSync('unsquashfs', ['-o', String(runtime.length), '-lls', out], {
+          encoding: 'utf8',
+          env: { ...process.env, TZ: 'UTC' },
+        });
+        expect(list.status, list.stderr).toBe(0);
+        const entries = list.stdout.split('\n').filter((l) => l.includes('squashfs-root'));
+        expect(entries.length).toBeGreaterThan(3);
+        for (const e of entries) expect(e).toContain('2023-11-14 22:13');
+      } finally {
+        vi.unstubAllEnvs();
+      }
+    },
+  );
+
+  it.runIf(realSquashfs)(
     'writes runtime + squashfs; AppRun links to the Electron binary; modes kept',
     async () => {
-      const runtime = Buffer.from('#fixture-runtime#'.repeat(64));
-      writeFileSync(join(root, 'rt'), runtime);
-      const app = join(root, 'Nutflix-linux-x64');
-      mkdirSync(join(app, 'resources', 'app.asar.unpacked', 'worker'), { recursive: true });
-      writeFileSync(join(app, 'nutflix'), '#!/bin/sh\n');
-      chmodSync(join(app, 'nutflix'), 0o755);
-      writeFileSync(join(app, 'resources', 'app.asar'), 'asar');
-      writeFileSync(join(app, 'resources', 'app.asar.unpacked', 'worker', 'boot.mjs'), 'x');
-      const maker = new MakerAppImage({
-        runtimeDir: root,
-        executableName: 'nutflix',
-        productName: 'Nutflix',
-        comment: 'P2P video',
-        categories: ['AudioVideo'],
-        runtimes: {
-          x64: { asset: 'rt', sha256: createHash('sha256').update(runtime).digest('hex') },
-        },
-      });
-      await maker.prepareConfig('x64');
-      const makeDir = join(root, 'make');
-      const [out] = await maker.make({
-        dir: app,
-        makeDir,
-        appName: 'Nutflix',
-        targetPlatform: 'linux',
-        targetArch: 'x64',
-        forgeConfig: {} as MakerOptions['forgeConfig'],
-        packageJSON: { version: '0.1.0' },
-      });
+      const { out, runtime, makeDir } = await makeFixtureAppImage();
       expect(out).toBe(join(makeDir, 'appimage', 'x64', 'Nutflix-0.1.0-x64.AppImage'));
-      const bytes = readFileSync(out!);
+      const bytes = readFileSync(out);
       expect(bytes.subarray(0, runtime.length).equals(runtime)).toBe(true);
       // squashfs magic right after the runtime.
       expect(bytes.subarray(runtime.length, runtime.length + 4).toString('latin1')).toBe('hsqs');
-      const list = spawnSync('unsquashfs', ['-o', String(runtime.length), '-lls', out!], {
+      const list = spawnSync('unsquashfs', ['-o', String(runtime.length), '-lls', out], {
         encoding: 'utf8',
       });
       expect(list.status, list.stderr).toBe(0);

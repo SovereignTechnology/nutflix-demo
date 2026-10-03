@@ -75,7 +75,9 @@ advisories), lint, typecheck, the audit-surface and contracts-version checks, th
 inventory, the Electron security lint, the test suite, the Electron e2e (Chromium's sandbox on,
 under xvfb) and the packaging stage gates. A fuzz campaign over the pay/1 codec and the payment
 parsers runs on demand ([`.github/workflows/fuzz.yml`](.github/workflows/fuzz.yml), Actions tab →
-fuzz → Run workflow; its targets also run briefly in every CI run). [`ci/gitlab-ci.yml`](ci/gitlab-ci.yml) mirrors the
+fuzz → Run workflow; its targets also run briefly in every CI run). Desktop releases are built
+by [`.github/workflows/release.yml`](.github/workflows/release.yml) on a `desktop-v<version>` tag
+(Linux `.deb` + AppImage into a draft GitHub release; ADR 0017 §9). [`ci/gitlab-ci.yml`](ci/gitlab-ci.yml) mirrors the
 same gates for a GitLab runner.
 
 `npm run ci` = lint → typecheck/build → test → locked-dir check → native-module inventory

@@ -24,7 +24,7 @@ import type { ResolvedForgeConfig } from '@electron-forge/shared-types';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import { madeList, parseCli, writeMadeList } from '../cli.ts';
-import { TARGETS, forgeConfig, makers } from '../forge-config.ts';
+import { LINUX_ICON, TARGETS, forgeConfig, makers } from '../forge-config.ts';
 import { assertAppFuses } from '../fuses.ts';
 import {
   MADE_LIST_SCHEMA,
@@ -129,6 +129,32 @@ describe('forgeConfig', () => {
       expect(() =>
         makers({ version: bad, electronChecksums: {}, appImageRuntimeDir: '/rt' }),
       ).toThrow(/not a plain version/);
+  });
+
+  // ADR 0017 Q2 (Cameron, 2026-10-02): a neutral placeholder icon until a brand one exists.
+  it('both Linux makers carry the placeholder icon, a 512x512 PNG', async () => {
+    interface Prepared {
+      prepareConfig(a: string): Promise<void>;
+    }
+    const [deb, appimage] = makers({
+      version: '0.1.0',
+      electronChecksums: {},
+      appImageRuntimeDir: '/rt',
+      targets: ['deb', 'appimage'],
+    }) as unknown as [
+      Prepared & { config: { options: Record<string, unknown> } },
+      Prepared & { config: Record<string, unknown> },
+    ];
+    await deb.prepareConfig('x64');
+    await appimage.prepareConfig('x64');
+    expect(deb.config.options['icon']).toBe(LINUX_ICON);
+    expect(appimage.config['icon']).toBe(LINUX_ICON);
+    const png = readFileSync(LINUX_ICON);
+    expect(png.subarray(0, 8)).toEqual(
+      Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    );
+    expect(png.toString('latin1', 12, 16)).toBe('IHDR');
+    expect([png.readUInt32BE(16), png.readUInt32BE(20)]).toEqual([512, 512]);
   });
 
   // Independent review: the old name said the sandbox setup was left to a decision; in fact the

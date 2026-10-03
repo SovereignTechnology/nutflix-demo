@@ -501,6 +501,15 @@ relays.
 The file is **not active**. `ci/gitlab-ci.yml` is parked (no runner yet) and is outside this
 lane's allowlist. Enabling it takes one `include:` line, proposed in `docs/lanes/S3-pack.md`.
 
+**Active since 2026-10-03: `.github/workflows/release.yml`** (Cameron, 2026-10-02: 0.1.0 is
+Linux only, released as a draft GitHub release). It ports `desktop-linux` and
+`desktop-release-manifest` (with the Linux list only) and adds `draft-release`: on a
+`desktop-v*` tag that names `@sovit/app-desktop`'s version, it attaches the `.deb`, the
+AppImage, SHA256SUMS, the manifest and the unsigned event to a **draft** release, which Cameron
+publishes once the notice is signed. Only that job can write (`contents: write`), only on a
+tag, and it runs no project code. A PR that touches the packaging runs the build and manifest
+as a dry run. The Windows and macOS jobs stay in the GitLab file for later.
+
 ## Consequences
 
 - F21's fuse half is closed for packaged builds, and the fuses are verified on every build.
@@ -543,9 +552,16 @@ lane's allowlist. Enabling it takes one `include:` line, proposed in `docs/lanes
 5. Should the host check the digests of the unpacked files it loads (bare-sidecar's JS,
    sodium-native's `.node`, the worker tree) against a list inside the asar before spawning, or
    is waiting for code signing enough?
-   **Answered 2026-10-02 (Cameron): add the digest check** before the release workflow: the
-   0.1.0 builds are not OS-signed, and the AppImage and a per-user install are writable by the
-   user, so waiting for code signing leaves tampering with the unpacked files undetected.
+   **Revised 2026-10-03 (Cameron): deferred until OS code signing exists.** The first answer
+   (add the check) rested on a claim that it would catch tampering; it would not. The list
+   would live in `app.asar`, which is no harder to rewrite than the unpacked files: the asar
+   integrity fuse does nothing on Linux (§4), and without code signing nothing anchors the
+   Electron binary either. For the Linux-only 0.1.0, the `.deb` is root-owned (whoever can
+   change the files can change the list) and the AppImage is a read-only squashfs (tampering
+   means repacking the whole image, list included). What remains is detecting corruption, at
+   a measured 0.2–0.5 s per launch (2,105 files, 121 MB, 79 MB of it the Bare binary), plus an
+   ordering problem (the host loads sodium-native before a host-side check could run). Revisit
+   when OS code signing anchors the list.
 6. `d` = `nutflix-desktop` keeps one replaceable "latest release" notice on relays, now one per
    release covering every platform. Use a per-version `d` instead, to keep history?
    **Answered 2026-10-02 (Cameron): one `d` = `nutflix-desktop`** (relays keep the latest
