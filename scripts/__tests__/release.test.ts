@@ -464,6 +464,50 @@ describe('scripts/release-manifest.mjs — one release, only this make (independ
     const job = /^desktop-release-manifest:\n((?: {2}.*\n|\s*\n)*)/m.exec(code)?.[1] ?? '';
     expect(job).toContain('release-manifest.mjs');
   });
+
+  // Cameron, 2026-10-02: 0.1.0 is Linux only, released from GitHub Actions on `desktop-v*`
+  // tags into a DRAFT GitHub release; PRs that touch the packaging run the build as a dry run.
+  it('the GitHub release workflow: one manifest after the Linux job; only a tag-only draft job writes', async () => {
+    const wf = readFileSync(join(repoRoot, '.github', 'workflows', 'release.yml'), 'utf8');
+    const code = wf
+      .split('\n')
+      .filter((l) => !/^\s*#/.test(l))
+      .join('\n');
+    expect(code).toMatch(/^on:\n {2}push:\n {4}tags: \['desktop-v\*'\]\n {2}pull_request:\n/m);
+    // ONE manifest run, over the Linux list, after the Linux job.
+    const runs = code.match(/node scripts\/release-manifest\.mjs[^\n]*(?:\n\s+--[^\n]*)*/g) ?? [];
+    expect(runs).toHaveLength(1);
+    expect(runs[0]).toContain('--made packages/app-desktop/out/make/linux-x64.artifacts.json');
+    expect(code).toMatch(/^ {2}desktop-release-manifest:\n {4}needs: \[desktop-linux\]\n/m);
+    // A tag must name the version being built.
+    expect(code).toContain('"$GITHUB_REF_NAME" != "desktop-v$v"');
+    // Read-only by default; write only in draft-release, only on a tag push, only a draft, and
+    // that job runs no project code.
+    expect(code).toMatch(/^permissions:\n {2}contents: read\n/m);
+    expect(code.match(/contents: write/g)).toHaveLength(1);
+    const draft = /^ {2}draft-release:\n((?: {4}.*\n|\s*\n)*)/m.exec(code)?.[1] ?? '';
+    expect(draft).toMatch(/^ {4}if: github\.event_name == 'push'\n/m);
+    expect(draft).toMatch(/^ {6}contents: write\n/m);
+    expect(draft).toContain('gh release create "$GITHUB_REF_NAME" --draft --verify-tag');
+    expect(draft).not.toMatch(/\bnpm\b|\bnode\b/);
+    // Every action pinned to a full commit sha; no secrets; no stored credentials.
+    const uses = code.match(/uses: \S+/g) ?? [];
+    expect(uses.length).toBeGreaterThan(0);
+    for (const u of uses) expect(u).toMatch(/^uses: actions\/[a-z-]+@[0-9a-f]{40}$/);
+    expect(code).not.toMatch(/secrets\./);
+    expect(code.match(/persist-credentials: false/g)?.length).toBe(
+      code.match(/uses: actions\/checkout@/g)?.length,
+    );
+    // The runtime it fetches is checked against the maker's own pin.
+    const { APPIMAGE_RUNTIMES } = (await import(
+      /* @vite-ignore */ join(repoRoot, 'packages', 'app-desktop', 'packaging', 'maker-appimage.ts')
+    )) as { APPIMAGE_RUNTIMES: Record<string, { asset: string; sha256: string }> };
+    const x64 = APPIMAGE_RUNTIMES['x64'];
+    expect(code).toContain(`releases/download/20251108/${x64?.asset ?? '?'}`);
+    expect(code).toContain(
+      `echo '${x64?.sha256 ?? '?'}  packages/app-desktop/out/appimage-runtime/`,
+    );
+  });
 });
 
 /** A Forge maker as the tests drive it (the config is resolved by prepareConfig). */

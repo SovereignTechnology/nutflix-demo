@@ -15,6 +15,7 @@
  */
 import { readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import MakerDeb from '@electron-forge/maker-deb';
 import MakerSquirrel from '@electron-forge/maker-squirrel';
@@ -27,6 +28,12 @@ import { MakerAppImage } from './maker-appimage.ts';
 import { MakerDmg } from './maker-dmg.ts';
 
 export const TARGETS = ['squirrel', 'dmg', 'deb', 'appimage'] as const;
+
+/**
+ * The Linux desktop icon (512×512 PNG): a neutral PLACEHOLDER until a brand icon exists
+ * (Cameron, 2026-10-02, ADR 0017 Q2). Replacing this file is the whole change.
+ */
+export const LINUX_ICON = fileURLToPath(new URL('./icons/nutflix.png', import.meta.url));
 export type Target = (typeof TARGETS)[number];
 
 export interface ForgeConfigOptions {
@@ -81,6 +88,7 @@ export function makers(o: ForgeConfigOptions): ForgeConfigMaker[] {
         priority: 'optional',
         maintainer: APP.maintainer,
         bin: APP.name,
+        icon: LINUX_ICON,
         categories: ['AudioVideo', 'Video', 'Network'],
         // Studio uploads transcode with the system ffmpeg (worker/ffmpeg.ts).
         recommends: ['ffmpeg'],
@@ -97,6 +105,7 @@ export function makers(o: ForgeConfigOptions): ForgeConfigMaker[] {
       productName: APP.productName,
       comment: APP.description,
       categories: ['AudioVideo', 'Video', 'Network'],
+      icon: LINUX_ICON,
     }),
   };
   return TARGETS.filter((t) => want.has(t)).map((t) => all[t]);
