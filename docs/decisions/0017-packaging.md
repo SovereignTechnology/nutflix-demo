@@ -639,3 +639,9 @@ as a dry run. The Windows and macOS jobs stay in the GitLab file for later.
     `--force-fieldtrial-params` (whether a forced trial can turn a feature on in a packaged
     Electron build without `--enable-features` was not checked here: no Electron is launched).
     Refuse them in a packaged build as well, or leave them?
+
+    **Answered 2026-10-03 (Cameron): refuse them.** `enable-blink-features`,
+    `disable-blink-features`, `force-fieldtrials` and `force-fieldtrial-params` joined
+    `PACKAGED_REFUSED_SWITCHES` (`src/main/security.ts`): a packaged build exits 78
+    (`app.process-switch-refused`) before anything starts; a dev build keeps them. No packaged
+    user needs them; one who does asks, and an allow-list follows, as for question 11.

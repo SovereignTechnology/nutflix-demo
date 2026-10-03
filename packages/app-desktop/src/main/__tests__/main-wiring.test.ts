@@ -471,6 +471,10 @@ describe('main.ts wiring (fake electron)', () => {
     'js-flags',
     'disable-site-isolation-trials',
     'disable-web-security',
+    'enable-blink-features',
+    'disable-blink-features',
+    'force-fieldtrials',
+    'force-fieldtrial-params',
   ])(
     'a packaged build refuses --%s (exit 78, nothing started); a dev build keeps it',
     async (sw) => {

@@ -325,13 +325,18 @@ describe('no process wrappers, V8 flags or isolation overrides in a packaged bui
     'js-flags',
     'disable-site-isolation-trials',
     'disable-web-security',
+    // ADR 0017 Q12 (Cameron, 2026-10-03): the other ways to switch Chromium features.
+    'enable-blink-features',
+    'disable-blink-features',
+    'force-fieldtrials',
+    'force-fieldtrial-params',
   ])('--%s is refused when packaged', (sw) => {
     expect(PACKAGED_REFUSED_SWITCHES).toContain(sw);
     expect(packagedRefusedSwitch({ hasSwitch: (n) => n === sw })).toBe(sw);
   });
 
-  it('exactly those eight; none absent is reported; no switch sits in two lists', () => {
-    expect(PACKAGED_REFUSED_SWITCHES).toHaveLength(8);
+  it('exactly those twelve; none absent is reported; no switch sits in two lists', () => {
+    expect(PACKAGED_REFUSED_SWITCHES).toHaveLength(12);
     expect(packagedRefusedSwitch({ hasSwitch: () => false })).toBeUndefined();
     const all = [
       ...SANDBOX_BYPASS_SWITCHES,
