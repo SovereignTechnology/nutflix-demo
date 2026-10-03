@@ -525,21 +525,39 @@ lane's allowlist. Enabling it takes one `include:` line, proposed in `docs/lanes
 ## Open questions (Cameron)
 
 1. App id `xyz.sovit.nutflix` and the `.deb` maintainer `SovTech <git@sovit.xyz>`. Keep them?
+   **Answered 2026-10-02 (Cameron): keep both.**
 2. Brand icons: none exist in the repo. The installers currently show Electron's default icon.
+   **Answered 2026-10-02 (Cameron): a neutral placeholder icon** for 0.1.0, replaceable later
+   without other changes.
 3. `pear://` for Windows: add an msix maker (Pear's Windows format), or keep Windows
    `.exe`-only (then Windows is not on `pear://`)?
+   **Answered 2026-10-02 (Cameron): `.exe`-only for 0.1.0**; no msix, so Windows is not on
+   `pear://` yet. 0.1.0 builds Linux only (`.deb` + AppImage): Windows and macOS have never been
+   built and are not OS-signed (no Apple Developer ID or Windows certificate for 0.1.0).
 4. AppImage on Ubuntu ≥ 24.04: it cannot start there without a user-namespace grant, and a
    profile on its `/tmp` mount point would open user namespaces to every local user (§7). The
    recommendation is the `.deb`. Should the extract-to-root-owned-`/opt` route be documented for
    users, or should the AppImage simply be marked "not for Ubuntu ≥ 24.04"?
+   **Answered 2026-10-02 (Cameron): mark it "not for Ubuntu ≥ 24.04"**; the release notes
+   point those users to the `.deb`. No `/opt` route is documented.
 5. Should the host check the digests of the unpacked files it loads (bare-sidecar's JS,
    sodium-native's `.node`, the worker tree) against a list inside the asar before spawning, or
    is waiting for code signing enough?
+   **Answered 2026-10-02 (Cameron): add the digest check** before the release workflow: the
+   0.1.0 builds are not OS-signed, and the AppImage and a per-user install are writable by the
+   user, so waiting for code signing leaves tampering with the unpacked files undetected.
 6. `d` = `nutflix-desktop` keeps one replaceable "latest release" notice on relays, now one per
    release covering every platform. Use a per-version `d` instead, to keep history?
+   **Answered 2026-10-02 (Cameron): one `d` = `nutflix-desktop`** (relays keep the latest
+   only). History stays in git tags and the GitHub releases; the update check reads one event.
+   The signed notice goes to the app's default relays: `wss://relay.damus.io`, `wss://nos.lol`,
+   `wss://relay.primal.net`.
 7. Confirm the pinned AppImage runtime digests, for example with
    `gh release view 20251108 -R AppImage/type2-runtime` or by checking the `.sig` files. They
    were read from GitHub's release listing. A wrong pin fails closed.
+   **Checked 2026-10-02:** both files downloaded from the `20251108` release hash to exactly the
+   pinned digests (x86_64 `2fca8b44…260d`, aarch64 `00cbdfcf…7444`). That confirms the pins match
+   what GitHub serves for the tag; the `.sig` files (AppImage's own key) were not checked.
 8. **Answered 2026-09-26:** `GrantFileProtocolExtraPrivileges` is turned off as well (§4). The
    decision did not name `EnableCookieEncryption`, which keeps its default. (The question was
    whether to flip the two fuses left at their defaults because only five were asked for. The
@@ -551,10 +569,16 @@ lane's allowlist. Enabling it takes one `include:` line, proposed in `docs/lanes
    AppImage maker adds `--no-sandbox` on Ubuntu ≥ 24 (main refuses it, D4) and pulls
    electron-builder's `app-builder-lib`, and the maintained dmg maker brings a high advisory.
    Approve the substitution, or name the Pear makers to use and accept what they bring?
+   **Answered 2026-10-02 (Cameron): substitution approved.** The in-repo makers stay (Forge
+   Squirrel and deb, `maker-appimage.ts`, `maker-dmg.ts`); the Pear steps (`pear touch`,
+   `build`, `stage`, `provision`, `seed`) stay a separate manual step on the offline-key machine.
 10. **The setuid-root `chrome-sandbox` in the `.deb`** (§7). It is Chromium's standard Linux
     sandbox helper and what makes the sandbox start on Ubuntu 24.04 without a profile. Accept
     it, or ship an AppArmor userns profile for `/usr/lib/nutflix/nutflix` instead (a maintainer
     script that runs as root at install)?
+    **Answered 2026-10-02 (Cameron): accept the setuid helper.** It is what Chromium-based apps
+    ship; the sandbox starts on Ubuntu 24.04 with no maintainer script, and an AppArmor profile
+    would cover only AppArmor systems while adding a root postinst.
 11. **`--enable-features` / `--disable-features` in a packaged build** (cross-lane review,
     round 4). Some Chromium features are sandbox layers (the network service's sandbox, for
     one), so `--disable-features=…` or `--enable-features=NetworkServiceInProcess…` on an

@@ -18,6 +18,9 @@ import { _electron, type ElectronApplication, type Page } from 'playwright-core'
 export const E2E = process.env['NUTFLIX_E2E'] === '1';
 export const PKG = dirname(dirname(fileURLToPath(import.meta.url)));
 
+/** Holds main's `ready` until Playwright has attached (see the file: a launch race). */
+const HOLD_READY = join(PKG, 'e2e', 'hold-ready.cjs');
+
 /** The Electron binary `node node_modules/electron/install.js` extracted. */
 export function electronBinary(): string {
   const req = createRequire(import.meta.url);
@@ -299,6 +302,30 @@ function teeLogs(app: ElectronApplication): void {
   }
 }
 
+/** The most of a launch's call log a failure keeps (its last lines: the hang is at the end). */
+const CALL_LOG_LINES = 60;
+
+/**
+ * A launch failure, readable in a CI log: the error's first line, plus the tail of Playwright's
+ * "Call log". That log holds Electron's own stdout/stderr (`[pid=…][err] …`, main's lines
+ * already redacted by its logger): what says WHY a launch failed. It is how the intermittent 30 s
+ * `electron.launch` timeout was traced to an attach race (fixed by `hold-ready.cjs`).
+ */
+export function launchFailure(e: unknown): string {
+  if (!(e instanceof Error)) return String(e);
+  const [first = '', ...rest] = e.message.split('\n');
+  // eslint-disable-next-line no-control-regex -- Playwright dims the call log with ANSI codes
+  const log = rest.map((l) => l.replace(/\u001b\[[0-9;]*m/g, '')).filter((l) => l.trim() !== '');
+  if (log.length === 0) return first;
+  const tail = log.slice(-CALL_LOG_LINES);
+  const cut = log.length - tail.length;
+  return [
+    first,
+    ...(cut > 0 ? [`    … ${String(cut)} earlier lines`] : []),
+    ...tail.map((l) => `    ${l}`),
+  ].join('\n');
+}
+
 /**
  * Launches `script` (a main-process entry) with the display strategy until one shows a
  * window, WITH the Chromium sandbox (`chromiumSandbox: true`: never let playwright add
@@ -323,7 +350,7 @@ export async function launch(
     try {
       app = await _electron.launch({
         executablePath: binary,
-        args: [...d.switches, script, ...args],
+        args: ['-r', HOLD_READY, ...d.switches, script, ...args],
         env: { ...(process.env as Record<string, string>), ...d.env, ...env },
         chromiumSandbox: true,
         timeout: 30_000,
@@ -337,9 +364,7 @@ export async function launch(
       });
       return { app, page, display: d.name, sandbox };
     } catch (e: unknown) {
-      failures.push(
-        `${d.name}: ${e instanceof Error ? (e.message.split('\n')[0] ?? '') : String(e)}`,
-      );
+      failures.push(`${d.name}: ${launchFailure(e)}`);
       await app?.close().catch(() => undefined);
     }
   }
