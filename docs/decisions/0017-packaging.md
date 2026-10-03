@@ -463,9 +463,29 @@ Inputs and rules:
   A corrected manifest for the same commit must be newer than the event it replaces on the
   relays. `--created-at` overrides it.
 
-Nothing in the repo signs. Cameron signs the event with the SovTech key through Bunker46, using
-NIP-46 `sign_event` in his signer. The nsec never leaves the bunker, and no job, script or
-agent holds it.
+Nothing in the repo holds a key. Cameron signs the event with the SovTech key through Bunker46
+(NIP-46 `sign_event`). The nsec never leaves the bunker, and no job, script or agent holds it.
+
+**`scripts/release-publish.mjs` (2026-10-03, Cameron's choice of a repo script)** runs that last
+step on Cameron's machine:
+
+1. **Before the network:** the unsigned template must be a SovTech kind 30071 release whose
+   tags agree (`release-verify.mjs` `checkUnsignedRelease`), and every file in `--dir` must
+   match it.
+2. **The bunker URI** is read from the terminal with echo off, never from argv. It is used for
+   one connection and never written or logged.
+3. **The bunker must sign for the SovTech key**, or nothing is asked of it. The signature is
+   requested through `@sovit/core`'s `Nip46Signer`, which refuses any returned event that is
+   not exactly the template signed by that key.
+4. **The result is checked by the same `verifyRelease`** users run, and saved as
+   `release-event.json`, never over an existing file.
+5. **Publishing** happens only after typing `publish`, to `wss://relay.damus.io`,
+   `wss://nos.lol` and `wss://relay.primal.net`, and each relay's answer is reported.
+
+An already signed event skips the signing (verify, confirm, publish: a retry), and `--dry-run`
+stops before publishing. Every relay socket uses `ws`: under Node 22's built-in WebSocket,
+nostr-tools 2.25.2 overflows the stack on an unreachable relay (reproduced; not on Electron 44's
+Node 24.20, which the app runs on).
 
 `scripts/release-verify.mjs <signed-event.json> <file>…` (or `--all <dir>`) accepts only an
 event that passes all of these:
