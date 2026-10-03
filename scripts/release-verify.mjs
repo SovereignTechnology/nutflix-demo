@@ -49,8 +49,8 @@ const refuse = (msg) => {
   throw new ReleaseVerifyError(msg);
 };
 
-/** The release (version, date, artifacts) from a signature-checked event (checks 1–3). */
-export function checkEvent(input, trustedPubkey) {
+/** `input` as plain JSON data, after checking the trusted key's shape. */
+function plainEvent(input, trustedPubkey) {
   if (typeof trustedPubkey !== 'string' || !HEX64.test(trustedPubkey))
     refuse('the trusted key must be a 64-hex public key');
   if (typeof input !== 'object' || input === null || Array.isArray(input))
@@ -59,12 +59,16 @@ export function checkEvent(input, trustedPubkey) {
   // object (set when an event is signed or verified, and COPIED by `{ ...ev }`), so an object that was
   // once verified and then edited would pass without being re-checked. A JSON round trip drops
   // every symbol and non-JSON value; the checks below then see exactly what was signed.
-  let ev;
   try {
-    ev = JSON.parse(JSON.stringify(input));
+    return JSON.parse(JSON.stringify(input));
   } catch {
-    refuse('the event is not plain JSON data');
+    return refuse('the event is not plain JSON data');
   }
+}
+
+/** The release (version, date, artifacts) from a signature-checked event (checks 1–3). */
+export function checkEvent(input, trustedPubkey) {
+  const ev = plainEvent(input, trustedPubkey);
   let valid;
   try {
     // Throws on a structurally invalid event (missing fields, non-string tags).
@@ -73,6 +77,32 @@ export function checkEvent(input, trustedPubkey) {
     valid = false;
   }
   if (!valid) refuse('bad event: its id or signature does not verify');
+  return releaseShape(ev, trustedPubkey);
+}
+
+/**
+ * The release from an UNSIGNED template (release-manifest.mjs's release-event.unsigned.json):
+ * the same checks as checkEvent but the signature, which it does not have yet (`id` and `sig`
+ * empty). For scripts/release-publish.mjs, before it asks anyone to sign.
+ */
+export function checkUnsignedRelease(input, trustedPubkey) {
+  const ev = plainEvent(input, trustedPubkey);
+  if (ev.id !== '' || ev.sig !== '')
+    refuse('not an unsigned release template (its id and sig must be empty)');
+  if (!Number.isSafeInteger(ev.created_at) || ev.created_at <= 0)
+    refuse('the template has no valid created_at');
+  if (typeof ev.content !== 'string') refuse('the template content is not a string');
+  if (
+    !Array.isArray(ev.tags) ||
+    !ev.tags.every((t) => Array.isArray(t) && t.every((v) => typeof v === 'string'))
+  )
+    refuse('the template tags are not lists of strings');
+  if (ev.pubkey !== trustedPubkey) refuse('the template is not for the SovTech key');
+  return { ...releaseShape(ev, trustedPubkey), event: ev };
+}
+
+/** Checks 2–3 on plain data whose structure is already valid. */
+function releaseShape(ev, trustedPubkey) {
   if (ev.pubkey !== trustedPubkey) refuse('the event is not signed by the SovTech key');
   if (ev.kind !== RELEASE_NOTICE_KIND)
     refuse(`wrong kind ${String(ev.kind)} (want ${String(RELEASE_NOTICE_KIND)})`);
@@ -153,6 +183,15 @@ export async function verifyRelease(
   { files = [], allDir, trustedPubkey = sovtechPubkeyHex() },
 ) {
   const { artifacts, version, commit, createdAt } = checkEvent(ev, trustedPubkey);
+  const ok = await checkFiles(artifacts, { files, allDir });
+  return { version, commit, createdAt, files: ok };
+}
+
+/**
+ * Check 4: each of `files` (or, with `allDir`, every artifact, in that directory) is listed in
+ * `artifacts` and matches its size and sha256. Returns the artifacts checked.
+ */
+export async function checkFiles(artifacts, { files = [], allDir }) {
   const byName = new Map(artifacts.map((a) => [a.name, a]));
   const targets = [];
   if (allDir !== undefined) {
@@ -180,7 +219,7 @@ export async function verifyRelease(
     if (got.sha256 !== a.sha256) refuse(`${a.name}: sha256 does not match the signed release`);
     ok.push(a);
   }
-  return { version, commit, createdAt, files: ok };
+  return ok;
 }
 
 export async function run(argv) {
