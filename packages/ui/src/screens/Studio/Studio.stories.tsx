@@ -440,6 +440,8 @@ export const SeederMeltNoBalance: Story = {
 
 export const WithMiniPlayer: Story = {
   name: 'With mini-player slot',
+  // The frame spans the screenshot viewport (1280 × 900), so the fixed mini-player is in the PNG.
+  parameters: { nf: { width: 1280, minHeight: 900 } },
   render: () => (
     <Screen
       adapter={storyAdapter()}

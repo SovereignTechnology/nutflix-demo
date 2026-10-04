@@ -36,9 +36,14 @@ const preview: Preview = {
       const root = document.documentElement;
       if (theme === 'light' || theme === 'dark') root.setAttribute('data-theme', theme);
       else root.removeAttribute('data-theme');
-      const width = (context.parameters['nf'] as { width?: number } | undefined)?.width ?? 640;
+      const nf = context.parameters['nf'] as { width?: number; minHeight?: number } | undefined;
+      const width = nf?.width ?? 640;
+      // `minHeight`: a story with a `position: fixed` part (the mini-player sits at the viewport's
+      // bottom right) sets it to the screenshot viewport's height, so that part is inside the
+      // frame the PNG is cut from. Without it a short screen's PNG shows no mini-player at all.
+      const minHeight = nf?.minHeight;
       return (
-        <div className="nf-story" data-nf-story style={{ width }}>
+        <div className="nf-story" data-nf-story style={{ width, minHeight }}>
           <Story />
         </div>
       );
