@@ -348,7 +348,11 @@ describe('release-publish: the CLI', () => {
     // Every pool uses `ws`: Node 22's built-in WebSocket overflows the stack on an unreachable
     // relay under nostr-tools 2.25.2 (reproduced; see the script).
     expect(src).toContain("import WebSocket from 'ws';");
-    expect(src).toMatch(/^useWebSocketImplementation\(WebSocket\);$/m);
+    // … through RelaySocket, `ws` with an `error` listener on every socket (a relay that never
+    // finishes the handshake must not end the process).
+    expect(src).toMatch(/^class RelaySocket extends WebSocket \{$/m);
+    expect(src).toMatch(/^useWebSocketImplementation\(RelaySocket\);$/m);
+    expect(src.match(/useWebSocketImplementation\(/g)).toHaveLength(1);
     expect(src).not.toMatch(/process\.env\[?['.]?\w*BUNKER/i);
   });
 });
