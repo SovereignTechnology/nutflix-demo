@@ -48,7 +48,20 @@ import {
 // on a socket still connecting re-fires `error` synchronously, recursing until the stack
 // overflows, so an unreachable relay could throw an uncaught RangeError mid-publish
 // (reproduced on Node 22.22.0; not on Electron 44's Node 24.20, which the app runs on).
-useWebSocketImplementation(WebSocket);
+//
+// `ws` needs one more guard. When a relay accepts the TCP connection and never finishes the
+// handshake, nostr-tools' connection timeout calls close() on the socket still connecting; `ws`
+// then emits `error` ("closed before the connection was established") after nostr-tools has
+// dropped its handlers, and an `error` nobody listens for ends the process (seen 2026-10-05:
+// relay.primal.net was down, and the publish died before reporting any relay). Every socket
+// keeps a listener of its own, so that relay is reported as failed like any other.
+class RelaySocket extends WebSocket {
+  constructor(...args) {
+    super(...args);
+    this.on('error', () => undefined);
+  }
+}
+useWebSocketImplementation(RelaySocket);
 
 /** Where the notice is published (Cameron, 2026-10-02: the app's three default relays). */
 export const RELEASE_RELAYS = Object.freeze([
