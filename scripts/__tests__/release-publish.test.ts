@@ -8,6 +8,7 @@
  * comes back (checkRemoteSigned) is exercised for real. Nothing here touches the network.
  */
 import { writeFileSync } from 'node:fs';
+import { createServer, type Socket } from 'node:net';
 import { join } from 'node:path';
 import { finalizeEvent, generateSecretKey, getPublicKey } from 'nostr-tools/pure';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
@@ -410,4 +411,40 @@ describe('release-publish: publishToRelays', () => {
       }
     }
   });
+
+  // A relay that is down behind a live TCP endpoint (relay.primal.net, 2026-10-05): the
+  // connection is accepted and the handshake never finishes. nostr-tools gives up and closes the
+  // socket still connecting, and `ws` then emits an `error` that nothing listened for: the
+  // script died mid-publish, with no relay reported. The run of this test fails with that
+  // uncaught error unless every socket has a listener.
+  it('a relay that never finishes the handshake is reported, and does not end the process', async () => {
+    const p = await lib<PublishLib>('release-publish.mjs');
+    const held: Socket[] = [];
+    const server = createServer((s) => {
+      held.push(s);
+    });
+    await new Promise<void>((resolve) => {
+      server.listen(0, '127.0.0.1', resolve);
+    });
+    try {
+      const a = server.address();
+      const url = `ws://127.0.0.1:${String(a !== null && typeof a === 'object' ? a.port : 0)}`;
+      const ev = finalizeEvent(
+        {
+          kind: template.kind,
+          created_at: template.created_at,
+          tags: template.tags,
+          content: template.content,
+        },
+        sk,
+      ) as unknown as Ev;
+      const results = await p.publishToRelays([url], ev, 15_000);
+      expect(results.map((r) => [r.relay, r.ok])).toEqual([[url, false]]);
+      // Let the socket's late `error` arrive inside this test, where it would fail it.
+      await new Promise((resolve) => setTimeout(resolve, 200));
+    } finally {
+      for (const s of held) s.destroy();
+      server.close();
+    }
+  }, 30_000);
 });
