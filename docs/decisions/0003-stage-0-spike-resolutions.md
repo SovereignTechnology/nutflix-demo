@@ -4,7 +4,8 @@ Date: 2026-09-04
 
 ## Status
 
-Accepted
+Accepted. Amended by [ADR 0019](0019-scope-pear-desktop-only.md): nothing was built on the
+browser-Hypercore result (spike A8), which stands as research.
 
 ## Context
 

@@ -5,7 +5,7 @@ Date: 2026-09-25
 ## Status
 
 Accepted for Stage 3 (issue #1: security review F33; issue #8: "the credit pool is not sized per
-seeder window"). Cameron's decision, 2026-09-24: "request each range from a single seeder — no
+seeder window"). The maintainer's decision, 2026-09-24: "request each range from a single seeder — no
 duplicates, seeders paid fairly". Implemented on `stage-3/f33-one-peer`, with the fixes from the
 lane's independent review (2026-09-25).
 
@@ -135,12 +135,12 @@ v6 ships without it. The router is correct without it, only conservative.
   `upstream.creditBlocks − 1`. It does not follow the pool, which any connected `pay/1` peer's
   HELLO can grow.
 
-## Amendment 2026-09-26 — the seeder's count, and paying an old tail (Cameron)
+## Amendment 2026-09-26 — the seeder's count, and paying an old tail (the maintainer)
 
 The cross-lane review showed the "per-process debts" residual is routine, not rare: blocks
 delivered but unpaid when a session closes, the app quits or crashes (or, before the image
 fix, one probe block) stay counted by the seeder for good, and the viewer's next run, starting
-from zero, overruns that seeder and is banned. Cameron's answers:
+from zero, overruns that seeder and is banned. The maintainer's answers:
 
 - **The seeder reports; the viewer pays.** pay/1 gains, additively in contracts v6:
   - `OWED` (seeder → viewer), sent once both HELLOs verify, one per core where the seeder
@@ -287,7 +287,7 @@ orchestrator's decisions, as built:
   for an over-claiming seeder to be paid twice. A failed write is logged and the PAY still goes
   out: its proofs are built.
 
-### The end of the report (2026-10-02, Cameron; contracts v7)
+### The end of the report (2026-10-02, the maintainer; contracts v7)
 - Every seeder this repository builds ends its `OWED` report with an end marker (`pay-protocol.ts`
   rule 5: `core` `OWED_END_CORE`, no ranges), also when nothing is owed, and never after a report
   that failed part-way. A viewer's report is complete when the marker arrives: no
@@ -296,7 +296,7 @@ orchestrator's decisions, as built:
   it. A seeder that sends no marker keeps the bounded wait. The desktop's durable word is now a
   hint for those seeders only. Review record: `docs/reviews/2026-10-02-pre-push-pay-v7.md`.
 
-### Crash tails (2026-10-02, Cameron: persist open-session budgets; R2)
+### Crash tails (2026-10-02, the maintainer: persist open-session budgets; R2)
 - Every OPEN session also has an entry in the tail book, a provisional tail: what a crash of the
   whole app would leave payable for it — at most what the session has left, capped at
   `MAX_TAIL_BLOCKS`. It is written when the session is authorised and lowered on disk before each

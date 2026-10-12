@@ -4,7 +4,7 @@ Date: 2026-09-05
 
 ## Status
 
-Accepted (answers given by Cameron via the orchestrator's batched question, 2026-09-05)
+Accepted (answers given by the maintainer via the orchestrator's batched question, 2026-09-05)
 
 ## Context
 
@@ -42,7 +42,7 @@ it can pay with. No change.
 
 ### Q4 — gateway markup → **percentage**, not flat per-block (**config/lane change in `packages/gateway`**)
 
-L3 shipped `markupSatsPerBlock` (flat, default 0). Cameron chose a percentage. Shape:
+L3 shipped `markupSatsPerBlock` (flat, default 0). The maintainer chose a percentage. Shape:
 `markupPercent` (integer ≥ 0, default **0**) replaces `markupSatsPerBlock`;
 `gatewaySatsPerBlock = ceil(policy.satsPerBlock × (100 + markupPercent) / 100)` — ceil so
 the gateway never undercharges itself and the result is always an integer number of sats
@@ -97,11 +97,11 @@ toggle. Recorded alongside the design brief in `docs/design/README.md`.
 - Orchestrator follow-up lane: `L3-markup` (percentage markup in `packages/gateway`).
 - L6 brief: no bundled ffmpeg; system-ffmpeg probe + "not found" state.
 - L5 Studio brief: an "ffmpeg not found" state with install instructions.
-- `docs/status.md` "Inputs still needed from Cameron" is now empty for Wave 2.
+- `docs/status.md` "Inputs still needed from the maintainer" is now empty for Wave 2.
 
 ## Erratum (2026-09-23) — Q1's stated consequence is wrong; the rule itself is unchanged
 
-**Superseded in part by ADR 0007** (Cameron, 2026-09-23): minimum PAY size + the creator's
+**Superseded in part by ADR 0007** (the maintainer, 2026-09-23): minimum PAY size + the creator's
 fractional remainder carried across PAYs, implemented in Stage 2.
 
 Found by lane L5-Studio, verified by the orchestrator. Q1 says "when `amount ≥ 2` and both
@@ -114,7 +114,7 @@ consequence was misstated. Correctly:
 - Counter-examples to the old text: `amount 2, split 99/1 → 2/0`; `amount 2, 51/49 → 2/0`;
   `amount 3, 70/30 → 3/0`.
 
-**Economic consequence (open for Cameron, not decided here):** with the default window of 4
+**Economic consequence (open for the maintainer, not decided here):** with the default window of 4
 blocks at `satsPerBlock = 1`, a PAY is 4 sats, so any split with `c < 25` pays the creator
 nothing on every PAY. At `c = 10` the creator only earns on PAYs of ≥ 10 sats. Round-up
 favours the seeder by up to 1 sat per PAY, and at small PAYs that 1 sat is the whole creator

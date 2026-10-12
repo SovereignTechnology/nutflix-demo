@@ -4,7 +4,8 @@ Date: 2026-09-04
 
 ## Status
 
-Accepted
+Accepted. Amended by [ADR 0019](0019-scope-pear-desktop-only.md): the web shell and the web portal
+are out of scope for this repository.
 
 ## Context
 

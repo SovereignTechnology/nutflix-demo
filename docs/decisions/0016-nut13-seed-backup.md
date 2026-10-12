@@ -4,13 +4,13 @@ Date: 2026-09-25
 
 ## Status
 
-Accepted 2026-09-25 with Cameron's answers (below), which differ from the draft's
+Accepted 2026-09-25 with the maintainer's answers (below), which differ from the draft's
 recommendations on D2 and D3. Core implemented 2026-09-26 (lane N1-nut13-core, see Implementation
-notes at the end); the desktop is lane N2. Cameron (2026-09-24, issue #3): NUT-13 seed
+notes at the end); the desktop is lane N2. The maintainer (2026-09-24, issue #3): NUT-13 seed
 backup is in Stage 3, design and ADR first, then his multiple-choice answers before any code.
 This builds on ADR 0014 (write-ahead journal + NUT-09 restore) and replaces none of it.
 
-## Decisions (Cameron, 2026-09-25)
+## Decisions (the maintainer, 2026-09-25)
 
 - **D1 seed source: a new 12-word BIP-39 phrase** (a), shown once in main's prompt window.
 - **D2 storage: this device AND an encrypted relay copy** (a + b). The phrase is sealed on this
@@ -239,7 +239,7 @@ which may not persist counters.
   - So the phrase recovers ecash, not the 17375 key: nutzaps locked to that key and not yet
     redeemed still need the nsec.
 
-**Recommendation: as stated.** Cameron can widen either.
+**Recommendation: as stated.** The maintainer can widen either.
 
 ## Proposed design (with the recommendations)
 
@@ -432,7 +432,7 @@ which may not persist counters.
 4. **Specs not vendored.** NUT-07, NUT-09 and NUT-13, with its test vectors, are not in
    `docs/vendor`. Vendor them before any code.
 
-## Questions for Cameron (answered 2026-09-25, see Decisions)
+## Questions for the maintainer (answered 2026-09-25, see Decisions)
 
 1. **Seed source:** new 12 words kept on this device (recommended), new 12 words plus an encrypted
    relay copy, derived from the Nostr key, or kept in the NIP-60 wallet event.
@@ -490,7 +490,7 @@ what the real-mint lane measured (details: `docs/lanes/N1-nut13-core.md`,
   history line); dust the input fee would eat is left.
 - **§5 step 5.** PENDING proofs are left out (the store has no "marked" state); a later restore
   adds them if the melt failed. Contract request `docs/contract-requests/N1-nut13-core.md` item 2.
-- **§5 step 3, the batch cap (open for Cameron).** This device's own phrase is scanned at least to
+- **§5 step 3, the batch cap (open for the maintainer).** This device's own phrase is scanned at least to
   its counters file's `next`, whatever the gaps or the cap. Any other scan the 200-batch cap stops
   is reported, with where to resume (`RestoreDetail.resume`, never outcome `nothing`), because a
   hostile mint and an honest long history look the same from counter 0. The 32-keyset cap is
@@ -522,7 +522,7 @@ The decisions stand. What the desktop now does (details: `docs/lanes/W8a-money.m
 - **§5 step 3, the batch cap.** The host follows core's `resume`: up to 10 calls per phrase and
   mint per restore, only while a call moves the scan on; an unfinished scan keeps its cursor in the
   host and reads "could not be reached" until the Settings screen has a "not finished" outcome
-  (`docs/contract-requests/W8a-money.md`). Cameron's open decision on the bound (N1 item 7) stands:
+  (`docs/contract-requests/W8a-money.md`). The maintainer's open decision on the bound (N1 item 7) stands:
   this is option 1 with the host doing the continuing.
 - **D5, when a reissue is complete** (the final rule, fix rounds 8 and 9). Nothing moves at a
   mint while an operation is journaled there, whatever is spendable there. Such a mint keeps the

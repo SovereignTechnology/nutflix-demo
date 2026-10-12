@@ -134,7 +134,7 @@ creator whole however small the PAYs are (the fairness problem), and honest view
 the minimum whenever one seeder is owed that much (the overhead problem). What is given up: a
 viewer that throttles itself to one block per PAY imposes mint input fees on the seeder (≤ ~2
 proofs per PAY). Default `DEFAULT_MIN_PAY_SATS = 10` (ADR 0007's proposal, confirmed).
-**Cameron may want to revisit this** — the alternative is a per-seeder credit design in the
+**The maintainer may want to revisit this** — the alternative is a per-seeder credit design in the
 worker, which needs peer selection Hypercore does not expose.
 
 ## 4. The mock (item 7) and what changed in L10's suite

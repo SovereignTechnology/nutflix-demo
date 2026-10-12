@@ -4,7 +4,7 @@ Date: 2026-09-25
 
 ## Status
 
-Accepted for Stage 3 (issue #5, parts b and c). Cameron's decisions, 2026-09-24/25:
+Accepted for Stage 3 (issue #5, parts b and c). The maintainer's decisions, 2026-09-24/25:
 - media on Pear only;
 - thumbnails and avatars fetched P2P;
 - thumbnails and avatars live in the creator's **profile core**, not in each video's core;
@@ -77,12 +77,12 @@ price keeps images out of the payment path entirely.
   design. The daemon and gateway serve free cores only if something opens them (they seed only
   local content today).
 
-## Amendment 2026-09-26 — seeders say "free" (Cameron)
+## Amendment 2026-09-26 — seeders say "free" (the maintainer)
 
 The cross-lane review found that a thumbnail URL naming a paid video's core made `image.fetch`
 download it unpaid, so that video's honest seeders banned the viewer; the interim probe (one
 block per seeder, stop on `PRICE`) still left one unpaid block per seeder, which a restart turned
-into a ban. Cameron's answer: **seeders say "free" per core, and viewers fetch image blocks only
+into a ban. The maintainer's answer: **seeders say "free" per core, and viewers fetch image blocks only
 from seeders that said so.**
 
 - pay/1 `PRICE` gains `free` (contracts v6, additive): `free: true` means the seeder serves that

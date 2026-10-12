@@ -5,7 +5,7 @@ Date: 2026-09-24
 ## Status
 
 Accepted for Stage 3 (lane "desktop signer", branch `stage-3/desktop-signer`). Implemented and
-tested, including the real Electron prompt window (`e2e/signer.e2e.ts`). Cameron's choice
+tested, including the real Electron prompt window (`e2e/signer.e2e.ts`). The maintainer's choice
 (2026-09-24): offer all three unlock methods and let the user pick.
 
 ## Context
@@ -127,7 +127,7 @@ header ("Unlock" while locked, "Lock", "Sign out").
 
 ## 7. Addendum (same day): removing the key, NIP-46 approval links
 
-Cameron: "do the still missing".
+The maintainer: "do the still missing".
 
 - **Removing the key.** With a key on the device, the prompt window's "Local key" question offers
   "Forgot the passphrase? Remove this key…" (`flow: 'remove'`, fits only when a key exists).

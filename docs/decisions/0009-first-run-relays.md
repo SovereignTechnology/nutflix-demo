@@ -4,7 +4,7 @@ Date: 2026-09-23
 
 ## Status
 
-Accepted (decision by Cameron, 2026-09-23, answering the open question in
+Accepted (decision by the maintainer, 2026-09-23, answering the open question in
 the Stage 1 exit handoff §3.5, an internal session note, not published).
 
 ## Context
@@ -35,4 +35,4 @@ Settings (read/write per relay), and the stored list replaces the defaults.
   browsing, and nothing in the UI should imply it does.
 - Revisit this in Stage 3 (packaging and first-run polish). A first-run notice naming the relays,
   or adding a SovTech relay to the list, would not reverse this decision.
-- `docs/status.md` records the answer under the Cameron inputs table.
+- `docs/status.md` records the answer under the the maintainer inputs table.
