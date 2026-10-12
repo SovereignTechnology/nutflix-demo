@@ -6,7 +6,7 @@ Date: 2026-09-24
 
 Accepted for Stage 3 (lane "F31 recovery", branch `stage-3/wallet-journal`). Implemented and
 tested, including against Nutshell 0.21.0 and cdk-mintd 0.18.1. This departs from the security
-review's suggested fix for F31 (NUT-13 deterministic secrets). The reasons are below; Cameron may
+review's suggested fix for F31 (NUT-13 deterministic secrets). The reasons are below; the maintainer may
 still want NUT-13 for seed backups (see Consequences).
 
 ## Context
@@ -99,7 +99,7 @@ is counted once (tested).
     loses that operation's outputs;
   - melt change is not journaled;
   - while a send is unresolved, its inputs still count in the balance.
-- Not done: NUT-13 seed backup. If Cameron wants a wallet that can be rebuilt from words alone,
+- Not done: NUT-13 seed backup. If the maintainer wants a wallet that can be rebuilt from words alone,
   that is a separate decision: the seed's source, per-device counters, and the relation to NIP-60.
 
 ## Amendment (2026-09-25): the three residuals (issue #8, lane `S3-residuals`)

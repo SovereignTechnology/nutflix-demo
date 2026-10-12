@@ -5,7 +5,7 @@ Date: 2026-09-24
 ## Status
 
 Proposed (Stage 3, lane "seeder runtime", branch `stage-3/seeder-runtime`). Implemented and
-tested; §8 records Cameron's answers (2026-09-24). Nothing here changes a core contract.
+tested; §8 records the maintainer's answers (2026-09-24). Nothing here changes a core contract.
 
 ## Context
 
@@ -51,7 +51,7 @@ builds the next state, writes it to `proofs.json.tmp` (0600), fsyncs, renames ov
 fsyncs the directory, and only then makes it live — before the wallet returns the operation's
 result, as the contract requires. Commits are serialised.
 
-**Encrypted at rest** (Cameron, 2026-09-24): the JSON is NIP-44 encrypted to the node's own Nostr
+**Encrypted at rest** (the maintainer, 2026-09-24): the JSON is NIP-44 encrypted to the node's own Nostr
 key through the signer (`nip44Encrypt(ownPubkey, …)`, the scheme NIP-60 uses for wallet events),
 so no key leaves the signer and no cryptography is written here. NIP-44 takes at most 64 KiB per
 message, so the document is cut into 60 000-character chunks, each carrying `index/count` inside
@@ -161,7 +161,7 @@ gateway and the desktop worker keep their own wiring.
 which still needs them). A failed start releases the runtime too. The Stage 1 start-up warning is
 gone.
 
-## 7. Payout: earnings leave for the owner's own wallet (Cameron, 2026-09-24)
+## 7. Payout: earnings leave for the owner's own wallet (the maintainer, 2026-09-24)
 
 `runtime/payout.ts`, configured by `payout: { pubkey, p2pk, thresholdSats = 1000, relays }`.
 When a mint's balance reaches the threshold (checked at start and after every flush that swapped
@@ -190,7 +190,7 @@ Safety:
 Privacy: a payout is a public nutzap, so it links the seeder's pubkey to the owner's and shows
 amounts. Operators who mind use a dedicated wallet pubkey for `payout.pubkey`.
 
-## 8. For Cameron — answered 2026-09-24
+## 8. For the maintainer — answered 2026-09-24
 
 1. **Melt-out** → payout to the owner's wallet instead (§7); the owner melts from their wallet.
    Melting on the daemon stays possible later (a control socket), not planned.
@@ -201,7 +201,7 @@ amounts. Operators who mind use a dedicated wallet pubkey for `payout.pubkey`.
 4. **Paid views** → counting nutzap senders now counts seeders, deliberately: naming viewers would
    publish who watched what. Recommended: show sats to the creator per video (already in the
    nutzaps and in trending) and drop the view count until a private count exists — a change to the
-   `VideoStats` contract, trending and three screens, for the UI polish lane (Cameron reviews it).
+   `VideoStats` contract, trending and three screens, for the UI polish lane (the maintainer reviews it).
 
 ## 9. The gateway on the same runtime (`stage-3/gateway-runtime`)
 

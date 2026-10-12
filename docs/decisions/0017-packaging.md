@@ -4,23 +4,23 @@ Date: 2026-09-25
 
 ## Status
 
-Accepted for Stage 3 (issue #6, security review F21). Cameron's decisions, 2026-09-24:
+Accepted for Stage 3 (issue #6, security review F21). The maintainer's decisions, 2026-09-24:
 
 - Electron Forge plus Pear makers.
 - Targets: Windows `.exe`, macOS `.dmg`, Linux `.deb`, Linux AppImage, and a `pear://` address.
 - Fuses: `RunAsNode`, `EnableNodeOptionsEnvironmentVariable` and `EnableNodeCliInspectArguments`
   off; `EnableEmbeddedAsarIntegrityValidation` and `OnlyLoadAppFromAsar` on. On 2026-09-26
-  Cameron added a sixth: `GrantFileProtocolExtraPrivileges` off (§4; open question 8).
+  The maintainer added a sixth: `GrantFileProtocolExtraPrivileges` off (§4; open question 8).
 - Every release is signed with the SovTech ngit Nostr key through Bunker46, as a Nostr-signed
   manifest of sha256 sums. The nsec is never written anywhere.
 - Gatekeeper and SmartScreen warnings are accepted for now.
 
-Implemented on `stage-3/packaging`. On Linux, this lane built the package and the `.deb`. The
-AppImage, `.exe` and `.dmg` are configured but were not built (§7).
+Implemented, and shipped as desktop 0.1.0 on 2026-10-05: a Linux `.deb` and AppImage. The Windows
+`.exe`, the macOS `.dmg` and a `pear://` address are configured but were never built or released.
 
-One part of the decision is **not** implemented as stated and waits for Cameron's sign-off: no
-Pear maker is used. The makers are Forge's own plus two in-repo ones, because Holepunch's
-AppImage maker adds `--no-sandbox` (§5, open question 9).
+One part of the decision differs from what was asked, with the maintainer's approval (open
+question 9, answered 2026-10-02): no Pear maker is used. The makers are Forge's own plus two
+in-repo ones, because Holepunch's AppImage maker adds `--no-sandbox` (§5).
 
 ## Context
 
@@ -192,7 +192,7 @@ path) is still dropped.
 ### 4. Fuses
 
 - `packaging/fuses.ts` holds exactly six settings: the five of the decision, and
-  `GrantFileProtocolExtraPrivileges` **off** (Cameron, 2026-09-26, answering open question 8).
+  `GrantFileProtocolExtraPrivileges` **off** (the maintainer, 2026-09-26, answering open question 8).
   The app never loads `file://` (it serves everything over its own `app:` scheme), so taking
   `file:` pages' extra privileges away is defence in depth only; Electron's security guidance
   recommends it. Every other fuse keeps Electron's default, `EnableCookieEncryption` (off)
@@ -243,7 +243,7 @@ path) is still dropped.
   means the app never goes on (no window, host or worker). Not refused: the debug pauses
   (`*-startup-dialog`, `wait-for-debugger*`), and `--enable-features`/`--disable-features`
   (open question 11). No Electron was launched with these switches: this box cannot start the
-  Chromium sandbox without Cameron's grant (e2e/support.ts), so the refusals are tested through
+  Chromium sandbox without the maintainer's grant (e2e/support.ts), so the refusals are tested through
   main's fake-Electron wiring tests.
 - Platform notes:
   - Electron implements `EnableEmbeddedAsarIntegrityValidation` on **macOS and Windows only**.
@@ -294,14 +294,14 @@ these names and refuses any other (§8). So a stale artifact of **another versio
 prerelease one included, cannot be signed by accident. A name cannot tell two builds of the
 **same** version apart; only `--made` keeps an older same-version build out (§8).
 
-**Deviation from "Pear makers".** Cameron's decision named Pear makers. None is used:
+**Deviation from "Pear makers".** The maintainer's decision named Pear makers. None is used:
 
 - Holepunch's `pear-electron-forge-maker-appimage` writes an `AppRun` that adds `--no-sandbox`
   on Ubuntu ≥ 24. Main refuses that switch (D4), so the app would not start there, and the
   sandbox is not negotiable.
-- Pear's Windows format is `.msix`, and Cameron asked for an `.exe` (Squirrel).
+- Pear's Windows format is `.msix`, and the maintainer asked for an `.exe` (Squirrel).
 
-The in-repo makers above take their place. This is put to Cameron as open question 9 rather
+The in-repo makers above take their place. This is put to the maintainer as open question 9 rather
 than decided here.
 
 **Squirrel.Windows lifecycle** (`src/main/squirrel.ts`). Squirrel starts the installed app
@@ -352,7 +352,7 @@ Decided here:
   DHT. This lane contacts nothing outside the npm registry.
 - No CI job yet. What `pear build` is given depends on open questions 3 and 9, the Pear CLI
   would need an exact pin reviewed like any other dependency, and the link's write key stays on
-  Cameron's machine, never on a runner. The commands above are the recipe.
+  The maintainer's machine, never on a runner. The commands above are the recipe.
 
 ### 7. The Chromium sandbox on Linux (never `--no-sandbox`)
 
@@ -360,7 +360,7 @@ Decided here:
   (4755)** while staging, and dpkg installs it that way. No maintainer script is involved. This
   is Chromium's audited helper and the standard Electron/Chrome `.deb` layout, so the sandbox
   starts on Ubuntu 24.04 without an AppArmor profile. A setuid-root binary is still a choice
-  worth Cameron's explicit yes (open question 10).
+  worth the maintainer's explicit yes (open question 10).
 - **AppImage.** FUSE mounts the image `nosuid`, so the SUID helper cannot work. The sandbox then
   needs unprivileged user namespaces:
   - Debian, Fedora and Arch allow them;
@@ -400,7 +400,7 @@ Decided here:
   root-owned. So `out/Nutflix-linux-x64/nutflix` aborts before any JavaScript runs:
   `FATAL:setuid_sandbox_host.cc:166 The SUID sandbox helper binary was found, but is not
   configured correctly`. To run it, and so prove the dev-flag refusal (exit 78) on a real
-  packaged binary, Cameron would change the D4 profile's attachment to:
+  packaged binary, the maintainer would change the D4 profile's attachment to:
 
   ```
   profile nutflix-electron /home/<you>/nutflix/{,.worktrees/*/}{node_modules/electron/dist/electron,packages/app-desktop/out/Nutflix-linux-*/nutflix} flags=(unconfined) {
@@ -463,11 +463,11 @@ Inputs and rules:
   A corrected manifest for the same commit must be newer than the event it replaces on the
   relays. `--created-at` overrides it.
 
-Nothing in the repo holds a key. Cameron signs the event with the SovTech key through Bunker46
+Nothing in the repo holds a key. The maintainer signs the event with the SovTech key through Bunker46
 (NIP-46 `sign_event`). The nsec never leaves the bunker, and no job, script or agent holds it.
 
-**`scripts/release-publish.mjs` (2026-10-03, Cameron's choice of a repo script)** runs that last
-step on Cameron's machine:
+**`scripts/release-publish.mjs` (2026-10-03, the maintainer's choice of a repo script)** runs that last
+step on the maintainer's machine:
 
 1. **Before the network:** the unsigned template must be a SovTech kind 30071 release whose
    tags agree (`release-verify.mjs` `checkUnsignedRelease`), and every file in `--dir` must
@@ -521,11 +521,11 @@ relays.
 The file is **not active**. `ci/gitlab-ci.yml` is parked (no runner yet) and is outside this
 lane's allowlist. Enabling it takes one `include:` line, proposed in `docs/lanes/S3-pack.md`.
 
-**Active since 2026-10-03: `.github/workflows/release.yml`** (Cameron, 2026-10-02: 0.1.0 is
+**Active since 2026-10-03: `.github/workflows/release.yml`** (the maintainer, 2026-10-02: 0.1.0 is
 Linux only, released as a draft GitHub release). It ports `desktop-linux` and
 `desktop-release-manifest` (with the Linux list only) and adds `draft-release`: on a
 `desktop-v*` tag that names `@sovit/app-desktop`'s version, it attaches the `.deb`, the
-AppImage, SHA256SUMS, the manifest and the unsigned event to a **draft** release, which Cameron
+AppImage, SHA256SUMS, the manifest and the unsigned event to a **draft** release, which the maintainer
 publishes once the notice is signed. Only that job can write (`contents: write`), only on a
 tag, and it runs no project code. A PR that touches the packaging runs the build and manifest
 as a dry run. The Windows and macOS jobs stay in the GitLab file for later.
@@ -551,28 +551,28 @@ as a dry run. The Windows and macOS jobs stay in the GitLab file for later.
   copy is user-writable anyway (its `app.asar` can simply be edited), so this gives nothing
   beyond what the copy already allows.
 
-## Open questions (Cameron)
+## Open questions (the maintainer)
 
 1. App id `xyz.sovit.nutflix` and the `.deb` maintainer `SovTech <git@sovit.xyz>`. Keep them?
-   **Answered 2026-10-02 (Cameron): keep both.**
+   **Answered 2026-10-02 (the maintainer): keep both.**
 2. Brand icons: none exist in the repo. The installers currently show Electron's default icon.
-   **Answered 2026-10-02 (Cameron): a neutral placeholder icon** for 0.1.0, replaceable later
+   **Answered 2026-10-02 (the maintainer): a neutral placeholder icon** for 0.1.0, replaceable later
    without other changes.
 3. `pear://` for Windows: add an msix maker (Pear's Windows format), or keep Windows
    `.exe`-only (then Windows is not on `pear://`)?
-   **Answered 2026-10-02 (Cameron): `.exe`-only for 0.1.0**; no msix, so Windows is not on
+   **Answered 2026-10-02 (the maintainer): `.exe`-only for 0.1.0**; no msix, so Windows is not on
    `pear://` yet. 0.1.0 builds Linux only (`.deb` + AppImage): Windows and macOS have never been
    built and are not OS-signed (no Apple Developer ID or Windows certificate for 0.1.0).
 4. AppImage on Ubuntu ≥ 24.04: it cannot start there without a user-namespace grant, and a
    profile on its `/tmp` mount point would open user namespaces to every local user (§7). The
    recommendation is the `.deb`. Should the extract-to-root-owned-`/opt` route be documented for
    users, or should the AppImage simply be marked "not for Ubuntu ≥ 24.04"?
-   **Answered 2026-10-02 (Cameron): mark it "not for Ubuntu ≥ 24.04"**; the release notes
+   **Answered 2026-10-02 (the maintainer): mark it "not for Ubuntu ≥ 24.04"**; the release notes
    point those users to the `.deb`. No `/opt` route is documented.
 5. Should the host check the digests of the unpacked files it loads (bare-sidecar's JS,
    sodium-native's `.node`, the worker tree) against a list inside the asar before spawning, or
    is waiting for code signing enough?
-   **Revised 2026-10-03 (Cameron): deferred until OS code signing exists.** The first answer
+   **Revised 2026-10-03 (the maintainer): deferred until OS code signing exists.** The first answer
    (add the check) rested on a claim that it would catch tampering; it would not. The list
    would live in `app.asar`, which is no harder to rewrite than the unpacked files: the asar
    integrity fuse does nothing on Linux (§4), and without code signing nothing anchors the
@@ -584,7 +584,7 @@ as a dry run. The Windows and macOS jobs stay in the GitLab file for later.
    when OS code signing anchors the list.
 6. `d` = `nutflix-desktop` keeps one replaceable "latest release" notice on relays, now one per
    release covering every platform. Use a per-version `d` instead, to keep history?
-   **Answered 2026-10-02 (Cameron): one `d` = `nutflix-desktop`** (relays keep the latest
+   **Answered 2026-10-02 (the maintainer): one `d` = `nutflix-desktop`** (relays keep the latest
    only). History stays in git tags and the GitHub releases; the update check reads one event.
    The signed notice goes to the app's default relays: `wss://relay.damus.io`, `wss://nos.lol`,
    `wss://relay.primal.net`.
@@ -605,14 +605,14 @@ as a dry run. The Windows and macOS jobs stay in the GitLab file for later.
    AppImage maker adds `--no-sandbox` on Ubuntu ≥ 24 (main refuses it, D4) and pulls
    electron-builder's `app-builder-lib`, and the maintained dmg maker brings a high advisory.
    Approve the substitution, or name the Pear makers to use and accept what they bring?
-   **Answered 2026-10-02 (Cameron): substitution approved.** The in-repo makers stay (Forge
+   **Answered 2026-10-02 (the maintainer): substitution approved.** The in-repo makers stay (Forge
    Squirrel and deb, `maker-appimage.ts`, `maker-dmg.ts`); the Pear steps (`pear touch`,
    `build`, `stage`, `provision`, `seed`) stay a separate manual step on the offline-key machine.
 10. **The setuid-root `chrome-sandbox` in the `.deb`** (§7). It is Chromium's standard Linux
     sandbox helper and what makes the sandbox start on Ubuntu 24.04 without a profile. Accept
     it, or ship an AppArmor userns profile for `/usr/lib/nutflix/nutflix` instead (a maintainer
     script that runs as root at install)?
-    **Answered 2026-10-02 (Cameron): accept the setuid helper.** It is what Chromium-based apps
+    **Answered 2026-10-02 (the maintainer): accept the setuid helper.** It is what Chromium-based apps
     ship; the sandbox starts on Ubuntu 24.04 with no maintainer script, and an AppArmor profile
     would cover only AppArmor systems while adding a root postinst.
 11. **`--enable-features` / `--disable-features` in a packaged build** (cross-lane review,
@@ -625,7 +625,7 @@ as a dry run. The Windows and macOS jobs stay in the GitLab file for later.
     launching Electron. Refuse named features (which list?), refuse the switches outright, or
     leave them?
 
-    **Answered 2026-10-02 (Cameron): an allow-list.** A packaged build accepts the two switches
+    **Answered 2026-10-02 (the maintainer): an allow-list.** A packaged build accepts the two switches
     only when every feature they name is in `PACKAGED_ALLOWED_FEATURES` (`src/main/security.ts`:
     `UseOzonePlatform`, `WaylandWindowDecorations`); anything else is refused in main (exit 78,
     `app.feature-switch-refused`), after the process switches. Fails closed: each comma-separated
@@ -640,7 +640,7 @@ as a dry run. The Windows and macOS jobs stay in the GitLab file for later.
     Electron build without `--enable-features` was not checked here: no Electron is launched).
     Refuse them in a packaged build as well, or leave them?
 
-    **Answered 2026-10-03 (Cameron): refuse them.** `enable-blink-features`,
+    **Answered 2026-10-03 (the maintainer): refuse them.** `enable-blink-features`,
     `disable-blink-features`, `force-fieldtrials` and `force-fieldtrial-params` joined
     `PACKAGED_REFUSED_SWITCHES` (`src/main/security.ts`): a packaged build exits 78
     (`app.process-switch-refused`) before anything starts; a dev build keeps them. No packaged

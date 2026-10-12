@@ -24,7 +24,7 @@
  *       (required — dislikes are always shown) and `.myReaction?`. (b) `NetworkAdapter
  *       .unreact(videoId)` — NIP-09 deletion; un-like must never be sent as a `-` dislike.
  *       (c) `PricePolicy.split` doc points at ADR 0007 (min PAY size + creator carry,
- *       implemented in Stage 2). The Stage 2 bump planned as "v4" in docs/status.md is v5.
+ *       implemented in Stage 2). The Stage 2 bump planned as "v4" in docs/archive/status-2026-10-04.md is v5.
  *   5 — 2026-09-23 Stage 2 (ADR 0010). BREAKING for the money path, additive elsewhere.
  *       (a) `BlockRange.core` REQUIRED; `recordUpload(peer, blocks: BlockRange, policy)`
  *       records block INDEXES (distinct per core) and takes the core's policy (effective

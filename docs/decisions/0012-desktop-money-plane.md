@@ -6,7 +6,7 @@ Date: 2026-09-24
 
 Accepted for Stage 3 (lane "desktop runtime", branch `stage-3/desktop-runtime`). Implemented and
 tested end to end. The signer connect flow that opens the money plane for a real user is ADR 0013
-(`stage-3/desktop-signer`).
+(`stage-3/desktop-signer`). Superseded in part on 2026-09-26; see the dated note under the decision.
 
 ## Context
 
@@ -102,7 +102,7 @@ ceiling was above the video's price, even a core it priced within it.
   refused. At most 256 are kept. Core locks the quotes themselves with NUT-20 where the mint
   supports it.
 
-- Addendum 2026-09-25 (issue #2, security review F4; Cameron 2026-09-24): **auto top-ups
+- Addendum 2026-09-25 (issue #2, security review F4; the maintainer 2026-09-24): **auto top-ups
   execute** — `host/topup/auto-topup.ts`, with the user's real wallet only (with `--dev-mocks` a
   due top-up is still only logged). When a payment is about to draw from a mint whose balance is
   below `Settings.autoTopUp.belowSats`, the host runs `mintQuote(target, amount)` →
@@ -333,7 +333,7 @@ ceiling was above the video's price, even a core it priced within it.
     source mint must ANSWER short of PAID (UNPAID, or its payment stuck PENDING): round 5 also
     released when the source could not be read at all, but a failed read says nothing and the
     melt may have paid. A source gone for good therefore holds its target back again, with no
-    in-app clear (R5-R1). **Since 2026-10-02 (Cameron: waive, keep watching):** Settings lists
+    in-app clear (R5-R1). **Since 2026-10-02 (the maintainer: waive, keep watching):** Settings lists
     each held top-up with its reason and a Resume that main's native dialog confirms; a resumed
     hold is waived (`LedgerEntry.waived`), never deleted — it stops holding its target back and is
     still minted if the target pays it. Review record

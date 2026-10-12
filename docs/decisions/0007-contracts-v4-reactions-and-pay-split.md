@@ -4,7 +4,7 @@ Date: 2026-09-23
 
 ## Status
 
-Accepted (decisions by Cameron, 2026-09-23, answering the open inputs recorded in
+Accepted (decisions by the maintainer, 2026-09-23, answering the open inputs recorded in
 `docs/status.md` after the L5 screens merged). Amends ADR 0005 Q1.
 
 ## Context
@@ -16,7 +16,7 @@ Accepted (decisions by Cameron, 2026-09-23, answering the open inputs recorded i
    default 4-block window and 1 sat/block a PAY is 4 sats, so any split with `c < 25` pays the
    creator nothing on every PAY — for the whole video.
 2. **Dislikes.** The L5 screens could only show one `reactions` number, and un-like was sent as a
-   NIP-25 `-` reaction because v3 had no way to withdraw one (Watch, Shorts). Cameron: **always
+   NIP-25 `-` reaction because v3 had no way to withdraw one (Watch, Shorts). The maintainer: **always
    show dislikes.** Once dislikes are public, un-like-as-`-` would register a public dislike.
 3. **Card price vs charged price.** Cards said "from <cheapest rendition>"; Watch and Shorts charge
    the manifest's first (default) rendition, priced exactly.

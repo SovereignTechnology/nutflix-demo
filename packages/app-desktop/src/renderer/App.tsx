@@ -2,7 +2,7 @@
  * The desktop shell (design §4): header, sidebar, the routed screen, the mini-player and ONE
  * shell `ToastStack` (fed by Settings and Library through `onToast`; it outlives the screens,
  * and a toast's action closes that toast before it runs, once). Every prop the screens expect
- * from a shell (docs/status.md "Shell contract the screens expect") is wired here:
+ * from a shell (docs/archive/status-2026-10-04.md "Shell contract the screens expect") is wired here:
  *
  *   Home      `tab`, `hoverPreview` from Settings
  *   Watch     `videoId`, `startAtSec` (route `t`), `onMiniPlayer` → coordinator, `resumeSession`
