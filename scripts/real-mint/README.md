@@ -1,6 +1,6 @@
-# Real-mint testing lane
+# Real-mint tests
 
-Opt-in integration tests against real Cashu mints (execution plan §4; security review F6, §0a).
+Opt-in integration tests against real Cashu mints (security review F6 and §0a).
 They never run in plain `npm test` — CI stays offline — and nothing real moves: both mints use a
 FakeWallet Lightning backend on loopback.
 
@@ -14,9 +14,9 @@ and that the in-process `TestMint` does not reproduce by default.
 
 ```sh
 # once: NUTSHELL_VENV (see nutshell.sh), CDK_MINTD_BIN (see cdk-mintd.sh)
-NUTSHELL_VENV=… scripts/real-mint/nutshell.sh start 3399
-NUTSHELL_VENV=… scripts/real-mint/nutshell.sh start 3398   # external invoices for the melt test
-CDK_MINTD_BIN=… MNEMONIC_PYTHON=$NUTSHELL_VENV/bin/python scripts/real-mint/cdk-mintd.sh start 3397
+NUTSHELL_VENV=/path/to/venv scripts/real-mint/nutshell.sh start 3399
+NUTSHELL_VENV=/path/to/venv scripts/real-mint/nutshell.sh start 3398   # external invoices for the melt test
+CDK_MINTD_BIN=/path/to/cdk-mintd MNEMONIC_PYTHON=$NUTSHELL_VENV/bin/python scripts/real-mint/cdk-mintd.sh start 3397
 
 for m in 3399 3397; do
   NUTFLIX_REAL_MINT_URL=http://127.0.0.1:$m NUTFLIX_REAL_MINT_URL_2=http://127.0.0.1:3398 \

@@ -4,7 +4,7 @@ Build-plan §7 asks for `MemoryDenyWriteExecute` to be **tested** against the JS
 JIT rather than assumed. This is that test. Reproduce with
 `bash deploy/systemd/test-hardening.sh` (user scope, no sudo needed).
 
-- Date: 2026-09-04 · host: laptop2 (Ubuntu 24.04, kernel 7.0.0-31, systemd 255.4)
+- Date: 2026-09-04 · host: a development laptop (Ubuntu 24.04, kernel 7.0.0-31, systemd 255.4)
 - Runtime: Node **v22.22.0** (V8 12.4), `systemd-run --user --wait --pipe -p MemoryDenyWriteExecute=yes`
 - No sudo on this machine, so everything below is **user scope**. `ProtectSystem`,
   `ProtectHome`, `PrivateTmp`, `CapabilityBoundingSet` need a system manager and were not
@@ -63,7 +63,7 @@ resolves to `sodium-native` under Node, `@cashu/cashu-ts` → `@noble/*` pure JS
 dependency needs wasm on the server, the choice is between dropping MDWE and dropping that
 dependency — record it here.
 
-**Correction (2026-09-23, lane Seeder-entry): Node 22 itself needs it.** Node's built-in
+**Correction (2026-09-23): Node 22 itself needs it.** Node's built-in
 `undici` (behind the global `WebSocket`/`fetch` and `http.WebSocket`) compiles its HTTP parser
 to WebAssembly the moment it is loaded, so under `--jitless` loading it kills the process.
 The real package entries hit that at startup; the `-e` rows above never did. See §6.
@@ -117,7 +117,7 @@ hardening test: 13 passed, 0 failed
 
 ## 6. `--jitless` vs Node 22's lazy `undici` — the real entries crash at startup (2026-09-23)
 
-Found by lane Seeder-entry when the seeder got a real entry point, by running the built
+Found when the seeder got a real entry point, by running the built
 `dist/index.js` with the unit's own flags (the §5 rows only ever ran `-e` scripts that
 `require()` modules, never the package entries). Node v22.22.0; reproducers need no systemd:
 
@@ -155,7 +155,7 @@ Who triggers it:
 
 ## 7. The third door: the global `fetch` — every mint request (2026-09-24)
 
-Found by the Stage 3 seeder-runtime lane's pre-push review, before any real mint call had run
+Found in the seeder-runtime pre-push review, before any real mint call had run
 under the unit's flags (every money-path test runs in vitest, which is not `--jitless`). Node
 v22.22.0:
 
