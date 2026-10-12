@@ -9,9 +9,9 @@ Accepted
 ## Context
 
 Stage 1 Wave 1 (L9, L1, L10, L2, L8) merged against `CONTRACTS_VERSION = 2`. It produced one
-formal contract request (`docs/contract-requests/L9.md`), one doc/code divergence (L1 and L8
+formal contract request (`docs/archive/contract-requests/L9.md`), one doc/code divergence (L1 and L8
 both implement a `hyper://` grammar the contract comment does not describe), and two flags
-from L2 (`docs/lanes/L2.md` "Assumptions and decisions") that are not requests but describe
+from L2 (`docs/archive/lanes/L2.md` "Assumptions and decisions") that are not requests but describe
 workarounds the seeder had to make inside the v2 shape. `docs/status.md` batched all of them
 into one bump before Wave 2 so no Wave 2 lane is issued against a contract known to be wrong.
 
@@ -115,7 +115,7 @@ The seeder keeps the replay path until it is re-issued at v3 (it is contract-cle
 ## Consequences
 
 - `CONTRACTS_VERSION = 3`. All four changes are additive; `main` is green with every Wave 1
-  lane's code untouched. `docs/lanes/BRIEFS.md` and the lane prompt slot now say v3.
+  lane's code untouched. `docs/archive/lanes/BRIEFS.md` and the lane prompt slot now say v3.
 - **Wave 2 lanes (L3 first) are issued against v3** and must: put `core` in every `PAY` they
   construct, call `recordUpload(peer, blocks, core)` with the core, and use `rebind` for the
   provisional-identity bind. The gateway is *the* multi-core case, so L3 is the first real

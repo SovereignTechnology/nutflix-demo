@@ -9,7 +9,7 @@
  * Typing is debounced (~300 ms), Enter submits immediately and announces the route, `/`
  * focuses the box from anywhere. Every search carries a sequence number and every effect a
  * cancellation flag, so a slow answer to an older query can never overwrite a newer one
- * (the contract's `search` takes no AbortSignal — see docs/contract-requests/L5-Search.md).
+ * (the contract's `search` takes no AbortSignal — see docs/archive/contract-requests/L5-Search.md).
  * Skeleton rows while in flight, a designed "no results" state that echoes the query, a
  * retryable ErrorState for relay failures, infinite scroll with a "Load more" fallback.
  *

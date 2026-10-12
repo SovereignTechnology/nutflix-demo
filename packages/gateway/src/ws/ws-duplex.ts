@@ -15,7 +15,7 @@
  *     seeder-side cut the viewer keeps sending until it reads our close frame) are DROPPED.
  *     Pausing for them would stop the socket from reading the viewer's close reply, and the
  *     closing handshake would then wait out `ws`'s `closeTimeout` (30 s) — the L3-flake bug,
- *     see docs/lanes/L3-flake.md.
+ *     see docs/archive/lanes/L3-flake.md.
  *   - Destroy is GRACEFUL where possible: a seeder-side cut (spike S-A) destroys the Noise
  *     stream, which destroys this duplex; we `close()` (not `terminate()`) so the frames
  *     already handed to the socket still reach the viewer — that is what makes "the viewer
@@ -31,7 +31,7 @@
  *
  * `streamx` is a transitive dependency of `hypercore` (lockfile 2.28.1). It is imported
  * directly here because the Hypercore side of the pipe IS a streamx stream and mixing in
- * a `node:stream` Duplex costs a compatibility shim for nothing. See docs/lanes/L3.md.
+ * a `node:stream` Duplex costs a compatibility shim for nothing. See docs/archive/lanes/L3.md.
  */
 import { Duplex } from 'streamx';
 import type { WebSocket } from 'ws';

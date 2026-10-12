@@ -14,8 +14,8 @@ git worktree add -b "$branch" "$dir" main
 {
   echo "lane: $lane"
   for p in "$@"; do echo "allow: $p"; done
-  echo "allow: docs/lanes/$lane.md"
-  echo "allow: docs/contract-requests/$lane.md"
+  echo "allow: docs/archive/lanes/$lane.md"
+  echo "allow: docs/archive/contract-requests/$lane.md"
 } > "$dir/.lane"
 (cd "$dir" && bash scripts/install-hooks.sh)
 echo "worktree $dir on branch $branch; allowlist:"

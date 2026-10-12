@@ -58,7 +58,7 @@ vi.setConfig({ testTimeout: 240_000 });
 
 const REPO_ROOT = new URL('../../../../../', import.meta.url);
 
-/** A policy where both shares are ≥ 1 sat for `blocks` blocks (see docs/lanes/L10.md §edge). */
+/** A policy where both shares are ≥ 1 sat for `blocks` blocks (see docs/archive/lanes/L10.md §edge). */
 const pricedScenarioArb = fc
   .record({
     blocks: fc.integer({ min: 1, max: 12 }),
@@ -407,7 +407,7 @@ describe('SECURITY.md money-path invariants', () => {
           const pA = policyWith({ satsPerBlock: sats(priceA) });
           const pB = policyWith({ satsPerBlock: sats(priceB) });
           // Both honest shares must be ≥ 1 sat or the PAY is an INV3 case, not an amount one
-          // (docs/lanes/L10.md §observations 3). v5 rounds the CREATOR share down (ADR 0005/
+          // (docs/archive/lanes/L10.md §observations 3). v5 rounds the CREATOR share down (ADR 0005/
           // 0007), so it is the creator share that can be 0 now; check both, as stated.
           const [a, b] = [expectedShares(blocks, pA), expectedShares(blocks, pB)];
           fc.pre(a.seeder >= 1 && a.creator >= 1 && b.seeder >= 1 && b.creator >= 1);

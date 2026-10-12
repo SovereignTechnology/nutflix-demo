@@ -6,7 +6,7 @@
  * `provider.mts`. Rows whose control lives elsewhere (T1/T2/T11 → L2, T12 → L9, T13 → L7,
  * T14 → Stage 2 signer + L2 redaction, T15/T16 → L4) get the strongest pin that is
  * checkable at the interface/contract/repo-policy level today; the comment on each test
- * names the owner of the runtime proof. See docs/lanes/L10.md for the full/pinned split.
+ * names the owner of the runtime proof. See docs/archive/lanes/L10.md for the full/pinned split.
  */
 import { readFile, readdir } from 'node:fs/promises';
 import { describe, expect, it, vi } from 'vitest';
@@ -536,7 +536,7 @@ describe('SECURITY.md threat table', () => {
     'T7 a proof whose unblinded signature `C` is altered fails DLEQ even with a well-formed `dleq` (Stage 2 packages/core/src/payment/ unskips this)',
     async () => {
       // The reference model never looks at `C` (its DLEQ stand-in is `dleq.s !== FORGED`), so
-      // this is skipped under the mock and documented in docs/lanes/L10.md. NUT-12: the DLEQ
+      // this is skipped under the mock and documented in docs/archive/lanes/L10.md. NUT-12: the DLEQ
       // proves C = k·B' for the keyset's k; any change to C, secret or amount breaks it.
       const { viewer, seeder } = getPair('honest');
       upload(seeder, VIEWER, 4);

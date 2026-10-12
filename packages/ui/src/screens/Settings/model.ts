@@ -195,7 +195,7 @@ export const AUTO_TOP_UP_PER_DAY_SATS = UI_AUTO_TOP_UP_PER_DAY_SATS;
  * `Settings.autoTopUp` is optional and `updateSettings` takes a `Partial<Settings>` merge, so
  * under `exactOptionalPropertyTypes` a patch cannot remove it. "Off" is therefore written as a
  * zero threshold (the balance is never below 0 sats) and read back the same way — see
- * docs/contract-requests/L5-Settings.md.
+ * docs/archive/contract-requests/L5-Settings.md.
  */
 export function autoTopUpEnabled(
   a: { readonly belowSats: number } | undefined,

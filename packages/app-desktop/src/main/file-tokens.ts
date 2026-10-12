@@ -1,5 +1,5 @@
 /**
- * SE-1 file-token registry (docs/reviews/2026-09-23-pre-push-l5-v4.md; design §2).
+ * SE-1 file-token registry (docs/archive/reviews/2026-09-23-pre-push-l5-v4.md; design §2).
  *
  * The renderer never names a file. The preload turns a DOM `File` the USER picked or dropped
  * into its path (`webUtils.getPathForFile`) and asks main for a token (`nf:grant-file`); main
@@ -14,7 +14,7 @@
  * Main swaps a token for `{ path, name, size }` only when relaying `studio.upload` (the IPC
  * gate); any other string there is `file-token-invalid`.
  *
- * Residual (documented in docs/lanes/L6-A.md): a compromised renderer can still ask for a token
+ * Residual (documented in docs/archive/lanes/L6-A.md): a compromised renderer can still ask for a token
  * for a path it knows, because `isGrantFileMsg` is all main sees — the preload only ever sends
  * `webUtils.getPathForFile(file)`, and a renderer-constructed `File` has no path (`''`), which
  * is refused. The upload itself still needs the user's Publish click in Studio.

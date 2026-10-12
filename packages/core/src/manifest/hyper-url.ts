@@ -8,7 +8,7 @@
  * `byteLength` is the imeta `size`, so it is not repeated here; `byteOffset` is only
  * written when non-zero (a blob that is not first in its core). The core key is the
  * 64-char hex form (`CoreKeyHex`); z32 is not accepted in this version (noted in
- * docs/lanes/L1.md).
+ * docs/archive/lanes/L1.md).
  */
 import type { CoreKeyHex, HyperblobRef } from '../contracts/index.js';
 

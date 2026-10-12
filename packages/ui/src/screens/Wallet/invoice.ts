@@ -137,7 +137,7 @@ export type AutoTopUp = NonNullable<Settings['autoTopUp']>;
  * `Settings.autoTopUp` is optional, and under `exactOptionalPropertyTypes` a
  * `Partial<Settings>` patch cannot carry `autoTopUp: undefined` — nor would the key survive a
  * JSON hop to the gateway. So "off" is written as `belowSats: 0` ("top up below 0 sats" can
- * never trigger). See docs/contract-requests/L5-Wallet.md.
+ * never trigger). See docs/archive/contract-requests/L5-Wallet.md.
  */
 export function isAutoTopUpOn(a: Settings['autoTopUp']): a is AutoTopUp {
   return a !== undefined && a.belowSats > 0;

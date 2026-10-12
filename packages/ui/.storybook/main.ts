@@ -1,6 +1,6 @@
 import { defineMain } from '@storybook/react-vite/node';
 
-// Storybook 10 + Vite 8, no addons: the pinned dependency set has none (docs/lanes/L4.md).
+// Storybook 10 + Vite 8, no addons: the pinned dependency set has none (docs/archive/lanes/L4.md).
 // Both themes are driven by the `theme` global in preview.tsx; the screenshot script
 // (scripts/screenshots.ts) iterates index.json × {light, dark}.
 export default defineMain({

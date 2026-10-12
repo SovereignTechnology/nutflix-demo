@@ -1,7 +1,7 @@
 /**
  * Desktop worker transcode adapter (lane L8). Runs inside the Bare worker (L6), which owns
  * `require('bare-subprocess')` and the path to the ffmpeg binary (shipped or system — the
- * path is injected config either way, see docs/lanes/L8.md).
+ * path is injected config either way, see docs/archive/lanes/L8.md).
  *
  * Wiring sketch for L6:
  *   const { spawn } = require('bare-subprocess')

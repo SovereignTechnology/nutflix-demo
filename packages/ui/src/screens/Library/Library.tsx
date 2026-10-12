@@ -78,7 +78,7 @@ export interface LibraryProps extends ScreenProps {
   readonly tab?: LibraryTab | undefined;
   /**
    * Opens this playlist (its NIP-51 `d` tag) on the Playlists tab. `Route` has no field for it
-   * yet (docs/contract-requests/L5-Library.md), so a shell that wants deep links passes it.
+   * yet (docs/archive/contract-requests/L5-Library.md), so a shell that wants deep links passes it.
    */
   readonly playlistId?: string | undefined;
   /** "now" for day grouping and relative timestamps; stories/tests pin it. */

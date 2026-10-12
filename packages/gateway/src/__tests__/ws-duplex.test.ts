@@ -143,7 +143,7 @@ describe('WsDuplex', () => {
     // Spike S-A cut over a real socket: the seeder destroys the duplex while the viewer still
     // has requests in flight, so frames keep arriving until the viewer reads our close frame.
     // They must not pause the socket — a paused socket never reads the viewer's close reply,
-    // and the handshake then waits out ws's closeTimeout (30 s). docs/lanes/L3-flake.md.
+    // and the handshake then waits out ws's closeTimeout (30 s). docs/archive/lanes/L3-flake.md.
     const { server, serverWs, client } = await pair();
     const clientClosed = new Promise<number>((r) =>
       client.once('close', (code) => {
@@ -174,7 +174,7 @@ describe('WsDuplex', () => {
   });
 
   it('a destroy during a stalled write still starts the closing handshake, and stays graceful', async () => {
-    // F2 (docs/lanes/L3-flake.md): streamx defers `_destroy` until an in-flight `_write` calls
+    // F2 (docs/archive/lanes/L3-flake.md): streamx defers `_destroy` until an in-flight `_write` calls
     // back, and ours calls back only once `ws` has flushed the frame — never, while the peer
     // does not read. The close must start at the destroy anyway (`_predestroy`).
     const { server, serverWs, client } = await pair({ highWaterMark: 4096 });

@@ -11,7 +11,7 @@ tested; §8 records the maintainer's answers (2026-09-24). Nothing here changes 
 
 Until now the seeder daemon (`nutflix-seeder.service`, `packages/seeder/src/cli/main.ts`) refused
 to start on purpose: `cli/providers.ts` returned no runtime, so there was no engine, no wallet, no
-identity and no `pay/1` on swarm sessions (docs/lanes/Seeder-entry.md §3). Build-plan Phase 3
+identity and no `pay/1` on swarm sessions (docs/archive/lanes/Seeder-entry.md §3). Build-plan Phase 3
 needs a seeder that runs on a server unattended, is paid over `pay/1`, keeps its share in its own
 wallet, forwards the creator's share as NIP-61 nutzaps and survives restarts without losing money.
 

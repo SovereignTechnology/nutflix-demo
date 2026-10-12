@@ -1,6 +1,6 @@
 /**
  * Pure formatting helpers shared by the components. No DOM, no data fetching.
- * Locale is pinned to `en-US` so screenshots are diffable (docs/lanes/L4.md "defaults").
+ * Locale is pinned to `en-US` so screenshots are diffable (docs/archive/lanes/L4.md "defaults").
  */
 import type { MintUrl, NostrPubkey, PricePolicy, Rendition, Sats, UnixSeconds } from '@sovit/core';
 

@@ -12,7 +12,7 @@
  *     S1 now holds exactly the first half and S2 exactly the second: a viewer MUST fetch
  *     from both, deterministically (design §5(a) has S1 clear `[16, 32)`; S2 mirroring only
  *     that half makes the split disjoint, which is what makes "attributed to both seeders"
- *     deterministic — see docs/lanes/L6-C.md);
+ *     deterministic — see docs/archive/lanes/L6-C.md);
  *   - `videos`: live manifests of those blobs — UNSIGNED (`sig` = zeros, id = NIP-01 hash of
  *     the unsigned event), loudly logged, for the host's fixture catalogue only.
  *

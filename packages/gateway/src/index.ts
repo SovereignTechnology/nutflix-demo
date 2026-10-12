@@ -1,6 +1,6 @@
 /**
  * @sovit/gateway — `@sovit/seeder` + WS bridge + Blossom HTTP + upstream paying
- * (build-plan §5). Issued against CONTRACTS_VERSION = 3. Public API in docs/lanes/L3.md.
+ * (build-plan §5). Issued against CONTRACTS_VERSION = 3. Public API in docs/archive/lanes/L3.md.
  *
  * This module is BOTH the library entry and the daemon entry: the canonical systemd unit
  * runs `node --jitless …/dist/index.js --config /etc/nutflix/gateway.json`, so when this

@@ -17,7 +17,7 @@ export const DESKTOP_FILE = 'desktop.json';
 const FILE_V = 1 as const;
 
 /**
- * First-run settings. Decisions (docs/lanes/L6-B.md): three widely used public relays so a
+ * First-run settings. Decisions (docs/archive/lanes/L6-B.md): three widely used public relays so a
  * first run shows something; no default mint (the user chooses who holds their money);
  * seeding OFF until the user opts in (it spends disk and upload bandwidth); a 30 s prefetch
  * ("buffer = money"); theme follows the system.
@@ -81,7 +81,7 @@ export interface StoredSettings {
  * Whether a top-up of `mint` (whose balance is `balance`) is due — the question the contract
  * defines; `../topup/auto-topup.ts` executes it (issue #2) behind its own caps and confirm:
  *
- *   - SE-4 (docs/reviews/2026-09-23-pre-push-l5-v4.md): "off" when absent or `belowSats <= 0`
+ *   - SE-4 (docs/archive/reviews/2026-09-23-pre-push-l5-v4.md): "off" when absent or `belowSats <= 0`
  *     (a patch cannot clear the optional key, so Settings/Wallet write `belowSats: 0`); the
  *     trigger is strictly `balance < belowSats`;
  *   - v5 (ADR 0010 item 5): `mint` is the mint a payment is about to draw from, the top-up is

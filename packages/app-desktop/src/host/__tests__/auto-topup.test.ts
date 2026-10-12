@@ -812,7 +812,7 @@ describe('AutoTopUp — the history label', () => {
   });
 });
 
-// ---- independent review of the lane (docs/reviews/2026-09-25-pre-push-auto-topup.md) ------------
+// ---- independent review of the lane (docs/archive/reviews/2026-09-25-pre-push-auto-topup.md) ------------
 
 describe('AutoTopUp — review F2: the "top-up" label outlives the 24-hour window', () => {
   it('a funding melt still reads "top-up" the next day, after the window pruned its entry — and after a restart', async () => {

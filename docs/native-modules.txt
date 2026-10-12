@@ -2,7 +2,7 @@
 # Regenerate with: scripts/native-module-inventory.sh --accept   (only AFTER reading every new line)
 # Verify with:     scripts/native-module-inventory.sh --check    (part of npm run ci and CI)
 # Columns: name@version | install path | native markers | lifecycle install scripts | scope | shortest dependency chain from a workspace package
-# Every line has been read by a human on the stated version; the review notes live in docs/lanes/L9.md.
+# Every line has been read by a human on the stated version; the review notes live in docs/archive/lanes/L9.md.
 # platform: linux-x64
 @electron-internal/extract-zip@1.0.5 | node_modules/@electron-internal/extract-zip | .node | scripts=none | dev-only | via @sovit/app-desktop>electron>@electron-internal/extract-zip
 @esbuild/linux-x64@0.28.2 | node_modules/@esbuild/linux-x64 | platform-pkg | scripts=none | dev-only | via @sovit/app-desktop>esbuild>@esbuild/linux-x64

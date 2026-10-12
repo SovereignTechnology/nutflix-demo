@@ -108,7 +108,7 @@ Hypercore picks the peer for each request and offers no public way to choose it.
 
 ## Optional contract change (v7): the seeder's count in `ACK`
 
-`docs/contract-requests/S3-f33.md` proposes an optional `ACK.window = { outstanding, windowBlocks
+`docs/archive/contract-requests/S3-f33.md` proposes an optional `ACK.window = { outstanding, windowBlocks
 }`. With it, the viewer could re-base its estimate on what the seeder actually counted, and shrink
 the permanent debts above. That would fix three residuals, each of which lets the viewer fall out
 of step with what the seeder counts:
@@ -294,7 +294,7 @@ orchestrator's decisions, as built:
   `REPORT_WAIT_MS` toward such a seeder, so the residuals "a report delayed past
   `REPORT_WAIT_MS`" and the gateway's one-block risk after its own crash (R3, R4) are closed toward
   it. A seeder that sends no marker keeps the bounded wait. The desktop's durable word is now a
-  hint for those seeders only. Review record: `docs/reviews/2026-10-02-pre-push-pay-v7.md`.
+  hint for those seeders only. Review record: `docs/archive/reviews/2026-10-02-pre-push-pay-v7.md`.
 
 ### Crash tails (2026-10-02, the maintainer: persist open-session budgets; R2)
 - Every OPEN session also has an entry in the tail book, a provisional tail: what a crash of the
@@ -305,4 +305,4 @@ orchestrator's decisions, as built:
   replaces it with the ordinary tail, or drops it when nothing is unpaid. Found on disk at the
   next start, it is a crash's: an ordinary tail, expiring `TAIL_TTL_MS` after its last write.
   The spending authority this adds is the one a clean close already leaves (same caps, same
-  checks); review record `docs/reviews/2026-10-02-pre-push-crash-tails.md`.
+  checks); review record `docs/archive/reviews/2026-10-02-pre-push-crash-tails.md`.

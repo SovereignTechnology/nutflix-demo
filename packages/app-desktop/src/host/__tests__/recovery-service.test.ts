@@ -862,7 +862,7 @@ describe('guard rails', () => {
 });
 
 /**
- * The independent review of this lane (2026-09-27, docs/reviews/2026-09-26-pre-push-nut13-desktop.md
+ * The independent review of this lane (2026-09-27, docs/archive/reviews/2026-09-26-pre-push-nut13-desktop.md
  * § Independent review): each test failed before its fix.
  */
 describe('independent review fixes', () => {

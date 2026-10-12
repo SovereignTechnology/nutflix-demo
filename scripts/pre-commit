@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
 # Git pre-commit hook. Installed by `npm run hooks:install` (scripts/install-hooks.sh).
 #
-# Two mechanical guards from docs/plan/execution.md §0:
+# Two mechanical guards from docs/archive/execution-plan.md §0:
 #   rule 2 — a lane may only commit paths in its allowlist (.lane file in the worktree root)
 #   rule 3 — locked directories stay interface-only until Stage 2
 #
 # Lane allowlist format (.lane, gitignored, one entry per line, `#` comments):
 #   lane: L2
 #   allow: packages/seeder/
-#   allow: docs/lanes/L2.md
-#   allow: docs/contract-requests/L2.md
+#   allow: docs/archive/lanes/L2.md
+#   allow: docs/archive/contract-requests/L2.md
 # A worktree with no .lane file is treated as the orchestrator and is unrestricted.
 set -euo pipefail
 root="$(git rev-parse --show-toplevel)"
@@ -33,7 +33,7 @@ if [[ -f .lane ]]; then
   if [[ ${#bad[@]} -gt 0 ]]; then
     echo "pre-commit: lane ${lane:-?} may not commit these paths (see .lane allowlist):"
     printf '  %s\n' "${bad[@]}"
-    echo "If you need a contract change, write docs/contract-requests/${lane:-LANE}.md and stop."
+    echo "If you need a contract change, write docs/archive/contract-requests/${lane:-LANE}.md and stop."
     exit 1
   fi
   # A lane never touches contracts, full stop.

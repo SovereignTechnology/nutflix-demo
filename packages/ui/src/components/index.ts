@@ -1,6 +1,6 @@
 /**
  * Component exports. The orchestrator re-exports this file from `src/index.ts`
- * (`export * from './components/index.js'`), see docs/lanes/L4.md.
+ * (`export * from './components/index.js'`), see docs/archive/lanes/L4.md.
  */
 export { Button, IconButton } from './Button/Button.js';
 export type { ButtonProps, ButtonSize, ButtonVariant, IconButtonProps } from './Button/Button.js';

@@ -630,7 +630,7 @@ export class BlossomHandler {
 
       // Dedupe / cap are decided HERE, before `putFile`: the seeder's `putStream` opens
       // its second read stream eagerly and never consumes it on those two early returns,
-      // so the spool file must outlive an open it would otherwise race (docs/lanes/L3.md).
+      // so the spool file must outlive an open it would otherwise race (docs/archive/lanes/L3.md).
       const existing = this.seeder.blob(sha);
       if (existing) {
         this.owners.add(pubkey, sha);

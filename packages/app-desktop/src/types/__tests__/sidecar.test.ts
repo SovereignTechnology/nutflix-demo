@@ -113,7 +113,7 @@ describe('host ⇄ worker over PearRuntime.run (real bare)', () => {
         };
         expect(info.argv).toEqual(['/tmp/storage-arg', 'second']); // Bare.argv[2…]
         expect(info.version).toBe('v1.31.0');
-        // The Bare 1.31 globals finding (docs/lanes/L6-0.md).
+        // The Bare 1.31 globals finding (docs/archive/lanes/L6-0.md).
         expect(info.globals).toEqual({
           TextEncoder: 'undefined',
           TextDecoder: 'undefined',

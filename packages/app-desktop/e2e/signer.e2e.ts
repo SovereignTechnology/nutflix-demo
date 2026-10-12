@@ -3,7 +3,7 @@
  *
  *   NUTFLIX_E2E=1 NUTFLIX_E2E_APPARMOR_PROFILE=1 node --test packages/app-desktop/e2e/signer.e2e.ts
  *
- * Same prerequisites as stage1.e2e.ts (docs/lanes/L6-A.md "Running the Electron suites"). The app
+ * Same prerequisites as stage1.e2e.ts (docs/development.md "Running the Electron end-to-end suites"). The app
  * runs with `--dev-mocks` (no public network), which refuses the signer flow itself, so the suite
  * opens the prompt window through main's `--e2e-hooks` (`openPrompt`): the same `PromptService`,
  * window, preload, page and IPC checks the host's questions use. It asserts what the unit tests

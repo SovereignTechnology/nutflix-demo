@@ -519,7 +519,7 @@ relays.
   the manifest and the one unsigned event.
 
 The file is **not active**. `ci/gitlab-ci.yml` is parked (no runner yet) and is outside this
-lane's allowlist. Enabling it takes one `include:` line, proposed in `docs/lanes/S3-pack.md`.
+lane's allowlist. Enabling it takes one `include:` line, proposed in `docs/archive/lanes/S3-pack.md`.
 
 **Active since 2026-10-03: `.github/workflows/release.yml`** (the maintainer, 2026-10-02: 0.1.0 is
 Linux only, released as a draft GitHub release). It ports `desktop-linux` and

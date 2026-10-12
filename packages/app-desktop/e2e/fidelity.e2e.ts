@@ -18,7 +18,7 @@
  *   6. An ESM `utilityProcess` starts and spawns Bare via `bare-sidecar` (echo over IPC).
  *   7. The CSP response header blocks an inline script; the page has no `require`.
  *
- * The findings are printed as JSON; copy them into docs/lanes/L6-A.md ("Fidelity findings").
+ * The findings are printed as JSON; copy them into docs/archive/lanes/L6-A.md ("Fidelity findings").
  */
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync, statSync, writeFileSync } from 'node:fs';

@@ -2,7 +2,7 @@
  * Minimal ambient declarations for the Holepunch stack, covering EXACTLY the surface the
  * seeder uses. Written against the pinned versions (hypercore@11.35.3, hyperblobs@2.12.1,
  * corestore@7.12.2, hyperswarm@4.17.0, hyperdht@6.34.0) by reading their source — see
- * docs/lanes/L2.md. Nothing here is a full typing of those libraries.
+ * docs/archive/lanes/L2.md. Nothing here is a full typing of those libraries.
  */
 
 declare module 'hypercore' {

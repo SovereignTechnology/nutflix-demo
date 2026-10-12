@@ -802,7 +802,7 @@ describe('scripts/release-manifest.mjs — exact maker names (verifier, round 2)
 // Lane I1 (packaging round-3 verifier, Low): a real-maker test that timed out left TMPDIR in a
 // dir afterEach then deleted, and the 10 tests after it failed with ENOENT. Ordered on purpose:
 // the first test leaves exactly what such a timeout leaves; the second is the test after it.
-// (Manual check, recorded in docs/reviews/2026-09-25-pre-push-dleq-packaging.md: with that
+// (Manual check, recorded in docs/archive/reviews/2026-09-25-pre-push-dleq-packaging.md: with that
 // test's timeout cut to 300 ms, the file now fails 1 test, the timeout, not 11.)
 describe('a maker run that outlives its test does not take TMPDIR with it (lane I1)', () => {
   it('leaves TMPDIR pointed into its own dir, unrestored, as a timed-out makerNames does', () => {

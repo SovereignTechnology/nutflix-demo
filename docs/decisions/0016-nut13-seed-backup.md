@@ -445,8 +445,8 @@ which may not persist counters.
 ## Implementation notes (lane N1-nut13-core, core, 2026-09-26)
 
 The decisions stand. Where the core implementation sharpens or departs from the design text, and
-what the real-mint lane measured (details: `docs/lanes/N1-nut13-core.md`,
-`docs/reviews/2026-09-26-pre-push-nut13-core.md`):
+what the real-mint lane measured (details: `docs/archive/lanes/N1-nut13-core.md`,
+`docs/archive/reviews/2026-09-26-pre-push-nut13-core.md`):
 
 - **§4, the code of a collision.** Real mints do not answer "outputs already signed" with 10002:
   Nutshell 0.21.0 says 11003 "outputs already signed" (mint, swap, melt); cdk-mintd 0.18.1 says
@@ -489,7 +489,7 @@ what the real-mint lane measured (details: `docs/lanes/N1-nut13-core.md`,
 - **§5 step 4.** At a mint without NUT-12 everything unspent is swapped before it counts (one
   history line); dust the input fee would eat is left.
 - **§5 step 5.** PENDING proofs are left out (the store has no "marked" state); a later restore
-  adds them if the melt failed. Contract request `docs/contract-requests/N1-nut13-core.md` item 2.
+  adds them if the melt failed. Contract request `docs/archive/contract-requests/N1-nut13-core.md` item 2.
 - **§5 step 3, the batch cap (open for the maintainer).** This device's own phrase is scanned at least to
   its counters file's `next`, whatever the gaps or the cap. Any other scan the 200-batch cap stops
   is reported, with where to resume (`RestoreDetail.resume`, never outcome `nothing`), because a
@@ -508,8 +508,8 @@ what the real-mint lane measured (details: `docs/lanes/N1-nut13-core.md`,
 
 ## Implementation notes (lane W8a-money, final cross-lane review, 2026-09-27)
 
-The decisions stand. What the desktop now does (details: `docs/lanes/W8a-money.md`,
-`docs/reviews/2026-09-27-pre-push-w8a-money.md`):
+The decisions stand. What the desktop now does (details: `docs/archive/lanes/W8a-money.md`,
+`docs/archive/reviews/2026-09-27-pre-push-w8a-money.md`):
 
 - **§3, startup restore wired.** After the journal's startup settle, a seeded money plane calls
   `CashuWallet.restoreUnpublished()` (contract request N1-4), each mint inside the PAY/melt gate.
@@ -522,7 +522,7 @@ The decisions stand. What the desktop now does (details: `docs/lanes/W8a-money.m
 - **§5 step 3, the batch cap.** The host follows core's `resume`: up to 10 calls per phrase and
   mint per restore, only while a call moves the scan on; an unfinished scan keeps its cursor in the
   host and reads "could not be reached" until the Settings screen has a "not finished" outcome
-  (`docs/contract-requests/W8a-money.md`). The maintainer's open decision on the bound (N1 item 7) stands:
+  (`docs/archive/contract-requests/W8a-money.md`). The maintainer's open decision on the bound (N1 item 7) stands:
   this is option 1 with the host doing the continuing.
 - **D5, when a reissue is complete** (the final rule, fix rounds 8 and 9). Nothing moves at a
   mint while an operation is journaled there, whatever is spendable there. Such a mint keeps the

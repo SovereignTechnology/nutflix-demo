@@ -10,7 +10,7 @@ is a batching target, not a seeder-side rejection (§3.3). Everything else in AD
 ## Context
 
 Stage 1 closed with nine open contract-change requests (`docs/status.md` → "Open contract-change
-requests", full text in `docs/contract-requests/*.md`), two money-path bugs in
+requests", full text in `docs/archive/contract-requests/*.md`), two money-path bugs in
 `MockPaymentEngine` found by L6-C, and ADR 0007's per-PAY split waiting for its contract text.
 The Stage 2 prompt makes the v5 bump the first deliverable: accept, amend or defer each item in
 writing, fix the mock, re-run L10's adversary suite and say which expectations changed and why.

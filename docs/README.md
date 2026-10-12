@@ -30,6 +30,7 @@ trying to do.
 - [`plan/build-plan.md`](plan/build-plan.md): the original build plan. It is a historical input:
   where it disagrees with the ADRs or the code, those win.
 - [`spikes/`](spikes/): the three early research spikes that ADRs 0002 and 0003 rest on.
+- [`development.md`](development.md): running the Electron end-to-end suites.
 - [`native-modules.txt`](native-modules.txt): the reviewed list of native modules. CI fails if the
   installed set differs; `scripts/native-module-inventory.sh --check` runs the same test.
 
@@ -39,8 +40,8 @@ trying to do.
   money-path invariants and the audit surface.
 - [`security-review.md`](security-review.md): the security review: every finding, its state and
   its residual risk.
-- [`reviews/`](reviews/): per-change review records written before each push (differential
-  review and sharp-edges notes).
+- [`archive/reviews/`](archive/reviews/): the per-change review records written before each
+  push. They are self-review by the session that made the change, not independent audits.
 
 ## Reference
 
@@ -51,11 +52,8 @@ trying to do.
 
 ## Project history
 
-These are the working records of the build. They are kept for provenance, not as current
-documentation, and commit hashes or branch names in them may not exist in this repository.
-
-- [`lanes/`](lanes/): one report per work lane (scope, what changed, how it was verified).
-- [`contract-requests/`](contract-requests/): requests to change the frozen interface contracts.
-- [`prompts/`](prompts/): the working prompts used during the build.
-- [`plan/execution.md`](plan/execution.md) and [`plan/L6-design.md`](plan/L6-design.md): the
-  execution plan and the desktop shell design review.
+[`archive/`](archive/README.md) holds the working records of the build: the old status log, the
+execution plan, the lane reports, the contract requests, the pre-push security reviews and the
+prompts. They are kept for provenance and are not current documentation; commit hashes and branch
+names in them may not exist in this repository. The design review of the desktop shell,
+[`plan/L6-design.md`](plan/L6-design.md), is also from before it was built.

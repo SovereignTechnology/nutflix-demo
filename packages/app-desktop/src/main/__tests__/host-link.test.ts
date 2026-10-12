@@ -230,7 +230,7 @@ describe('main argv', () => {
  * The two ends of the main → host argv must agree. They drifted once (main sent
  * `--user-data=`, the host's strict parser wanted `--user-data-dir=` and `--worker-entry=`): the
  * host exited 2, main respawned it until the budget ran out and reloaded the window each time,
- * and nothing loaded in Electron (docs/lanes/E2E-fix.md, failure 2). So main's `hostArgs()` is
+ * and nothing loaded in Electron (docs/archive/lanes/E2E-fix.md, failure 2). So main's `hostArgs()` is
  * fed to the host's REAL `parseHostArgs()` — another TypeScript project, imported by path.
  */
 describe("main → host argv round trip (the host's real parser)", () => {

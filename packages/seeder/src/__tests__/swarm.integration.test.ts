@@ -5,7 +5,7 @@
  *
  * Also runtime-checks S-A findings 3 + 6 on a real UDX transport: the cut fires inside
  * `upload`, `peerInfo.ban(true)` blocks reconnection, and the viewer ends up with AT MOST
- * `windowBlocks` blocks (see docs/lanes/L2.md — on a real socket, blocks already handed
+ * `windowBlocks` blocks (see docs/archive/lanes/L2.md — on a real socket, blocks already handed
  * to the transport can be lost when the stream is destroyed, so "exactly" holds at the
  * Hypercore layer and "≤" on the wire).
  */
@@ -132,7 +132,7 @@ describe('replication over hyperswarm (local hyperdht testnet)', () => {
     // Accounting: the session and the engine counted exactly window+1 (the crossing block)
     // and nothing after the cut. Hypercore itself may emit one more `upload` for a request
     // already queued when the stream was destroyed (the send is a no-op on a destroyed
-    // stream — see docs/lanes/L2.md), so the raw event count is >= window+1.
+    // stream — see docs/archive/lanes/L2.md), so the raw event count is >= window+1.
     const cut = a.events.find(
       (e): e is Extract<SeederEvent, { type: 'session-cut' }> => e.type === 'session-cut',
     );

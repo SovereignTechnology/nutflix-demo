@@ -65,7 +65,7 @@ export const HOST_ENTRY = 'host/main.js';
 /**
  * Relative to `dist/`: the worker entry the host spawns with `bare-sidecar`. It is the `tsc`
  * output, never a bundle: a bundle hoists `@sovit/core` above `bare-encoding/global` and the
- * worker dies at load (D6, docs/lanes/L6-C.md).
+ * worker dies at load (D6, docs/archive/lanes/L6-C.md).
  */
 export const WORKER_ENTRY = 'worker/entry.js';
 

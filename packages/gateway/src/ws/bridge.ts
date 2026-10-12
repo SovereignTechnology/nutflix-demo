@@ -21,7 +21,7 @@
  *     until the WebSocket's own `close`. Destroying the duplex starts the closing handshake
  *     (`WsDuplex._predestroy`, even mid-write); a peer that has not completed it within
  *     `WS_CLOSE_GRACE_MS` (it never reads, or never answers the close frame) is terminated.
- *     Before this (docs/lanes/L3-flake.md F1/F2) the socket left the set at the stream's end,
+ *     Before this (docs/archive/lanes/L3-flake.md F1/F2) the socket left the set at the stream's end,
  *     uncounted and unpinged, and could stay open for 30 s — or indefinitely, if the peer had
  *     stopped reading mid-write.
  */

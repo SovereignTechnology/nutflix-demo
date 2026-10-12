@@ -1,7 +1,7 @@
 /**
  * Gateway — `@sovit/seeder` plus a WS bridge, Blossom HTTP and upstream paying
  * (build-plan §5). This is the façade the CLI entry (`cli/main.ts`), the L7 web-shell's
- * dev harness and the tests drive. See docs/lanes/L3.md for the public surface.
+ * dev harness and the tests drive. See docs/archive/lanes/L3.md for the public surface.
  *
  * To a browser the gateway IS a seeder: every session (WS-bridged or swarm) gets a `pay/1`
  * instance from the injected factory, the seeder's pay bridge (HELLO → bind, PAY → verify

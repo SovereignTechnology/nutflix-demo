@@ -1,7 +1,7 @@
 /**
  * Ambient `Bare` global for the desktop worker — only the surface L6 uses. There is no types
  * package for the Bare global in node_modules; everything here was read from the runtime
- * itself and checked by running it (docs/lanes/L6-0.md "Bare globals"):
+ * itself and checked by running it (docs/archive/lanes/L6-0.md "Bare globals"):
  *
  *   Bare 1.31.0 runtime, bundled into node_modules/bare-sidecar/prebuilds/<platform>/bare as
  *   module `/src/bare.js`: `class Bare extends EventEmitter` with getters `platform`, `arch`,

@@ -1,6 +1,6 @@
 /**
  * Shared plumbing for the Electron end-to-end suites (never run by `npm test`; see
- * docs/lanes/L6-A.md "Running the Electron suites"). Runs under plain Node 24 with type
+ * docs/development.md "Running the Electron end-to-end suites"). Runs under plain Node 24 with type
  * stripping: only erasable TypeScript, relative imports with `.ts` extensions.
  *
  * Nothing here weakens the sandbox (D4): `sandboxReady()` only REPORTS whether Chromium's
@@ -184,7 +184,7 @@ export function discoverXwayland(): { display: string; xauthority: string } | un
 
 /**
  * How the window gets a display. Measured with Electron 44.2.0 on the dev laptop (2026-09-23,
- * docs/lanes/E2E-fix.md):
+ * docs/archive/lanes/E2E-fix.md):
  *   - X11 WORKS — `DISPLAY` if set, else GNOME's Xwayland (`/tmp/.X11-unix/X<n>` + mutter's
  *     auth file). That X screen has no monitor (0×0), so the window is clamped to its minimum
  *     size; the suites resize it to 1280×800 (`launch`). Nothing is visible to the user.

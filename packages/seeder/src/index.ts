@@ -1,7 +1,7 @@
 /**
  * @sovit/seeder — Corestore + Hyperblobs seeder daemon (build-plan §2.1, §2.3, §7).
  * Issued against CONTRACTS_VERSION = 2, re-issued at CONTRACTS_VERSION = 3 (ADR 0004).
- * Public API documented in docs/lanes/L2.md; the daemon entry in docs/lanes/Seeder-entry.md.
+ * Public API documented in docs/archive/lanes/L2.md; the daemon entry in docs/archive/lanes/Seeder-entry.md.
  *
  * Node entry = the runtime-portable API (`./portable.ts`, also the `bare` export condition)
  * plus the Node adapters plus the daemon CLI.

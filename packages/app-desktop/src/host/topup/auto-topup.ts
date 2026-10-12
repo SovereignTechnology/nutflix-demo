@@ -57,7 +57,7 @@
  *
  * History (NIP-60 kind 7376): minting at the target already writes `in … "top-up"` and the melt
  * writes `out … "melt to Lightning"` at the source — nothing more is written (no double entry).
- * Core's melt takes no memo (contracts `Wallet.melt`; docs/contract-requests/S3-topup.md), so the
+ * Core's melt takes no memo (contracts `Wallet.melt`; docs/archive/contract-requests/S3-topup.md), so the
  * host shows that melt as "top-up" (`relabel`), by the history id the ledger recorded.
  *
  * A play at zero balance waits for its top-up at most `PLAY_TOP_UP_WAIT_MS` in all — every mint it

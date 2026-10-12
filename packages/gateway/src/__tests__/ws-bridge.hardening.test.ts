@@ -1,5 +1,5 @@
 /**
- * `WsBridge` hardening (docs/lanes/L3-flake.md, F1 + F2): what happens to a WebSocket after its
+ * `WsBridge` hardening (docs/archive/lanes/L3-flake.md, F1 + F2): what happens to a WebSocket after its
  * replication stream has ended — a seeder cut, a handshake timeout, a remote Noise close.
  *
  *   - F1: the socket stays in the bridge's `sockets` — counted against `maxConnections`,

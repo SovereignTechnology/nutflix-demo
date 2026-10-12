@@ -25,7 +25,7 @@
  * a per-video count of ANY seeder announcing that core. (b) cannot say whether the channel
  * itself runs a seeder (a popular video has seeders whoever made it), so it is shown only as
  * "availability" on the About tab; the header indicator comes from (a), or from the
- * `seedingVideos` prop when the shell knows (see docs/contract-requests/L5-Channel.md).
+ * `seedingVideos` prop when the shell knows (see docs/archive/contract-requests/L5-Channel.md).
  */
 import {
   useCallback,

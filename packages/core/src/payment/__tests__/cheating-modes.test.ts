@@ -151,7 +151,7 @@ describe('MockPaymentEngine cheating modes (each mode, each reason)', () => {
       .filter(({ blocks, policy }) => {
         // Both honest shares must be ≥ 2 sat so `underpay` (−1 on the creator side) and
         // `stiff-*` remain distinguishable from an empty set, for the first PAY and for the
-        // second, whose split the carry can move by one sat. See docs/lanes/L10.md §edge.
+        // second, whose split the carry can move by one sat. See docs/archive/lanes/L10.md §edge.
         const one = expectedShares(blocks, policy);
         const two = expectedShares(blocks, policy, one.carryOut);
         return Math.min(one.seeder, one.creator, two.seeder, two.creator) >= 2;
