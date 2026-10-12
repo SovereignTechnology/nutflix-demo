@@ -1,25 +1,38 @@
-# Security review — Stage 2 (PART B)
+# Security review
 
-Date: 2026-09-23. Reviewer: the Stage 2 session (`stage-2/2026-09-23`, on top of `stage-1`).
-Scope: the seams listed in `docs/prompts/stage-2-security.md` PART B, plus the residual risks of
-the five modules Stage 2 implemented (signer, `wallet/spend.ts`, payment, pay-protocol,
-gateway auth). There is no web portal; only the gateway's web-facing responses were reviewed.
+The record of this project's security review: every finding (F1 to F58), what was done about it,
+and the risk that remains. **It was done in-house, with AI assistance, by internal review
+sessions. It is not an independent audit.**
 
-Method: every claim below was checked against the source at `f398f9f` (file:line references are
-to that tree), and against measurements where a number is given. Findings are ranked by what an
-attacker gains and how cheaply. Each finding carries a concrete fix and a test. PART B forbade
-fixes outside the five Stage 2 directories; on 2026-09-24 Cameron asked for the fixes, and **§0
-records what was fixed and what is still open** (filed as `stage-3` issues, §6).
+**Current state, as of desktop 0.1.0 (tag `desktop-v0.1.0`, 2026-10-05).** Each finding is fixed,
+verified against a real mint implementation, or recorded as an accepted residual; section 0 and
+its sub-sections 0a to 0d are the current status of every one. Read those first.
 
-**Exposure today is nil for the money findings.** No runtime provider is wired: the desktop
-worker, the seeder and the gateway CLIs all refuse to start without `--dev-mocks`
-(`*/providers.ts` return `undefined`), so no real ecash moves until Stage 3 wires the Stage 2
-modules in. F1–F4 and F30 were the **Stage 3 blockers**; all five are fixed (§0).
+**How the sections relate.** Sections 1 to 3 and 5 are the original review of 2026-09-23, kept as
+written: where one of them describes a finding in the present tense and section 0 says it is
+fixed, section 0 is right. Sections 6 and 7 were brought up to date for the release. File and
+line references in the original sections are to the tree that was reviewed, and may have moved.
+
+Commit hashes and branch names in this document (`stage-2/...`, `stage-3/...`) belong to the
+history of the build before the repository was published. They do not exist here; to find a fix,
+use the finding's ID, the file named in section 0, or the test that pins it. The F-numbers are
+stable and are cited from source comments and tests.
+
+**Scope.** The original review covered the seams between the payment, signer, `pay/1` and
+gateway-auth code and the code that uses them, plus the residual risk of those five modules.
+Later rounds reviewed each piece that was added before release (the desktop money plane, the
+signer, the wallet journal, images, NUT-13 backup, packaging, one-seeder routing). There is no web
+portal; only the gateway's web-facing responses were reviewed.
+
+**Method.** Every claim was checked against the source (file:line references) and, where a number
+is given, against a measurement. Findings are ranked by what an attacker gains and how cheaply.
+Each finding carries a concrete fix and a test.
 
 ## 0. Status after the review fixes (2026-09-24, branch `stage-2/review-fixes`)
 
-Cameron asked for the fixes on 2026-09-24, which lifts PART B's "do not fix outside the five
-directories" for this list. Each fix carries a test that fails without it, except where noted.
+The maintainer asked for the fixes on 2026-09-24, which lifted the original review's rule not to
+fix outside the five modules for this list. Each fix carries a test that fails without it, except
+where noted.
 
 | ID | Status | What changed |
 |---|---|---|
@@ -40,10 +53,10 @@ directories" for this list. Each fix carries a test that fails without it, excep
 | F15 | **Fixed** | Uploads over 8 MiB must send `X-SHA-256` (no unauthenticated spooling of large bodies); default MIME allowlist (F3); a per-pubkey byte quota (`blossom.maxBytesPerPubkey`, default 2 GiB since 2026-09-25, `null` = none) on upload, mirror and authenticated `HEAD`, checked before a declared body is spooled, with in-flight bytes held (`stage-3/upload-quota`). Open: whether uploads should default to allow-list-only (decision) |
 | F16 | **Fixed** | The gateway loads `node:http` via `createRequire`; the unit gains `--no-experimental-websocket`; a spawn test runs the built entry with the unit's flags (verified on Node 22.22.0) |
 | F17 | **Fixed** (`stage-3/nut20-quotes`) | Where the mint advertises NUT-20 and the wallet key is held in the process (the NIP-60 wallet key; the seeder's is signer-held and stays unlocked), `mintQuote` locks the quote to that key and refuses an answer locked to anything else; `pollQuote` signs the mint request (cashu-ts: the amended NUT-20 message, the legacy one as fallback) and refuses a quote locked to a key it cannot sign with. Verified on Nutshell 0.21.0 and cdk-mintd 0.18.1 (one `POST /v1/mint/bolt11`, i.e. the amended signature accepted first try). The desktop hands the renderer an opaque handle (`h…`) in place of every quote id — replies and `wallet.change` events — polls by the stored quote, and forgets every handle when the signer changes |
-| F18 | **Fixed (loading)** (`stage-3/image-privacy`) | The distinctive user agent is gone. Cameron's decision (2026-09-24): `Settings.loadRemoteImages`, default off — the desktop host refuses an image without a signed sha256 before any request, so a publisher's URL cannot act as a tracking pixel; hash-addressed images load, verified; Settings › Appearance has the switch. Thumbnails over Pear (ADR 0015, `stage-3/images-over-pear`): Studio writes the thumbnail into the creator's profile core, and viewers read it over Pear (no `https:` request), with hash and size checked; seeders serve profile cores free and outside payment, or not at all (`serveImages`). Viewer-side avatars from a profile core work too, and setting one's own (`setProfilePicture`, `stage-3/profile-picture`) puts the picture in the profile core and re-publishes kind 0 with every other field kept |
+| F18 | **Fixed (loading)** (`stage-3/image-privacy`) | The distinctive user agent is gone. The maintainer's decision (2026-09-24): `Settings.loadRemoteImages`, default off — the desktop host refuses an image without a signed sha256 before any request, so a publisher's URL cannot act as a tracking pixel; hash-addressed images load, verified; Settings › Appearance has the switch. Thumbnails over Pear (ADR 0015, `stage-3/images-over-pear`): Studio writes the thumbnail into the creator's profile core, and viewers read it over Pear (no `https:` request), with hash and size checked; seeders serve profile cores free and outside payment, or not at all (`serveImages`). Viewer-side avatars from a profile core work too, and setting one's own (`setProfilePicture`, `stage-3/profile-picture`) puts the picture in the profile core and re-publishes kind 0 with every other field kept |
 | F19 | **Fixed** | Watch refuses a session whose policy charges more than the quote (play and quality switch) |
 | F20 | **Fixed** | `StoredReport.signatureVerified` is `true` after the auth boundary verified the report |
-| F21 | **Fixed** (`stage-3/f21-dev-flags`, `stage-3/packaging`, integration) | A packaged build refuses the dev flags, Chromium's remote-debugging switches and the sandbox-weakening / process-wrapper switches (exit 78, tested). Packaged builds (ADR 0017, Electron Forge) set the fuses `RunAsNode`, `EnableNodeOptionsEnvironmentVariable`, `EnableNodeCliInspectArguments` and (Cameron, 2026-09-26) `GrantFileProtocolExtraPrivileges` off, `EnableEmbeddedAsarIntegrityValidation` and `OnlyLoadAppFromAsar` on; every packaged binary's fuses are read back and the build fails on a mismatch; main, the host (with its npm code) and the renderer are inside `app.asar`; a stale build refuses to stage. Releases are a SovTech-signed Nostr manifest of sha256 sums (`scripts/release-verify.mjs`; signing through Bunker46 is Cameron's step). Residual: asar integrity is checked on macOS and Windows only, and the unpacked worker, `node_modules` and native addons are outside it everywhere (ADR 0017 open question 5); no platform code signing (accepted) |
+| F21 | **Fixed** (`stage-3/f21-dev-flags`, `stage-3/packaging`, integration) | A packaged build refuses the dev flags, Chromium's remote-debugging switches and the sandbox-weakening / process-wrapper switches (exit 78, tested). Packaged builds (ADR 0017, Electron Forge) set the fuses `RunAsNode`, `EnableNodeOptionsEnvironmentVariable`, `EnableNodeCliInspectArguments` and (the maintainer, 2026-09-26) `GrantFileProtocolExtraPrivileges` off, `EnableEmbeddedAsarIntegrityValidation` and `OnlyLoadAppFromAsar` on; every packaged binary's fuses are read back and the build fails on a mismatch; main, the host (with its npm code) and the renderer are inside `app.asar`; a stale build refuses to stage. Releases are a SovTech-signed Nostr manifest of sha256 sums (`scripts/release-verify.mjs`; signing through Bunker46 is the maintainer's step). Residual: asar integrity is checked on macOS and Windows only, and the unpacked worker, `node_modules` and native addons are outside it everywhere (ADR 0017 open question 5); no platform code signing (accepted) |
 | F22 | **Fixed** | `app.requestSingleInstanceLock()`; a second launch focuses the first window |
 | F23 | **Fixed** | `Nip60ProofStore` verifies every event itself |
 | F24 | **Fixed** — seeder daemon (`stage-3/seeder-runtime`) and desktop (`stage-3/desktop-signer`) | Daemon: key file 0600 (`--keygen`, `O_EXCL`, refused when group/other can read it), headless unlock from the `seeder-key-passphrase` systemd credential (ADR 0011 §1). Desktop (ADR 0013): the file `KeyStore` writes 0600 in a 0700 dir through an `O_EXCL` temp file, reads with `O_NOFOLLOW` and refuses a symlink, another owner or a loose mode before any passphrase is asked; unlock is the user's choice — a passphrase in main's trusted prompt window, the OS keychain (`safeStorage`, never Linux `basic_text`), or a NIP-46 bunker |
@@ -148,7 +161,7 @@ reviewed by a four-lens panel (money plane, worker/P2P, packaging, test integrit
 | F40 | High | cashu-ts's default fetch transport retries NUT-19 cached endpoints; a 429 answering the retry of a swap that had executed was taken as a refusal, the journal entry dropped and the proofs lost (reproduced on cdk-mintd) | **Fixed** (`stage-3/residuals` rounds 2–3): single-attempt transports everywhere (desktop `node:http`, core default over `fetch`), a 429 is ambiguous (held, then NUT-09/NUT-07), melts get 300 s |
 | F41 | High | A PAY queued behind a 300 s melt at its mint was built after the worker's `pay.build` deadline; its P2PK proofs were never delivered | **Fixed** (`stage-3/int-pay-melt-gate`, ADR 0012 amendment): a per-mint PAY/melt gate and a per-PAY start-by bound that counts journal settles |
 | F42 | High | An auto top-up whose funding melt ended unclear dropped the target quote; the melt later paid, the quote was never minted and a second top-up ran (Lightning paid twice) | **Fixed** (integration round 4): the quote is kept and sealed before the melt, minted exactly once, and blocks new top-ups into that target |
-| F43 | High | A thumbnail/avatar URL naming a paid video core made `image.fetch` download it unrouted and unpaid, so its honest seeders banned the viewer | **Fixed**: sold/attached cores refused (round 4), and since `stage-3/owed-viewer` image reads ask a peer only after its `PRICE { free: true }` for the core (Cameron, 2026-09-26) — no probe, nothing counted; a stored paid core is never marked free after a restart (round 8) |
+| F43 | High | A thumbnail/avatar URL naming a paid video core made `image.fetch` download it unrouted and unpaid, so its honest seeders banned the viewer | **Fixed**: sold/attached cores refused (round 4), and since `stage-3/owed-viewer` image reads ask a peer only after its `PRICE { free: true }` for the core (the maintainer, 2026-09-26) — no probe, nothing counted; a stored paid core is never marked free after a restart (round 8) |
 | F44 | Medium | Packaged builds never found the DLEQ thread entry and checked PAYs inline on the worker's loop, silently | **Fixed** (`stage-3/int-dleq-packaging`): resolved from the worker root, staged and gated |
 | F45 | High | Blocks unpaid at a close, quit or crash stay counted by the seeder; the next run overruns it and is banned | **Fixed**: close and quit pay the tail (round 4); pay/1 `OWED` at session start and `ACK.outstanding` (`stage-3/owed-seeder`); the viewer starts credit from the report and pays only blocks its durable record proves it received, under a persisted host authorisation (`stage-3/owed-viewer`); never twice across links, never dropped on a transient failure (round 8) |
 | F46 | High | One core's failing PAY aborted paying every other core of that seeder | **Fixed** (round 4): per-core isolation, time-bounded retries, explicit unpaid settlement |
@@ -166,6 +179,8 @@ reviewed by a four-lens panel (money plane, worker/P2P, packaging, test integrit
 | F58 | Low | pay/1 frames were malleable: the codec read invalid UTF-8 in any string as U+FFFD, and any uint (a string's length too) in a non-minimal encoding (`0xfd 0 0` for 0), so different frames decoded to one message; encode also wrote a lone surrogate as U+FFFD. No money path was found to depend on frame bytes (a re-sent HELLO compares bytes and would only refuse its own peer) | **Fixed 2026-10-02**, found by the first fuzz campaign (`docs/reviews/2026-10-02-pre-push-fuzz.md`): strict UTF-8 and minimal uints on decode, well-formed strings on encode |
 
 ## 1. Summary
+
+*Original text of 2026-09-23, kept as written. Section 0 gives the current status of each finding.*
 
 | ID | Sev | Finding | Where |
 |---|---|---|---|
@@ -205,6 +220,8 @@ reviewed by a four-lens panel (money plane, worker/P2P, packaging, test integrit
 F30–F32 were added by the pre-push differential review (`docs/reviews/2026-09-23-pre-push-stage-2.md`); their rows sit at their severity.
 
 ## 2. Findings
+
+*Original text of 2026-09-23, kept as written. Section 0 gives the current status of each finding.*
 
 ### F1 — Critical — `PRICE` can raise the price above the manifest
 
@@ -543,6 +560,8 @@ hash-addressed images).
 
 ## 3. Checklist coverage
 
+*Original text of 2026-09-23, kept as written. Section 0 gives the current status of each finding.*
+
 | Item | Result |
 |---|---|
 | webPreferences | `contextIsolation`, `sandbox`, `nodeIntegration*` false as literals, `webviewTag`/`webSecurity` at secure defaults (`main/window.ts`); `app.enableSandbox()`; `--no-sandbox`/`--disable-gpu-sandbox`/`--no-zygote` refused at start (exit 78). **Pass** |
@@ -582,6 +601,8 @@ hash-addressed images).
 
 ## 5. Stage 2 modules — what holds, what is residual
 
+*Original text of 2026-09-23, kept as written. Section 0 gives the current status of each finding.*
+
 - **Signer.** Keys live in `sodium_malloc` buffers, compared with `sodium_memcmp` and wiped on
   lock. The key file is argon2id13 + XChaCha20-Poly1305 with the header as AD and KDF cost
   bounds on read. The wallet P2PK key is separate from the Nostr key (NIP-60/61 require it).
@@ -612,11 +633,9 @@ that disables it; `verifyHello` returns a verdict object instead of `null`-means
 any rejected PAY that leaves the peer engine-banned (the forged-DLEQ `bad-dleq` ban included)
 is ACKed, then cut, with the ban persisted.
 
-## 6. Stage 3 issues
+## 6. Follow-up record
 
-To be filed on GitLab, labelled `stage-3` and `security`, severity in the title, body = the
-finding's section above plus its row in §0. **Filing waits for Cameron's go-ahead**
-(outward-facing). Only what §0 leaves open:
+The follow-ups the review produced. All are done; this is the record of what each became.
 
 | Issue title |
 |---|
@@ -627,17 +646,23 @@ finding's section above plus its row in §0. **Filing waits for Cameron's go-ahe
 | [Done] F10/F11/F12/F31 hooks in the desktop runtime — the worker's seeder engine persists seen secrets and pending PAYs and asks the host for `checkSpent` / `spentByUs` (ADR 0012) |
 | [Done] F31: a lost mint answer is restored (write-ahead journal + NUT-09, ADR 0014); the desktop journal is sealed and durable, melt change journaled (`stage-3/residuals`) |
 | [Done] NUT-13 seed backup (ADR 0016): a phrase per device, sealed + relay copy, reissue once, `@scure/bip39` in the locked `seed.ts`; restore follows core's resume; end to end on Nutshell and cdk (`stage-3/nut13-core`, `stage-3/nut13-desktop`, integration); F55/F56 fixed, tests pending CI |
-| [Done] Pear only (Cameron, 2026-09-24/25): Studio's third-party Blossom mirroring removed, our manifests name no Blossom server (contracts v6); the gateway's Blossom endpoints stay as a Nostr-signed HTTP face over its Pear seeder; per-pubkey quota default 2 GiB (`stage-3/pear-only`) |
+| [Done] Pear only (the maintainer, 2026-09-24/25): Studio's third-party Blossom mirroring removed, our manifests name no Blossom server (contracts v6); the gateway's Blossom endpoints stay as a Nostr-signed HTTP face over its Pear seeder; per-pubkey quota default 2 GiB (`stage-3/pear-only`) |
 | [Done] F18: images hash-addressed only by default; thumbnails and avatars in the creator's profile core over Pear (ADR 0015); image reads ask only seeders that said `PRICE { free: true }` (F43) |
 | [Done] F15: per-pubkey upload quota (`blossom.maxBytesPerPubkey`) |
 | [Done] F17: NUT-20 locked mint quotes; opaque quote handles over IPC. Residual [Low]: a signer-held wallet key (the seeder daemon) takes unlocked quotes — cashu-ts signs NUT-20 itself and needs the key as a string |
 | [Done] F4: auto top-ups execute — off by default, ≤ 10 000 sat per top-up, ≤ 50 000 per rolling 24 h (fees included), own mints only, first-time confirm in main's prompt window, every top-up in wallet history (`stage-3/auto-topup`) |
-| [Done] F21: packaging (ADR 0017): Forge build, six fuses, `.deb` built here, `.exe`/`.dmg`/AppImage configured, the Nostr-signed release manifest (unsigned template + verifier); `pear://` and in-repo makers instead of Pear makers await Cameron (ADR 0017 open questions) |
+| [Done] F21: packaging (ADR 0017): Forge build, six fuses, `.deb` built here, `.exe`/`.dmg`/AppImage configured, the Nostr-signed release manifest (unsigned template + verifier); `pear://` and in-repo makers instead of Pear makers await the maintainer (ADR 0017 open questions) |
 | [Done] F24: the desktop's file `KeyStore` (ADR 0013) |
 | [Done] Desktop signer: remove the key from this device; NIP-46 `auth_url` approval links (ADR 0013 §7) |
 | [Done] F25: external links open only after main's prompt window showed the real host |
 
 ## 7. Not verified
+
+Still unverified at the 0.1.0 release, in addition to the items below: the packaged `.deb` and
+AppImage have no recorded end-to-end run against real relays, real peers and a real mint (the
+Electron end-to-end suites run the development layout with fixtures and mock money), and the real-mint
+suites used a fake Lightning backend, so no real payment is on record.
+
 
 - Real mints (nutshell, cdk): NUT-07 behaviour beyond the real-mint suite, fee handling. (The `pay1` tag, F6, and NUT-20 locked quotes, F17, were verified on Nutshell 0.21.0 and cdk-mintd 0.18.1.)
 - Electron at runtime beyond the Stage 1 e2e (webPreferences, key allowlist, one session):
