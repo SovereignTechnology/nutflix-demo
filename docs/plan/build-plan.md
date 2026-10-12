@@ -1,5 +1,12 @@
 # Nutflix — Build Plan v2: Nostr-native P2P video network with Cashu-paid seeding and a YouTube-grade UI
 
+> **Historical planning input (v2, September 2026), kept as written. It is not a current spec.**
+> Where it disagrees with [`docs/decisions/`](../decisions/) or the code, those win: for example, the
+> web portal in this plan is out of scope ([ADR 0019](../decisions/0019-scope-pear-desktop-only.md)),
+> and section 1's threat table now lives in [`SECURITY.md`](../../SECURITY.md), which is the copy
+> that is maintained. Source comments cite this file by section number, so it stays where it is.
+> Its second-person asides are addressed to the maintainer during planning.
+
 Target: multiple peers seed a creator's video over Pear and get paid per block in Cashu; the creator picks the mint; 50/50 seeder/creator split by default; Blossom-addressable end to end; a web portal that runs the same protocol, same Nostr identity, and same Cashu wallet as the Pear app; and a UI that feels like YouTube, not like a protocol demo.
 
 **Naming:** Nutflix is the brand/community name only. Package scope (`@sovit/`), protocol identifiers (`pay/1`), and repo names stay neutral so a forced rename touches the app icon and README, not the codebase. See §9 item 11.
