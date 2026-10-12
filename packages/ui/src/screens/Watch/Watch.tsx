@@ -24,7 +24,7 @@
  *  - related videos are never prefetched — only their hash-verified thumbnails load;
  *  - thumbnails/avatars/captions go through `adapter.image(url, sha256)` (T16).
  *
- * Mini-player handshake (docs/lanes/L5-Watch.md): `onMiniPlayer(session, videoId, handoff)`
+ * Mini-player handshake (docs/archive/lanes/L5-Watch.md): `onMiniPlayer(session, videoId, handoff)`
  * gives the live session to the shell — on `i` / the mini-player button, on in-screen
  * navigation to a non-watch route, and on unmount while a session is live — after which the
  * shell owns it. `resumeSession` hands one back. Without `onMiniPlayer` the mini-player

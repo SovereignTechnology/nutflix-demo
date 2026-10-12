@@ -62,7 +62,7 @@ desktop-windows:
   tags: [windows]
   script:
     # electron-winstaller's install script (skipped by --ignore-scripts, reviewed in
-    # docs/lanes/S3-pack.md) only copies vendor/7z-<arch>.exe/.dll to vendor/7z.exe/.dll. It
+    # docs/archive/lanes/S3-pack.md) only copies vendor/7z-<arch>.exe/.dll to vendor/7z.exe/.dll. It
     # uses paths relative to its package directory. One command per line: works in any shell.
     - cd node_modules/electron-winstaller
     - node script/select-7z-arch.js

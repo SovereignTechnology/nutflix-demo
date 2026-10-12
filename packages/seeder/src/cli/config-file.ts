@@ -8,7 +8,7 @@
  * value — so the list can be logged verbatim (SECURITY.md invariant 7). The seeder must not
  * import `@sovit/gateway` (the dependency runs gateway → seeder), so this mirrors the
  * gateway's rules for the fields they share rather than sharing code. It is stricter in
- * places (docs/lanes/Seeder-entry.md lists them; the two should converge):
+ * places (docs/archive/lanes/Seeder-entry.md lists them; the two should converge):
  *   - unknown keys are rejected at EVERY level, not only the top one;
  *   - `policy` is required, and so are its `satsPerBlock`, `mints` (≥ 1, normalised form,
  *     no duplicates) and `creatorP2pk` (`0[23]` + 64 hex, the form `@sovit/core` uses);

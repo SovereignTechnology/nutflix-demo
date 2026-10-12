@@ -2,7 +2,7 @@
 
 **Issued against `CONTRACTS_VERSION = 3`.** Branch `lane/L5-Wallet`, based on main @ `684faa4`
 (which pinned `uqr@0.1.3` in `@sovit/ui` for this lane). Contract **notes** (no blockers):
-`docs/contract-requests/L5-Wallet.md` — switching auto top-up off, resumable mint quotes,
+`docs/archive/contract-requests/L5-Wallet.md` — switching auto top-up off, resumable mint quotes,
 a history cursor, mint reachability, and the paramless `wallet` route.
 
 Scope: build-plan §6.1 row **Wallet** (balance per mint, fund via LN invoice QR, auto-top-up

@@ -311,7 +311,7 @@ describe('--dev-fixtures (design §5a)', () => {
     // Writes still need a real signer.
     expect(await codeOf(a.react(mocks.VIDEOS[0]!.id, '+'))).toBe('no-signer');
 
-    // The boot race (docs/lanes/E2E-fix.md, failure 3): a feed read before the worker's
+    // The boot race (docs/archive/lanes/E2E-fix.md, failure 3): a feed read before the worker's
     // first dev.fixtures WAITS for it instead of answering with the mock catalogue only.
     let early: string | undefined;
     const earlyFeed = a.feed({ source: 'trending' }).then((p) => {

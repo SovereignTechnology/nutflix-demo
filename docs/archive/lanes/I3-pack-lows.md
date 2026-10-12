@@ -3,7 +3,7 @@
 Branch `stage-3/int-packaging-lows`, off `e55adf0` (lane I1's head: the packaged DLEQ thread
 fix, on the Stage 3 integration head with packaging #6 merged). Date: 2026-09-25. Commits:
 `c7d44f5` (the switches), `b2f0762` (staging: freshness and test doubles), then this report,
-the review record and ADR 0017. Review record: `docs/reviews/2026-09-25-pre-push-int-packaging-lows.md`, whose "Cross-lane review
+the review record and ADR 0017. Review record: `docs/archive/reviews/2026-09-25-pre-push-int-packaging-lows.md`, whose "Cross-lane review
 (round 4)" section has each finding and its mutation checks. ADR 0017 §1, §2 and §4 and its open
 questions were updated.
 
@@ -96,7 +96,7 @@ gets in.
 ## Round 5 (the round-4 verifier's findings)
 
 Commits: `26f4e98` (the rule and its tests), then this report, the review record and ADR 0017.
-Review record: the "Round 5" section of `docs/reviews/2026-09-25-pre-push-int-packaging-lows.md`.
+Review record: the "Round 5" section of `docs/archive/reviews/2026-09-25-pre-push-int-packaging-lows.md`.
 
 | Finding | Outcome |
 |---|---|
@@ -133,7 +133,7 @@ Review record: the "Round 5" section of `docs/reviews/2026-09-25-pre-push-int-pa
 ## Files
 
 - New:
-  - `docs/reviews/2026-09-25-pre-push-int-packaging-lows.md`
+  - `docs/archive/reviews/2026-09-25-pre-push-int-packaging-lows.md`
   - this file
 - Changed:
   - packaging: `packaging/stage.ts`, `packaging/cli.ts` (comment);

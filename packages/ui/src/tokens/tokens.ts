@@ -4,7 +4,7 @@
  * `tokens.css` is GENERATED from this file (`npm run -w packages/ui build:tokens`) and a
  * test fails if the two drift. Every value below is a default L4 chose against the design
  * brief (YouTube first, Rumble second, clean and mainstream); the rationale for each group
- * is recorded in `docs/lanes/L4.md` so Cameron can react to PNGs rather than JSX.
+ * is recorded in `docs/archive/lanes/L4.md` so Cameron can react to PNGs rather than JSX.
  *
  * Naming: every custom property is `--nf-<group>-<name>`. Semantic colours exist in BOTH
  * themes with identical keys (enforced by the type below and by a test).

@@ -2,7 +2,7 @@
 
 Diff: `main` at `068a432` → the v7 branch (lane C2-pay-v7, a Claude Code cloud session).
 Cameron's decision (status.md, Stage 3 input 29): **yes, pay/1 v7** for R3/R4, option 1 of
-`docs/contract-requests/P2-owed-viewer.md`. Method: the change written against the contract
+`docs/archive/contract-requests/P2-owed-viewer.md`. Method: the change written against the contract
 request, every layer given a test that fails without its part (below), then a differential read
 of the whole diff and the attacker model.
 

@@ -2,7 +2,7 @@
  * RFC 7233 single byte-range resolution for `GET /<sha256>` (BUD-01 "Range requests").
  *
  * Semantics borrowed from `hypercore-blob-server@1.15.0` `_onblob()` (read, not embedded —
- * see docs/lanes/L3.md): offsets are zero-indexed and INCLUSIVE, `end` is clamped to
+ * see docs/archive/lanes/L3.md): offsets are zero-indexed and INCLUSIVE, `end` is clamped to
  * `size - 1`, an unsatisfiable range is 416 with `Content-Range: bytes STAR/<size>` (a
  * literal asterisk — spelled out here because it would close this comment). Two
  * deliberate differences from its `parseRange()`:

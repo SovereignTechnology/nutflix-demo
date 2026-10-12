@@ -1,7 +1,7 @@
 /**
  * Test support (not a suite): L1's offline test kit, loaded from core's SOURCE the way L6-0's
  * tests load the ui classifiers (a runtime URL import, invisible to `tsc`). `TestSigner` is the
- * integration point L1 names for L6 (docs/lanes/L1.md): real Schnorr signatures through
+ * integration point L1 names for L6 (docs/archive/lanes/L1.md): real Schnorr signatures through
  * nostr-tools, a reversible fake nip44. No key material is handled in this lane's code.
  *
  * Importing that module also registers L1's own one-test self-check of `TestSigner` in the

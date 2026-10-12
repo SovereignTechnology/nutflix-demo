@@ -3,7 +3,7 @@
 Diff: `54f49bb` → `stage-3/owed-seeder` (`2305f83` wip, `e06eee8`, `551adbf`, `214a2a7`,
 `776ab04`, and this record). Method: `differential-review` and `sharp-edges`, inline, on the whole
 diff including the interrupted agent's unreviewed wip commit. Decisions: Cameron 2026-09-26, the
-amendments to ADRs 0015 and 0018. Lane record: `docs/lanes/P1-owed-seeder.md`.
+amendments to ADRs 0015 and 0018. Lane record: `docs/archive/lanes/P1-owed-seeder.md`.
 
 ## Executive summary
 

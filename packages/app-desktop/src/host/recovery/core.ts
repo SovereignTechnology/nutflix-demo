@@ -73,7 +73,7 @@ const ENTROPY_HEX = /^[0-9a-f]{32}$/;
 /**
  * 32 lower-case hex characters → the 16-byte `RecoveryEntropy` the seam's other methods take.
  *
- * The seam has no "from raw entropy" method (docs/contract-requests/N2-nut13-desktop.md, item 1),
+ * The seam has no "from raw entropy" method (docs/archive/contract-requests/N2-nut13-desktop.md, item 1),
  * yet both the sealed file and the relay copy hold the entropy as hex (`RecoveryRelayCopy`). This
  * is the ONE place the desktop brands bytes as entropy, after checking there are exactly 16; core
  * still validates every phrase it is handed (`toSeed`, `toIndices`).

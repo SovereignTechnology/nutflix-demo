@@ -1,12 +1,12 @@
 # Lane L5-Studio — the Studio screen (`packages/ui/src/screens/Studio/`)
 
 **Issued against `CONTRACTS_VERSION = 3`.** Branch `lane/L5-Studio`, based on main @ `684faa4`.
-Contract requests for v4 (none blocking): `docs/contract-requests/L5-Studio.md`.
+Contract requests for v4 (none blocking): `docs/archive/contract-requests/L5-Studio.md`.
 
 Scope: build-plan §6.1 row **Studio** (Upload / Analytics / Seeder status) + §6.4 (upload
 pipeline), ADR 0005 (split rounding, no bundled ffmpeg, web uploads stored as-is), design
-brief `docs/design/README.md` (YouTube Studio first), L4 component API (`docs/lanes/L4.md`),
-BRIEFS L5 row. Worked examples: `docs/lanes/L5-Home.md`, `docs/lanes/L5-Channel.md`.
+brief `docs/design/README.md` (YouTube Studio first), L4 component API (`docs/archive/lanes/L4.md`),
+BRIEFS L5 row. Worked examples: `docs/archive/lanes/L5-Home.md`, `docs/archive/lanes/L5-Channel.md`.
 
 ## What was built
 

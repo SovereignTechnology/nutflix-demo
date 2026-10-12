@@ -99,7 +99,7 @@ export function SeedingSection({
       label: LABEL_ENABLED,
       patch: (base) => ({ seeding: { ...base.seeding, enabled: on } }),
       // The live seeder is switched through its own method; it persists the preference
-      // (see docs/contract-requests/L5-Settings.md for the v4 clarification asked for).
+      // (see docs/archive/contract-requests/L5-Settings.md for the v4 clarification asked for).
       write: async (_patch, base): Promise<Settings> => {
         await adapter.seeder.setEnabled(on);
         return { ...base, seeding: { ...base.seeding, enabled: on } };

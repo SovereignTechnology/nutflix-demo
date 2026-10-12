@@ -15,7 +15,7 @@ split. It needs a desktop app and a web portal that share identity, wallet and p
 and a UI that competes with YouTube rather than looking like a protocol demo.
 
 The full design is in `docs/plan/build-plan.md` (the *what*) and the delivery method in
-`docs/plan/execution.md` (the *how*). This record captures the decisions that are
+`docs/archive/execution-plan.md` (the *how*). This record captures the decisions that are
 expensive to reverse.
 
 ## Decision
@@ -47,7 +47,7 @@ expensive to reverse.
   roughly halving the audit surface versus a hand-written chunk protocol.
 - The audit surface is small and named: `core/src/payment`, `core/src/signer`,
   `core/src/pay-protocol`, `core/src/wallet/spend.ts`, `gateway/src/auth`. These are
-  locked until a dedicated security stage (`docs/plan/execution.md` §3).
+  locked until a dedicated security stage (`docs/archive/execution-plan.md` §3).
 - Contracts in `packages/core/src/contracts/` are frozen before parallel work begins;
   changing them is an orchestrator-only action with a version bump.
 - Several assumptions (A4 per-peer upload gating, A8 browser Hypercore, A9 block size,

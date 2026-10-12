@@ -13,7 +13,7 @@ Branch `stage-3/int-reconcile`, off `54f49bb` (the base for the next fan-out). D
   loaded box, explicit 30 s on this lane's real top-up tests (measured times in a note).
 - `a7828a4` test(money): F3's end to end waits for the melt in flight (a race the whole suite
   exposed at load ~20).
-- then this report and the review record `docs/reviews/2026-09-26-pre-push-int-reconcile.md`
+- then this report and the review record `docs/archive/reviews/2026-09-26-pre-push-int-reconcile.md`
   (findings with file:line and scenario, sharp edges, the attacker model, 28 mutation checks).
 - `522edd0` test(money), fix round 7: the start-by pinned to the reservation's stamp (R6-3 had
   no test; the verifier's mutant passed every host test). Then the review record's "Round 7"

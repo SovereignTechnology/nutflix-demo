@@ -6,7 +6,7 @@ lane so eslint's project service covers `scripts/bundle.ts`). Spec: `docs/plan/L
 L6-A with §1 (Main, Renderer, PlaySession across processes), §2 (renderer ⇄ main, SE-1, rehydrate),
 §3 (all rows except the worker playback server and host images), §4, §5(b), D3, D4, D5, risk 5.
 
-No contract change requested (`docs/contract-requests/L6-A.md` does not exist on purpose). No
+No contract change requested (`docs/archive/contract-requests/L6-A.md` does not exist on purpose). No
 `src/ipc/` or `src/types/` edit, no dependency added, `package.json` and the lockfile untouched —
 the script changes the orchestrator must make are listed below. One file outside the package, on
 the orchestrator's instruction: `scripts/__tests__/electron-security-lint.test.ts` asserted "zero
@@ -140,7 +140,7 @@ packages/app-desktop/
 
 `e2e/stage1.e2e.ts` and the fidelity spike `e2e/fidelity.e2e.ts` (+ `e2e/fidelity/*`) run on
 the dev laptop since Cameron installed the AppArmor profile (D4), and each passes 3/3 in a row on
-the final build. Lane E2E-fix (`docs/lanes/E2E-fix.md`) lists the eight failures found on the
+the final build. Lane E2E-fix (`docs/archive/lanes/E2E-fix.md`) lists the eight failures found on the
 way: two product bugs (the main → host argv, the dev-fixture boot race) and six suite/tooling
 assumptions. Both are `node --test` suites (Node 24 type stripping, no vitest), skipped unless
 `NUTFLIX_E2E=1`, and check their prerequisites first (the sandbox check REPORTS; it never works
@@ -392,7 +392,7 @@ playable videos (design §5a `fixture-catalog.ts` + `fixtures-net.ts`). Adjust w
 B and C are merged; the suite is written to be edited then.
 
 **Orchestrator — `package.json` changes this lane needed** (made on main since; E2E-fix asks for
-`--test-concurrency=1` in `test:e2e`, see `docs/lanes/E2E-fix.md`)
+`--test-concurrency=1` in `test:e2e`, see `docs/archive/lanes/E2E-fix.md`)
 
 - `packages/app-desktop/package.json` scripts:
   - `"bundle": "node scripts/bundle.ts"`

@@ -11,7 +11,7 @@
  * --jitless`, `AF_NETLINK`, `Type=simple` — see `deploy/systemd/MDWE-RESULTS.md` and
  * `deploy/systemd/README.md`). The v2 `renderSystemdUnit()` / `HARDENING_DIRECTIVES` and
  * the duplicate `packages/seeder/systemd/` copy had drifted from it on all four of those
- * facts and were removed in the v3 re-issue (docs/lanes/L2.md "v3 re-issue"): a second
+ * facts and were removed in the v3 re-issue (docs/archive/lanes/L2.md "v3 re-issue"): a second
  * source of truth for a file this package cannot edit is only a second copy to drift.
  */
 import type { SeederProcess, SignalName } from '../adapters/process.js';

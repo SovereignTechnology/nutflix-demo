@@ -17,7 +17,7 @@ request 7). See §(g) and the review record's "Independent review" section. The 
 verifier then found 3 low items in that fix pass (fix round 7); all three are fixed. See §(h) and
 the review record's "Round 7" section.
 
-No dependency, lockfile or `package.json` change. `docs/contract-requests/N1-nut13-core.md` lists
+No dependency, lockfile or `package.json` change. `docs/archive/contract-requests/N1-nut13-core.md` lists
 seven items, none blocking (all worked around; item 7 also asks Cameron for a decision). Nothing outside the allowlist; `docs/status.md` and
 `docs/security-review.md` untouched (proposed text at the end).
 
@@ -299,7 +299,7 @@ Gates (2026-09-27, on a shared box at load average ~25):
   cdk-mintd 0.18.1 (:3397), both with `NUTFLIX_REAL_MINT_URL_2=http://127.0.0.1:3398`.
 - No app-desktop change, so no `lint:electron`; no dependency change, so no `check:native`.
 - Mutation checks: 35 guards broken one at a time, each caught by a test (two needed a stronger
-  test or a fixed filter first; `docs/reviews/2026-09-26-pre-push-nut13-core.md`).
+  test or a fixed filter first; `docs/archive/reviews/2026-09-26-pre-push-nut13-core.md`).
 
 Commits: `fc324fb` (vendored specs, first agent), `88fafaf` (the wip, first agent, unreviewed),
 `af7af77` (review fixes and the tests), `aaf39b6` (payout comment), `b2b7195` (one counter source

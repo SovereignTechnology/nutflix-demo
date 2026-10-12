@@ -47,7 +47,7 @@ case "${1:-}" in
     else
       echo "native-module-inventory: FAIL — installed native modules differ from the reviewed list ($reviewed)."
       echo "  Review every added/changed line (read the package: prebuilds only? install scripts? who pulls it?),"
-      echo "  record the review in docs/lanes/<lane>.md, then run: scripts/native-module-inventory.sh --accept"
+      echo "  record the review in docs/archive/lanes/<lane>.md, then run: scripts/native-module-inventory.sh --accept"
       exit 1
     fi ;;
   --accept)
@@ -56,7 +56,7 @@ case "${1:-}" in
       echo "# Regenerate with: scripts/native-module-inventory.sh --accept   (only AFTER reading every new line)"
       echo "# Verify with:     scripts/native-module-inventory.sh --check    (part of npm run ci and CI)"
       echo "# Columns: name@version | install path | native markers | lifecycle install scripts | scope | shortest dependency chain from a workspace package"
-      echo "# Every line has been read by a human on the stated version; the review notes live in docs/lanes/L9.md."
+      echo "# Every line has been read by a human on the stated version; the review notes live in docs/archive/lanes/L9.md."
       echo "# platform: $platform"
       inventory
     } > "$reviewed"

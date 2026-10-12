@@ -4,7 +4,7 @@
 Date: 2026-09-23. Branch `lane/L6-B` off `99b79be`. Spec: `docs/plan/L6-design.md` §6 row L6-B,
 §1 (Host row, Settings, Wallet and engine, PlaySession across processes), §2 (the host's side of
 both hops), §3 (images, IPC re-validation), §4 (session backstop), §5(a) fixtures seam, D2
-(amended), D3, D5, SE-4, SE-5. Contract requests: `docs/contract-requests/L6-B.md`.
+(amended), D3, D5, SE-4, SE-5. Contract requests: `docs/archive/contract-requests/L6-B.md`.
 No dependency, `package.json`, lockfile, `src/ipc/` or `src/types/` change.
 
 ## What was built — `packages/app-desktop/src/host/`

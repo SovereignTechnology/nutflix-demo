@@ -1,7 +1,7 @@
 # Lane L5-Settings: the Settings screen (`packages/ui/src/screens/Settings/`)
 
 **Issued against `CONTRACTS_VERSION = 3`.** Branch `lane/L5-Settings`, based on main @ `e259115`.
-The contract request is in `docs/contract-requests/L5-Settings.md`. It asks for a way to
+The contract request is in `docs/archive/contract-requests/L5-Settings.md`. It asks for a way to
 change signer, a way to clear `autoTopUp`, and a clarification of the two seeding switches.
 Nothing is blocked: each gap has a v3 workaround, described below.
 

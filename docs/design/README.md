@@ -19,7 +19,7 @@ The maintainer supplied this brief in writing on 2026-09-05, verbatim:
 - **No brand assets were supplied** (no files, palette or type). The design system therefore uses
   defaults that match the brief: a neutral palette with light and dark themes, a system UI font
   stack, YouTube-like density and radii. Each choice is recorded in the design-system report
-  (`docs/lanes/L4.md`) and can be changed without touching the screens, because everything is a
+  (`docs/archive/lanes/L4.md`) and can be changed without touching the screens, because everything is a
   token.
 - **Theme** (ADR 0005): light and dark, following the system (`prefers-color-scheme`), with a
   toggle in Settings. Both themes are token sets.

@@ -1,7 +1,7 @@
 /**
  * Byte ⇄ text codecs for the IPC layer that need NO globals beyond `Uint8Array`: Bare 1.31
  * has no `TextEncoder`/`TextDecoder` (verified against the bare-sidecar prebuilt, see
- * docs/lanes/L6-0.md), and `@sovit/app-desktop` declares no `b4a` dependency.
+ * docs/archive/lanes/L6-0.md), and `@sovit/app-desktop` declares no `b4a` dependency.
  *
  * UTF-8 decoding is STRICT (fatal): overlong forms, surrogate code points, values above
  * U+10FFFF and truncated sequences throw `CodecError` instead of becoming U+FFFD, so a

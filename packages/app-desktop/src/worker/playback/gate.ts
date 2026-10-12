@@ -20,7 +20,7 @@
  *     they cost nothing. This is what makes "buffer = money" hold against a greedy reader:
  *     a paused `<video>` or plain kernel socket buffers (≈ 2.7 MB measured on loopback) would
  *     otherwise pull the whole file through a merely on-demand gate. (Refinement of design §1,
- *     see docs/lanes/L6-C.md.)
+ *     see docs/archive/lanes/L6-C.md.)
  *   - **credit** → every network request first takes a unit from the worker-wide
  *     `CreditPool` (≤ the seeders' unpaid window), so an honest viewer is never cut.
  *   - **lookahead** → after serving block `i` the reader prefetches `(i, allowedEnd)` in the

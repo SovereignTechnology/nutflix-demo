@@ -1,6 +1,6 @@
 /**
  * Seeder — the daemon's public façade (build-plan §2.1 `@sovit/seeder`). This is the API
- * L3 (gateway) and L6 (desktop shell) consume; see docs/lanes/L2.md "Public API".
+ * L3 (gateway) and L6 (desktop shell) consume; see docs/archive/lanes/L2.md "Public API".
  *
  * Composition:
  *   BlobStore (Corestore + Hyperblobs, CAS index, disk cap)

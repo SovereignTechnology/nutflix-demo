@@ -76,7 +76,7 @@ describe('scripts/electron-security-lint.mjs', () => {
 
   // Lane L6-A added the app's one window (src/main/window.ts); ADR 0013 (Stage 3, the signer
   // lane) added the second, main's trusted prompt window (`createPromptWindow`, same file, same
-  // literal posture plus `devTools: false`), reviewed in docs/reviews/2026-09-24-pre-push-desktop-
+  // literal posture plus `devTools: false`), reviewed in docs/archive/reviews/2026-09-24-pre-push-desktop-
   // signer.md. Exactly two: a third window or webPreferences object in src/ must be another
   // deliberate, reviewed change that updates this test.
   it('packages/app-desktop/src passes: exactly two windows, literal posture (L6-A, ADR 0013)', () => {

@@ -24,7 +24,7 @@
  *            for a remote signer), then show the words again; an unconfirmed backup may be
  *            confirmed then.
  *   restore  requires this device's own phrase in use (the seam's restore lives on the seeded
- *            wallet, docs/contract-requests/N2-nut13-desktop.md item 2); an optional typed phrase
+ *            wallet, docs/archive/contract-requests/N2-nut13-desktop.md item 2); an optional typed phrase
  *            and mint addresses (`recovery-restore`, checksum re-checked here by core), this
  *            device's phrases (current and retired) and every relay copy the identity decrypts —
  *            read ONLY here — each scanned from counter 0 at the wallet's mints and the typed
@@ -1103,7 +1103,7 @@ export class RecoveryService {
    * each call moves the scan on. A mint still unfinished keeps its cursor for the next restore of
    * this identity (and starts from a kept one now). Per mint: the sats added, the outcome — a scan
    * left unfinished with nothing added reads `unreachable` (the wire has no "not finished" yet:
-   * docs/contract-requests/W8a-money.md), never core's `refused` for a batch cap it could go on
+   * docs/archive/contract-requests/W8a-money.md), never core's `refused` for a batch cap it could go on
    * past — and whether it is unfinished.
    */
   private async restorePass(

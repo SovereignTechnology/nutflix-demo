@@ -17,7 +17,7 @@ the real `@scure/bip39` conversions).
 
 The lane resumed a previous agent's interrupted, unreviewed work (`e00272f`, kept as is); the
 review record lists what was kept, fixed and replaced. No contract change
-(`docs/contract-requests/N2-nut13-desktop.md`: six items, all worked around). No core mock was
+(`docs/archive/contract-requests/N2-nut13-desktop.md`: six items, all worked around). No core mock was
 needed: the seam's fakes live in app-desktop's test support, so they cannot collide with N1. No dependency,
 lockfile or `package.json` change; nothing outside the allowlist; `packaging/` read, not changed.
 
@@ -316,7 +316,7 @@ rule; a record write that fails after a swap can repeat that mint once.
 
 ## Mutation checks
 
-See `docs/reviews/2026-09-26-pre-push-nut13-desktop.md`: 32 mutations of security-relevant
+See `docs/archive/reviews/2026-09-26-pre-push-nut13-desktop.md`: 32 mutations of security-relevant
 guards (wire shapes, main's checksum and content protection, the page's form check and hiding,
 the preload, error and log hygiene, re-authentication, restore-only relay reads, counters and
 file refusals, the seed ownership, the native-dialog exclusivity, the reissue filter), each killed
@@ -347,7 +347,7 @@ after a swap can repeat that mint once); the ones that need someone else:
 
 ## Proposed row for `docs/status.md`
 
-| Issue #3 — NUT-13 recovery phrase, desktop side (ADR 0016) | `stage-3/nut13-desktop` | DONE (desktop half; lane N1's core wired at merge through `host/recovery/core.ts` `recoveryCore()`): one 12-word phrase per device, sealed in `<userData>/wallet/recovery-<pubkey>.sealed` (NIP-44 to self, 0600/0700, fails loudly and is kept when damaged) and copied to the user's relays (kind 30078, `d` = `nutflix/nut13/<device id>`, read only by an explicit restore); counters file for core (atomic, fsynced, fails loudly); main's prompt window shows the words from its own bundled BIP-39 list (indices on the wire), content protection on, hidden after 2 min or on blur, no copy; confirm three words; the old balance reissued after main's native fee dialog (each mint's plan checked, one it cannot show left out and counted; each mint recorded as it moves, so a retry never moves or charges a covered mint again); show again after the passphrase (native confirm for NIP-46, its own question for a rotation); restore from this device's phrases, every relay copy, a typed phrase and typed https mint addresses, with progress and a per-mint report; Settings › Recovery phrase (web: "not covered"); log rule for word phrases (JSON arrays, quoted words, query strings, URL-encoded lists and JSON, pretty-printed JSON) with a canary. Review `docs/reviews/2026-09-26-pre-push-nut13-desktop.md` (self-review of resumed WIP: 12 findings fixed, 32 mutation checks; independent review: 11 findings addressed, 19 mutation checks; fix round 7: 3 findings fixed, 14 mutation checks); contract request `N2-nut13-desktop.md` (6 items, worked around) |
+| Issue #3 — NUT-13 recovery phrase, desktop side (ADR 0016) | `stage-3/nut13-desktop` | DONE (desktop half; lane N1's core wired at merge through `host/recovery/core.ts` `recoveryCore()`): one 12-word phrase per device, sealed in `<userData>/wallet/recovery-<pubkey>.sealed` (NIP-44 to self, 0600/0700, fails loudly and is kept when damaged) and copied to the user's relays (kind 30078, `d` = `nutflix/nut13/<device id>`, read only by an explicit restore); counters file for core (atomic, fsynced, fails loudly); main's prompt window shows the words from its own bundled BIP-39 list (indices on the wire), content protection on, hidden after 2 min or on blur, no copy; confirm three words; the old balance reissued after main's native fee dialog (each mint's plan checked, one it cannot show left out and counted; each mint recorded as it moves, so a retry never moves or charges a covered mint again); show again after the passphrase (native confirm for NIP-46, its own question for a rotation); restore from this device's phrases, every relay copy, a typed phrase and typed https mint addresses, with progress and a per-mint report; Settings › Recovery phrase (web: "not covered"); log rule for word phrases (JSON arrays, quoted words, query strings, URL-encoded lists and JSON, pretty-printed JSON) with a canary. Review `docs/archive/reviews/2026-09-26-pre-push-nut13-desktop.md` (self-review of resumed WIP: 12 findings fixed, 32 mutation checks; independent review: 11 findings addressed, 19 mutation checks; fix round 7: 3 findings fixed, 14 mutation checks); contract request `N2-nut13-desktop.md` (6 items, worked around) |
 
 ## Proposed text for `docs/security-review.md`
 

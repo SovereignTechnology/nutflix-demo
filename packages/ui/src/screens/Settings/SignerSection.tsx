@@ -5,7 +5,7 @@
  *
  * The v3 contract has no method to change signer, so the choice is read-only unless the shell
  * passes `onChangeSigner` (it owns the connect/switch flow); see
- * docs/contract-requests/L5-Settings.md.
+ * docs/archive/contract-requests/L5-Settings.md.
  */
 import { useCallback, useEffect, useRef, useState, type ReactElement } from 'react';
 import type { NetworkAdapter, Profile, SignerStatus } from '@sovit/core';

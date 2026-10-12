@@ -1,6 +1,6 @@
 /**
  * Desktop IPC protocol (lane L6-0; design `docs/plan/L6-design.md` §2). FROZEN for L6-A/B/C:
- * change it only through `docs/contract-requests/`.
+ * change it only through `docs/archive/contract-requests/`.
  *
  * Three hops use it:
  *   renderer ⇄ main   `ipcRenderer.invoke` on `CHANNEL.*` (structured clone), gated in main

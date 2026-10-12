@@ -149,7 +149,7 @@ real-mint-swarm.integration.test.ts`). Both real-mint suites are opt-in
   have reached the terminal / journal past the redacting logger. `core` `connectBunker` /
   `resumeBunker` now default `onauth` to a no-op (a caller that supports the flow passes its own);
   a test spies on `console.warn`. The rest of that review (the prompt throttle, the keychain-record
-  ordering, pool disposal): docs/reviews/2026-09-24-pre-push-desktop-signer.md.
+  ordering, pool disposal): docs/archive/reviews/2026-09-24-pre-push-desktop-signer.md.
 
 ## 0d. Found by the Stage 3 fan-out reviews (2026-09-25/26, `stage-3/integration`)
 
@@ -176,7 +176,7 @@ reviewed by a four-lens panel (money plane, worker/P2P, packaging, test integrit
 | F55 | Medium | A mint blocked by a journal entry during a reissue is swapped but not recorded, so each later "Finish backup" charges its fee again | **Fixed, CI green 2026-10-02** (first GitHub Actions run of these tests, `39d266b`) (`stage-3/r8-money`) |
 | F56 | Medium | Dust (or an entry at a zero-balance mint) keeps the reissue pending forever, which also hides "Replace phrase" | **Fixed, CI green 2026-10-02** (first GitHub Actions run of these tests, `39d266b`) (`stage-3/r8-money`, round 9): a young journal entry at a reachable mint keeps the reissue pending (the first fix counted it done, which would have left returning funds under a leaked phrase); an overdue or unreachable mint is done but watched, and the backup reopens when a balance worth moving appears |
 | F57 | High | Corestore 7's `replicate()` attaches any stored core a peer names by discovery key, outside `BlobStore`, so the seeder's upload gate never runs: after a restart a stored paid core could be fetched free and uncounted by any connected peer | **Fixed, CI green 2026-10-02** (first GitHub Actions run of these tests, `39d266b`) (`stage-3/r8-p2p`, confirmed by reading corestore/hypercore/protomux): a gated corestore refuses remote-initiated opens. Residual [Low]: a core opened locally with `store.get()` outside `BlobStore` would still be served ungated |
-| F58 | Low | pay/1 frames were malleable: the codec read invalid UTF-8 in any string as U+FFFD, and any uint (a string's length too) in a non-minimal encoding (`0xfd 0 0` for 0), so different frames decoded to one message; encode also wrote a lone surrogate as U+FFFD. No money path was found to depend on frame bytes (a re-sent HELLO compares bytes and would only refuse its own peer) | **Fixed 2026-10-02**, found by the first fuzz campaign (`docs/reviews/2026-10-02-pre-push-fuzz.md`): strict UTF-8 and minimal uints on decode, well-formed strings on encode |
+| F58 | Low | pay/1 frames were malleable: the codec read invalid UTF-8 in any string as U+FFFD, and any uint (a string's length too) in a non-minimal encoding (`0xfd 0 0` for 0), so different frames decoded to one message; encode also wrote a lone surrogate as U+FFFD. No money path was found to depend on frame bytes (a re-sent HELLO compares bytes and would only refuse its own peer) | **Fixed 2026-10-02**, found by the first fuzz campaign (`docs/archive/reviews/2026-10-02-pre-push-fuzz.md`): strict UTF-8 and minimal uints on decode, well-formed strings on encode |
 
 ## 1. Summary
 
@@ -217,7 +217,7 @@ reviewed by a four-lens panel (money plane, worker/P2P, packaging, test integrit
 | F29 | Info | BlossomAuth's `server`-tag rule follows nostr-tools, not BUD-11 text (not vendored) | `gateway/src/auth/blossom-auth.ts`, ADR 0010 §8 |
 | F32 | Info | A DLEQ without `r`, or with non-hex fields, is treated as a forgery and banned — a third-party wallet that strips `r` gets banned | `core/src/payment/engine.ts` `dleqOk` |
 
-F30–F32 were added by the pre-push differential review (`docs/reviews/2026-09-23-pre-push-stage-2.md`); their rows sit at their severity.
+F30–F32 were added by the pre-push differential review (`docs/archive/reviews/2026-09-23-pre-push-stage-2.md`); their rows sit at their severity.
 
 ## 2. Findings
 
@@ -589,7 +589,7 @@ hash-addressed images).
 | SE-1 … SE-5 | §4 |
 | Gateway web responses | F3, F14, F15; CORS `*` on everything is Blossom-conformant but only safe once F3 lands; `OPTIONS` fine; error bodies are fixed strings (`X-Reason`), no reflection. |
 
-## 4. SE-1 … SE-5 (docs/reviews/2026-09-23-pre-push-l5-v4.md)
+## 4. SE-1 … SE-5 (docs/archive/reviews/2026-09-23-pre-push-l5-v4.md)
 
 | | Status |
 |---|---|
@@ -625,7 +625,7 @@ hash-addressed images).
 
 **Fixed in the pre-push review** (inside the five directories, or in a consumer adapting to a
 Stage 2 change; details and which ones carry a new test in
-`docs/reviews/2026-09-23-pre-push-stage-2.md`): `signSecret` signs only NUT-10 P2PK secrets (was a
+`docs/archive/reviews/2026-09-23-pre-push-stage-2.md`): `signSecret` signs only NUT-10 P2PK secrets (was a
 general signing oracle for the wallet key); a second HELLO that changes the terms is a
 protocol error (was silently adopted as `peer`); a proof set naming more than 3 keyset ids is
 `malformed` before any lookup; `checkPayLock` never throws; `SeenSecrets` refuses a capacity

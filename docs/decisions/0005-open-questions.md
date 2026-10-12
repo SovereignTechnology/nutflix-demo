@@ -32,7 +32,7 @@ the Stage 2 bump (v4); items marked **config/lane** are ordinary code changes.
   Rejected alternatives: a minimum PAY of N blocks (needs an end-of-video special case) and a
   `satsPerBlock ≥ 2` floor (raises the minimum price for every video).
 - Until the v4 bump, L10's property tests keep filtering to shares ≥ 1 (documented in
-  `docs/lanes/L10.md`); the mock is **not** changed mid-freeze.
+  `docs/archive/lanes/L10.md`); the mock is **not** changed mid-freeze.
 
 ### Q2 — mints per video → **several** (keep as is)
 

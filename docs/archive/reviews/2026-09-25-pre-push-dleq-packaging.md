@@ -268,7 +268,7 @@ dev fixture rig: S1 and S2 seed a 16-block paid video, the worker has seeding of
 `s1 bans: expected [ {…} ] to deeply equal []`: both fixture seeders banned the viewer, as the
 reviewer measured (`{ uploaded: 6, paid: 0, windowBlocks: 5, banned: true }`).
 
-**The mechanism** (design and trade-offs in `docs/contract-requests/I1-dleqpack.md`):
+**The mechanism** (design and trade-offs in `docs/archive/contract-requests/I1-dleqpack.md`):
 
 - **Refusal of known sold cores** (`WorkerHost.soldCore`). `image.fetch` refuses, before anything
   is opened, any core that is:
@@ -527,7 +527,7 @@ now also asserts that nothing is opened, and the rerun was caught.
 - **IR4.** Debts across a crash or restart are the seeder's own count, and only the v7
   ACK-window request (S3-f33) fixes them. A graceful quit or close now pays its tail; a crash
   does not.
-- **The interim signal** (`docs/contract-requests/I1-dleqpack.md`). Invariant 1 on image reads
+- **The interim signal** (`docs/archive/contract-requests/I1-dleqpack.md`). Invariant 1 on image reads
   rests on every seeder announcing a counted core's price before its first block. A seeder that
   counts in silence (announcing off, an older build, a third-party implementation, or a seeder
   with no policy at all for the core) is taken as free after the probe block, and can still cut

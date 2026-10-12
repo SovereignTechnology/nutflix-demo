@@ -1,7 +1,7 @@
 # Lane Seeder-entry — a real entry point behind `nutflix-seeder.service`
 
 **Issued against `CONTRACTS_VERSION = 4`.** Date: 2026-09-23. Branch `lane/Seeder-entry`, base
-`main @ 607abcc`. No contract change requested (`docs/contract-requests/Seeder-entry.md` does
+`main @ 607abcc`. No contract change requested (`docs/archive/contract-requests/Seeder-entry.md` does
 not exist on purpose). Nothing here implements hashing, signatures, blinding or key derivation.
 
 Follow-up 5 in `docs/status.md` ("`packages/seeder` ships no self-executing entry point, but
@@ -222,7 +222,7 @@ electron lint OK. The built-entry block ran (not skipped): `dist/` is built befo
 - `packages/seeder/src/portable.ts`'s header says "`index.ts` is this module plus the Node
   adapters". It is now that plus the daemon CLI. That is a one-line comment fix outside this
   lane's allowlist.
-- `docs/lanes/L2.md` "Public API" gains: `main`, `parseCliArgs`, `loadConfig`, `EXIT_CONFIG`,
+- `docs/archive/lanes/L2.md` "Public API" gains: `main`, `parseCliArgs`, `loadConfig`, `EXIT_CONFIG`,
   `USAGE`, `isMainModule`, `parseDaemonConfigText`, `validateDaemonConfig`,
   `applyDaemonEnvOverrides`, `DAEMON_ENV`, `getRuntimeDeps`, `MISSING_PROVIDERS_REASON` and
   the types `MainOptions`, `ParsedArgs`, `DaemonConfig`, `DaemonConfigResult`, `RuntimeDeps`.

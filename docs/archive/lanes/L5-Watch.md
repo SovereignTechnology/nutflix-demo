@@ -2,10 +2,10 @@
 
 **Issued against `CONTRACTS_VERSION = 3`.** Branch `lane/L5-Watch`, based on main @ `e259115`.
 Contract requests (none blocking — every one is worked around in v3):
-`docs/contract-requests/L5-Watch.md`.
+`docs/archive/contract-requests/L5-Watch.md`.
 
 Scope: build-plan §6.1 row **Watch** + all of §6.2, design brief `docs/design/README.md`
-(YouTube first, Rumble second, clean), L4 component API (`docs/lanes/L4.md`), BRIEFS L5 row,
+(YouTube first, Rumble second, clean), L4 component API (`docs/archive/lanes/L4.md`), BRIEFS L5 row,
 execution plan Stage-2 audit item "any UI path where the price shown can differ from the price
 charged".
 

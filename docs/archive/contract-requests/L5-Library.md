@@ -1,7 +1,7 @@
 # Contract request — L5-Library (against `CONTRACTS_VERSION = 3`)
 
 Nothing here blocks the lane: every item is worked around inside v3 and documented in
-`docs/lanes/L5-Library.md`. Listed so the orchestrator can decide whether a later version
+`docs/archive/lanes/L5-Library.md`. Listed so the orchestrator can decide whether a later version
 should carry them.
 
 ## 1. `Route` — deep link to an open playlist (orchestrator-owned `screens/shared/route.ts`)

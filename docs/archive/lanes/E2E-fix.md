@@ -3,7 +3,7 @@
 **Issued against `CONTRACTS_VERSION = 4`**. Date: 2026-09-23. Branch `lane/E2E-fix` off `d4134dc`.
 Spec: `docs/plan/L6-design.md` §5(b) and D4; the orchestrator's triage (five failures, each proven
 by a reverted temporary patch). Allowlist: `packages/app-desktop/{src/main,src/host,src/preload,
-src/renderer,src/worker,e2e}/`, `docs/lanes/{L6-A,E2E-fix}.md`. No contract request, no
+src/renderer,src/worker,e2e}/`, `docs/archive/lanes/{L6-A,E2E-fix}.md`. No contract request, no
 `package.json`/lockfile change, no dependency, no renderer/preload/worker edit.
 
 ## Result
@@ -26,7 +26,7 @@ src/renderer,src/worker,e2e}/`, `docs/lanes/{L6-A,E2E-fix}.md`. No contract requ
 - Both suites in one serial invocation from `packages/app-desktop` (the command proposed for
   `test:e2e` below): 13/13 in 14.6 s.
 - `npm run ci`: exit 0, 124 files, 2085 passed / 27 skipped (details under "Tests").
-- The fidelity findings JSON and the working recipe are in `docs/lanes/L6-A.md` ("Running the
+- The fidelity findings JSON and the working recipe are in `docs/archive/lanes/L6-A.md` ("Running the
   Electron suites", "Fidelity findings (first run, 2026-09-23)").
 
 ## Every failure: root cause, owner, fix, test

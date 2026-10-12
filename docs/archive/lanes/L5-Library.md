@@ -1,12 +1,12 @@
 # Lane L5-Library — the Library screen (`packages/ui/src/screens/Library/`)
 
 **Issued against `CONTRACTS_VERSION = 3`.** Branch `lane/L5-Library`, based on main @ `e259115`.
-One non-blocking request filed: `docs/contract-requests/L5-Library.md` (a `playlist` field on
+One non-blocking request filed: `docs/archive/contract-requests/L5-Library.md` (a `playlist` field on
 the `library` route, plus two contract-comment clarifications). Everything works within v3.
 
 Scope: build-plan §6.1 row **Library** + §6.2 ("Resume from NIP-51 private history"), design
 brief `docs/design/README.md` (YouTube first, Rumble second, clean), L4 component API
-(`docs/lanes/L4.md`), BRIEFS L5 row, `docs/lanes/L5-Home.md` as the worked example.
+(`docs/archive/lanes/L4.md`), BRIEFS L5 row, `docs/archive/lanes/L5-Home.md` as the worked example.
 
 ## What was built
 

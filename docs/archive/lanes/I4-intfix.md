@@ -6,7 +6,7 @@ NUT-13 core wired into lane N2's seam at `packages/app-desktop/src/host/recovery
 
 - Commits: `8479fc9` (the log rule and the two messages), `0d1f830` (the mint-transport pin),
   `e0afbf1` (the desktop on core's real NUT-13 code), then this report and the review record.
-- Review record: `docs/reviews/2026-09-27-pre-push-int-fix-2.md`. It has each cause, the
+- Review record: `docs/archive/reviews/2026-09-27-pre-push-int-fix-2.md`. It has each cause, the
   measurements, the sharp edges, the mutation table and the residuals.
 - No contract request.
 - Nothing changed under `packages/core/src/contracts/`, the locked paths, `docs/status.md` or
@@ -127,4 +127,4 @@ See the review record's Residuals; in short:
 
 ## Proposed row for `docs/status.md`
 
-| Integration fix 2 — N1's real NUT-13 core in N2's desktop seam | `stage-3/int-fix-2` | DONE. The five failures of the merge fixed at their causes:<br>• the host and money-plane tests on core's real phrases and seeds (a pass-through spy; fakes kept for the service's stub-plane unit tests);<br>• the desktop counters file admits core's phrase binding (without it every seeded operation failed on the merged build);<br>• the plane closes its NUT-13 counter source and wipes its seed on any failed open;<br>• the mint-transport pin parses the source (a type is not a construction; an alias now is);<br>• two P2 log messages reworded.<br>The phrase log rule takes backslash escapes (`\n` `\t` `\r\n` `\u` `\x`, `%5C`) and remainders after an escape (the verifier's low and info).<br>Setup → reissue → restore from the relay copy on a fresh profile, end to end in-process and against Nutshell and cdk-mintd. Review `docs/reviews/2026-09-27-pre-push-int-fix-2.md` (38 mutation checks) |
+| Integration fix 2 — N1's real NUT-13 core in N2's desktop seam | `stage-3/int-fix-2` | DONE. The five failures of the merge fixed at their causes:<br>• the host and money-plane tests on core's real phrases and seeds (a pass-through spy; fakes kept for the service's stub-plane unit tests);<br>• the desktop counters file admits core's phrase binding (without it every seeded operation failed on the merged build);<br>• the plane closes its NUT-13 counter source and wipes its seed on any failed open;<br>• the mint-transport pin parses the source (a type is not a construction; an alias now is);<br>• two P2 log messages reworded.<br>The phrase log rule takes backslash escapes (`\n` `\t` `\r\n` `\u` `\x`, `%5C`) and remainders after an escape (the verifier's low and info).<br>Setup → reissue → restore from the relay copy on a fresh profile, end to end in-process and against Nutshell and cdk-mintd. Review `docs/archive/reviews/2026-09-27-pre-push-int-fix-2.md` (38 mutation checks) |

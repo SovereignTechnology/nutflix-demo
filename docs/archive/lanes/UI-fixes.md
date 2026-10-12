@@ -2,7 +2,7 @@
 
 **Issued against `CONTRACTS_VERSION = 4`.** Branch `lane/UI-fixes`, based on
 `orch/2026-09-23-l5` @ `1fa4c59`. No contract change requested
-(`docs/contract-requests/UI-fixes.md` does not exist on purpose).
+(`docs/archive/contract-requests/UI-fixes.md` does not exist on purpose).
 
 Scope: ADR 0007 (b) reactions, (c) card price, (d) Library copy, the Studio line for (a);
 `docs/status.md` "Follow-ups owed by the orchestrator" items 3, 6 and 7.
@@ -155,18 +155,18 @@ Studio upload-details and videos.
 ## Could not do inside the allowlist — for the orchestrator
 
 The brief asks to delete the "un-like sends a dislike" notes from the Watch/Shorts lane docs,
-but `docs/lanes/L5-*.md` are outside this lane's `.lane` allowlist (the pre-commit hook would
+but `docs/archive/lanes/L5-*.md` are outside this lane's `.lane` allowlist (the pre-commit hook would
 refuse them), so they are **not** edited. Exact text to change:
 
-- `docs/lanes/L5-Shorts.md` "Things I was unsure about / judgement calls": delete the bullet
+- `docs/archive/lanes/L5-Shorts.md` "Things I was unsure about / judgement calls": delete the bullet
   "**Un-like sends `react(id, '-')`** (a NIP-25 *dislike*), because v3 has no way to retract a
   reaction — same as the Watch lane. Contract request filed (`unreact(videoId)`, v4)."
-- `docs/lanes/L5-Shorts.md` "Side rail and actions": the "**Like · N**" bullet and the tests
+- `docs/archive/lanes/L5-Shorts.md` "Side rail and actions": the "**Like · N**" bullet and the tests
   line "Like → `react('+')` … again → `react('-')`" describe the old behaviour; replace with a
   pointer to this file (like/dislike icon pills, `reactionStep`, un-like = `unreact`).
-- `docs/lanes/L5-Watch.md` "Channel row + actions": "Like (`adapter.react '+'/'-'`, pressed
-  state + count)" → "Like / Dislike (`ReactionButtons`; see `docs/lanes/UI-fixes.md`)".
-- `docs/contract-requests/L5-Shorts.md` (the `unreact` request) is satisfied by v4 and can be
+- `docs/archive/lanes/L5-Watch.md` "Channel row + actions": "Like (`adapter.react '+'/'-'`, pressed
+  state + count)" → "Like / Dislike (`ReactionButtons`; see `docs/archive/lanes/UI-fixes.md`)".
+- `docs/archive/contract-requests/L5-Shorts.md` (the `unreact` request) is satisfied by v4 and can be
   marked done.
 
 ## Judgement calls / unsure

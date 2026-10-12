@@ -54,7 +54,7 @@ export const WATCH_RELATED_COUNT = 8;
 export const WATCH_PLAYLIST_MAX = 50;
 
 /**
- * The mini-player handshake payload (docs/lanes/L5-Watch.md "Mini-player handshake").
+ * The mini-player handshake payload (docs/archive/lanes/L5-Watch.md "Mini-player handshake").
  *
  * `Watch → shell` (`onMiniPlayer`): the live, already-priced `PlaySession` plus what the
  * shell needs to keep showing it — from this call on the SHELL owns the session and must

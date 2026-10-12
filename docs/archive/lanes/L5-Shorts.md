@@ -1,13 +1,13 @@
 # Lane L5-Shorts — the Shorts screen (`packages/ui/src/screens/Shorts/`)
 
 **Issued against `CONTRACTS_VERSION = 3`.** Branch `lane/L5-Shorts`, based on main @ `e259115`.
-One non-blocking contract request: `docs/contract-requests/L5-Shorts.md` (no way to take a
+One non-blocking contract request: `docs/archive/contract-requests/L5-Shorts.md` (no way to take a
 like back — see "Things I was unsure about").
 
 Scope: build-plan §6.1 row **Shorts** ("vertical swipe feed of kind 22") + §6.2 ("buffer =
 money"), design brief `docs/design/README.md` (YouTube first, Rumble second, clean), L4
-component API (`docs/lanes/L4.md`), BRIEFS L5 row, SECURITY.md T16 and "price shown vs price
-charged". Worked example followed: `docs/lanes/L5-Home.md`.
+component API (`docs/archive/lanes/L4.md`), BRIEFS L5 row, SECURITY.md T16 and "price shown vs price
+charged". Worked example followed: `docs/archive/lanes/L5-Home.md`.
 
 ## What was built
 
@@ -163,7 +163,7 @@ stream stopped and nothing more is being paid for" + Retry.
 > **Superseded 2026-09-23 (lane UI-fixes, contracts v4, ADR 0007):** like and dislike are two
 > icon buttons with both counts from `stats().likes`/`.dislikes`, pressed state from
 > `stats().myReaction`; pressing the active one calls `unreact(id)` — **never** `react(id, '-')`.
-> See `docs/lanes/UI-fixes.md`.
+> See `docs/archive/lanes/UI-fixes.md`.
 
 - **Like · N** (`Button`, `pressed` when liked): `react(id, '+')` / `react(id, '-')` (see the
   contract request), count = `stats.reactions` ± the viewer's own toggles; liked state from

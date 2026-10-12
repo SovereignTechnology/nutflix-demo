@@ -15,7 +15,7 @@
  *   - HELLO "signatures" that are the literal string `dev-unsigned`.
  *
  * Execution plan §0 rule 4 says mocks are never imported by production code paths; this
- * module is the one, flag-gated exception and docs/lanes/L3.md flags it for review.
+ * module is the one, flag-gated exception and docs/archive/lanes/L3.md flags it for review.
  */
 import type {
   AckMessage,

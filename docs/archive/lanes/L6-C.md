@@ -5,7 +5,7 @@ Branch `lane/L6-C` off `99b79be` (+ `cc7185c` scripts tsconfig, + `778b32d` with
 merged). Spec: `docs/plan/L6-design.md` §6 row L6-C, §1 (Worker row, "PlaySession across
 processes", "Pause/prefetch in the worker"), §3 (worker playback server), §5(a), D1, D2, D6,
 risks 3 and 4. No dependency added; no `package.json`, lockfile, `src/ipc/`, `src/types/` or
-`src/worker/transcode/` change. Contract requests: `docs/contract-requests/L6-C.md` (6 items, none
+`src/worker/transcode/` change. Contract requests: `docs/archive/contract-requests/L6-C.md` (6 items, none
 blocking).
 
 ## What was built

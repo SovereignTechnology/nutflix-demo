@@ -8,7 +8,7 @@ whole diff, after every finding was first reproduced (or refuted) against the co
 - Nothing changed under `packages/core/src/contracts/`, `docs/status.md` or
   `docs/security-review.md`. The locked `packages/core/src/wallet/spend.ts` changed: no logging, no
   new import (`npm run check:locked`: OK).
-- Contract request: `docs/contract-requests/W8a-money.md` (the Settings screen).
+- Contract request: `docs/archive/contract-requests/W8a-money.md` (the Settings screen).
 - Nothing outward: no push, MR or issue edit.
 
 ## 1. The findings, verified first

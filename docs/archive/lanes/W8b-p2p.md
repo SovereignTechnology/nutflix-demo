@@ -8,7 +8,7 @@ final cross-lane review panel on pay/1 and the desktop worker (`review:protocol`
   policies, shared opens, the profile core), `25f5951` (the router's `room`), `21db130` (test
   integrity), `0121eab` (ADR notes), `675d8f1` (tests for the two mutations that survived the
   first round), then this record and the review record.
-- Review record: `docs/reviews/2026-09-27-pre-push-p2p.md` — each finding verified and
+- Review record: `docs/archive/reviews/2026-09-27-pre-push-p2p.md` — each finding verified and
   reproduced, the fix, the differential review and sharp edges, the mutation table, residuals.
 - ADR notes: 0015 and 0018 gain "round-8 fixes" paragraphs.
 - No contract request. Nothing under `packages/core/src/contracts/`, `docs/status.md` or
@@ -124,7 +124,7 @@ skipping there.
 
 ## Proposed row for `docs/status.md`
 
-| W8b-p2p — round-8 findings on pay/1 and the worker | `stage-3/r8-p2p` | DONE. Eleven findings of the final panel (3 medium, 2 low, 6 info), all fixed with tests that fail before the fix:<br>• an OWED on a second node of one seeder key never pays a block pending on the first (the reviewer's double pay);<br>• an owed range failing for now is never forgotten: retried on its backoff and paid on the same connection (separate streaks from fresh blocks);<br>• a PAY's blocks leave the unpaid record on disk before the PAY is sent;<br>• per-core prices kept across restarts: an attacker's thumbnail can no longer make our node serve a video it played or uploaded free; our own profile core is never priced;<br>• one Hypercore session per core under concurrent opens; our profile core free before its gate;<br>• free image requests share the seeder's window while in flight; one bounded answer for `free`;<br>• stated timeout reasons; `NUTFLIX_REQUIRE_BUILT=1` makes the real-Bare tests fail instead of skip.<br>Review `docs/reviews/2026-09-27-pre-push-p2p.md` (31 mutation checks) |
+| W8b-p2p — round-8 findings on pay/1 and the worker | `stage-3/r8-p2p` | DONE. Eleven findings of the final panel (3 medium, 2 low, 6 info), all fixed with tests that fail before the fix:<br>• an OWED on a second node of one seeder key never pays a block pending on the first (the reviewer's double pay);<br>• an owed range failing for now is never forgotten: retried on its backoff and paid on the same connection (separate streaks from fresh blocks);<br>• a PAY's blocks leave the unpaid record on disk before the PAY is sent;<br>• per-core prices kept across restarts: an attacker's thumbnail can no longer make our node serve a video it played or uploaded free; our own profile core is never priced;<br>• one Hypercore session per core under concurrent opens; our profile core free before its gate;<br>• free image requests share the seeder's window while in flight; one bounded answer for `free`;<br>• stated timeout reasons; `NUTFLIX_REQUIRE_BUILT=1` makes the real-Bare tests fail instead of skip.<br>Review `docs/archive/reviews/2026-09-27-pre-push-p2p.md` (31 mutation checks) |
 
 ## Addendum — F54 (the round-8 verifier, medium; 2026-09-27)
 

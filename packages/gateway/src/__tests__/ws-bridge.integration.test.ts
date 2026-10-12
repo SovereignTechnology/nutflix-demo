@@ -116,7 +116,7 @@ type CutEvent = Extract<SeederEvent, { type: 'session-cut' }>;
 /**
  * Bounds for the cut tests' waits. Every wait there is on an EVENT, bounded well inside the
  * 20 s test timeout so that a stall fails with a message naming it. Under load the events
- * simply arrive later; nothing races a timer. (docs/lanes/L3-flake.md)
+ * simply arrive later; nothing races a timer. (docs/archive/lanes/L3-flake.md)
  */
 const CUT_WITHIN_MS = 8_000;
 /** Far below `ws`'s 30 s closeTimeout, so a stalled closing handshake is reported as one. */

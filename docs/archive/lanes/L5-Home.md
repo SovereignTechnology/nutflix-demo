@@ -1,11 +1,11 @@
 # Lane L5-Home — the Home screen (`packages/ui/src/screens/Home/`)
 
 **Issued against `CONTRACTS_VERSION = 3`.** Branch `lane/L5-Home`, based on main @ `ccafa90`.
-No contract change requested (`docs/contract-requests/L5-Home.md` does not exist on purpose —
+No contract change requested (`docs/archive/contract-requests/L5-Home.md` does not exist on purpose —
 see "Things I was unsure about" for the one place a future method might help).
 
 Scope: build-plan §6.1 row **Home** + §6.2, design brief `docs/design/README.md`
-(YouTube first, Rumble second, clean), L4 component API (`docs/lanes/L4.md`), BRIEFS L5 row.
+(YouTube first, Rumble second, clean), L4 component API (`docs/archive/lanes/L4.md`), BRIEFS L5 row.
 
 ## What was built
 

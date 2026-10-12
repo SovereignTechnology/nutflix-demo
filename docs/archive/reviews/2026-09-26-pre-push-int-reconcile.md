@@ -2,7 +2,7 @@
 
 Diff `54f49bb..HEAD`: the first agent's unreviewed wip commit `30ce842` (stopped by a usage limit
 on 2026-09-26) and the resumed lane's commits on top, `51a2409`, `1ed1cee`, `5014c6f`,
-`dadd56f`, `a7828a4`, then this record and the lane report `docs/lanes/R6-reconcile.md`. Method: the
+`dadd56f`, `a7828a4`, then this record and the lane report `docs/archive/lanes/R6-reconcile.md`. Method: the
 `differential-review` skill (risk triage, removed code with `git blame`, blast radius, test
 coverage, an attacker model for the HIGH-risk files) and the `sharp-edges` skill (defaults,
 injectable options, silent failures, configuration cliffs, stringly-typed decisions), on every

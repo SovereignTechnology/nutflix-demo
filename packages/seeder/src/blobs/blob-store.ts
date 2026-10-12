@@ -8,7 +8,7 @@
  * LAZILY, only once the write pass actually starts: on the dedupe / disk-cap early returns
  * no second read stream exists, so a caller that unlinks the file right after the result
  * cannot leave an orphaned `createReadStream` behind to raise an uncaught ENOENT (found by
- * L3, docs/lanes/L3.md).
+ * L3, docs/archive/lanes/L3.md).
  *
  * Lane W8b-p2p (round-8 review, LOW): opens of one core share ONE Hypercore session. Two callers
  * opening the same core at once (two thumbnails of one profile core) used to get two sessions:

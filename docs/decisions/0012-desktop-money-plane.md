@@ -150,7 +150,7 @@ ceiling was above the video's price, even a core it priced within it.
     (`defaultMints`, `autoTopUp`), which are per install too;
   - **history**: minting writes `in … "top-up"` at the target and the melt `out … "melt to
     Lightning"` at the source; nothing more is written. Core's melt takes no memo
-    (docs/contract-requests/S3-topup.md), so the host shows that melt as "top-up" by the id the
+    (docs/archive/contract-requests/S3-topup.md), so the host shows that melt as "top-up" by the id the
     ledger recorded. Those ids are a list of their own (the newest 256, bounded by the ledger's
     guard), never pruned by the 24-hour window, so this device keeps the label after a day.
   Main's settings gate (F4/F8) now also asks when `amountSats` changes, and its question states
@@ -212,7 +212,7 @@ ceiling was above the video's price, even a core it priced within it.
   signed, and wallet operations that are not PAYs or melts at the same mint (a redeem, a NUT-07
   check, a top-up's mint at the target, the settle loop). Each of those is a few 30 s round
   trips, and core's queue does not show them to the host. Closing that fully needs core to check
-  a deadline when it grants the turn (a locked path); see `docs/reviews/2026-09-25-pre-push-pay-melt-gate.md`.
+  a deadline when it grants the turn (a locked path); see `docs/archive/reviews/2026-09-25-pre-push-pay-melt-gate.md`.
   A withdrawal made while a PAY is in flight waits for that PAY, up to 300 s at the worst, with
   nothing on screen to say why.
 
@@ -337,7 +337,7 @@ ceiling was above the video's price, even a core it priced within it.
     each held top-up with its reason and a Resume that main's native dialog confirms; a resumed
     hold is waived (`LedgerEntry.waived`), never deleted — it stops holding its target back and is
     still minted if the target pays it. Review record
-    `docs/reviews/2026-10-02-pre-push-topup-resume.md`.
+    `docs/archive/reviews/2026-10-02-pre-push-topup-resume.md`.
   - **The restart bound covers what comes before the melt request.** A melt now starts within
     `TOP_UP_MELT_START_BY_MS` = 5 min of its reservation or not at all (the entry settles
     `failed`: nothing moved) — between the two the run seals the record through the signer, and

@@ -1,14 +1,14 @@
 # Lane L5-Channel — the Channel screen (`packages/ui/src/screens/Channel/`)
 
 **Issued against `CONTRACTS_VERSION = 3`.** Branch `lane/L5-Channel`, based on main @ `e259115`.
-One contract **note** (not a blocker): `docs/contract-requests/L5-Channel.md` (there is no
+One contract **note** (not a blocker): `docs/archive/contract-requests/L5-Channel.md` (there is no
 author-scoped kind-10019 seeder lookup; worked around with a screen prop).
 
 Scope: build-plan §6.1 row **Channel** (banner, avatar, NIP-05 verification badge, tabs Videos /
 Shorts / Playlists / About, "Seeding N videos" if the channel runs a seeder; kind 0, 21/22,
 30005, 10019) + §6.2 where it applies, design brief `docs/design/README.md` (YouTube first,
-Rumble second), L4 component API (`docs/lanes/L4.md`), BRIEFS L5 row. Worked example:
-`docs/lanes/L5-Home.md`.
+Rumble second), L4 component API (`docs/archive/lanes/L4.md`), BRIEFS L5 row. Worked example:
+`docs/archive/lanes/L5-Home.md`.
 
 ## What was built
 
@@ -135,7 +135,7 @@ PNGs were rendered with.
   M videos" / "No seeders online for these videos right now" (the `no-seeders` state).
 - One-line alternative if the orchestrator prefers the looser reading: set `seedingCount` to
   "videos with `seedersOnline > 0`" when neither (a) nor (b) applies. Contract note with a
-  proposed `seederAnnouncement(pubkey)` method: `docs/contract-requests/L5-Channel.md`.
+  proposed `seederAnnouncement(pubkey)` method: `docs/archive/contract-requests/L5-Channel.md`.
 
 ## States (Storybook `Screens/Channel`, 23 stories × 2 themes = **46 PNGs** in `artifacts/screens/channel/`)
 

@@ -1,5 +1,5 @@
 /**
- * `--dev-fixtures` boot race (docs/lanes/E2E-fix.md, failure 3): the Home screen fetches its
+ * `--dev-fixtures` boot race (docs/archive/lanes/E2E-fix.md, failure 3): the Home screen fetches its
  * feed once, at mount, about a second before the worker's `dev.fixtures` event reaches the
  * catalogue — so it rendered the mock catalogue only and never showed the playable fixtures.
  * Catalogue reads now wait for the first `dev.fixtures`, bounded by `FIXTURE_WAIT_MS`, and stop

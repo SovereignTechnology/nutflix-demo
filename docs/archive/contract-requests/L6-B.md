@@ -74,7 +74,7 @@ Stage 1 has no `Signer` at all, and paying needs the wallet, not a Nostr identit
 **Workaround.** Behind `--dev-mocks` only, `DevViewerIdentity` (`host/identity.ts`): `me()` is
 the fixtures' `ME` pubkey (a public key, no private key anywhere), `signer()` reports it
 `locked: true`, and every write still rejects `no-signer:`. Without `--dev-mocks`, `me()` is
-`null`. **Decision needed** (see docs/lanes/L6-B.md): keep this dev identity for the Stage 1
+`null`. **Decision needed** (see docs/archive/lanes/L6-B.md): keep this dev identity for the Stage 1
 exit test, or let the screens play signed out.
 
 ### 8. Smaller ones

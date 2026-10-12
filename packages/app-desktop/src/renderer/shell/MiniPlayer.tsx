@@ -1,5 +1,5 @@
 /**
- * The shell's mini-player (Watch → shell hand-off; docs/lanes/L5-Watch.md "Mini-player
+ * The shell's mini-player (Watch → shell hand-off; docs/archive/lanes/L5-Watch.md "Mini-player
  * handshake"). Rendered ONCE at shell level (not in each screen's `miniPlayer` slot) so its
  * `<video>` survives navigation. It shows the coordinator's mini session:
  *

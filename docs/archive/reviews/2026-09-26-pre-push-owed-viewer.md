@@ -9,7 +9,7 @@ Diff: `ea9d4dc` (this lane's base: `54f49bb`, with `stage-3/owed-seeder` and
   "Coverage limits".
 - **Decisions.** Cameron 2026-09-26: the amendments at the end of ADR 0018 (the seeder's count,
   paying an old tail) and ADR 0015 (seeders say "free").
-- **Lane record.** `docs/lanes/P2-owed-viewer.md`.
+- **Lane record.** `docs/archive/lanes/P2-owed-viewer.md`.
 - **Independent review (2026-09-27):** the section at the end. It found what this author's pass
   missed: 1 HIGH (fresh PAYs lost their carry), 1 MEDIUM, 1 LOW and 6 INFO; building the HIGH's
   test found a second HIGH (N1: a PAY with an empty creator share refused after it was built).
@@ -381,7 +381,7 @@ cdk-mintd 0.18.1 `:3397`):
 - **R3: a report delayed past `REPORT_WAIT_MS`.** For a seeder the ledger says may be at its
   window, the report is taken as empty after 10 s. An `OWED` that arrives later than that and says
   the seeder is at its window would be overrun by the first ask.
-  `docs/contract-requests/P2-owed-viewer.md` asks for an explicit end to the report.
+  `docs/archive/contract-requests/P2-owed-viewer.md` asks for an explicit end to the report.
 - **R4: the gateway after its own crash.** It has no durable ledger. After its own crash at a
   seeder's exact window, the one block asked before the report overruns that seeder. With no crash
   (a graceful stop flushes), or any count below the window, it is safe.
@@ -409,7 +409,7 @@ On `3340a41`:
 - The whole suite: 3442 passed, 22 skipped, 0 failed.
 - Real-mint lanes: 11 of 11 at Nutshell and at cdk-mintd.
 
-The details are in the lane record, `docs/lanes/P2-owed-viewer.md`, under "Gates".
+The details are in the lane record, `docs/archive/lanes/P2-owed-viewer.md`, under "Gates".
 
 ## Independent review (2026-09-27)
 

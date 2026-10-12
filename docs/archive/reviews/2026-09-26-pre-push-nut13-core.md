@@ -207,12 +207,12 @@ puts the other device at counter 100+ and also checks the cursor (`441d663`), ca
 New: `seed.test.ts` (36), `nut13-wallet.test.ts` (26), `nut13-restore.test.ts` (21), the rig's own
 check, and the opt-in `nut13-real-mint.integration.test.ts` (5, green on Nutshell 0.21.0 and
 cdk-mintd 0.18.1). Whole suite, `tsc -b --force`, eslint/prettier, `check:locked`: see
-`docs/lanes/N1-nut13-core.md` §Tests (only the three known R6 failures remain once timing
+`docs/archive/lanes/N1-nut13-core.md` §Tests (only the three known R6 failures remain once timing
 failures are re-run alone and the build is fresh).
 
 ## Residuals
 
-See `docs/lanes/N1-nut13-core.md` §Residuals (11 items): the code-based guard without a journal; one
+See `docs/archive/lanes/N1-nut13-core.md` §Residuals (11 items): the code-based guard without a journal; one
 counters store per identity per process; a malformed counters file fails closed; restore cost and
 the mint lock; PENDING proofs left out; linking; unwipeable strings and library intermediates; a
 non-NUT-12 mint restoring more than `max_array_length`; legacy base64 keysets; https-only URLs are
@@ -263,7 +263,7 @@ keys (DLEQ included) and call it spent or unspent as it likes. From counter 0, t
 
 Bounding the scan of a phrase with no known high-water mark (another device's, or this one after
 losing its counters file) without cutting off an honest history needs information from outside the
-mint. So it is Cameron's decision, set out in `docs/contract-requests/N1-nut13-core.md` item 7: keep
+mint. So it is Cameron's decision, set out in `docs/archive/contract-requests/N1-nut13-core.md` item 7: keep
 per-call caps with resume, raise the cap, or add checkpoints to the relay copy. The seam part of item
 7 asks for a `'partial'` outcome and a `resume` field.
 

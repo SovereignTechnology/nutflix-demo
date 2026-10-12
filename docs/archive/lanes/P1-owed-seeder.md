@@ -8,7 +8,7 @@ Branch `stage-3/owed-seeder`, off `54f49bb`. Date: 2026-09-26/27. Commits:
 - `6abd292`: the independent review's fixes (2026-09-27, see "Independent review" below), then
   this record and the review record updated.
 
-Review record: `docs/reviews/2026-09-26-pre-push-owed-seeder.md`. Decisions: Cameron 2026-09-26,
+Review record: `docs/archive/reviews/2026-09-26-pre-push-owed-seeder.md`. Decisions: Cameron 2026-09-26,
 the amendments at the end of ADR 0018 (the seeder's count; paying an old tail) and ADR 0015
 (seeders say "free"). Lane P2 builds the viewer side on top of this branch.
 

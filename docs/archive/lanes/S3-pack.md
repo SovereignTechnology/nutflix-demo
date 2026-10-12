@@ -1,7 +1,7 @@
 # Lane S3-pack — packaging (issue #6, security review F21)
 
 Branch `stage-3/packaging`, off `c08c99f` (contracts v6). Date: 2026-09-25. Decision record:
-ADR 0017 (`docs/decisions/0017-packaging.md`). Review: `docs/reviews/2026-09-25-pre-push-packaging.md`.
+ADR 0017 (`docs/decisions/0017-packaging.md`). Review: `docs/archive/reviews/2026-09-25-pre-push-packaging.md`.
 There is no contract request, and no file under `packages/core/src/contracts/`, the locked
 paths, `docs/status.md` or `docs/security-review.md` changed.
 
@@ -177,7 +177,7 @@ Files this round:
     `src/main/__tests__/worker-entry.test.ts`, `src/ipc/__tests__/asar-path.test.ts`;
   - `scripts/release-manifest.mjs`, `scripts/release-verify.mjs`,
     `scripts/__tests__/release.test.ts`;
-  - `docs/decisions/0017-packaging.md`, `docs/reviews/2026-09-25-pre-push-packaging.md`, this
+  - `docs/decisions/0017-packaging.md`, `docs/archive/reviews/2026-09-25-pre-push-packaging.md`, this
     file.
 - Changed:
   - `packages/app-desktop/src/host/worker/sidecar.ts`, `src/main/args.ts`, `src/main/main.ts`

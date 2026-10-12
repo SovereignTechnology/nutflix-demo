@@ -31,7 +31,7 @@ export interface CatalogSource {
   /**
    * `VideoStats.seedersOnline`. Stage 1 has no swarm lookup on the host, so a source answers
    * only what it KNOWS is seeded and says 0 otherwise (fail closed: the screens gate play on
-   * 0, and `play()` reports the truth anyway). See docs/contract-requests/L6-B.md.
+   * 0, and `play()` reports the truth anyway). See docs/archive/contract-requests/L6-B.md.
    */
   seedersOnline(video: VideoManifest): Promise<number>;
 }
@@ -95,7 +95,7 @@ export class NostrCatalog implements CatalogSource {
 
   profile(pubkey: NostrPubkey): Promise<Profile | null> {
     // No live NIP-05 lookup in Stage 1: it would make the host fetch a URL named by a relay
-    // event; `nip05Status` stays `unverified` (docs/lanes/L6-B.md).
+    // event; `nip05Status` stays `unverified` (docs/archive/lanes/L6-B.md).
     return nostr.fetchProfile(this.client(), pubkey);
   }
 

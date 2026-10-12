@@ -7,7 +7,7 @@
  * One phrase per device (ADR 0016 D3): a device derives only from its own phrase, from counter
  * 0 up; phrases of other devices (from their relay copies, D2) or typed in are used only to
  * restore. Frozen for the fan-out: a lane that needs a change writes
- * docs/contract-requests/<LANE>.md instead of editing this file.
+ * docs/archive/contract-requests/<LANE>.md instead of editing this file.
  */
 import type { MintUrl, Sats } from '../contracts/index.js';
 

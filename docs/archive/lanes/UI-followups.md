@@ -1,11 +1,11 @@
 # Lane UI-followups — one shell toast stack; Shorts stops paying when its element pauses
 
 **Issued against `CONTRACTS_VERSION = 4`** (frozen, ADR 0007). Branch `lane/UI-followups`, based
-on `main` @ `607abcc`. No contract change requested (`docs/contract-requests/UI-followups.md`
+on `main` @ `607abcc`. No contract change requested (`docs/archive/contract-requests/UI-followups.md`
 does not exist on purpose). No `package.json` / lockfile edit, no new dependency, nothing
 outside the allowlist.
 
-Scope: `docs/status.md` follow-up 9 (from L6-A) = `docs/lanes/L6-A.md` deviations 5 and 13 and
+Scope: `docs/status.md` follow-up 9 (from L6-A) = `docs/archive/lanes/L6-A.md` deviations 5 and 13 and
 open questions 3 and 4.
 
 ## What changed

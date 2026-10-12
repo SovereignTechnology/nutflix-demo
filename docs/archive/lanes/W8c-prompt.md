@@ -9,7 +9,7 @@ main's trusted prompt window and the packaging stage. Date: 2026-09-27.
   - `be1e370` (prompt page: in-page suggestions, `[hidden]`);
   - `a90ef09` (packaging: the allow-list and the freshness rule);
   - then this report, the review record and the ADR 0016 notes.
-- Review record: `docs/reviews/2026-09-27-pre-push-r8-prompt.md`. It has the verification of each
+- Review record: `docs/archive/reviews/2026-09-27-pre-push-r8-prompt.md`. It has the verification of each
   finding, the differential review, the sharp edges, the 35 mutation checks and the residuals.
 - No contract request. `HostOut` is the desktop's own main ↔ host protocol, not a core contract.
 - Nothing changed under `packages/core/src/contracts/`, the locked paths, `docs/status.md` or
@@ -102,7 +102,7 @@ See the review record's Residuals; in short:
 
 ## Proposed row for `docs/status.md`
 
-| Round 8 — prompt window and packaging (final panel) | `stage-3/r8-prompt` | DONE. Five findings fixed:<br>• the recovery word fields draw their own suggestions in the page (no `<datalist>`, whose popup is its own window, outside content protection on macOS);<br>• a host confirm nobody waits for is closed: `HostOut` `confirm-cancel` on the host's deadline and at shutdown, main aborts the dialog (also when the host goes away), drops the late answer and refuses nothing after;<br>• staging refuses a prompt bundle older than the installed `@scure/bip39` and its dependencies (resolved from the lockfile);<br>• the prompt bundle's npm allow-list checks the whole package chain from this package's or the repo's `node_modules`;<br>• `[hidden]` always hides in the prompt window.<br>Review `docs/reviews/2026-09-27-pre-push-r8-prompt.md` (35 mutation checks) |
+| Round 8 — prompt window and packaging (final panel) | `stage-3/r8-prompt` | DONE. Five findings fixed:<br>• the recovery word fields draw their own suggestions in the page (no `<datalist>`, whose popup is its own window, outside content protection on macOS);<br>• a host confirm nobody waits for is closed: `HostOut` `confirm-cancel` on the host's deadline and at shutdown, main aborts the dialog (also when the host goes away), drops the late answer and refuses nothing after;<br>• staging refuses a prompt bundle older than the installed `@scure/bip39` and its dependencies (resolved from the lockfile);<br>• the prompt bundle's npm allow-list checks the whole package chain from this package's or the repo's `node_modules`;<br>• `[hidden]` always hides in the prompt window.<br>Review `docs/archive/reviews/2026-09-27-pre-push-r8-prompt.md` (35 mutation checks) |
 
 ## Follow-up — the round-8 verifier's low (multi-word paste), tests written, NOT run
 

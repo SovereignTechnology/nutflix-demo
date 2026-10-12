@@ -19,7 +19,7 @@ Commits:
 - then fix round 7 (section 4 below), with this record and the review record ("Round 7")
   updated.
 
-Review record: `docs/reviews/2026-09-26-pre-push-owed-viewer.md`. Decisions: Cameron 2026-09-26,
+Review record: `docs/archive/reviews/2026-09-26-pre-push-owed-viewer.md`. Decisions: Cameron 2026-09-26,
 the amendments at the end of ADR 0018 (the seeder's count, paying an old tail) and ADR 0015
 (seeders say "free"). ADRs 0015 and 0018 each gained a "viewer side as built" section.
 `docs/status.md` and `docs/security-review.md` were not edited; the text proposed for each is at
@@ -216,7 +216,7 @@ orchestrator decided to close it fully. The review record ("Round 7") has the de
 - **Tests** (extended): see "Tests".
 - **Docs:**
   - ADRs 0015 and 0018 ("viewer side as built");
-  - `docs/contract-requests/P2-owed-viewer.md`;
+  - `docs/archive/contract-requests/P2-owed-viewer.md`;
   - this record and the review record.
 - **Independent review fixes:**
   - `worker/pay/viewer-payer.ts` (the carry forwarded; accepted owed indexes; the connection
@@ -436,7 +436,7 @@ Run on the final code (`3340a41`; this record and the review record change no co
 2. **R1.** Is `MAX_TAIL_BLOCKS` = 1024 for 7 days the right bound for what a compromised worker
    can keep? Would a shorter expiry (for example 24 h) serve, given that seeders forget on
    restart anyway?
-3. **R3 and R4.** Is an explicit end-of-report marker (`docs/contract-requests/P2-owed-viewer.md`,
+3. **R3 and R4.** Is an explicit end-of-report marker (`docs/archive/contract-requests/P2-owed-viewer.md`,
    also lane P1's Q2) worth a v7 change? It would remove the 10 s wait and the gateway's crash
    residual.
 

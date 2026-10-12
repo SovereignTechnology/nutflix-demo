@@ -3,7 +3,7 @@
 Branch `stage-3/int-dleq-packaging`, off the Stage 3 integration head `9a20d30` (auto top-up #2,
 residuals #8, F33 #1, packaging #6 merged). Date: 2026-09-25. Commits: `4ca8b21` (task 1),
 `47a3520` (task 2), then this report and the review record. Review record:
-`docs/reviews/2026-09-25-pre-push-dleq-packaging.md`. ADR 0017 §2 and §4 were updated. There is
+`docs/archive/reviews/2026-09-25-pre-push-dleq-packaging.md`. ADR 0017 §2 and §4 were updated. There is
 no contract request, and nothing under `packages/core/src/contracts/`, the locked paths,
 `docs/status.md` or `docs/security-review.md` changed.
 
@@ -83,7 +83,7 @@ plus 10 × ENOENT); after, 1 failed (the timeout). Nothing was left in `/tmp`.
 - New:
   - `packages/app-desktop/src/worker/worker-root.ts`
   - `packages/app-desktop/src/worker/dev/dleq-selfcheck.ts`
-  - `docs/reviews/2026-09-25-pre-push-dleq-packaging.md`
+  - `docs/archive/reviews/2026-09-25-pre-push-dleq-packaging.md`
   - this file
 - Changed:
   - worker: `src/worker/adapters/bare.ts`, `src/worker/pay/dleq-thread.ts`,
@@ -131,7 +131,7 @@ orchestrator ruled on each one; the rulings are applied. For this round the `.la
 `packages/seeder/`, `packages/gateway/src/` and `packages/core/src/mocks/` (the last was not
 used). Each finding was reproduced on the unfixed code first. Full record: the review record's
 "Cross-lane review (round 4)" section. Contract request (a note, not a blocker):
-`docs/contract-requests/I1-dleqpack.md`.
+`docs/archive/contract-requests/I1-dleqpack.md`.
 
 - **HIGH, image URLs naming a paid core** (Cameron's rule: never banned, never charged, browsing
   never spends sats). Fixed:

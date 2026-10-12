@@ -4,7 +4,7 @@
  *
  * Intended wiring (orchestrator, packages/core/src/index.ts):
  *   export * as media from './media/index.js';
- * and, for Node hosts, a `./media/node` subpath export (see docs/lanes/L8.md).
+ * and, for Node hosts, a `./media/node` subpath export (see docs/archive/lanes/L8.md).
  */
 export { createMediaPipeline } from './pipeline.js';
 export { runStudioUpload } from './upload.js';

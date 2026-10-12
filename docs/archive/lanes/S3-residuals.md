@@ -11,7 +11,7 @@ belongs to another lane.
 
 An independent review of `c1cf406` returned fix-first (two medium liveness findings, two low,
 two info). All six were verified; five are fixed and one info is deferred. See "Independent
-review round" below and `docs/reviews/2026-09-25-pre-push-residuals.md` § Independent review.
+review round" below and `docs/archive/reviews/2026-09-25-pre-push-residuals.md` § Independent review.
 
 An independent verifier then checked that fix pass. It found one high regression, caused by the
 finding-4 fix, and two low findings. All three are fixed: see "Fix round 2" below and the review
@@ -348,7 +348,7 @@ balance event too. Two existing F31 tests expected 16 while the input was held; 
   - `runtime.ts`, `providers.ts`, `host.ts`.
 - Docs:
   - `docs/decisions/0014-wallet-journal-nut09.md` (amendment);
-  - `docs/reviews/2026-09-25-pre-push-residuals.md`;
+  - `docs/archive/reviews/2026-09-25-pre-push-residuals.md`;
   - this report.
 - Review round: core `wallet/settle-loop.ts` (new), `wallet/wallet.ts` (`settleSchedule`),
   `wallet/index.ts`, `wallet/nip60.ts` (`compactOutbox`), `wallet/spend.ts` (locked:
@@ -418,7 +418,7 @@ Commands:
 ## Mutation checks
 
 28 guards were broken one at a time; each made at least one test fail. Three guards (M5, M19b,
-M22) first survived and got a new test. Full table: `docs/reviews/2026-09-25-pre-push-residuals.md`.
+M22) first survived and got a new test. Full table: `docs/archive/reviews/2026-09-25-pre-push-residuals.md`.
 Highlights:
 
 - M1: write-ahead off, so the crash tests fail;

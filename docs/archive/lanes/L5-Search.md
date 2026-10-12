@@ -1,12 +1,12 @@
 # Lane L5-Search — the Search screen (`packages/ui/src/screens/Search/`)
 
 **Issued against `CONTRACTS_VERSION = 3`.** Branch `lane/L5-Search`, based on main @ `e259115`.
-Contract/route requests: `docs/contract-requests/L5-Search.md` (filters in the search route,
+Contract/route requests: `docs/archive/contract-requests/L5-Search.md` (filters in the search route,
 channel search, optional `AbortSignal`/`limit`) — every one has a working workaround here.
 
 Scope: build-plan §6.1 row **Search** ("Results with filters (date, duration, tags,
 creator) — NIP-50 + local index") + §6.2/§6.3, design brief `docs/design/README.md`
-(YouTube first, Rumble second, clean), L4 component API (`docs/lanes/L4.md`), BRIEFS L5 row.
+(YouTube first, Rumble second, clean), L4 component API (`docs/archive/lanes/L4.md`), BRIEFS L5 row.
 
 This lane was resumed from an interrupted session's uncommitted draft (screen, 21 tests,
 stories, CSS). The draft typechecked and its tests passed, but it had real bugs, fixed here:

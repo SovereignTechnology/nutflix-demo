@@ -19,7 +19,7 @@ export interface SeederConfig {
   readonly swarm?: SwarmConfig | null;
   /**
    * Price policy `PAY` messages are verified against. One per seeder for now — see
-   * docs/lanes/L2.md ("PAY has no core key").
+   * docs/archive/lanes/L2.md ("PAY has no core key").
    */
   readonly policy?: PricePolicy;
   /** Swap batch triggers; default from the engine's `config` when it has one, else 64 / 60 s. */

@@ -2,7 +2,7 @@
 
 Branch `stage-3/int-pay-melt-gate`, on the Stage 3 integration head `9a20d30`. Contracts and
 locked paths untouched: no contract request. Review record:
-`docs/reviews/2026-09-25-pre-push-pay-melt-gate.md`. ADR 0012 has an amendment.
+`docs/archive/reviews/2026-09-25-pre-push-pay-melt-gate.md`. ADR 0012 has an amendment.
 
 ## What and why
 

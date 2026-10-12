@@ -2,7 +2,7 @@
  * @sovit/ui component stylesheet. Load once per shell, after tokens.css:
  *   <link rel="stylesheet" href="…/tokens.css"><link rel="stylesheet" href="…/components.css">
  * Plain CSS with an `nf-` class namespace — no bundler-specific processing needed, so the
- * Electron and web shells render byte-identical styles (docs/lanes/L4.md "styling").
+ * Electron and web shells render byte-identical styles (docs/archive/lanes/L4.md "styling").
  * `npm run -w packages/ui build:css` flattens these imports into dist/ui.css.
  */
 @import './Button/Button.css';

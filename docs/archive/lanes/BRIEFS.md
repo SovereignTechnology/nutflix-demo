@@ -1,6 +1,6 @@
 # Stage 1 lane briefs (CONTRACTS_VERSION = 3 — Wave 1 was issued at v2; ADR 0004)
 
-Fill the lane prompt (`docs/prompts/lane.md`) from this table. Every lane gets, in addition
+Fill the lane prompt (`docs/archive/prompts/lane.md`) from this table. Every lane gets, in addition
 to what is listed: `packages/core/src/contracts/`, `SECURITY.md`, `docs/decisions/0003-*.md`
 (spike resolutions), and this file's row. Nothing else. Create the worktree with
 `scripts/new-lane-worktree.sh <LANE> <allowed paths…>`.

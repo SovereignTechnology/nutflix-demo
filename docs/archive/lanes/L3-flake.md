@@ -8,7 +8,7 @@ diagnosis moved into the source:
 - `packages/gateway/src/__tests__/ws-duplex.test.ts`
 - `packages/gateway/src/ws/bridge.ts`
 - `packages/gateway/src/__tests__/ws-bridge.hardening.test.ts` (new)
-- `docs/lanes/L3-flake.md`
+- `docs/archive/lanes/L3-flake.md`
 
 | Commit | What |
 |---|---|

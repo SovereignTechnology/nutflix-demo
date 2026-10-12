@@ -4,7 +4,7 @@
  * Videos here are REGULAR events (kind 21/22), so the root scope is an `E` tag (id +
  * author) with `K` = video kind and `P` = video author — not `A`, which NIP-22 reserves
  * for addressable events (build-plan §2.2 says "A/a"; the fixtures use `A`; the spec
- * says `E`/`e` for kinds 21/22 — see docs/lanes/L1.md). Parse accepts both.
+ * says `E`/`e` for kinds 21/22 — see docs/archive/lanes/L1.md). Parse accepts both.
  *
  * Top-level:  e = video id,      k = video kind, p = video author
  * Reply:      e = parent comment, k = 1111,       p = parent author

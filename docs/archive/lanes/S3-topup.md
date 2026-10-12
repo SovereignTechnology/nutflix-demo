@@ -6,7 +6,7 @@
 most 10 000 sats a top-up and 50 000 a day, only into mints on the user's own list, a native
 confirm the first time a mint is funded, every top-up in wallet history.
 
-No contract change; `docs/contract-requests/S3-topup.md` asks for a memo on `Wallet.melt`, for
+No contract change; `docs/archive/contract-requests/S3-topup.md` asks for a memo on `Wallet.melt`, for
 one sentence on fees in the daily cap, and (after the independent review) for a way to cap a
 melt's input fees up front — all worked around. No dependency, lockfile or
 `package.json` change. Nothing outside the allowlist.
@@ -111,7 +111,7 @@ merge keeps `amountSats`).
 
 - New: `app-desktop/src/host/topup/{auto-topup,ledger}.ts`; tests
   `host/__tests__/{auto-topup,topup-host,topup-real-mint.integration}.test.ts`;
-  `docs/contract-requests/S3-topup.md`; `docs/reviews/2026-09-25-pre-push-auto-topup.md`; this file.
+  `docs/archive/contract-requests/S3-topup.md`; `docs/archive/reviews/2026-09-25-pre-push-auto-topup.md`; this file.
 - Changed (app-desktop): `host/{adapter,dispatch,host,index,money,topics,wallet}.ts`,
   `host/settings/{json-file,settings}.ts`, `ipc/{guards,protocol}.ts`,
   `main/{main,money-gate,prompt}.ts`, `renderer/prompt/{prompt.ts,prompt.css}`; tests
@@ -216,7 +216,7 @@ the failure count is read from vitest's summary line only).
 ## Independent review (after `0cd3d30`)
 
 Verdict **ship**; five low and six info findings, each checked against the code first. Full
-record: `docs/reviews/2026-09-25-pre-push-auto-topup.md`, "Independent review".
+record: `docs/archive/reviews/2026-09-25-pre-push-auto-topup.md`, "Independent review".
 
 | # | Finding | Outcome |
 |---|---|---|
@@ -285,7 +285,7 @@ Runner: `scratchpad/S3-topup/mut.py` (one exact-string patch, `npx vitest run <f
 
 ## Proposed row for `docs/status.md`
 
-| Issue #2 — auto top-ups execute (F4) | `stage-3/auto-topup` | DONE: with the real wallet a due top-up runs from the payment path only (a play opening, a PAY for an open session; never the user's own withdrawal or any other balance change) — mint quote at the target, melt at `fromMint` — off by default, only into mints on the user's list, ≤ 10 000 per top-up and ≤ 50 000 per rolling 24 h (fees and in-flight included; ledger persisted, fails closed), first funding of a mint confirmed in main's prompt window (remembered only on yes), re-checked (same wallet, same settings) before the reservation and the melt, one at a time with backoff, both sides in wallet history; Settings amount field + cap copy. Review `docs/reviews/2026-09-25-pre-push-auto-topup.md` (self-review + independent review: 11 findings — 9 fixed, 1 fixed in part with the up-front input-fee refusal deferred, 1 not a defect and documented); contract request `S3-topup.md` (melt memo, fees in the cap, melt input-fee cap) |
+| Issue #2 — auto top-ups execute (F4) | `stage-3/auto-topup` | DONE: with the real wallet a due top-up runs from the payment path only (a play opening, a PAY for an open session; never the user's own withdrawal or any other balance change) — mint quote at the target, melt at `fromMint` — off by default, only into mints on the user's list, ≤ 10 000 per top-up and ≤ 50 000 per rolling 24 h (fees and in-flight included; ledger persisted, fails closed), first funding of a mint confirmed in main's prompt window (remembered only on yes), re-checked (same wallet, same settings) before the reservation and the melt, one at a time with backoff, both sides in wallet history; Settings amount field + cap copy. Review `docs/archive/reviews/2026-09-25-pre-push-auto-topup.md` (self-review + independent review: 11 findings — 9 fixed, 1 fixed in part with the up-front input-fee refusal deferred, 1 not a defect and documented); contract request `S3-topup.md` (melt memo, fees in the cap, melt input-fee cap) |
 
 ## Proposed text for `docs/security-review.md`
 
@@ -303,6 +303,6 @@ F4 changes state (executed, not only evaluated). Proposed edits:
   withdrawal that empties an allowed mint moves nothing while a PAY that leaves it below the
   threshold tops it up, a sign-out during the first-funding question moves nothing, and a pending
   reservation still counts after a restart. Review:
-  `docs/reviews/2026-09-25-pre-push-auto-topup.md` (self-review: five findings fixed; independent
+  `docs/archive/reviews/2026-09-25-pre-push-auto-topup.md` (self-review: five findings fixed; independent
   review: eleven findings — nine fixed, one fixed in part with the up-front input-fee refusal
   deferred as contract request 3, one not a defect and documented; 22 + 18 mutation checks).
