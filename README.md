@@ -1,100 +1,236 @@
-# nutflix-demo
+# Nutflix
 
+[![CI](https://github.com/SovereignTechnology/nutflix-demo/actions/workflows/ci.yml/badge.svg)](https://github.com/SovereignTechnology/nutflix-demo/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/SovereignTechnology/nutflix-demo)](https://github.com/SovereignTechnology/nutflix-demo/releases/latest)
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](LICENSE)
 
-> **The Pear-runtime demo — working.** A Nostr-native peer-to-peer video network where seeders
-> are paid per block in Cashu ecash, the creator picks the mint, and the UI aims at YouTube
-> rather than at a protocol demo. This repository is the JavaScript implementation on Electron +
-> the Pear runtime (Hypercore/Hyperblobs over Hyperswarm). **For the Rust/iroh implementation,
-> see nfx** (published separately).
->
-> Status: Stages 0–2 done; Stage 3 (integration and polish) in review. See
-> [`docs/status.md`](docs/status.md) and the security review
-> [`docs/security-review.md`](docs/security-review.md).
+**Peer-to-peer video where the people who seed a video are paid by the people who watch it.**
+Videos are announced on [Nostr](https://nostr.com), streamed from other people's computers over
+[Hypercore](https://docs.pears.com), and paid for block by block in [Cashu](https://cashu.space)
+ecash. The creator chooses the mint and sets the price, and the price is shown before you press
+Play.
 
-The source of truth is on Nostr (NIP-34, via [ngit](https://ngit.dev)); GitHub is a mirror.
+<!-- Screenshots go here (docs/images/), once the screenshots workflow has produced them. -->
 
-**"Nutflix" is the brand name only.** Package scope is `@sovit/*`, the wire protocol is
-`pay/1`, and nothing in the code depends on the brand (build plan §9.11).
+This repository, `nutflix-demo`, is the JavaScript implementation: an Electron desktop app with a
+[Bare](https://github.com/holepunchto/bare) worker, plus the seeder and gateway daemons. A Rust
+implementation built on iroh lives in [nfx](https://github.com/SovereignTechnology/nfx).
 
-## Read first
+> **Status: experimental.** Desktop 0.1.0 for Linux x86_64 was released on 2026-10-05. It is a
+> demo, not a product you should trust with money you cannot afford to lose. Read
+> [Known limitations](#known-limitations) before you install it.
 
-| Document | What it is |
-|----------|------------|
-| [`docs/plan/build-plan.md`](docs/plan/build-plan.md) | The *what*: assumptions, threat model, architecture, data model, `pay/1`, payment flow, UI, hardening, phases, open questions |
-| [`docs/plan/execution.md`](docs/plan/execution.md) | The *how*: ground rules for parallel agents, stages, lanes, merge order, prompts |
-| [`SECURITY.md`](SECURITY.md) | Threat table (normative for the adversary suite), money-path invariants, locked directories |
-| [`docs/decisions/`](docs/decisions/) | ADRs — from 0002 (stack) to 0018 (one seeder per block); 0014 wallet journal, 0015 images over Pear, 0016 NUT-13 seed backup, 0017 packaging |
-| [`docs/security-review.md`](docs/security-review.md) | The security review: every finding, its state and residuals |
-| [`docs/reviews/`](docs/reviews/) | Pre-push review records (differential review + sharp edges) for each change |
-| [`docs/spikes/`](docs/spikes/) | S-A per-peer gating, S-B browser Hypercore, S-C transcode |
-| [`docs/lanes/BRIEFS.md`](docs/lanes/BRIEFS.md) | Per-lane allowlists, context, definition of done |
-| [`docs/vendor/`](docs/vendor/) | Pinned upstream specs and READMEs. **The API is what is in here and in `node_modules/`, not what you remember.** |
+## Contents
 
-## Layout
+- [What it does](#what-it-does)
+- [How it works](#how-it-works)
+- [Known limitations](#known-limitations)
+- [Install](#install)
+- [Run from source](#run-from-source)
+- [Run a seeder or gateway](#run-a-seeder-or-gateway)
+- [Repository layout](#repository-layout)
+- [Documentation](#documentation)
+- [Contributing](#contributing) · [Security](#security) · [Licence](#licence)
 
-```
-packages/core         @sovit/core        runtime-agnostic protocol lib: contracts, mocks, (nostr, manifest, media, payment…)
-packages/seeder       @sovit/seeder      Corestore + Hyperblobs seeder daemon, pay/1 server side
-packages/gateway      @sovit/gateway     seeder + WS bridge + Blossom HTTP
-packages/ui           @sovit/ui          React design system + screens, talks only to NetworkAdapter
-packages/app-desktop  @sovit/app-desktop Electron + pear-runtime Bare worker shell
-packages/app-web      @sovit/app-web     static web shell: in-page Hypercore over WS, service-worker player
-```
+## What it does
 
-`packages/core/src/contracts/` is the frozen interface surface (`CONTRACTS_VERSION`).
-`payment/`, `signer/`, `pay-protocol/`, `wallet/spend.ts`, `wallet/seed.ts` and
-`gateway/src/auth/` are the **audit surface**: nothing there logs, and they import only the
-audited libraries (`scripts/check-locked-dirs.sh`, [SECURITY.md](SECURITY.md#locked)).
+- **Watch.** Home (your subscriptions, and Trending), search, Shorts, channel pages, and a watch page
+  with a quality menu that shows each rendition's price, a mini-player, likes, comments and reports.
+  Opening a video does not start it: you see the price first.
+- **Pay per block.** Seeders send the video in blocks (64 KiB by default) and are paid as they go.
+  Pausing stops the payments. Auto top-up is off until you turn it on.
+- **Publish.** Studio transcodes an upload to 1080p, 720p and 360p (never upscaled), signs a Nostr
+  video event with your key, and lets you set the price per block, the mints you accept and how
+  each payment is split between the seeder and you (50/50 by default).
+- **Seed.** Turn seeding on to serve videos from your own disk and earn the seeder's share. It is
+  off by default, with a 10 GiB cap.
+- **Wallet.** A NIP-60 Cashu wallet with a balance per mint. Fund it by paying a Lightning invoice;
+  withdraw by pasting one. A 12-word recovery phrase (NUT-13) is shown once so you can restore it.
+- **Library.** History, watch later, playlists and likes, stored as Nostr lists encrypted to
+  yourself (a playlist can be made public).
+- **Sign in** with a local key (kept encrypted on disk) or a NIP-46 remote signer such as a bunker.
 
-## Getting started
+Defaults are chosen for privacy and safety: no default mint, seeding off, remote images off, and
+three public relays (`relay.damus.io`, `nos.lol`, `relay.primal.net`) that see your IP address and
+what you ask them for. You can change the relays and mints in Settings.
+
+## How it works
+
+1. **Discovery.** A video is a signed Nostr event (NIP-71, kinds 21 and 22). It names the Hypercore
+   that holds the video, lists the renditions, and states the price per block and the mints the
+   creator accepts.
+2. **Transport.** Your app joins the swarm for that Hypercore with Hyperswarm and reads Hyperblobs
+   from the peers that have it. Hypercore checks every block against its Merkle tree before the
+   block counts.
+3. **Payment.** `pay/1` runs on the same encrypted connection. A seeder lets a small window of
+   blocks go out unpaid (4 by default, wider when the creator's minimum payment needs it). The
+   viewer then pays for the blocks it has received. A viewer that does not pay is cut off and its
+   key is banned.
+4. **Money.** Each payment carries two sets of Cashu proofs, one for the seeder and one for the
+   creator, each locked to its recipient (NUT-11) and carrying a DLEQ proof (NUT-12). The seeder
+   checks them offline before it acknowledges.
+5. **The mint.** The creator picks the mints. A viewer pays only at a mint that is in the video's
+   list, in the seeder's list and in the viewer's own wallet. Neither side is ever more than the
+   unpaid window of blocks ahead of the other, which bounds what a cheat can gain.
+
+The threat model, the money-path invariants and the review of the implementation are in
+[SECURITY.md](SECURITY.md) and [docs/security-review.md](docs/security-review.md).
+
+## Known limitations
+
+These are the things you would otherwise find out by trying them. Release 0.1.0:
+
+- **Playback does not start on real relays.** The desktop app reports zero seeders for every video
+  it finds on a relay, and the watch page treats zero seeders as "Nobody is seeding this video right
+  now", so a signed-in viewer sees that message instead of a Play control. The offline demo
+  (`npm start`, below) uses fixture data and is not affected. Tracked in
+  [#23](https://github.com/SovereignTechnology/nutflix-demo/issues/23).
+- **It has not been run end to end against real relays, real peers and a real mint.** The
+  real-mint tests use two mint implementations (Nutshell 0.21.0 and cdk-mintd 0.18.1) on a local
+  machine with a fake Lightning backend. No real payment is on record. Cashu ecash is bearer money
+  and a mint can lose or withhold it, so keep balances small.
+- **Not independently audited.** The security review was done in-house with AI assistance. The
+  repository has an adversary test suite and a [fuzz workflow](.github/workflows/fuzz.yml), but no
+  outside party has reviewed it.
+- **Some screens are unfinished.** The "Your tags" tab on Home is always empty, the Zap button does
+  nothing, and nobody's NIP-05 name is ever looked up, so there are no "verified" badges. A creator
+  who is not the seeder is paid with a Nostr nutzap, and the app has no code to find and redeem
+  incoming ones.
+- **Linux x86_64 only.** There is no Windows, macOS or arm64 build, no automatic update, and no
+  operating-system code signing. You verify downloads yourself ([below](#verify-a-download)).
+- **The web app is a placeholder.** `packages/app-web` is an empty scaffold. The web portal that
+  the early plans described is not part of this repository.
+
+## Install
+
+Download the files for the latest release from the
+[Releases page](https://github.com/SovereignTechnology/nutflix-demo/releases/latest).
+
+| File                             | Use it on                                                                                   |
+| -------------------------------- | ------------------------------------------------------------------------------------------- |
+| `nutflix_<version>_amd64.deb`    | Debian and Ubuntu, including Ubuntu 24.04 and later (recommended)                            |
+| `Nutflix-<version>-x64.AppImage` | Other distributions. **Not Ubuntu 24.04 or later**: it cannot start there, so use the `.deb` |
 
 ```sh
-git clone nostr://npub1s0vtechh66tx7vrwdud8zfyheu9zca7swwfrzd4qu2a4f93mxs6qvn9adx/nutflix-demo
-# or the mirror: git clone https://github.com/SovereignTechnology/nutflix-demo.git
+sudo apt install ./nutflix_0.1.0_amd64.deb      # the ./ matters
+nutflix                                          # or start Nutflix from your menu
+```
+
+`sudo apt remove nutflix` uninstalls it and keeps your data. Studio needs `ffmpeg` and `ffprobe` on
+your `PATH` to transcode uploads (`sudo apt install ffmpeg`); the package only recommends them.
+
+### Verify a download
+
+The files are not signed by an operating-system vendor, so your system may warn about them. Their
+integrity rests on two things published with every release:
+
+- `SHA256SUMS`. Check a download with `sha256sum -c SHA256SUMS --ignore-missing`. This shows the
+  file is intact; it does not show who made it, because it comes from the same page.
+- A signed Nostr release notice (kind 30071, `d` tag `nutflix-desktop`), attached to the release as
+  `release-event.json` and signed by the SovTech key
+  `npub1s0vtechh66tx7vrwdud8zfyheu9zca7swwfrzd4qu2a4f93mxs6qvn9adx`.
+
+To check the signature, use a checkout of this repository (Node 22.18 or newer; see
+[Run from source](#run-from-source)):
+
+```sh
+git clone https://github.com/SovereignTechnology/nutflix-demo.git && cd nutflix-demo
+npm ci --ignore-scripts
+node scripts/release-verify.mjs release-event.json nutflix_0.1.0_amd64.deb   # one or more files
+node scripts/release-verify.mjs release-event.json --all ~/Downloads          # needs both files
+```
+
+It checks the signature, that the key is SovTech's, and each file's size and sha256. Keep the
+original file names. An older genuine release also verifies, so compare the version and date it
+prints with the current notice on the relays.
+
+## Run from source
+
+You need Node 22.18 or newer (`package.json` declares 22.12, but the build scripts run TypeScript
+files directly, which needs 22.18) and a Linux machine.
+
+```sh
+git clone https://github.com/SovereignTechnology/nutflix-demo.git
 cd nutflix-demo
-npm ci --ignore-scripts     # .npmrc already sets ignore-scripts + exact pins
-npm run hooks:install       # pre-commit: lane path allowlist + locked-dir check
-npm run build               # typecheck + bundles; tests run in CI (below)
+npm ci --ignore-scripts                          # .npmrc turns lifecycle scripts off
+node node_modules/electron/install.js            # so fetch Electron's binary explicitly
+npm run build
+npm start -w packages/app-desktop
 ```
 
-Requires Node ≥ 22.12. Refresh vendored docs with `scripts/vendor-docs.sh`.
+`npm start` runs an **offline demo**: a mock wallet with fake sats, fixture videos, in-memory
+relays and a local test DHT. Nothing leaves your machine. A packaged build refuses these flags and
+always uses the real network.
 
-### Working in a lane
+Chromium's sandbox has to be able to start, and Nutflix refuses to run without it. On Ubuntu 24.04
+and later, which restricts unprivileged user namespaces, give your checkout's sandbox helper the
+setuid bit:
 
 ```sh
-scripts/new-lane-worktree.sh L2 packages/seeder/
-cd .worktrees/L2            # .lane holds the allowlist; the hook enforces it
+sudo chown root:root node_modules/electron/dist/chrome-sandbox
+sudo chmod 4755 node_modules/electron/dist/chrome-sandbox
 ```
 
-## CI and hardening
+## Run a seeder or gateway
 
-CI runs on GitHub Actions ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)): the
-supply-chain gates (lockfile drift, registry-only resolutions, `npm audit signatures`,
-advisories), lint, typecheck, the audit-surface and contracts-version checks, the native-module
-inventory, the Electron security lint, the test suite, the Electron e2e (Chromium's sandbox on,
-under xvfb) and the packaging stage gates. A fuzz campaign over the pay/1 codec and the payment
-parsers runs on demand ([`.github/workflows/fuzz.yml`](.github/workflows/fuzz.yml), Actions tab →
-fuzz → Run workflow; its targets also run briefly in every CI run). Desktop releases are built
-by [`.github/workflows/release.yml`](.github/workflows/release.yml) on a `desktop-v<version>` tag
-(Linux `.deb` + AppImage into a draft GitHub release; ADR 0017 §9). [`ci/gitlab-ci.yml`](ci/gitlab-ci.yml) mirrors the
-same gates for a GitLab runner.
+The repository also holds a headless **seeder** daemon and a **gateway** (a seeder plus a WebSocket
+bridge and a Blossom HTTP server), each with a hardened systemd unit. They are not part of the
+desktop release. [`deploy/systemd/README.md`](deploy/systemd/README.md) covers the config, the key
+file, the exit codes and what each hardening directive does. The gateway is a network service, so
+the AGPL's section 13 applies: users who interact with a modified version are entitled to its source.
 
-`npm run ci` = lint → typecheck/build → test → locked-dir check → native-module inventory
-(`docs/native-modules.txt`, `scripts/native-module-inventory.sh --check`) → Electron
-security lint (`scripts/electron-security-lint.mjs`). Other tooling from build-plan §7:
+## Repository layout
 
-| Tool | Purpose |
-|------|---------|
-| `scripts/reproducible-web-build.sh --twice` | Clean build → deterministic tree hash → unsigned Nostr event template (`artifacts/web-build/`) |
-| `scripts/csp-sri.mjs <index.html>` | SRI on every script/stylesheet + strict CSP as `<meta>` and a headers file; fails on inline or third-party code |
-| `deploy/systemd/` | Hardened seeder/gateway units, directive-by-directive README, and the measured `MemoryDenyWriteExecute` result |
+| Package                | Name                 | What it is                                                                         |
+| ---------------------- | -------------------- | ---------------------------------------------------------------------------------- |
+| `packages/core`        | `@sovit/core`        | Protocol library: contracts, Nostr, manifests, media, payments, wallet, `pay/1`    |
+| `packages/seeder`      | `@sovit/seeder`      | Seeder daemon (Corestore and Hyperblobs, the `pay/1` server side)                  |
+| `packages/gateway`     | `@sovit/gateway`     | Seeder plus a WebSocket bridge and Blossom HTTP                                    |
+| `packages/ui`          | `@sovit/ui`          | React design system and screens; talks only to the `NetworkAdapter` contract       |
+| `packages/app-desktop` | `@sovit/app-desktop` | The Electron app: main process, host process, Bare worker, packaging               |
+| `packages/app-web`     | `@sovit/app-web`     | Placeholder scaffold, not shipped                                                  |
+
+The packages are internal to this workspace and are not published to npm. "Nutflix" is the brand
+name. The package scope is `@sovit/*` and the wire protocol is `pay/1`, but a few persisted
+formats embed the brand (the release notice's `d` tag, the key-file and wallet-journal formats, the
+`NUTFLIX_*` environment variables), so the name is not purely cosmetic.
+
+`packages/core/src/contracts/` is the frozen interface surface, versioned by `CONTRACTS_VERSION`.
+The payment, signer, `pay/1` and auth code is the **audit surface**: nothing there logs, and it
+imports only the audited libraries (`scripts/check-locked-dirs.sh`, [SECURITY.md](SECURITY.md)).
+
+## Documentation
+
+[`docs/README.md`](docs/README.md) indexes everything. The ones most readers want:
+
+- [`SECURITY.md`](SECURITY.md): reporting a vulnerability, the threat model and the invariants.
+- [`docs/decisions/`](docs/decisions/): architecture decision records, with the reasons for each
+  choice. [ADR 0017](docs/decisions/0017-packaging.md) covers packaging and release.
+- [`docs/security-review.md`](docs/security-review.md): every security finding, its state and its
+  residual risk.
+- [`deploy/systemd/README.md`](deploy/systemd/README.md): running the daemons.
 
 ## Contributing
 
-Read [CONTRIBUTING.md](CONTRIBUTING.md) and the [Code of Conduct](CODE_OF_CONDUCT.md).
-Security issues: see [SECURITY.md](SECURITY.md) — do not open a public issue.
+Open an issue, or a pull request on GitHub; see [CONTRIBUTING.md](CONTRIBUTING.md) and the
+[Code of Conduct](CODE_OF_CONDUCT.md). CI runs on GitHub Actions
+([`ci.yml`](.github/workflows/ci.yml)) for every pull request. The canonical copy of the repository
+is on Nostr (NIP-34), and the maintainer syncs `main` to it; to clone from there, install
+[ngit](https://ngit.dev) and run:
+
+```sh
+git clone nostr://npub1s0vtechh66tx7vrwdud8zfyheu9zca7swwfrzd4qu2a4f93mxs6qvn9adx/git.sovit.xyz/nutflix-demo
+```
+
+Much of this code was written with AI assistance.
+
+## Security
+
+Please do not open a public issue for a vulnerability. [SECURITY.md](SECURITY.md) says how to
+report one.
 
 ## Licence
 
-Copyright (C) 2026 Cameron. AGPL-3.0-or-later — see [LICENSE](LICENSE).
+Copyright (C) 2026 Sovereign Technology. [AGPL-3.0-or-later](LICENSE). The documents under
+`docs/vendor/` are copies of other projects' specifications and documentation and keep their own
+licences.
