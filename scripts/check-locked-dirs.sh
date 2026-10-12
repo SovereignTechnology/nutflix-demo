@@ -1,10 +1,9 @@
 #!/usr/bin/env bash
-# Enforces SECURITY.md §locked / execution plan §0 rule 3.
+# Enforces SECURITY.md "Locked directories".
 #
-# Until Stage 2 these paths held only interfaces, re-exports and tests. Stage 2 implemented
-# them (2026-09-23); they stay the AUDIT SURFACE, read by the owner on every diff
-# (.gitlab/CODEOWNERS). From Stage 3 on, this check enforces two standing rules on every
-# non-test file there:
+# These paths are the AUDIT SURFACE: the code that handles money, keys and the pay/1 wire
+# format. .github/CODEOWNERS asks the maintainer to review every change to them. This check
+# enforces two standing rules on every non-test file there:
 #
 #   1. Nothing logs. No `console.*` and no logger calls: SECURITY.md invariant 7 says nothing
 #      in these paths may log a proof, token or key, and the simplest proof is that nothing
@@ -15,7 +14,7 @@
 #      @sovit/core itself. A new dependency here — or a direct
 #      curve/hash library such as @noble/* or node:crypto — is a reviewed change to this list.
 #
-# LOCKED_DIRS_UNLOCKED, which Stage 2 used to skip the old interface-only rule, is ignored.
+# LOCKED_DIRS_UNLOCKED, which skipped an old interface-only rule, is ignored.
 #
 # Usage: scripts/check-locked-dirs.sh
 set -euo pipefail

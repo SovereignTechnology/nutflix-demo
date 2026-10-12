@@ -1,0 +1,17 @@
+# Owners are asked to review changes to these paths. GitHub only blocks a merge on this if branch
+# protection requires code-owner review, which is not currently enabled (see SECURITY.md).
+
+# The frozen interface contracts: a change here must also bump CONTRACTS_VERSION.
+/packages/core/src/contracts/        @SovereignTechnology
+
+# The audit surface (SECURITY.md, "Locked directories"). scripts/check-locked-dirs.sh enforces
+# no logging and an import allow-list on every non-test file here.
+/packages/core/src/payment/          @SovereignTechnology
+/packages/core/src/signer/           @SovereignTechnology
+/packages/core/src/pay-protocol/     @SovereignTechnology
+/packages/core/src/wallet/spend.ts   @SovereignTechnology
+/packages/core/src/wallet/seed.ts    @SovereignTechnology
+/packages/gateway/src/auth/          @SovereignTechnology
+
+# The threat model is normative for the adversary test suite.
+/SECURITY.md                         @SovereignTechnology
