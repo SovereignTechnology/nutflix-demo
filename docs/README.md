@@ -3,6 +3,12 @@
 Start with the [project README](../README.md). This page indexes everything else by what you are
 trying to do.
 
+## Project status
+
+- [`status.md`](status.md): the current status: what is released, what CI checks, what has not
+  been checked, and the open work.
+- [`CHANGELOG.md`](../CHANGELOG.md): what each release contains.
+
 ## Use the app
 
 - [Releases](https://github.com/SovereignTechnology/nutflix-demo/releases): the downloads, with
@@ -48,7 +54,6 @@ trying to do.
 These are the working records of the build. They are kept for provenance, not as current
 documentation, and commit hashes or branch names in them may not exist in this repository.
 
-- [`status.md`](status.md): the build log, lane by lane.
 - [`lanes/`](lanes/): one report per work lane (scope, what changed, how it was verified).
 - [`contract-requests/`](contract-requests/): requests to change the frozen interface contracts.
 - [`prompts/`](prompts/): the working prompts used during the build.
