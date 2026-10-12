@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 /**
- * docs/status.md "Shell contract the screens expect": every prop the shell owes each screen,
+ * docs/archive/status-2026-10-04.md "Shell contract the screens expect": every prop the shell owes each screen,
  * checked by replacing the nine screens with recording stubs (the rest of `@sovit/ui` stays
  * real). Screens always get the ONE coordinator-wrapped adapter and the router's navigate.
  */
