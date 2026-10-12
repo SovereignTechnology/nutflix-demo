@@ -2,7 +2,16 @@
   "name": "nutflix-monorepo",
   "version": "0.0.0",
   "private": true,
-  "description": "Nostr-native P2P video network with Cashu-paid seeding. Brand name only; code identifiers use the @sovit scope.",
+  "description": "Nutflix: peer-to-peer video where seeders are paid per block in Cashu ecash. Nostr discovery, Hypercore transport, Electron desktop app.",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/SovereignTechnology/nutflix-demo.git"
+  },
+  "bugs": {
+    "url": "https://github.com/SovereignTechnology/nutflix-demo/issues"
+  },
+  "homepage": "https://github.com/SovereignTechnology/nutflix-demo#readme",
+  "author": "Sovereign Technology",
   "license": "AGPL-3.0-or-later",
   "type": "module",
   "engines": {
