@@ -1,11 +1,14 @@
 # Plans
 
-- `build-plan.md` — v2 build plan (the *what*). Kept verbatim as the historical input;
-  resolutions of its open assumptions live in `docs/decisions/0003-*.md`.
-- `execution.md` — execution plan (the *how*). Prompts extracted to `docs/prompts/`; lane
-  context/allowlists to `docs/lanes/BRIEFS.md`.
+- `build-plan.md`: the v2 build plan (the *what*), kept verbatim as a historical input. Where it
+  disagrees with `docs/decisions/` or the code, those win; the resolutions of its open assumptions
+  are in `docs/decisions/0003-*.md`.
+- `L6-design.md`: the design review of the desktop shell, written before it was built. The ADRs
+  (0012, 0013, 0017) and the code are the current description.
+- The execution plan (the *how* of the parallel build) is in the archive:
+  [`../archive/execution-plan.md`](../archive/execution-plan.md).
 
-Section map used by the lane briefs (execution plan §0 rule 7 — a lane gets only its section):
+Section map used by the lane briefs in the archive (a lane got only its own section of the plan):
 
 | Lane | build-plan sections |
 |------|---------------------|

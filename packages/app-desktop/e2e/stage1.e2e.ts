@@ -5,7 +5,7 @@
  *
  * Needs D4 (Cameron's AppArmor `userns` profile: run with NUTFLIX_E2E_APPARMOR_PROFILE=1), an
  * X11 display (support.ts `displayStrategies`), `npm run build` and the system ffmpeg — see
- * docs/lanes/L6-A.md "Running the Electron suites". Prerequisites are checked first and
+ * docs/development.md "Running the Electron end-to-end suites". Prerequisites are checked first and
  * reported, never worked around.
  *
  * Launches `dist/main/main.js --dev-mocks --dev-fixtures --user-data-dir <tmp> --e2e-hooks`
