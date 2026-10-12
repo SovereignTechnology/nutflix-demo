@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Execution plan §0 rule 1: contracts freeze before fan-out. Any diff under
-# packages/core/src/contracts/ must bump CONTRACTS_VERSION, and only the orchestrator
-# (CODEOWNERS) may author it. This script checks the bump; CODEOWNERS checks the author.
+# The interface contracts are frozen. Any diff under packages/core/src/contracts/ must bump
+# CONTRACTS_VERSION (that includes the directory's README). This script checks the bump;
+# .github/CODEOWNERS asks the maintainer to review the change.
 #
 # Usage: scripts/check-contracts-version.sh [<base-ref>]   default base = origin/main
 set -euo pipefail

@@ -2,12 +2,21 @@
 
 ## Supported versions
 
-The project is pre-release. There is no released version yet, so there is nothing to
-backport fixes to. Once a `1.0.0` ships, this table gets filled in.
+| Version                               | Supported                                          |
+| ------------------------------------- | -------------------------------------------------- |
+| Desktop 0.1.x (Linux x86_64)          | Yes: a fix ships as a new tagged release           |
+| `main` and the unreleased daemons     | Best effort (the seeder and gateway are not released) |
+| Anything older than the latest 0.1.x  | No                                                 |
+
+The desktop app has no automatic update (ADR 0017). A fix ships as a new tagged release with a
+new signed release notice, and users have to download and
+[verify](README.md#verify-a-download) it themselves.
 
 ## Reporting a vulnerability
 
-**Do not open a public issue.** Email <git@sovit.xyz> with:
+**Do not open a public issue.** Report it privately, either on GitHub (the Security tab, then
+[Report a vulnerability](https://github.com/SovereignTechnology/nutflix-demo/security/advisories/new))
+or by email to <git@sovit.xyz>, with:
 
 - a description of the issue and its impact
 - steps to reproduce, or a proof of concept
@@ -20,8 +29,50 @@ release notes unless they ask not to be.
 
 ## Scope
 
-In scope: anything in this repository. Out of scope: the hosting infrastructure, and
-issues that require an already-compromised machine or physical access.
+In scope: anything in this repository, including the released builds. Out of scope: the hosting
+infrastructure, and issues that require an already-compromised machine or physical access. A
+Cashu mint that loses or withholds funds is a risk the design limits but cannot remove (T8 below),
+so report it only if this code makes it worse.
+
+## How this has been reviewed
+
+The design and the implementation were reviewed in-house, with AI assistance, and the findings,
+fixes and residual risks are recorded in [`docs/security-review.md`](docs/security-review.md). **No
+independent third party has audited this code.** The real-mint tests ran against two mint
+implementations with a fake Lightning backend, and no real payment is on record.
+
+What is enforced for every change, in CI on GitHub Actions:
+
+- the adversary tests, one named test per threat row and per invariant below;
+- `scripts/check-locked-dirs.sh`, which fails any change to the locked directories that logs or
+  imports from outside the audited libraries;
+- `scripts/check-contracts-version.sh`, which fails a change to the interface contracts that does
+  not bump `CONTRACTS_VERSION`;
+- lockfile, registry and advisory gates, and a frozen inventory of native modules.
+
+GitHub does not currently require a second reviewer on a pull request, including one that touches
+the locked directories.
+
+## What 0.1.0 does not protect against
+
+These are known limits of the released app, not bugs awaiting a report:
+
+- **Relays see you.** The three default relays learn your IP address and what you ask them for
+  (ADR 0009). The app makes no private-browsing claim.
+- **Images can reveal your IP.** With remote images off (the default), an `https` image is fetched
+  only when its publisher signed its hash, and the host it comes from still sees your address.
+- **Builds are signed by key, not by a vendor.** There is no operating-system code signing and no
+  claim that the builds are reproducible. Integrity rests on `SHA256SUMS` and a signed Nostr
+  notice, and a signature cannot show that a release is the latest one (ADR 0017).
+- **Electron's asar integrity check is not active on Linux.** It protects only macOS and Windows
+  builds (ADR 0017).
+- **The `.deb` installs a setuid helper.** `/usr/lib/nutflix/chrome-sandbox` is Chromium's standard
+  setuid-root sandbox helper; the app refuses to run without Chromium's sandbox (ADR 0017).
+- **The recovery phrase is not screen-capture protected on Linux.** The window that shows it says
+  so (ADR 0016).
+- **No NIP-05 check.** The desktop app never looks up a creator's NIP-05 name, so it establishes
+  only the signed event's public key (T9).
+- **Mint risk.** Funds held at a mint are the mint's to lose or withhold (T8).
 
 ---
 
@@ -34,8 +85,8 @@ pay, and never trust a peer or a server for anything you can check yourself.**
 
 This table is the normative source for the adversary test suite
 (`packages/core/src/payment/__tests__/`, `packages/core/src/pay-protocol/__tests__/`,
-`packages/gateway/src/auth/__tests__/`). Every row has a named test. It is reproduced
-verbatim from `docs/plan/build-plan.md` §1; change it there first.
+`packages/gateway/src/auth/__tests__/`). Every row has a named test. It began as section 1 of the
+original build plan (`docs/plan/build-plan.md`, now a historical document) and is maintained here.
 
 | # | Actor | Attack | Control | Residual loss |
 |---|-------|--------|---------|---------------|
@@ -55,6 +106,13 @@ verbatim from `docs/plan/build-plan.md` §1; change it there first.
 | T14 | Host | Keys read from disk/logs | Encrypted at rest, secure memory, log redaction | Keys on host |
 | T15 | Content | XSS via titles/descriptions/comments | Render as text or sanitized markdown; CSP no-inline; Electron `contextIsolation`, no `nodeIntegration`, sandboxed renderer | 0 |
 | T16 | Content | Malicious thumbnail/blob | Thumbnails are Blossom blobs with `x` hash in imeta; verify before display; images decoded in renderer only | 0 |
+
+Two rows describe the original plan more than the released app:
+
+- **T13** is about a web portal. No web shell ships in 0.1.0 (`packages/app-web` is an empty
+  scaffold), so the row is kept for a future one.
+- **T16** now works through ADR 0015: an image is shown only if it matches a hash its publisher
+  signed. If the user turns on remote images, any `https` image loads without that check.
 
 ## Non-negotiable invariants of the money path
 
@@ -80,15 +138,17 @@ Specified in `docs/plan/build-plan.md` §1–§3 and enforced by the adversary t
 8. **No browser persistence of proofs or keys.** The web shell holds NIP-60 state in memory
    only.
 
-## Locked directories {#locked}
+Invariant 8 is about a browser shell, which does not ship in 0.1.0; it applies to any future one.
 
-These directories are the audit surface. Until Stage 2 of `docs/plan/execution.md` they
-contained **only** interfaces, re-exports and tests (`MockPaymentEngine` lives in
-`packages/core/src/mocks/`, outside the lock). Stage 2 implemented them (2026-09-23); every
-later diff is read by the owner (CODEOWNERS), and `scripts/check-locked-dirs.sh` fails any
-change that makes them log anything or import from outside the audited libraries
-(`@cashu/cashu-ts`, `nostr-tools`, `sodium-universal`, `compact-encoding`, `@sovit/core`, and
-`@scure/bip39` for the NUT-13 recovery phrase — ADR 0016 D4, Cameron 2026-09-25).
+## Locked directories
+
+These directories are the audit surface: the code that handles money, keys and the `pay/1` wire
+format (`MockPaymentEngine` lives in `packages/core/src/mocks/`, outside the lock).
+`.github/CODEOWNERS` asks the maintainer to review every change to them, and
+`scripts/check-locked-dirs.sh` runs in CI and fails any change that makes them log anything or
+import from outside the audited libraries (`@cashu/cashu-ts`, `nostr-tools`,
+`sodium-universal`, `compact-encoding`, `@sovit/core`, and `@scure/bip39` for the NUT-13
+recovery phrase, ADR 0016 D4). Write the failing test first.
 
 ```
 packages/core/src/payment/
@@ -103,5 +163,5 @@ packages/gateway/src/auth/
 
 Hashing, signatures, blinding, DLEQ, key derivation and secure memory come from
 `@cashu/cashu-ts`, `sodium-native` / `sodium-universal`, `nostr-tools` and `hypercore`.
-Any contributor — human or agent — who finds themselves implementing one of these stops
-and reports.
+No code in this project, whether a person or an AI model wrote it, implements a cryptographic
+primitive. A contributor who finds that a change needs one stops and opens an issue.
