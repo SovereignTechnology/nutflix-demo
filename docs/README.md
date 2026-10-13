@@ -11,7 +11,7 @@ trying to do.
 
 ## Use the app
 
-- [Releases](https://github.com/SovereignTechnology/nutflix-demo/releases): the downloads, with
+- [Releases](https://github.com/SovereignTechnology/nutflix-pear/releases): the downloads, with
   checksums and the signed release notice.
 - [README: Install](../README.md#install) covers installing and verifying a release.
 

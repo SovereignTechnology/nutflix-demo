@@ -1,4 +1,4 @@
-# CI for the public nutflix-demo repo (GitHub Actions). Tests and CI never run on a developer
+# CI for the public nutflix-pear repo (GitHub Actions). Tests and CI never run on a developer
 # machine; this is where they run. Mirrors the gates in ci/gitlab-ci.yml, which stays for a
 # GitLab runner.
 #

@@ -7,7 +7,7 @@ for what does not work yet, see the README's [known limitations](../README.md#kn
 
 - **Desktop 0.1.0** is the current release: tag `desktop-v0.1.0`, published 2026-10-05 (UTC), as a
   Linux x86_64 `.deb` and AppImage. Downloads, checksums and the signed release notice are on the
-  [Releases page](https://github.com/SovereignTechnology/nutflix-demo/releases/latest).
+  [Releases page](https://github.com/SovereignTechnology/nutflix-pear/releases/latest).
 - `main` has moved on from the tag with documentation and a fix to the release-publishing script.
   The app code is the same as in the release.
 - It is **experimental**. There is no Windows, macOS or arm64 build, no automatic update and no
@@ -47,8 +47,7 @@ In no order of priority, and not scheduled:
 - The problems listed under the README's known limitations, starting with the playback gate.
 - Windows, macOS and arm64 builds, and a way to update the app.
 - Removing the empty `packages/app-web` scaffold (see [ADR 0019](decisions/0019-scope-pear-desktop-only.md)).
-- Open issues: [free (zero-price) videos](https://github.com/SovereignTechnology/nutflix-demo/issues/15)
-  and [renaming the project](https://github.com/SovereignTechnology/nutflix-demo/issues/16).
+- Open issue: [free (zero-price) videos](https://github.com/SovereignTechnology/nutflix-pear/issues/15).
 
 ## Elsewhere
 

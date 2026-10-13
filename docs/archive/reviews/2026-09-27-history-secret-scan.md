@@ -1,6 +1,6 @@
 # Full-history secret scan before a public GitHub publish (2026-09-27)
 
-Cameron chose GitHub (`nutflix-demo`, with Actions CI) as the CI route on 2026-09-27; the repo
+Cameron chose GitHub (`nutflix-pear`, with Actions CI) as the CI route on 2026-09-27; the repo
 is private on GitLab since the 2026-09-26 visibility lockdown, and nothing goes public without
 this scan and his explicit go-ahead. Read-only; no value was printed at any step.
 

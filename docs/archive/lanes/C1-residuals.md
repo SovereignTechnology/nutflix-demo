@@ -1,7 +1,7 @@
 # Lane C1-residuals — the small Stage 3 residuals (cloud session, 2026-10-02)
 
 Branch `claude/focused-hamilton-6573si`, restarted from `main` at `de86d72` after
-SovereignTechnology/nutflix-demo#1 merged. Run by a Claude Code cloud session under Cameron's
+SovereignTechnology/nutflix-pear#1 merged. Run by a Claude Code cloud session under Cameron's
 2026-10-02 decisions (status.md, Stage 3 inputs 20–31): tests run in the cloud container and in
 GitHub Actions; the container runs as root and has no DHT networking, so the hyperswarm
 integration tests and three unwritable-ledger cases fail there by environment (they pass in CI).

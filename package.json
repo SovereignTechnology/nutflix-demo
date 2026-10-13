@@ -5,12 +5,12 @@
   "description": "Nutflix: peer-to-peer video where seeders are paid per block in Cashu ecash. Nostr discovery, Hypercore transport, Electron desktop app.",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/SovereignTechnology/nutflix-demo.git"
+    "url": "git+https://github.com/SovereignTechnology/nutflix-pear.git"
   },
   "bugs": {
-    "url": "https://github.com/SovereignTechnology/nutflix-demo/issues"
+    "url": "https://github.com/SovereignTechnology/nutflix-pear/issues"
   },
-  "homepage": "https://github.com/SovereignTechnology/nutflix-demo#readme",
+  "homepage": "https://github.com/SovereignTechnology/nutflix-pear#readme",
   "author": "Sovereign Technology",
   "license": "AGPL-3.0-or-later",
   "type": "module",

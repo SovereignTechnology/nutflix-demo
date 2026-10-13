@@ -10,7 +10,7 @@
 
 [Unit]
 Description=Nutflix seeder (Corestore + Hyperblobs over Hyperswarm, pay/1 server side)
-Documentation=https://github.com/SovereignTechnology/nutflix-demo
+Documentation=https://github.com/SovereignTechnology/nutflix-pear
 After=network-online.target
 Wants=network-online.target
 # T11: a crash loop must not turn into a CPU DoS of the host.

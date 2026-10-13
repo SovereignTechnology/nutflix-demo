@@ -14,7 +14,7 @@
 
 [Unit]
 Description=Nutflix gateway (seeder + WS bridge + Blossom HTTP)
-Documentation=https://github.com/SovereignTechnology/nutflix-demo
+Documentation=https://github.com/SovereignTechnology/nutflix-pear
 After=network-online.target
 Wants=network-online.target
 StartLimitIntervalSec=300
