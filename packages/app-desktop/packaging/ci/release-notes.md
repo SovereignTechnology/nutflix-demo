@@ -1,4 +1,4 @@
-**Nutflix desktop for Linux (x86_64).** A peer-to-peer video player that pays seeders in Cashu ecash. It is experimental: read the [known limitations](https://github.com/SovereignTechnology/nutflix-demo#known-limitations) first.
+**Nutflix desktop for Linux (x86_64).** A peer-to-peer video player that pays seeders in Cashu ecash. It is experimental: read the [known limitations](https://github.com/SovereignTechnology/nutflix-pear#known-limitations) first.
 
 | File                             | For                                                                                                                         |
 | -------------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
@@ -17,7 +17,7 @@ These files are **not signed by an operating-system vendor**: your system may wa
 To check the signature you need a checkout of this repository and Node 22.18 or newer:
 
 ```sh
-git clone https://github.com/SovereignTechnology/nutflix-demo.git && cd nutflix-demo
+git clone https://github.com/SovereignTechnology/nutflix-pear.git && cd nutflix-pear
 npm ci --ignore-scripts
 node scripts/release-verify.mjs release-event.json nutflix_<version>_amd64.deb   # each file you downloaded
 node scripts/release-verify.mjs release-event.json --all <download-dir>           # needs both files

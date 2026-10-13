@@ -5,7 +5,7 @@ the places to go, in order:
 
 1. The [README](../README.md), especially [known limitations](../README.md#known-limitations) and
    [Install](../README.md#install), and the [docs index](../docs/README.md).
-2. Search the [issues](https://github.com/SovereignTechnology/nutflix-demo/issues); someone may
+2. Search the [issues](https://github.com/SovereignTechnology/nutflix-pear/issues); someone may
    have hit the same thing.
 3. Open a new issue: a bug report if something does not work as documented, or a feature request.
    Say which version you run and how you installed it.

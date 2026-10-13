@@ -1,7 +1,7 @@
 # Nutflix
 
-[![CI](https://github.com/SovereignTechnology/nutflix-demo/actions/workflows/ci.yml/badge.svg)](https://github.com/SovereignTechnology/nutflix-demo/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/github/v/release/SovereignTechnology/nutflix-demo)](https://github.com/SovereignTechnology/nutflix-demo/releases/latest)
+[![CI](https://github.com/SovereignTechnology/nutflix-pear/actions/workflows/ci.yml/badge.svg)](https://github.com/SovereignTechnology/nutflix-pear/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/SovereignTechnology/nutflix-pear)](https://github.com/SovereignTechnology/nutflix-pear/releases/latest)
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](LICENSE)
 
 **Peer-to-peer video where the people who seed a video are paid by the people who watch it.**
@@ -12,7 +12,7 @@ Play.
 
 <!-- Screenshots go here (docs/images/), once the screenshots workflow has produced them. -->
 
-This repository, `nutflix-demo`, is the JavaScript implementation: an Electron desktop app with a
+This repository, `nutflix-pear`, is the JavaScript implementation: an Electron desktop app with a
 [Bare](https://github.com/holepunchto/bare) worker, plus the seeder and gateway daemons. A Rust
 implementation built on iroh lives in [nfx](https://github.com/SovereignTechnology/nfx).
 
@@ -84,7 +84,7 @@ These are the things you would otherwise find out by trying them. Release 0.1.0:
   it finds on a relay, and the watch page treats zero seeders as "Nobody is seeding this video right
   now", so a signed-in viewer sees that message instead of a Play control. The offline demo
   (`npm start`, below) uses fixture data and is not affected. Tracked in
-  [#23](https://github.com/SovereignTechnology/nutflix-demo/issues/23).
+  [#23](https://github.com/SovereignTechnology/nutflix-pear/issues/23).
 - **It has not been run end to end against real relays, real peers and a real mint.** The
   real-mint tests use two mint implementations (Nutshell 0.21.0 and cdk-mintd 0.18.1) on a local
   machine with a fake Lightning backend. No real payment is on record. Cashu ecash is bearer money
@@ -104,7 +104,7 @@ These are the things you would otherwise find out by trying them. Release 0.1.0:
 ## Install
 
 Download the files for the latest release from the
-[Releases page](https://github.com/SovereignTechnology/nutflix-demo/releases/latest).
+[Releases page](https://github.com/SovereignTechnology/nutflix-pear/releases/latest).
 
 | File                             | Use it on                                                                                   |
 | -------------------------------- | ------------------------------------------------------------------------------------------- |
@@ -134,7 +134,7 @@ To check the signature, use a checkout of this repository (Node 22.18 or newer; 
 [Run from source](#run-from-source)):
 
 ```sh
-git clone https://github.com/SovereignTechnology/nutflix-demo.git && cd nutflix-demo
+git clone https://github.com/SovereignTechnology/nutflix-pear.git && cd nutflix-pear
 npm ci --ignore-scripts
 node scripts/release-verify.mjs release-event.json nutflix_0.1.0_amd64.deb   # one or more files
 node scripts/release-verify.mjs release-event.json --all ~/Downloads          # needs both files
@@ -150,8 +150,8 @@ You need Node 22.18 or newer (`package.json` declares 22.12, but the build scrip
 files directly, which needs 22.18) and a Linux machine.
 
 ```sh
-git clone https://github.com/SovereignTechnology/nutflix-demo.git
-cd nutflix-demo
+git clone https://github.com/SovereignTechnology/nutflix-pear.git
+cd nutflix-pear
 npm ci --ignore-scripts                          # .npmrc turns lifecycle scripts off
 node node_modules/electron/install.js            # so fetch Electron's binary explicitly
 npm run build
@@ -219,7 +219,7 @@ is on Nostr (NIP-34), and the maintainer syncs `main` to it; to clone from there
 [ngit](https://ngit.dev) and run:
 
 ```sh
-git clone nostr://npub1s0vtechh66tx7vrwdud8zfyheu9zca7swwfrzd4qu2a4f93mxs6qvn9adx/git.sovit.xyz/nutflix-demo
+git clone nostr://npub1s0vtechh66tx7vrwdud8zfyheu9zca7swwfrzd4qu2a4f93mxs6qvn9adx/git.sovit.xyz/nutflix-pear
 ```
 
 Much of this code was written with AI assistance.

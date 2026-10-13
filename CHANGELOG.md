@@ -3,7 +3,16 @@
 All notable changes to the Nutflix desktop app are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versions are desktop releases: release
 `X.Y.Z` is the tag `desktop-vX.Y.Z`, and its downloads and signed notice are on the
-[Releases page](https://github.com/SovereignTechnology/nutflix-demo/releases). Dates are UTC.
+[Releases page](https://github.com/SovereignTechnology/nutflix-pear/releases). Dates are UTC.
+
+## [Unreleased]
+
+### Changed
+
+- The repository is renamed `nutflix-pear` (was `nutflix-demo`): the GitHub repo, every README
+  badge and clone URL, the package metadata, docs, CI, issue templates and the desktop release
+  notes now point at `SovereignTechnology/nutflix-pear`. The 0.1.0 downloads and their signed
+  notice are unchanged.
 
 ## [0.1.0] - 2026-10-05
 
@@ -37,4 +46,5 @@ The first release of the desktop app, for Linux x86_64. It is experimental: read
 - Windows, macOS and arm64 builds, automatic updates and operating-system code signing.
 - A web app: `packages/app-web` is an empty scaffold.
 
-[0.1.0]: https://github.com/SovereignTechnology/nutflix-demo/releases/tag/desktop-v0.1.0
+[Unreleased]: https://github.com/SovereignTechnology/nutflix-pear/compare/desktop-v0.1.0...HEAD
+[0.1.0]: https://github.com/SovereignTechnology/nutflix-pear/releases/tag/desktop-v0.1.0

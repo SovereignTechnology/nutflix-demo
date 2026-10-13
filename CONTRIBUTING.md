@@ -24,8 +24,8 @@ You need Node 22.18 or newer on Linux. `package.json` declares 22.12, but the bu
 TypeScript files directly, which needs 22.18.
 
 ```sh
-git clone https://github.com/SovereignTechnology/nutflix-demo.git
-cd nutflix-demo
+git clone https://github.com/SovereignTechnology/nutflix-pear.git
+cd nutflix-pear
 npm ci --ignore-scripts       # .npmrc turns lifecycle scripts off and pins exact versions
 npm run build
 npm test

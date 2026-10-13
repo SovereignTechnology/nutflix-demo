@@ -8,7 +8,7 @@
  * initial empty document, it waits for the next `Page.frameNavigated`; if the navigation to
  * `app://nutflix/index.html` commits before `Page.enable` takes effect, that event never comes
  * and `electron.launch` times out after 30 s (reproduced under CPU load: 4 of 40 launches; CI:
- * main run 12, SovereignTechnology/nutflix-demo#7 and #8).
+ * main run 12, SovereignTechnology/nutflix-pear#7 and #8).
  *
  * Only the hold is copied from Playwright's loader (playwright-core 1.63.0,
  * `lib/server/electron/loader.js`, Apache-2.0): NOT its ~30 Chromium switches nor its
